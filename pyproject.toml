@@ -1,0 +1,90 @@
+[project]
+name = "arcomake"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "botocore[crt]",
+    "cdsapi",
+    "cfgrib",
+    "cftime",
+    "click",
+    "copernicusmarine",
+    "dask",
+    "dask_mpi",
+    "eccodes",
+    "etils",
+    "gcsfs",
+    "google-cloud-storage",
+    "h5netcdf",
+    "matplotlib",
+    "mpi4py",
+    "nc-time-axis",
+    "netCDF4",
+    "numcodecs < 0.16",
+    "numpy",
+    "pandas",
+    "requests",
+    "s3fs>2026",
+    "scipy",
+    "tqdm",
+    "xarray[complete]",
+    "xarray-regrid[accel]",
+    # TODO: Port to Zarr v3
+    "zarr >= 2, < 3",
+]
+authors = [{name = "Stefano Campanella", email = "scampanella@ogs.it"}]
+description = "Utility to download and preprocess data into ARCO format."
+readme = { file = "README.md", content-type = "text/markdown" }
+license = "MIT"
+
+[project.optional-dependencies]
+dev = [
+    "pandas-stubs~=3.0.3",
+    "pre-commit",
+    "ruff",
+    "ty",
+]
+
+[project.scripts]
+arco-make = "arcomake:cli"
+
+[project.urls]
+Homepage = "https://github.com/stefanocampanella/arco-make"
+
+[build-system]
+requires = ["uv_build >= 0.11.7, <0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+indent-width = 2
+extend-exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "scripts",
+    "notebooks",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501", "B028", "UP047", "SIM118"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["arcomake"]
+
+[tool.ty]
+# Keep defaults; configure project environment explicitly.
+
+[tool.ty.environment]
+python-version = "3.13"
+root = ["."]
+
+[tool.ty.src]
+include = ["src/arcomake/**/*.py"]
+respect-ignore-files = true
+
+[tool.ty.rules]
+# Disable type-checking for now.
+all = "error"
