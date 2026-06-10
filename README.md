@@ -16,6 +16,12 @@ For development, you can install the package with extra dependencies:
 pip install -e ".[dev]"
 ```
 
+Alternatively, you can pull from the GitHub Container Registry the latest image, e.g.
+
+```bash
+apptainer exec oras://ghcr.io/arco-make:latest arco-make download --help
+```
+
 ## Usage
 
 The typical workflow is:
@@ -30,7 +36,7 @@ The download phase is the most critical part, and most of its design choices wer
 
 1. It allows downloading different segments of long timeseries in parallel using SLURM job arrays. The lenght of such segments is specified in TOML configurations using the `array_step` key, in the top-level table, and it can be set to stay within maximum job time.
 2. As source datasets may have fine time or spatial resolutions, resulting in segments which might not fit into memory, `arco-make` downloads and preprocesses each dataset separately, saving regridded/resampled intermediate results on disk. To further reduce memory requirements, it does so by subdividing timeseries segments into smaller temporary segments, whose length can be specified using the `tmp_step` key in the top-level TOML table.
-3. It allows saving the resulting Zarr to zip archives to avoid the creation of a plethora of small files, which could impact parallel filesystems like LUSTRE.
+3. It allows saving the resulting Zarr to zip archives to avoid the creation of a plethora of small files, which could impact performance on parallel filesystems like LUSTRE or on tape storage.
 
 Arco-make allows downloading from many different data providers (as the Copernicus Marine or the Climate Data Store) and online resources (i.e., Google Cloud Storage or NetCDF files served via HTTP). Notice that temporary storage is used both for saving intermediate results and when downloading from the Climate Data Store or remote NetCDFs. If your temporary directory uses RAM, it might be a good idea to set up the `TMPDIR` environment variable to point elsewhere.
 
@@ -105,6 +111,6 @@ variable = 'mask_variable_name'
 # save options
 ```
 
-Currently, the implementation is scarcely documented, and there is no unit testing. There are plans to add both, and contributions in that regard are welcome (to add features and fixes as well).
+Currently, the implementation is scarcely documented, and there is no unit testing. There are plans to add both, and contributions in that regard are welcome (or to add features and fixes as well).
 
 Arco-make is a best-effort project, use at your own peril!

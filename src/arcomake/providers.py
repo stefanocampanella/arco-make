@@ -6,7 +6,7 @@ import pathlib
 import tempfile
 import warnings
 from abc import ABC, abstractmethod
-from typing import override
+from typing import Any, override
 from zipfile import ZipFile
 
 import cdsapi
@@ -36,15 +36,15 @@ class Provider(ABC):
 
   @abstractmethod
   def open_dataset(
-    self, date_interval: DateInterval | None, dir=pathlib.Path | None, **kwargs
+    self, backend_kwargs: dict[str, Any], date_interval: DateInterval | None, tmpdir: pathlib.Path | None = None,
   ) -> xr.Dataset:
     """Provides a common interface, whether one is downloading from Copernicus Marine, Climate Data Store, etc.
     Depending on the particular implementation, it might download temporary files to `dir`
 
     Args:
+      backend_kwargs: Additional keyword arguments passed to library code (e.g. copernicusmarine)
       date_interval (DateInterval, optional): Date interval to download. Defaults to None (whole dataset).
-      dir (pathlib.Path, optional): Directory to download to. Defaults to None (download to tempfile default path).
-      **kwargs: Additional keyword arguments passed to library code (e.g. copernicusmarine)
+      tmpdir (pathlib.Path, optional): Directory to download to. Defaults to None (download to tempfile default path).
     """
     pass
 
@@ -59,15 +59,14 @@ class CopernicusMarine(Provider):
     cm_logger.setLevel(level=getattr(logging, self.log_level.upper()))
 
   @override
-  def open_dataset(self, date_interval=None, dir=None, **kwargs):
+  def open_dataset(self, backend_kwargs, date_interval=None, tmpdir=None):
     if date_interval is not None:
       # Note! Copernicus Marine Data Store uses Python convention (right open)
-      kwargs = {
+      backend_kwargs.update({
         "start_datetime": date_interval.start,
         "end_datetime": date_interval.end,
-        **kwargs,
-      }
-    ds = cm.open_dataset(**kwargs)
+      })
+    ds = cm.open_dataset(**backend_kwargs)
     return ds
 
 
@@ -75,16 +74,16 @@ class ClimateDataStore(Provider):
   """Support for cdsapi. ARCO-ERA5 (WeatherBench datasets) should be preferred."""
 
   @override
-  def open_dataset(self, date_interval=None, dir=None, **kwargs):
+  def open_dataset(self, backend_kwargs, date_interval=None, tmpdir=None):
     if date_interval is None:
-      dataset_name, request = self._get_request()
-      ds = self._process_request(dataset_name, request, dir, self.progress, self.client_logger)
+      dataset_name, request = self._get_request(**backend_kwargs)
+      ds = self._process_request(dataset_name, request, tmpdir, self.progress, self.client_logger)
     else:
       consecutive_dates = self._consecutive_dates_with_same_month_or_year(date_interval)
       datasets = []
       for dates in consecutive_dates:
-        dataset_name, request = self._get_request(dates=dates, **kwargs)
-        ds = self._process_request(dataset_name, request, dir, self.progress, self.client_logger)
+        dataset_name, request = self._get_request(dates=dates, **backend_kwargs)
+        ds = self._process_request(dataset_name, request, tmpdir, self.progress, self.client_logger)
         # _process_request drops the time dimension if of length one
         if len(dates) == 1:
           ds = ds.expand_dims(dim="time", axis=0)
@@ -134,14 +133,14 @@ class ClimateDataStore(Provider):
       }
     return dataset_name, request
 
-  def _process_request(self, dataset_name, request, dir, progress, client_logger):
+  def _process_request(self, dataset_name, request, dir, progress, client_logger, **kwargs):
     """Submit a request to the Climate Data Store, download some temporary NetCDFs, and returns a dataset.
     Temporary files are deleted on exit.
     """
     file = tempfile.NamedTemporaryFile("w+", dir=dir, suffix=".zip", delete=False)  # noqa: SIM115
     file.close()
 
-    client = self.get_cdsapi_client(progress=progress, client_logger=client_logger)
+    client = self.get_cdsapi_client(progress=progress, client_logger=client_logger, **kwargs)
     logger.debug(f"Submitting request {request} with destination {file.name}")
     client.retrieve(dataset_name, request, file.name)
 
@@ -224,11 +223,12 @@ class ClimateDataStore(Provider):
     return cdsapi_client
 
 
-class GoogleCloudStorage(Provider):
+class RemoteZarr(Provider):
   @override
-  def open_dataset(self, date_interval=None, dir=None, **kwargs):
-    ds = xr.open_zarr(kwargs["url"], storage_options={"token": "anon"})
-    variables: list[str] | None = kwargs.get("variables")
+  def open_dataset(self, backend_kwargs, date_interval=None, tmpdir=None):
+    url: str = backend_kwargs.pop("url")
+    variables: list[str] | None = backend_kwargs.pop("variables", None)
+    ds = xr.open_zarr(url, **backend_kwargs)
     if variables is not None:
       variables_not_found: list[str] = [name for name in variables if name not in ds.data_vars]
       if variables_not_found:
@@ -239,7 +239,7 @@ class GoogleCloudStorage(Provider):
     return ds
 
 
-class URLProvider(Provider):
+class RemoteNetCDF(Provider):
   """Provider that downloads a NetCDF file from a URL.
 
   This provider downloads a NetCDF file from a specified URL and opens it as an xarray Dataset.
@@ -247,12 +247,12 @@ class URLProvider(Provider):
   """
 
   @override
-  def open_dataset(self, date_interval=None, dir=None, **kwargs):
+  def open_dataset(self, backend_kwargs, date_interval=None, tmpdir=None):
     """Downloads a NetCDF file from a URL and opens it as an xarray Dataset.
 
     Args:
       date_interval (DateInterval, optional): Date interval to filter the dataset. Defaults to None.
-      dir (pathlib.Path, optional): Directory to download temporary files to. Defaults to None.
+      tmpdir (pathlib.Path, optional): Directory to download temporary files to. Defaults to None.
       **kwargs: Additional keyword arguments, must include 'url'.
         url (str): URL of the NetCDF file to download.
         variables (list, optional): List of variables to keep in the dataset.
@@ -263,14 +263,13 @@ class URLProvider(Provider):
     Raises:
       ValueError: If 'url' is not provided in kwargs.
     """
-    if "url" not in kwargs:
+    url: str = backend_kwargs.get("url")
+    if url is None:
       raise ValueError("URL must be provided for URLProvider")
-
-    url = kwargs["url"]
-    logger.info(f"Downloading NetCDF from URL: {url}")
+    logger.info(f"Downloading NetCDF from: {url}")
 
     # Create a temporary file to download the NetCDF
-    with tempfile.NamedTemporaryFile(dir=dir, suffix=".nc", delete=False) as temp_file:
+    with tempfile.NamedTemporaryFile(dir=tmpdir, suffix=".nc", delete=False) as temp_file:
       temp_path = temp_file.name
 
     try:
@@ -286,7 +285,7 @@ class URLProvider(Provider):
       ds = xr.open_dataset(temp_path)
 
       # Filter by variables if specified
-      variables: list[str] | None = kwargs.get("variables")
+      variables: list[str] | None = backend_kwargs.get("variables")
       if variables is not None:
         if variables_not_found := [name for name in variables if name not in ds.data_vars]:
           logger.warning(f"{', '.join(variables_not_found)} variables not found")
@@ -307,6 +306,8 @@ class URLProvider(Provider):
 ProvidersRegistry = {
   "cds": ClimateDataStore,
   "cm": CopernicusMarine,
-  "gcs": GoogleCloudStorage,
-  "url": URLProvider,
+  "gcs": RemoteZarr,
+  "aws": RemoteZarr,
+  "url": RemoteNetCDF,
+  "http": RemoteNetCDF,
 }

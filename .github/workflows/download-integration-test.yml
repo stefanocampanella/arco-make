@@ -1,0 +1,45 @@
+name: Download Integration Test
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeccodes-dev
+
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Sync environment
+        run: uv sync --frozen
+
+      - name: Run download integration test
+        env:
+          COPERNICUSMARINE_SERVICE_USERNAME: ${{ secrets.COPERNICUSMARINE_SERVICE_USERNAME }}
+          COPERNICUSMARINE_SERVICE_PASSWORD: ${{ secrets.COPERNICUSMARINE_SERVICE_PASSWORD }}
+          CDSAPI_URL: ${{ secrets.CDSAPI_URL }}
+          CDSAPI_KEY: ${{ secrets.CDSAPI_KEY }}
+        run: >
+          uv run arco-make download
+          --start=2001-01-01 --end=2001-01-02
+          --no-progress
+          --overwrite
+          --
+          configs/arco-ocean_tres-1d_res-0p25_levels-10.toml /tmp/tempfile.zip
+
+      - name: Verify output
+        run: |
+          ls -l /tmp/tempfile.zip

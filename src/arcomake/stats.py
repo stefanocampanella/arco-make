@@ -37,7 +37,7 @@ import pathlib
 
 import click
 
-from arcomake.cli_utils import Configs, DictParamType
+from arcomake.cli_utils import DictParamType
 from arcomake.dask_distributed_utils import get_client
 from arcomake.dataset_utils import open_dataset_wo_static, save_to_zarr
 from arcomake.stats_utils import Stats, StatsRegistry
@@ -178,6 +178,6 @@ def compute(
   stats_ds = StatsRegistry[stats](dataset, time_dim=time_dim, skipna=skipna, keep_attrs=True)
   # At the beginning of `write_dataset_serial`, stats_ds is computed, meaning that there must be enough memory
   # available to the client process to hold stats_ds in memory. This could be a problem for climatology in some cases.
-  save_to_zarr(stats_ds, output, configs=Configs({"cname": cname, "clevel": clevel}))
+  save_to_zarr(stats_ds, output, configs={"cname": cname, "clevel": clevel})
 
   client.close()

@@ -13,8 +13,6 @@ import xarray_regrid
 from scipy.ndimage import gaussian_filter
 from xarray.core.types import InterpOptions
 
-from arcomake.cli_utils import Configs
-
 logger = logging.getLogger(__name__)
 
 
@@ -31,7 +29,7 @@ class Process:
     mask (xr.DataArray): Values on which to apply the processing step.
   """
 
-  def __init__(self, steps: Sequence[Configs] | None = None, mask: xr.DataArray | None = None):
+  def __init__(self, steps: Sequence[dict[str, Any]] | None = None, mask: xr.DataArray | None = None):
     """
     Initializes the Postprocess object.
 

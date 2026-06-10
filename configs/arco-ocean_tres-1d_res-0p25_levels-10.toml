@@ -20,6 +20,7 @@ variables = [
     'surface_solar_radiation_downwards',
     'surface_thermal_radiation_downwards',
     'total_precipitation']
+storage_options = {token = "anon"}
 
 [[datasets.preprocess]]
 name = 'isel'
@@ -85,6 +86,7 @@ type = 'static'
 
 [[datasets.parts]]
 url = 'gs://weatherbench2/datasets/era5/1959-2023_01_10-wb13-6h-1440x721_with_derived_variables.zarr'
+storage_options = {token = "anon"}
 variables = ['land_sea_mask', 'geopotential_at_surface']
 
 [[datasets.preprocess]]

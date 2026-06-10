@@ -1,0 +1,49 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%labels
+    Maintainer Stefano Campanella
+    Version 0.1
+    Description Apptainer image for arco-make based on Ubuntu 22.04 (using uv).
+
+%files
+    pyproject.toml /app/pyproject.toml
+    uv.lock /app/uv.lock
+    src /app/src
+    configs /app/configs
+    README.md /app/README.md
+    LICENSE /app/LICENSE
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
+    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libeccodes-dev
+
+    # Install uv by Astral
+    curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
+
+    # Create uv environment
+    cd /app
+    # The pyproject.toml specifies python >= 3.13
+    uv python install 3.13
+    uv sync --frozen
+
+%environment
+    # Add uv environment to PATH
+    export PATH="/app/.venv/bin:$PATH"
+    
+%runscript
+    cd /app
+    if [ $# -eq 0 ]; then
+        /bin/bash
+    else
+        exec uv run "$@"
+    fi
+
+%help
+    This container provides an environment for running arco-make.
+
+    USAGE EXAMPLE:
+
+      apptainer exec arco-make.sif download /path/to/config.toml /path/to/output.zip

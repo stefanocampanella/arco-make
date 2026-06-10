@@ -4,13 +4,19 @@ import logging
 import pathlib
 import pprint
 from datetime import datetime
+from typing import Any
 
 import click
 import dask
 import xarray as xr
 
 from arcomake.checks import check_coordinates, check_date_range, check_values
-from arcomake.cli_utils import Configs, DictParamType, check_output_path, set_default_logger
+from arcomake.cli_utils import (
+  DictParamType,
+  check_output_path,
+  read_configs,
+  set_default_logger,
+)
 from arcomake.dataset_utils import (
   get_dataset,
   open_mfdataset,
@@ -57,7 +63,7 @@ def array_range(
   """
 
   # Open the configuration file and load the TOML configs.
-  configs = Configs.read(config_path)
+  configs = read_configs(config_path)
 
   array_id = 0
   array = []
@@ -104,6 +110,29 @@ def array_range(
   type=click.DateTime(),
 )
 @click.option(
+  "--copernicusmarine-username",
+  help="Username for Copernicus Marine Service",
+  default=None,
+  type=str,
+)
+@click.option(
+  "--copernicusmarine-password",
+  help="Password for Copernicus Marine Service",
+  default=None,
+  type=str,
+)
+@click.option(
+  "--cdsapi-url",
+  help="URL of the CDS API",
+  default="https://ewds.climate.copernicus.eu/api"
+)
+@click.option(
+  "--cdsapi-key",
+  help="API key for the CDS API",
+  default=None,
+  type=str
+)
+@click.option(
   "--overwrite/--no-overwrite",
   help="Whether to overwrite existing outputs",
   default=False,
@@ -134,6 +163,10 @@ def download(
   array_id: int | None = None,
   start_date: datetime | None = None,
   end_date: datetime | None = None,
+  copernicusmarine_username: str | None = None,
+  copernicusmarine_password: str | None = None,
+  cdsapi_url: str | None = None,
+  cdsapi_key: str | None = None,
   progress: bool = False,
   log_level: str = "info",
   overwrite: bool = False,
@@ -153,7 +186,7 @@ def download(
   set_default_logger(log_level)
 
   # Open the configuration file and load the TOML configs.
-  configs = Configs.read(config_path)
+  configs = read_configs(config_path)
 
   date_intervals, output_path = parse_timeseries_arguments(
     configs, output_path, start=start_date, end=end_date, array_id=array_id
@@ -162,16 +195,23 @@ def download(
   # Check if the output path exists.
   check_output_path(output_path, overwrite=overwrite)
 
-  def reader(dataset_conf: Configs, **kwargs):
-    if provider_name := dataset_conf.get("provider"):
-      if provider_name in ProvidersRegistry:
-        provider = ProvidersRegistry[provider_name](
-          progress=progress, log_level=log_level, client_logger=logger
-        )
-      else:
-        raise ValueError(f"The 'provider' key value must be one of {ProvidersRegistry.keys()}.")
+  def reader(dataset_conf: dict[str, Any], **kwargs):
+    provider_name = dataset_conf.get("provider")
+    if provider_name is None or provider_name not in ProvidersRegistry:
+      raise ValueError(f"The 'provider' key value must be one of {ProvidersRegistry.keys()}.")
+    provider_kwargs = {}
+    if provider_name in ProvidersRegistry:
+      provider = ProvidersRegistry[provider_name](
+        progress=progress, log_level=log_level, client_logger=logger
+      )
     else:
-      raise ValueError("Dataset config should contain the 'provider' key.")
+      raise ValueError(f"The 'provider' key value must be one of {ProvidersRegistry.keys()}.")
+    if provider_name == "cm":
+      provider_kwargs["username"] = copernicusmarine_username
+      provider_kwargs["password"] = copernicusmarine_password
+    if provider_name == "cds":
+      provider_kwargs["url"] = cdsapi_url
+      provider_kwargs["key"] = cdsapi_key
 
     dataset_type = dataset_conf.get("type", "static")
     if dataset_type == "timeseries":
@@ -192,13 +232,13 @@ def download(
     )
 
   datasets = []
-  for dataset_conf in configs.get("parts", configs.get("datasets", [])):
+  for dataset_conf in configs.get("datasets", []):
     if mask_conf := dataset_conf.get("mask"):
       mask_var: str = mask_conf["variable"]
 
       @check_coordinates
       @check_values(variables=[mask_var])
-      def mask_reader(conf: Configs, **kwargs):
+      def mask_reader(conf: dict[str, Any], **kwargs):
         ds = reader(conf, **kwargs)
         postprocess = Process(steps=mask_conf.get("postprocess"))  # noqa: B023
         ds = postprocess(ds)
@@ -215,7 +255,7 @@ def download(
       start_date=date_intervals.interval.start, end_date=date_intervals.interval.end
     )
     @check_values(mask=mask_da)
-    def dataset_reader(conf: Configs, **kwargs):
+    def dataset_reader(conf: dict[str, Any], **kwargs):
       ds = reader(conf, **kwargs)
       postprocess = Process(steps=dataset_conf.get("postprocess"), mask=mask_da)  # noqa: B023
       ds = postprocess(ds)
@@ -340,5 +380,5 @@ def unpack_zips(
   save_to_zarr(
     dataset=dataset,
     path=output_path,
-    configs=Configs({"compressor": {"cname": cname, "clevel": clevel}}),
+    configs={"compressor": {"cname": cname, "clevel": clevel}},
   )

@@ -7,6 +7,7 @@ import tempfile
 import warnings
 from collections.abc import Sequence
 from contextlib import nullcontext
+from typing import Any
 
 import pandas as pd
 import xarray as xr
@@ -14,7 +15,6 @@ from dask.diagnostics import ProgressBar
 from numcodecs import Blosc
 from zarr.storage import DirectoryStore, TempStore, ZipStore
 
-from arcomake.cli_utils import Configs
 from arcomake.datetime_utils import (
   DateInterval,
   IterableDateInterval,
@@ -35,7 +35,7 @@ def bar(progress):
 
 
 def get_dataset(
-  configs: Configs,
+  configs: dict[str, Any],
   date_intervals: IterableDateInterval | tuple[None],
   provider: Provider,
   preprocess: Process,
@@ -56,10 +56,11 @@ def get_dataset(
       # represent different pieces of the same dataset.
       # When downloading from CDS, a temporary directory is needed to store partial netCDF files.
       with tempfile.TemporaryDirectory() as tempdir:
+        tempdir = pathlib.Path(tempdir)
         fragment_datasets = []
         for ds_conf in configs.get("parts", configs.get("datasets", [])):
           logger.info(f"Downloading dataset: {ds_conf}")
-          ds = provider.open_dataset(date_interval, dir=tempdir, **ds_conf)  # noqa: B023
+          ds = provider.open_dataset(backend_kwargs=ds_conf, date_interval=date_interval, tmpdir=tempdir)  # noqa: B023
           fragment_datasets.append(ds)
         fragment = xr.merge(fragment_datasets, join="exact")
         fragment = preprocess(fragment)
@@ -94,7 +95,7 @@ def get_dataset(
 # Each element of the SLURM job array will consume its interval of dates using sub-intervals
 # (of size equal to `tmp_step`).
 def parse_timeseries_arguments(
-  configs: Configs,
+  configs: dict[str, Any],
   output_path: pathlib.Path,
   start: datetime.datetime | str | None = None,
   end: datetime.datetime | str | None = None,
@@ -117,7 +118,7 @@ def parse_timeseries_arguments(
   # The array ID is the index of the job in the SLURM job array.
   # In this case, we append the start and end dates to the output path.
   if array_id is not None:
-    array_step = configs.get("array_step", None)
+    array_step = configs.get("array_step")
     if array_step is None:
       raise ValueError(
         "Configs top table should contain the 'array_step' key when "
@@ -268,7 +269,7 @@ def open_mfdataset(
 def save_to_zarr(
   dataset: xr.Dataset,
   path: pathlib.Path,
-  configs: Configs,
+  configs: dict[str, Any],
   progress: bool = False,
 ) -> None:
   logger.info(f"Saving dataset to {path} with {configs}")
