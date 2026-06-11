@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 import click
 
+import arcomake.xarray_accessors  # noqa: F401
 from arcomake.dataset import array_range, download, unpack_zips
 from arcomake.stats import compute
 

@@ -7,8 +7,11 @@ on:
     branches: [ master ]
 
 jobs:
-  integration-test:
+  download-integration-test:
     runs-on: ubuntu-latest
+    env:
+      DOWNLOAD_INTEGRATION_TEST_START_DATETIME: '2001-01-01T00:00:00'
+      DOWNLOAD_INTEGRATION_TEST_END_DATETIME: '2001-01-02T00:00:00'
     steps:
       - uses: actions/checkout@v6
 
@@ -34,7 +37,7 @@ jobs:
           CDSAPI_KEY: ${{ secrets.CDSAPI_KEY }}
         run: >
           uv run arco-make download
-          --start=2001-01-01 --end=2001-01-02
+          --start=${DOWNLOAD_INTEGRATION_TEST_START_DATETIME} --end=${DOWNLOAD_INTEGRATION_TEST_END_DATETIME}
           --no-progress
           --overwrite
           --
@@ -43,3 +46,6 @@ jobs:
       - name: Verify output
         run: |
           ls -l /tmp/tempfile.zip
+          uv run python tests/integration/check_download.py \
+            /tmp/tempfile.zip \
+            --start=${DOWNLOAD_INTEGRATION_TEST_START_DATETIME} --end=${DOWNLOAD_INTEGRATION_TEST_END_DATETIME}

@@ -60,6 +60,7 @@ class CopernicusMarine(Provider):
 
   @override
   def open_dataset(self, backend_kwargs, date_interval=None, tmpdir=None):
+    logger.info(f"Opening {backend_kwargs['dataset_id']} from Copernicus Marine")
     if date_interval is not None:
       # Note! Copernicus Marine Data Store uses Python convention (right open)
       backend_kwargs.update({
@@ -75,6 +76,7 @@ class ClimateDataStore(Provider):
 
   @override
   def open_dataset(self, backend_kwargs, date_interval=None, tmpdir=None):
+    logger.info(f"Downloading {backend_kwargs['dataset']} from CDS/EWDS")
     if date_interval is None:
       dataset_name, request = self._get_request(**backend_kwargs)
       ds = self._process_request(dataset_name, request, tmpdir, self.progress, self.client_logger)
@@ -226,6 +228,7 @@ class ClimateDataStore(Provider):
 class RemoteZarr(Provider):
   @override
   def open_dataset(self, backend_kwargs, date_interval=None, tmpdir=None):
+    logger.info(f"Opening remote zarr at {backend_kwargs['url']}")
     url: str = backend_kwargs.pop("url")
     variables: list[str] | None = backend_kwargs.pop("variables", None)
     ds = xr.open_zarr(url, **backend_kwargs)
@@ -234,8 +237,8 @@ class RemoteZarr(Provider):
       if variables_not_found:
         logger.warning(f"{', '.join(variables_not_found)} variables not found")
       ds = ds.drop_vars(names=[name for name in ds.data_vars if name not in variables])
-    if date_interval is not None:
-      ds = ds.sel(time=date_interval.to_slice())
+    # Filter by date interval if specified
+    ds = ds.arcomake.sel(date_interval)
     return ds
 
 
@@ -292,9 +295,7 @@ class RemoteNetCDF(Provider):
         ds = ds.drop_vars(names=[name for name in ds.data_vars if name not in variables])
 
       # Filter by date interval if specified
-      if date_interval is not None and "time" in ds.dims:
-        ds = ds.sel(time=slice(date_interval.start, date_interval.end))
-
+      ds = ds.arcomake.sel(date_interval)
       return ds
 
     finally:

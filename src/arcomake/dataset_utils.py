@@ -35,18 +35,17 @@ def bar(progress):
 
 
 def get_dataset(
-  configs: dict[str, Any],
-  date_intervals: IterableDateInterval | tuple[None],
   provider: Provider,
-  preprocess: Process,
+  configs: dict[str, Any],
+  date_intervals: IterableDateInterval | None,
+  mask: xr.DataArray | None = None,
   progress: bool = False,
 ) -> xr.Dataset:
   """
   Downloads and pre-processes a dataset based on provided configurations.
   """
+  preprocess = Process(steps=configs.get("preprocess"))
   with TempStore() as temporary_store:
-    is_first_fragment = True
-
     def _download_step(date_interval: DateInterval | None, **kwargs):
       if date_interval is not None:
         logger.info(f"Processing {date_interval}")
@@ -58,8 +57,7 @@ def get_dataset(
       with tempfile.TemporaryDirectory() as tempdir:
         tempdir = pathlib.Path(tempdir)
         fragment_datasets = []
-        for ds_conf in configs.get("parts", configs.get("datasets", [])):
-          logger.info(f"Downloading dataset: {ds_conf}")
+        for ds_conf in configs.get("parts", []):
           ds = provider.open_dataset(backend_kwargs=ds_conf, date_interval=date_interval, tmpdir=tempdir)  # noqa: B023
           fragment_datasets.append(ds)
         fragment = xr.merge(fragment_datasets, join="exact")
@@ -77,16 +75,22 @@ def get_dataset(
       fragment.to_zarr(store=temporary_store, **kwargs)
 
     # For each date_interval: download, postprocess, and append the dataset to a temporary Zarr
-    for date_interval in date_intervals:
-      if is_first_fragment:
-        _download_step(date_interval=date_interval, mode="w")
-        is_first_fragment = False
-      else:
-        _download_step(date_interval=date_interval, mode="a-", append_dim="time")
+    if date_intervals is None:
+      _download_step(date_interval=None, mode="w")
+    else:
+      is_first_fragment = True
+      for date_interval in date_intervals:
+        if is_first_fragment:
+          _download_step(date_interval=date_interval, mode="w")
+          is_first_fragment = False
+        else:
+          _download_step(date_interval=date_interval, mode="a-", append_dim="time")
 
     # Load the temporary Zarr into memroy and return it
     dataset = xr.load_dataset(temporary_store, engine='zarr',
                               backend_kwargs={"overwrite_encoded_chunks": True})
+    postprocess = Process(steps=configs.get("postprocess"), mask=mask)
+    dataset = postprocess(dataset)
     return dataset
 
 
@@ -100,7 +104,7 @@ def parse_timeseries_arguments(
   start: datetime.datetime | str | None = None,
   end: datetime.datetime | str | None = None,
   array_id: int | None = None,
-) -> tuple[IterableDateInterval, pathlib.Path]:
+) -> tuple[DateInterval, pathlib.Path]:
 
   # The start and end could be overridden using command line arguments, so we need to check them first.
   start = start or configs.get("start")
@@ -124,18 +128,13 @@ def parse_timeseries_arguments(
         "Configs top table should contain the 'array_step' key when "
         "downloading using SLURM arrays. See --help for more information."
       )
+    array_step = may_parse_timedelta(array_step)
     array_total_time_interval = DateInterval(start=start, end=end)
     array_time_intervals = IterableDateInterval(interval=array_total_time_interval, step=array_step)
     date_interval = array_time_intervals[array_id]
     output_path = output_path / f"{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
 
-  # Finally, we can compute the IterableDateInterval which will actually be used to download temporary datasets.
-  tmp_step = configs.get("tmp_step")
-  if tmp_step is None:
-    raise ValueError("`tmp_step` must be specified in the top table of the config file.")
-  tmp_step = may_parse_timedelta(tmp_step)
-  iterable_date_interval = IterableDateInterval(interval=date_interval, step=tmp_step)
-  return iterable_date_interval, output_path
+  return date_interval, output_path
 
 
 # FIXME: the code should handle both Zarr (using a DirectoryStore or a ZipStore) and NetCDF files.

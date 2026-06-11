@@ -24,7 +24,7 @@ from arcomake.dataset_utils import (
   save_to_zarr,
   valid_time_coordinate,
 )
-from arcomake.processing import Process
+from arcomake.datetime_utils import DateInterval, IterableDateInterval, may_parse_timedelta
 from arcomake.providers import ProvidersRegistry
 
 # TODO:
@@ -110,29 +110,6 @@ def array_range(
   type=click.DateTime(),
 )
 @click.option(
-  "--copernicusmarine-username",
-  help="Username for Copernicus Marine Service",
-  default=None,
-  type=str,
-)
-@click.option(
-  "--copernicusmarine-password",
-  help="Password for Copernicus Marine Service",
-  default=None,
-  type=str,
-)
-@click.option(
-  "--cdsapi-url",
-  help="URL of the CDS API",
-  default="https://ewds.climate.copernicus.eu/api"
-)
-@click.option(
-  "--cdsapi-key",
-  help="API key for the CDS API",
-  default=None,
-  type=str
-)
-@click.option(
   "--overwrite/--no-overwrite",
   help="Whether to overwrite existing outputs",
   default=False,
@@ -163,10 +140,6 @@ def download(
   array_id: int | None = None,
   start_date: datetime | None = None,
   end_date: datetime | None = None,
-  copernicusmarine_username: str | None = None,
-  copernicusmarine_password: str | None = None,
-  cdsapi_url: str | None = None,
-  cdsapi_key: str | None = None,
   progress: bool = False,
   log_level: str = "info",
   overwrite: bool = False,
@@ -188,83 +161,79 @@ def download(
   # Open the configuration file and load the TOML configs.
   configs = read_configs(config_path)
 
-  date_intervals, output_path = parse_timeseries_arguments(
+  date_interval, output_path = parse_timeseries_arguments(
     configs, output_path, start=start_date, end=end_date, array_id=array_id
   )
 
   # Check if the output path exists.
   check_output_path(output_path, overwrite=overwrite)
 
-  def reader(dataset_conf: dict[str, Any], **kwargs):
-    provider_name = dataset_conf.get("provider")
-    if provider_name is None or provider_name not in ProvidersRegistry:
+  def _download_dataset(
+      configs: dict[str, Any],
+      date_interval: DateInterval | None,
+      mask: xr.DataArray | None = None,
+  ) -> xr.Dataset:
+    provider_name = configs.get("provider")
+    if provider_name is None:
+      raise ValueError("The 'provider' key must be specified in the config file.")
+    elif provider_name not in ProvidersRegistry:
       raise ValueError(f"The 'provider' key value must be one of {ProvidersRegistry.keys()}.")
-    provider_kwargs = {}
-    if provider_name in ProvidersRegistry:
+    else:
       provider = ProvidersRegistry[provider_name](
-        progress=progress, log_level=log_level, client_logger=logger
+        progress=progress, log_level=logging.getLevelName(logger.getEffectiveLevel()), client_logger=logger
       )
-    else:
-      raise ValueError(f"The 'provider' key value must be one of {ProvidersRegistry.keys()}.")
-    if provider_name == "cm":
-      provider_kwargs["username"] = copernicusmarine_username
-      provider_kwargs["password"] = copernicusmarine_password
-    if provider_name == "cds":
-      provider_kwargs["url"] = cdsapi_url
-      provider_kwargs["key"] = cdsapi_key
 
-    dataset_type = dataset_conf.get("type", "static")
-    if dataset_type == "timeseries":
-      dataset_date_intervals = date_intervals
-    elif dataset_type == "static":
-      dataset_date_intervals = (None,)
-    else:
+    dataset_type = configs.get("type")
+    if dataset_type is None:
+      raise ValueError("The 'type' key must be specified in the config file.")
+    if dataset_type not in ["timeseries", "static"]:
       raise ValueError("The 'type' key value must be one of 'static' or 'timeseries'.")
+    if date_interval is not None and dataset_type == "timeseries":
+      # Compute the IterableDateInterval which will actually be used to download temporary datasets.
+      tmp_step = configs.get("tmp_step")
+      if tmp_step is None:
+        raise ValueError("`tmp_step` must be specified in the top table of the config file.")
+      tmp_step = may_parse_timedelta(tmp_step)
+      iterable_date_interval = IterableDateInterval(interval=date_interval, step=tmp_step)
+    else:
+      iterable_date_interval = None
 
-    preprocess = Process(steps=dataset_conf.get("preprocess"))
-
-    return get_dataset(
-      configs=dataset_conf,
-      date_intervals=dataset_date_intervals,
+    dataset = get_dataset(
       provider=provider,
-      preprocess=preprocess,
+      configs=configs,
+      date_intervals=iterable_date_interval,
+      mask=mask,
       progress=progress,
     )
+    return dataset
 
   datasets = []
   for dataset_conf in configs.get("datasets", []):
+    # TODO: The checks should be optional
+    dataset_name = dataset_conf.get("name")
     if mask_conf := dataset_conf.get("mask"):
-      mask_var: str = mask_conf["variable"]
-
-      @check_coordinates
-      @check_values(variables=[mask_var])
-      def mask_reader(conf: dict[str, Any], **kwargs):
-        ds = reader(conf, **kwargs)
-        postprocess = Process(steps=mask_conf.get("postprocess"))  # noqa: B023
-        ds = postprocess(ds)
-        return ds
-
-      mask_ds = mask_reader(mask_conf)
-      mask_da = mask_ds[mask_var]
+      mask_ds = _download_dataset(configs=mask_conf, date_interval=None, mask=None)
+      mask_ds = check_coordinates(mask_ds, dataset_name=f"{dataset_name} mask")
+      mask_ds = check_values(mask_ds, dataset_name=f"{dataset_name} mask")
+      mask_name: str = mask_conf["variable"]
+      mask = mask_ds[mask_name]
     else:
       mask_ds = None
-      mask_da = None
-
-    @check_coordinates
-    @check_date_range(
-      start_date=date_intervals.interval.start, end_date=date_intervals.interval.end
+      mask = None
+    ds = _download_dataset(configs=dataset_conf, date_interval=date_interval, mask=mask)
+    ds = check_coordinates(ds, dataset_name=dataset_name)
+    # FIXME: The frequency check should be read from configs
+    ds = check_date_range(
+      ds,
+      start_date=date_interval.start,
+      end_date=date_interval.end,
+      freq=dataset_conf.get("freq", "D"),
+      dataset_name=dataset_conf.get("name"),
     )
-    @check_values(mask=mask_da)
-    def dataset_reader(conf: dict[str, Any], **kwargs):
-      ds = reader(conf, **kwargs)
-      postprocess = Process(steps=dataset_conf.get("postprocess"), mask=mask_da)  # noqa: B023
-      ds = postprocess(ds)
-      if mask_ds is not None:  # noqa: B023
-        ds = xr.merge([ds, mask_ds])  # noqa: B023
-      return ds
-
-    datasets.append(dataset_reader(dataset_conf, **dataset_conf.get("kwargs", {})))
-
+    ds = check_values(ds, mask=mask, dataset_name=dataset_name)
+    if mask_ds is not None:
+      ds = xr.merge([ds, mask_ds])
+    datasets.append(ds)
   dataset = xr.merge(datasets, join="inner")
 
   # Save the dataset in a Zarr using sensible chunking and compression
