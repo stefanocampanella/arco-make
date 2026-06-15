@@ -20,23 +20,23 @@ variables = [
     'surface_solar_radiation_downwards',
     'surface_thermal_radiation_downwards',
     'total_precipitation']
-storage_options = {token = "anon"}
+storage_options = {token = 'anon'}
 
 [[datasets.preprocess]]
 name = 'isel'
 level = 0
 drop = true
 
-[[datasets.preprocess]]
-name = 'resample'
-time = '1 D'
-label = "left"
-closed = "left"
-reduce = 'mean'
-
 [[datasets.postprocess]]
 name = 'flip'
 dim = 'latitude'
+
+[[datasets.preprocess]]
+name = 'resample'
+time = '1 D'
+label = 'left'
+closed = 'left'
+reduce = 'mean'
 
 [[datasets.postprocess]]
 name = 'rescale'
@@ -85,7 +85,7 @@ tmp_step = '2 W'
 
 [[datasets.parts]]
 url = 'gs://weatherbench2/datasets/era5/1959-2023_01_10-wb13-6h-1440x721_with_derived_variables.zarr'
-storage_options = {token = "anon"}
+storage_options = {token = 'anon'}
 variables = ['land_sea_mask', 'geopotential_at_surface']
 
 [[datasets.preprocess]]
@@ -321,8 +321,8 @@ service = 'arco-geo-series'
 [[datasets.preprocess]]
 name = 'resample'
 time = '1 D'
-label = "left"
-closed = "left"
+label = 'left'
+closed = 'left'
 reduce = 'mean'
 
 [[datasets.preprocess]]
@@ -402,6 +402,8 @@ name_dict = {deptho = 'waverys_deptho'}
 [[datasets.mask.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
+
+# ==== SAVING SECTION ====
 
 [save]
 consolidated = true
