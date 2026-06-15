@@ -1,6 +1,10 @@
 start = 1993-01-01T00:00:00
 end = 2021-07-01T00:00:00
 array_step = '10 W'
+freq = '1D'
+check_global_ecmwf = true
+check_dates = true
+check_values = true
 
 [[datasets]]
 name = 'era5'
@@ -77,6 +81,8 @@ instantaneous_10m_wind_gust = 'i10fg'
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
+# ==== ERA5 STATIC ====
+
 [[datasets]]
 name = 'era5_static'
 provider = 'gcs'
@@ -106,6 +112,93 @@ name = 'rename'
 name_dict = {land_sea_mask = 'lsm', geopotential_at_surface = 'z'}
 
 [[datasets.postprocess]]
+name = 'rename_coordinates'
+name_dict = {latitude = 'lat', longitude = 'lon'}
+
+# ==== GLOFAS SECTION ====
+
+[[datasets]]
+name = 'glofas'
+provider = 'cds'
+type = 'timeseries'
+tmp_step = '2 W'
+
+[[datasets.parts]]
+dataset = 'cems-glofas-historical'
+system_version = ['version_4_0']
+hydrological_model = ['lisflood']
+product_type = ['consolidated']
+variable = ['river_discharge_in_the_last_24_hours']
+data_format = 'grib2'
+download_format = 'zip'
+
+[[datasets.preprocess]]
+name = 'regrid'
+method = 'conservative'
+latitude_dim = 'latitude'
+longitude_dim = 'longitude'
+kwargs = {skipna = true}
+grid = {south = -90.0, north = 90.0, west = 0.0, east = 359.75, resolution_lat = 0.25, resolution_lon = 0.25}
+
+[[datasets.preprocess]]
+name = 'astype'
+casting = 'same_kind'
+dtype = 'float32'
+
+[[datasets.postprocess]]
+name = 'gauss_fill'
+variables = ['dis24']
+sigma = 1.0
+radius = 4
+mode = 'mirror'
+output = 'float32'
+
+[[datasets.postprocess]]
+name = 'clip_negative'
+variables = ['dis24']
+
+[[datasets.postprocess]]
+name = 'chunk'
+time = 'auto'
+latitude = -1
+longitude = -1
+
+[[datasets.postprocess]]
+name = 'rename_coordinates'
+name_dict = {latitude = 'lat', longitude = 'lon'}
+
+[datasets.mask]
+provider = 'url'
+type = 'static'
+variable = 'glofas_mask'
+
+[[datasets.mask.parts]]
+url = 'https://confluence.ecmwf.int/download/attachments/242067380/uparea_glofas_v4_0.nc'
+
+[[datasets.mask.preprocess]]
+name = 'regrid'
+method = 'conservative'
+latitude_dim = 'latitude'
+longitude_dim = 'longitude'
+kwargs = {skipna = true}
+grid = {south = -90.0, north = 90.0, west = 0.0, east = 359.75, resolution_lat = 0.25, resolution_lon = 0.25}
+
+[[datasets.mask.preprocess]]
+name = 'astype'
+elevation = {dtype = 'float32', casting='same_kind'}
+uparea = {dtype = 'float32', casting='same_kind'}
+
+[[datasets.mask.postprocess]]
+name = 'get_land_mask'
+variable = 'uparea'
+mask_name = 'glofas_mask'
+
+[[datasets.mask.postprocess]]
+name = 'chunk'
+latitude = -1
+longitude = -1
+
+[[datasets.mask.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
@@ -215,93 +308,6 @@ longitude = -1
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon', depth = 'level'}
 set_new_coordinate = {'level' = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]}
-
-# ==== GLOFAS SECTION ====
-
-[[datasets]]
-name = 'glofas'
-provider = 'cds'
-type = 'timeseries'
-tmp_step = '2 W'
-
-[[datasets.parts]]
-dataset = 'cems-glofas-historical'
-system_version = ['version_4_0']
-hydrological_model = ['lisflood']
-product_type = ['consolidated']
-variable = ['river_discharge_in_the_last_24_hours']
-data_format = 'grib2'
-download_format = 'zip'
-
-[[datasets.preprocess]]
-name = 'regrid'
-method = 'conservative'
-latitude_dim = 'latitude'
-longitude_dim = 'longitude'
-kwargs = {skipna = true}
-grid = {south = -90.0, north = 90.0, west = 0.0, east = 359.75, resolution_lat = 0.25, resolution_lon = 0.25}
-
-[[datasets.preprocess]]
-name = 'astype'
-casting = 'same_kind'
-dtype = 'float32'
-
-[[datasets.postprocess]]
-name = 'gauss_fill'
-variables = ['dis24']
-sigma = 1.0
-radius = 4
-mode = 'mirror'
-output = 'float32'
-
-[[datasets.postprocess]]
-name = 'clip_negative'
-variables = ['dis24']
-
-[[datasets.postprocess]]
-name = 'chunk'
-time = 'auto'
-latitude = -1
-longitude = -1
-
-[[datasets.postprocess]]
-name = 'rename_coordinates'
-name_dict = {latitude = 'lat', longitude = 'lon'}
-
-[datasets.mask]
-provider = 'url'
-type = 'static'
-variable = 'glofas_mask'
-
-[[datasets.mask.parts]]
-url = 'https://confluence.ecmwf.int/download/attachments/242067380/uparea_glofas_v4_0.nc'
-
-[[datasets.mask.preprocess]]
-name = 'regrid'
-method = 'conservative'
-latitude_dim = 'latitude'
-longitude_dim = 'longitude'
-kwargs = {skipna = true}
-grid = {south = -90.0, north = 90.0, west = 0.0, east = 359.75, resolution_lat = 0.25, resolution_lon = 0.25}
-
-[[datasets.mask.preprocess]]
-name = 'astype'
-elevation = {dtype = 'float32', casting='same_kind'}
-uparea = {dtype = 'float32', casting='same_kind'}
-
-[[datasets.mask.postprocess]]
-name = 'get_land_mask'
-variable = 'uparea'
-mask_name = 'glofas_mask'
-
-[[datasets.mask.postprocess]]
-name = 'chunk'
-latitude = -1
-longitude = -1
-
-[[datasets.mask.postprocess]]
-name = 'rename_coordinates'
-name_dict = {latitude = 'lat', longitude = 'lon'}
 
 # ==== WAVERYS SECTION ====
 

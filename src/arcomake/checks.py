@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: MIT
 import logging
 import pathlib
-import warnings
 from collections.abc import Sequence
 from datetime import datetime
 
@@ -20,23 +19,19 @@ def check_values(
   mask: None | xr.DataArray = None,
   dataset_name: str | pathlib.Path | None = None,
 ) -> xr.Dataset:
-  def checker(block, dataset_info=None, block_info=None):
-    try:
-      if mask is not None:
-        mask_ = mask.isel({dim: 0 for dim in mask.dims if dim not in block.dims}, drop=True)
-        masked_block = block.where(mask_, 0.0)
-        nonvalid_values = masked_block.isnull()
-      else:
-        nonvalid_values = block.isnull()
-      if nonvalid_values.any():
-        warnings.warn(
-          f"{nonvalid_values.sum().values} NaN values found "
-          f"in dataset {dataset_info['dataset'] if dataset_info else 'unknown'} "
-          f"for variable {dataset_info['variable'] if dataset_info else 'unknown'}"
-        )
-    except UserWarning as w:
-      # FIXME: block_info here is None, find a way to forward information about the location of the nans
-      w.add_note(f"{block_info=}")
+  def checker(block, dataset_info=None):
+    if mask is not None:
+      mask_ = mask.isel({dim: 0 for dim in mask.dims if dim not in block.dims}, drop=True)
+      masked_block = block.where(mask_, 0.0)
+      nonvalid_values = masked_block.isnull()
+    else:
+      nonvalid_values = block.isnull()
+    if nonvalid_values.any():
+      raise ValueError(
+        f"{nonvalid_values.sum().values} NaN values found "
+        f"in dataset {dataset_info['dataset'] if dataset_info else 'unknown'} "
+        f"for variable {dataset_info['variable'] if dataset_info else 'unknown'}"
+      )
 
     return block
 
@@ -49,7 +44,7 @@ def check_values(
   return ds
 
 
-def check_date_range(
+def check_dates(
   ds: xr.Dataset,
   start_date: datetime,
   end_date: datetime,
@@ -84,7 +79,7 @@ def check_date_range(
       missing_str = [date.strftime("%Y-%m-%d") for date in missing_dates[:10]]  # Show first 10
       if len(missing_dates) > 10:
         missing_str.append(f"... and {len(missing_dates) - 10} more")
-      warnings.warn(
+      raise ValueError(
         f"Dataset {dataset_name or 'unknown'} is missing {len(missing_dates)} dates "
         f"from the expected interval [{start_date}, {end_date}]: {missing_str}"
       )
@@ -92,30 +87,24 @@ def check_date_range(
   return ds
 
 
-def check_coordinates(ds: xr.Dataset, dataset_name: str | pathlib.Path | None = None) -> xr.Dataset:
-  logger.info(f"Checking for mismatching coordinates in {dataset_name or 'dataset'}")
-  # 1. Check that each dataset contains all the days between beginning and end
-  if "time" in ds.dims:
-    time_range = pd.date_range(start=ds.time.min().item(), end=ds.time.max().item(), freq="D")
-    if not all(date in ds.time.values for date in time_range):
-      missing_dates = [date for date in time_range if date not in ds.time.values]
-      warnings.warn(f"Dataset {dataset_name or 'unknown'} is missing dates: {missing_dates}")
+def check_global_ecmwf(ds: xr.Dataset, dataset_name: str | pathlib.Path | None = None) -> xr.Dataset:
+  logger.info(f"Checking that coordinates use ECMWF global convention for {dataset_name or 'dataset'}")
 
-  # 2. Check that each dataset uses the [0, 360) convention for longitude
+  # Check that each dataset uses the [0, 360) convention for longitude
   if "longitude" in ds.dims or "lon" in ds.dims:
     lon_dim = "longitude" if "longitude" in ds.dims else "lon"
     if ds[lon_dim].min().item() < 0 or ds[lon_dim].max().item() >= 360:
-      warnings.warn(
+      raise ValueError(
         f"Dataset {dataset_name or 'unknown'} does not use the [0, 360) convention for longitude"
       )
 
-  # 3. Check that each dataset contains all latitudes in [-90, 90], and use the [-90, 90] convention
+  # Check that each dataset contains all latitudes in [-90, 90], and use the [-90, 90] convention
   if "latitude" in ds.dims or "lat" in ds.dims:
     lat_dim = "latitude" if "latitude" in ds.dims else "lat"
     if ds[lat_dim].min().item() < -90 or ds[lat_dim].max().item() > 90:
-      warnings.warn(f"Dataset {dataset_name or 'unknown'} has latitudes outside the [-90, 90] range")
+      raise ValueError(f"Dataset {dataset_name or 'unknown'} has latitudes outside the [-90, 90] range")
     if ds[lat_dim][0].item() > ds[lat_dim][-1].item():
-      warnings.warn(
+      raise ValueError(
         f"Dataset {dataset_name or 'unknown'} does not use the [90, -90] convention for latitude"
       )
 
