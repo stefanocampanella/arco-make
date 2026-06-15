@@ -289,6 +289,9 @@ def save_to_zarr(
     store = ZipStore(path=str(path), mode="w", compression=0, allowZip64=True)
   else:
     store = DirectoryStore(path=str(path))
+  if preprocess_conf := configs.pop("preprocess", None):
+    preprocess = Process(steps=preprocess_conf)
+    dataset = preprocess(dataset)
   with bar(progress):
     dataset.to_zarr(store=store, compute=True, mode="w", **configs)
 

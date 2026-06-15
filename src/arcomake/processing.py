@@ -175,6 +175,11 @@ class Process:
           # Keep old coordinate values as a non-index coordinate (with new name)
           old_coordinate = ds.coords[new_name]
           new_coordinate = set_new_coordinate[new_name]
+          if isinstance(new_coordinate, str):
+            if new_coordinate == 'auto':
+              new_coordinate = list(range(len(old_coordinate.data)))
+            else:
+              raise ValueError(f"Invalid value for new coordinate: {new_coordinate}")
           ds = ds.drop_indexes(new_name)
           ds = ds.drop_vars(new_name)
           ds = ds.assign_coords({new_name: (new_name, new_coordinate)})
@@ -232,6 +237,10 @@ class Process:
     else:
       ds[mask_name] = xr.where(ds[variable].notnull(), True, False)
     return ds
+
+  def isel_slice(self, ds: xr.Dataset, **kwargs) -> xr.Dataset:
+    return ds.isel({dim: slice(slice_kwargs.get("start"), slice_kwargs.get("stop"), slice_kwargs.get("step"))
+                    for dim, slice_kwargs in kwargs.items()})
 
   def time_shift(self, ds: xr.Dataset, quantity=None) -> xr.Dataset:
     if quantity is None:

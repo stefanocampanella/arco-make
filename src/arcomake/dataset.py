@@ -209,8 +209,11 @@ def download(
 
   datasets = []
   for dataset_conf in configs.get("datasets", []):
-    # TODO: The checks should be optional
     dataset_name = dataset_conf.get("name")
+    if dataset_conf.get("skip") is True:
+      logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
+      continue
+    # TODO: The checks should be optional
     if mask_conf := dataset_conf.get("mask"):
       mask_ds = _download_dataset(configs=mask_conf, date_interval=None, mask=None)
       mask_ds = check_coordinates(mask_ds, dataset_name=f"{dataset_name} mask")

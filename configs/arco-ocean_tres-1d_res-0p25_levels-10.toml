@@ -3,7 +3,7 @@ end = 2021-07-01T00:00:00
 array_step = '10 W'
 
 [[datasets]]
-name = 'era'
+name = 'era5'
 provider = 'gcs'
 type = 'timeseries'
 tmp_step = '2 W'
@@ -78,7 +78,7 @@ name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
 [[datasets]]
-name = 'era_static'
+name = 'era5_static'
 provider = 'gcs'
 type = 'static'
 tmp_step = '2 W'
@@ -409,3 +409,7 @@ name_dict = {latitude = 'lat', longitude = 'lon'}
 consolidated = true
 chunk = {time = 1, level = -1, lat = -1, lon = -1}
 compressor = {cname = 'lz4', clevel = 1}
+
+[[save.preprocess]]
+name = 'transpose'
+dims = ['time', 'level', 'lat', 'lon']

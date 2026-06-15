@@ -2,8 +2,10 @@ start = 1999-01-01T00:00:00
 end = 2021-06-01T00:00:00
 array_step = '10 W'
 
+# ==== ERA5 SECTION ====
+
 [[datasets]]
-name = 'era'
+name = 'era5'
 provider = 'gcs'
 type = 'timeseries'
 tmp_step = '2 W'
@@ -20,7 +22,7 @@ variables = [
     'surface_solar_radiation_downwards',
     'surface_thermal_radiation_downwards',
     'total_precipitation']
-storage_options = {token = "anon"}
+storage_options = {token = 'anon'}
 
 [[datasets.preprocess]]
 name = 'isel'
@@ -37,13 +39,13 @@ method = 'conservative'
 latitude_dim = 'latitude'
 longitude_dim = 'longitude'
 kwargs = {skipna = true}
-grid = {south = 30.18, north = 45.98, west = 4.54, east = 36.30, resolution_lat = 0.04166667, resolution_lon = 0.04166667}
+grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.preprocess]]
 name = 'resample'
 time = '1 D'
-label = "left"
-closed = "left"
+label = 'left'
+closed = 'left'
 reduce = 'mean'
 
 [[datasets.postprocess]]
@@ -85,15 +87,17 @@ instantaneous_10m_wind_gust = 'i10fg'
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
+# ==== ERA5 STATIC SECTION ====
+
 [[datasets]]
-name = 'era_static'
+name = 'era5_static'
 provider = 'gcs'
 type = 'static'
 tmp_step = '2 W'
 
 [[datasets.parts]]
 url = 'gs://weatherbench2/datasets/era5/1959-2023_01_10-wb13-6h-1440x721_with_derived_variables.zarr'
-storage_options = {token = "anon"}
+storage_options = {token = 'anon'}
 variables = ['land_sea_mask', 'geopotential_at_surface']
 
 [[datasets.preprocess]]
@@ -110,7 +114,7 @@ method = 'conservative'
 latitude_dim = 'latitude'
 longitude_dim = 'longitude'
 kwargs = {skipna = true}
-grid = {south = 30.18, north = 45.98, west = 4.54, east = 36.30, resolution_lat = 0.04166667, resolution_lon = 0.04166667}
+grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.postprocess]]
 name = 'chunk'
@@ -148,7 +152,7 @@ method = 'conservative'
 latitude_dim = 'latitude'
 longitude_dim = 'longitude'
 kwargs = {skipna = true}
-grid = {south = 30.18, north = 45.98, west = 4.54, east = 36.30, resolution_lat = 0.04166667, resolution_lon = 0.04166667}
+grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.preprocess]]
 name = 'astype'
@@ -191,7 +195,7 @@ method = 'conservative'
 latitude_dim = 'latitude'
 longitude_dim = 'longitude'
 kwargs = {skipna = true}
-grid = {south = 30.18, north = 45.98, west = 4.54, east = 36.30, resolution_lat = 0.04166667, resolution_lon = 0.04166667}
+grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.mask.preprocess]]
 name = 'astype'
@@ -256,8 +260,8 @@ dataset_part = 'default'
 service = 'arco-geo-series'
 
 [[datasets.preprocess]]
-name = 'isel'
-depth = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]
+name = 'isel_slice'
+depth = {start = 0, end = 125}
 
 [[datasets.preprocess]]
 name = 'regrid'
@@ -265,7 +269,7 @@ method = 'conservative'
 latitude_dim = 'latitude'
 longitude_dim = 'longitude'
 kwargs = {skipna = true}
-grid = {south = 30.18, north = 45.98, west = 4.54, east = 36.30, resolution_lat = 0.04166667, resolution_lon = 0.04166667}
+grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.preprocess]]
 name = 'astype'
@@ -294,7 +298,7 @@ longitude = -1
 [[datasets.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon', depth = 'level'}
-set_new_coordinate = {'level' = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]}
+set_new_coordinate = {'level' = 'auto'}
 
 [datasets.mask]
 provider = 'cm'
@@ -309,16 +313,12 @@ dataset_part = 'bathy'
 service = 'static-arco'
 
 [[datasets.mask.preprocess]]
-name = 'isel'
-depth = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]
-
-[[datasets.mask.preprocess]]
 name = 'regrid'
 method = 'conservative'
 latitude_dim = 'latitude'
 longitude_dim = 'longitude'
 kwargs = {skipna = true}
-grid = {south = 30.18, north = 45.98, west = 4.54, east = 36.30, resolution_lat = 0.04166667, resolution_lon = 0.04166667}
+grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.mask.preprocess]]
 name = 'astype'
@@ -341,7 +341,7 @@ longitude = -1
 [[datasets.mask.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon', depth = 'level'}
-set_new_coordinate = {'level' = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]}
+set_new_coordinate = {'level' = 'auto'}
 
 # ==== MEDSEA WAVE SECTION ====
 
@@ -371,7 +371,7 @@ method = 'conservative'
 latitude_dim = 'latitude'
 longitude_dim = 'longitude'
 kwargs = {skipna = true}
-grid = {south = 30.18, north = 45.98, west = 4.54, east = 36.30, resolution_lat = 0.04166667, resolution_lon = 0.04166667}
+grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.preprocess]]
 name = 'astype'
@@ -418,7 +418,7 @@ method = 'conservative'
 latitude_dim = 'latitude'
 longitude_dim = 'longitude'
 kwargs = {skipna = true}
-grid = {south = 30.18, north = 45.98, west = 4.54, east = 36.30, resolution_lat = 0.04166667, resolution_lon = 0.04166667}
+grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.mask.preprocess]]
 name = 'astype'
@@ -437,7 +437,7 @@ longitude = -1
 
 [[datasets.mask.postprocess]]
 name = 'rename'
-name_dict = {deptho = 'waverys_deptho'}
+name_dict = {deptho = 'medsea_wave_deptho'}
 
 [[datasets.mask.postprocess]]
 name = 'rename_coordinates'
@@ -487,16 +487,12 @@ dataset_part = 'default'
 service = 'arco-geo-series'
 
 [[datasets.preprocess]]
-name = 'isel'
-depth = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]
-
-[[datasets.preprocess]]
 name = 'regrid'
 method = 'conservative'
 latitude_dim = 'latitude'
 longitude_dim = 'longitude'
 kwargs = {skipna = true}
-grid = {south = 30.18, north = 45.98, west = 4.54, east = 36.30, resolution_lat = 0.04166667, resolution_lon = 0.04166667}
+grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.preprocess]]
 name = 'astype'
@@ -517,7 +513,7 @@ longitude = -1
 [[datasets.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon', depth = 'level'}
-set_new_coordinate = {'level' = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]}
+set_new_coordinate = {'level' = 'auto'}
 
 [datasets.mask]
 provider = 'cm'
@@ -532,16 +528,12 @@ dataset_part = 'bathy'
 service = 'static-arco'
 
 [[datasets.mask.preprocess]]
-name = 'isel'
-depth = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]
-
-[[datasets.mask.preprocess]]
 name = 'regrid'
 method = 'conservative'
 latitude_dim = 'latitude'
 longitude_dim = 'longitude'
 kwargs = {skipna = true}
-grid = {south = 30.18, north = 45.98, west = 4.54, east = 36.30, resolution_lat = 0.04166667, resolution_lon = 0.04166667}
+grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.mask.preprocess]]
 name = 'astype'
@@ -564,9 +556,14 @@ longitude = -1
 [[datasets.mask.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon', depth = 'level'}
-set_new_coordinate = {'level' = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]}
+set_new_coordinate = {'level' = 'auto'}
 
 [save]
 consolidated = true
 chunk = {time = 1, level = -1, lat = -1, lon = -1}
 compressor = {cname = 'lz4', clevel = 1}
+
+[[save.preprocess]]
+name = 'transpose'
+dims = ['time', 'level', 'lat', 'lon']
+
