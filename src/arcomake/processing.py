@@ -67,7 +67,7 @@ class Process:
         "'regrid' will be applied first, followed by 'interpolate'."
       )
     logger.info(
-      "Processing dataset with the following steps: " + ", ".join(self.configs.keys()) + ". "
+      "Postprocessing dataset following steps: " + ", ".join(self.configs.keys()) + ". "
     )
     for step in self.configs:
       conf = self.configs.get(step, {})

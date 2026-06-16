@@ -44,7 +44,7 @@ def get_dataset(
   """
   Downloads and pre-processes a dataset based on provided configurations.
   """
-  preprocess = Process(steps=configs.get("preprocess"))
+  postprocess = Process(steps=configs.get("postprocess"), mask=mask)
   with TempStore() as temporary_store:
     def _download_step(date_interval: DateInterval | None, **kwargs):
       if date_interval is not None:
@@ -61,7 +61,7 @@ def get_dataset(
           ds = provider.open_dataset(backend_kwargs=ds_conf, date_interval=date_interval, tmpdir=tempdir)  # noqa: B023
           fragment_datasets.append(ds)
         fragment = xr.merge(fragment_datasets, join="exact")
-        fragment = preprocess(fragment)
+        fragment = postprocess(fragment)
         with bar(progress):
           # Requires that fragment fits into memory
           fragment = fragment.compute()
@@ -89,8 +89,6 @@ def get_dataset(
     # Load the temporary Zarr into memroy and return it
     dataset = xr.load_dataset(temporary_store, engine='zarr',
                               backend_kwargs={"overwrite_encoded_chunks": True})
-    postprocess = Process(steps=configs.get("postprocess"), mask=mask)
-    dataset = postprocess(dataset)
     return dataset
 
 
@@ -289,9 +287,9 @@ def save_to_zarr(
     store = ZipStore(path=str(path), mode="w", compression=0, allowZip64=True)
   else:
     store = DirectoryStore(path=str(path))
-  if preprocess_conf := configs.pop("preprocess", None):
-    preprocess = Process(steps=preprocess_conf)
-    dataset = preprocess(dataset)
+  if postprocess_conf := configs.pop("postprocess", None):
+    postprocess = Process(steps=postprocess_conf)
+    dataset = postprocess(dataset)
   with bar(progress):
     dataset.to_zarr(store=store, compute=True, mode="w", **configs)
 

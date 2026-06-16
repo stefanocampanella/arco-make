@@ -148,7 +148,7 @@ def download(
   """
   Download an process multiple datasets into a single ARCO dataset.
 
-  The function reads dataset configurations, applies necessary preprocessing steps,
+  The function reads dataset configurations, applies necessary postprocessing steps,
   and saves the merged dataset to a Zarr store.
   """
 

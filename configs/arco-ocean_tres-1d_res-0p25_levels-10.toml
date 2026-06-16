@@ -25,39 +25,39 @@ variables = [
     'total_precipitation']
 storage_options = {token = 'anon'}
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'isel'
 level = 0
 drop = true
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'flip'
 dim = 'latitude'
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'resample'
 time = '1 D'
 label = 'left'
 closed = 'left'
 reduce = 'mean'
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'rescale'
 
-[datasets.preprocess.values]
+[datasets.postprocess.values]
 evaporation = 24.0
 total_precipitation = 24.0
 surface_solar_radiation_downwards = 24.0
 surface_thermal_radiation_downwards = 24.0
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'clip_negative'
 variables = ['total_precipitation']
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'rename'
 
-[datasets.preprocess.name_dict]
+[datasets.postprocess.name_dict]
 10m_u_component_of_wind = '10u'
 10m_v_component_of_wind = '10v'
 2m_dewpoint_temperature = '2d'
@@ -69,7 +69,7 @@ surface_solar_radiation_downwards = 'ssrd'
 surface_thermal_radiation_downwards = 'strd'
 total_precipitation = 'tp'
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
@@ -86,19 +86,19 @@ url = 'gs://weatherbench2/datasets/era5/1959-2023_01_10-wb13-6h-1440x721_with_de
 storage_options = {token = 'anon'}
 variables = ['land_sea_mask', 'geopotential_at_surface']
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'drop_vars'
 names = ['time', 'level']
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'flip'
 dim = 'latitude'
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'rename'
 name_dict = {land_sea_mask = 'lsm', geopotential_at_surface = 'z'}
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
@@ -119,7 +119,7 @@ variable = ['river_discharge_in_the_last_24_hours']
 data_format = 'grib2'
 download_format = 'zip'
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'regrid'
 method = 'conservative'
 latitude_dim = 'latitude'
@@ -127,12 +127,12 @@ longitude_dim = 'longitude'
 kwargs = {skipna = true, nan_threshold = 0.0}
 grid = {south = -90.0, north = 90.0, west = 0.0, east = 359.75, resolution_lat = 0.25, resolution_lon = 0.25}
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'astype'
 casting = 'same_kind'
 dtype = 'float32'
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
@@ -144,7 +144,7 @@ variable = 'glofas_mask'
 [[datasets.mask.parts]]
 url = 'https://confluence.ecmwf.int/download/attachments/242067380/uparea_glofas_v4_0.nc'
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'regrid'
 method = 'conservative'
 latitude_dim = 'latitude'
@@ -152,17 +152,17 @@ longitude_dim = 'longitude'
 kwargs = {skipna = true, nan_threshold = 0.0}
 grid = {south = -90.0, north = 90.0, west = 0.0, east = 359.75, resolution_lat = 0.25, resolution_lon = 0.25}
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'astype'
 elevation = {dtype = 'float32', casting='same_kind'}
 uparea = {dtype = 'float32', casting='same_kind'}
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'get_land_mask'
 variable = 'uparea'
 mask_name = 'glofas_mask'
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
@@ -181,11 +181,11 @@ variables = ['uo', 'vo', 'so', 'thetao', 'mlotst', 'zos', 'sithick', 'siconc', '
 dataset_part = 'default'
 service = 'arco-geo-series'
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'isel'
 depth = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'regrid'
 method = 'conservative'
 latitude_dim = 'latitude'
@@ -193,12 +193,12 @@ longitude_dim = 'longitude'
 kwargs = {skipna = true}
 grid = {south = -90.0, north = 90.0, west = 0.0, east = 359.75, resolution_lat = 0.25, resolution_lon = 0.25}
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'astype'
 casting = 'same_kind'
 dtype = 'float32'
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon', depth = 'level'}
 set_new_coordinate = {'level' = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]}
@@ -227,11 +227,11 @@ variables = ['deptho', 'depth']
 dataset_part = 'bathy'
 service = 'static-arco'
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'isel'
 depth = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'regrid'
 method = 'conservative'
 latitude_dim = 'latitude'
@@ -239,23 +239,23 @@ longitude_dim = 'longitude'
 kwargs = {skipna = true}
 grid = {south = -90.0, north = 90.0, west = 0.0, east = 359.75, resolution_lat = 0.25, resolution_lon = 0.25}
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'astype'
 dtype = 'float32'
 casting = 'same_kind'
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'rename'
 name_dict = {deptho = 'glorys_deptho'}
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'get_sea_mask'
 bathymetry = 'glorys_deptho'
 depth_coordinate = 'depth'
 depth_dim = 'depth'
 mask_name = 'glorys_mask'
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon', depth = 'level'}
 set_new_coordinate = {'level' = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]}
@@ -275,7 +275,7 @@ variables = ['VHM0', 'VTM02', 'VMDR', 'VSDX', 'VSDY']
 dataset_part = 'default'
 service = 'arco-geo-series'
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'regrid'
 method = 'conservative'
 latitude_dim = 'latitude'
@@ -283,23 +283,23 @@ longitude_dim = 'longitude'
 kwargs = {skipna = true}
 grid = {south = -90.0, north = 90.0, west = 0.0, east = 359.75, resolution_lat = 0.25, resolution_lon = 0.25}
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'resample'
 time = '1 D'
 label = 'left'
 closed = 'left'
 reduce = 'mean'
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'astype'
 casting = 'same_kind'
 dtype = 'float32'
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'rename'
 name_dict = {VHM0 = 'swh', VTM02 = 'swp', VSDX = 'usd', VSDY = 'vsd', VMDR = 'mwd'}
 
-[[datasets.preprocess]]
+[[datasets.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
@@ -319,7 +319,7 @@ variables = ['deptho']
 dataset_part = 'bathy'
 service = 'static-arco'
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'regrid'
 method = 'conservative'
 latitude_dim = 'latitude'
@@ -327,21 +327,21 @@ longitude_dim = 'longitude'
 kwargs = {skipna = true}
 grid = {south = -90.0, north = 90.0, west = 0.0, east = 359.75, resolution_lat = 0.25, resolution_lon = 0.25}
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'astype'
 dtype = 'float32'
 casting = 'same_kind'
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'get_land_mask'
 variable = 'deptho'
 mask_name = 'waverys_mask'
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'rename'
 name_dict = {deptho = 'waverys_deptho'}
 
-[[datasets.mask.preprocess]]
+[[datasets.mask.postprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
@@ -352,6 +352,6 @@ consolidated = true
 chunk = {time = 1, level = -1, lat = -1, lon = -1}
 compressor = {cname = 'lz4', clevel = 1}
 
-[[save.preprocess]]
+[[save.postprocess]]
 name = 'transpose'
 dims = ['time', 'level', 'lat', 'lon']
