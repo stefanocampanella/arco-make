@@ -213,34 +213,31 @@ def download(
     if dataset_conf.get("skip") is True:
       logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
       continue
-    # TODO: The checks should be optional
     if mask_conf := dataset_conf.get("mask"):
       mask_ds = _download_dataset(configs=mask_conf, date_interval=None, mask=None)
-      if configs.get("check_global_ecmwf", False):
-        mask_ds = check_global_ecmwf(mask_ds, dataset_name=f"{dataset_name} mask")
-      if configs.get("check_values", False):
-        mask_ds = check_values(mask_ds, dataset_name=f"{dataset_name} mask")
       mask_name: str = mask_conf["variable"]
       mask = mask_ds[mask_name]
     else:
       mask_ds = None
       mask = None
     ds = _download_dataset(configs=dataset_conf, date_interval=date_interval, mask=mask)
-    if configs.get("check_global_ecmwf", False):
-      ds = check_global_ecmwf(ds, dataset_name=dataset_name)
-    if configs.get("check_dates", False):
-      # FIXME: The frequency check should be read from configs
-      ds = check_dates(
-        ds,
-        start_date=date_interval.start,
-        end_date=date_interval.end,
-        freq=dataset_conf.get("freq", "1D"),
-        dataset_name=dataset_conf.get("name"),
-      )
-    if configs.get("check_values", False):
-      ds = check_values(ds, mask=mask, dataset_name=dataset_name)
     if mask_ds is not None:
       ds = xr.merge([ds, mask_ds])
+    checks = dataset_conf.get("checks", [])
+    if "global_ecmwf_coords" in checks:
+      ds = check_global_ecmwf(ds)
+    if "dates" in checks:
+      if freq := dataset_conf.get("freq"):
+        ds = check_dates(
+          ds,
+          start_date=date_interval.start,
+          end_date=date_interval.end,
+          freq=freq,
+        )
+      else:
+        raise ValueError("`freq` must be specified in the top table of the config file.")
+    if "values" in checks:
+      ds = check_values(ds, mask=mask)
     datasets.append(ds)
   dataset = xr.merge(datasets, join="inner")
 

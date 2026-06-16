@@ -18,9 +18,10 @@ url = 'gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3'
 variables = [
     '10m_u_component_of_wind',
     '10m_v_component_of_wind',
-    'instantaneous_10m_wind_gust',
-    '2m_temperature',
     '2m_dewpoint_temperature',
+    '2m_temperature',
+    'evaporation',
+    'instantaneous_10m_wind_gust',
     'surface_pressure',
     'surface_solar_radiation_downwards',
     'surface_thermal_radiation_downwards',
@@ -32,7 +33,7 @@ name = 'isel'
 level = 0
 drop = true
 
-[[datasets.postprocess]]
+[[datasets.preprocess]]
 name = 'flip'
 dim = 'latitude'
 
@@ -51,42 +52,34 @@ label = 'left'
 closed = 'left'
 reduce = 'mean'
 
-[[datasets.postprocess]]
+[[datasets.preprocess]]
 name = 'rescale'
 
-[datasets.postprocess.values]
+[datasets.preprocess.values]
 total_precipitation = 24.0
 surface_solar_radiation_downwards = 24.0
 surface_thermal_radiation_downwards = 24.0
 
-[[datasets.postprocess]]
+[[datasets.preprocess]]
 name = 'clip_negative'
-variables = [
-    'surface_solar_radiation_downwards',
-    'surface_thermal_radiation_downwards',
-    'total_precipitation']
+variables = ['total_precipitation']
 
-[[datasets.postprocess]]
-name = 'chunk'
-time = 'auto'
-latitude = -1
-longitude = -1
-
-[[datasets.postprocess]]
+[[datasets.preprocess]]
 name = 'rename'
 
-[datasets.postprocess.name_dict]
-2m_temperature = '2t'
+[datasets.preprocess.name_dict]
+10m_u_component_of_wind = '10u'
+10m_v_component_of_wind = '10v'
 2m_dewpoint_temperature = '2d'
+2m_temperature = '2t'
+evaporation = 'e'
+instantaneous_10m_wind_gust = 'i10fg'
 surface_pressure = 'sp'
 surface_solar_radiation_downwards = 'ssrd'
 surface_thermal_radiation_downwards = 'strd'
 total_precipitation = 'tp'
-10m_u_component_of_wind = '10u'
-10m_v_component_of_wind = '10v'
-instantaneous_10m_wind_gust = 'i10fg'
 
-[[datasets.postprocess]]
+[[datasets.preprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
@@ -119,16 +112,11 @@ longitude_dim = 'longitude'
 kwargs = {skipna = true}
 grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
-[[datasets.postprocess]]
-name = 'chunk'
-latitude = -1
-longitude = -1
-
-[[datasets.postprocess]]
+[[datasets.preprocess]]
 name = 'rename'
 name_dict = {land_sea_mask = 'lsm', geopotential_at_surface = 'z'}
 
-[[datasets.postprocess]]
+[[datasets.preprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
@@ -154,7 +142,7 @@ name = 'regrid'
 method = 'conservative'
 latitude_dim = 'latitude'
 longitude_dim = 'longitude'
-kwargs = {skipna = true}
+kwargs = {skipna = true, nan_threshold = 0.0}
 grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.preprocess]]
@@ -162,25 +150,7 @@ name = 'astype'
 casting = 'same_kind'
 dtype = 'float32'
 
-[[datasets.postprocess]]
-name = 'gauss_fill'
-variables = ['dis24']
-sigma = 1.0
-radius = 4
-mode = 'mirror'
-output = 'float32'
-
-[[datasets.postprocess]]
-name = 'clip_negative'
-variables = ['dis24']
-
-[[datasets.postprocess]]
-name = 'chunk'
-time = 'auto'
-latitude = -1
-longitude = -1
-
-[[datasets.postprocess]]
+[[datasets.preprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
@@ -197,7 +167,7 @@ name = 'regrid'
 method = 'conservative'
 latitude_dim = 'latitude'
 longitude_dim = 'longitude'
-kwargs = {skipna = true}
+kwargs = {skipna = true, nan_threshold = 0.0}
 grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.mask.preprocess]]
@@ -205,17 +175,12 @@ name = 'astype'
 elevation = {dtype = 'float32', casting='same_kind'}
 uparea = {dtype = 'float32', casting='same_kind'}
 
-[[datasets.mask.postprocess]]
+[[datasets.mask.preprocess]]
 name = 'get_land_mask'
 variable = 'uparea'
 mask_name = 'glofas_mask'
 
-[[datasets.mask.postprocess]]
-name = 'chunk'
-latitude = -1
-longitude = -1
-
-[[datasets.mask.postprocess]]
+[[datasets.mask.preprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
@@ -279,18 +244,7 @@ name = 'astype'
 casting = 'same_kind'
 dtype = 'float32'
 
-[[datasets.postprocess]]
-name = 'clip_negative'
-variables = ['so', 'mlotst']
-
-[[datasets.postprocess]]
-name = 'chunk'
-time = 'auto'
-depth = -1
-latitude = -1
-longitude = -1
-
-[[datasets.postprocess]]
+[[datasets.preprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon', depth = 'level'}
 set_new_coordinate = {'level' = 'auto'}
@@ -320,24 +274,18 @@ name = 'astype'
 dtype = 'float32'
 casting = 'same_kind'
 
-[[datasets.mask.postprocess]]
+[[datasets.mask.preprocess]]
+name = 'rename'
+name_dict = {deptho = 'medsea_phys_deptho'}
+
+[[datasets.mask.preprocess]]
 name = 'get_sea_mask'
-bathymetry = 'deptho'
+bathymetry = 'medsea_phys_deptho'
 depth_coordinate = 'depth'
 depth_dim = 'depth'
 mask_name = 'medsea_phys_mask'
 
-[[datasets.mask.postprocess]]
-name = 'chunk'
-depth = -1
-latitude = -1
-longitude = -1
-
-[[datasets.mask.postprocess]]
-name = 'rename'
-name_dict = {deptho = 'medsea_phys_deptho'}
-
-[[datasets.mask.postprocess]]
+[[datasets.mask.preprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon', depth = 'level'}
 set_new_coordinate = {'level' = 'auto'}
@@ -358,13 +306,6 @@ dataset_part = 'default'
 service = 'arco-geo-series'
 
 [[datasets.preprocess]]
-name = 'resample'
-time = '1 D'
-label = 'left'
-closed = 'left'
-reduce = 'mean'
-
-[[datasets.preprocess]]
 name = 'regrid'
 method = 'conservative'
 latitude_dim = 'latitude'
@@ -373,31 +314,28 @@ kwargs = {skipna = true}
 grid = {south = 30.00, north = 46.00, west = -5.60, east = 36.40, resolution_lat = 0.04, resolution_lon = 0.04}
 
 [[datasets.preprocess]]
+name = 'resample'
+time = '1 D'
+label = 'left'
+closed = 'left'
+reduce = 'mean'
+
+[[datasets.preprocess]]
 name = 'astype'
 casting = 'same_kind'
 dtype = 'float32'
 
-[[datasets.postprocess]]
-name = 'fill'
-variables = ['VHM0', 'VTM02', 'VMDR', 'VSDX', 'VSDY']
-
-[[datasets.postprocess]]
-name = 'clip_negative'
-variables = ['VHM0', 'VTM02']
-
-[[datasets.postprocess]]
-name = 'chunk'
-time = 'auto'
-latitude = -1
-longitude = -1
-
-[[datasets.postprocess]]
+[[datasets.preprocess]]
 name = 'rename'
 name_dict = {VHM0 = 'swh', VTM02 = 'swp', VSDX = 'usd', VSDY = 'vsd', VMDR = 'mwd'}
 
-[[datasets.postprocess]]
+[[datasets.preprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
+
+[[datasets.postprocess]]
+name = 'fill'
+variables = ['swh', 'swp', 'mwd', 'usd', 'vsd']
 
 [datasets.mask]
 provider = 'cm'
@@ -424,21 +362,16 @@ name = 'astype'
 dtype = 'float32'
 casting = 'same_kind'
 
-[[datasets.mask.postprocess]]
+[[datasets.mask.preprocess]]
 name = 'get_land_mask'
 variable = 'deptho'
 mask_name = 'medsea_wave_mask'
 
-[[datasets.mask.postprocess]]
-name = 'chunk'
-latitude = -1
-longitude = -1
-
-[[datasets.mask.postprocess]]
+[[datasets.mask.preprocess]]
 name = 'rename'
 name_dict = {deptho = 'medsea_wave_deptho'}
 
-[[datasets.mask.postprocess]]
+[[datasets.mask.preprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon'}
 
@@ -498,18 +431,7 @@ name = 'astype'
 casting = 'same_kind'
 dtype = 'float32'
 
-[[datasets.postprocess]]
-name = 'clip_negative'
-variables = ['dissic', 'spco2', 'fpco2', 'no3', 'po4', 'nh4', 'phyc', 'chl', 'nppv', 'o2']
-
-[[datasets.postprocess]]
-name = 'chunk'
-time = 'auto'
-depth = -1
-latitude = -1
-longitude = -1
-
-[[datasets.postprocess]]
+[[datasets.preprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon', depth = 'level'}
 set_new_coordinate = {'level' = 'auto'}
@@ -539,25 +461,19 @@ name = 'astype'
 dtype = 'float32'
 casting = 'same_kind'
 
-[[datasets.mask.postprocess]]
+[[datasets.mask.preprocess]]
 name = 'get_sea_mask'
 bathymetry = 'deptho'
 depth_coordinate = 'depth'
 depth_dim = 'depth'
 mask_name = 'medsea_bio_mask'
 
-[[datasets.mask.postprocess]]
-name = 'chunk'
-depth = -1
-latitude = -1
-longitude = -1
-
-[[datasets.mask.postprocess]]
+[[datasets.mask.preprocess]]
 name = 'rename_coordinates'
 name_dict = {latitude = 'lat', longitude = 'lon', depth = 'level'}
 set_new_coordinate = {'level' = 'auto'}
 
-[[datasets.mask.postprocess]]
+[[datasets.mask.preprocess]]
 name = 'rename'
 name_dict = {deptho = 'medsea_bio_deptho'}
 

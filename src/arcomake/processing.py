@@ -313,7 +313,7 @@ class Process:
     ds: xr.Dataset,
     bathymetry="deptho",
     depth_coordinate="depth",
-    depth_dim="depth",
+    depth_dim="level",
     mask_name="sea_land_mask",
   ) -> xr.Dataset:
     bathymetry_values = ds[bathymetry].values
