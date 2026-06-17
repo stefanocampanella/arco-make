@@ -197,7 +197,7 @@ def download(
       iterable_date_interval = IterableDateInterval(interval=date_interval, step=tmp_step)
     else:
       iterable_date_interval = None
-
+    logger.info(f"Downloading {dataset_type} dataset from {provider_name}")
     dataset = get_dataset(
       provider=provider,
       configs=configs,

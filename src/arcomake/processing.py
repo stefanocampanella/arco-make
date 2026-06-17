@@ -218,6 +218,15 @@ class Process:
           ds[var] = xr.where(da.isnull() & mask, fill_value, da)
     return ds
 
+  # FIXME: gauss_fill implementation is problematic for several reasons; for each data array in ds:
+  #    1. It assumes that mask has only spatial dimensions and that data array and mask use the same names for spatial
+  #    dimensions (however, this is true also for several other processing steps).
+  #    2. It assumes that if mask has some dimension but data array does not, then 0-th component of the mask along that
+  #    dimension is the one to use (e.g., for the depth/level).
+  #    3. It uses map_block, hence need rechunking of both mask and data array.
+  #    4. It rechunks both mask and data array along all spatial dimensions, but in principle it could allow for chunked
+  #    depth/level dimension and make better use of underlying dask workers.
+  #  These assumptions and implementation choices should be revisited or clearly documented.
   def gauss_fill(self, ds: xr.Dataset, variables=None, **kwargs) -> xr.Dataset:
     if self.mask is None or variables is None:
       raise ValueError("Mask and variables must be provided to gauss_fill")
@@ -225,7 +234,9 @@ class Process:
       for var, da in ds.data_vars.items():
         if var in variables:
           mask = self.mask.isel({dim: 0 for dim in self.mask.dims if dim not in da.dims}, drop=True)
-          # TODO: check that does as intended (why was I seeing less and less nans with increasing radius?)
+          # Note: ensuring that da is not chunked along mask dimensions is crucial, otherwise map_block will fail!
+          mask = mask.chunk(chunks={dim: -1 for dim in mask.dims})
+          da = da.chunk(chunks={dim: -1 for dim in mask.dims})
           ds[var] = da.map_blocks(gauss_filter_nan, args=(mask,), kwargs=kwargs, template=da)
     return ds
 
@@ -344,7 +355,7 @@ class Process:
     return ds
 
 
-def gauss_filter_nan(data, mask, **kwargs):
+def gauss_filter_nan(data: xr.DataArray, mask: xr.DataArray, **kwargs) -> xr.DataArray:
   data_u = xr.where(data.isnull() | np.logical_not(mask), 0.0, data)
   data_u.values = gaussian_filter(data_u.values, **kwargs)
   data_v = xr.where(data.isnull() | np.logical_not(mask), 0.0, 1.0)
