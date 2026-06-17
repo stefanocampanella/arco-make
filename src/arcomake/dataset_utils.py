@@ -48,7 +48,7 @@ def get_dataset(
   with TempStore() as temporary_store:
     def _download_step(date_interval: DateInterval | None, **kwargs):
       if date_interval is not None:
-        logger.info(f"Downloading and processing temporary dataset ({date_interval})")
+        logger.info(f"Downloading and postprocessing {date_interval}")
       # When downloading from Copernicus Marine Data Store or Climate Data Store, the typical case is a large dataset,
       # spanning a long time period, with several sets of variables in different datasets (bio, phys, etc.),
       # which needs to be downloaded one piece at a time. Hence, `parts` list in the TOML configuration file

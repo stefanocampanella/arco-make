@@ -17,7 +17,56 @@ From: ubuntu:22.04
     export DEBIAN_FRONTEND=noninteractive
     export LANG=C.UTF-8
     export LC_ALL=C.UTF-8
-    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libeccodes-dev
+    apt-get update && apt-get install -y --no-install-recommends \
+        file \
+        bzip2 \
+        ca-certificates \
+        curl \
+        g++ \
+        gcc \
+        gfortran \
+        git \
+        gzip \
+        lsb-release \
+        patch \
+        python3 \
+        tar \
+        unzip \
+        xz-utils \
+        zstd
+
+    # Install Spack
+    export SPACK_ROOT=/opt/spack
+    git clone --depth=2 --branch=releases/v1.1 https://github.com/spack/spack.git $SPACK_ROOT
+    . $SPACK_ROOT/share/spack/setup-env.sh
+
+    # Discover system-installed dependencies
+    spack compiler find
+    spack external find --all
+    spack config add "concretizer:reuse:true"
+    spack config add "concretizer:duplicates:strategy:none"
+    spack config add "concretizer:targets:granularity:generic"
+    spack config add "concretizer:unify:when_possible"
+    spack config add "packages:all:buildable:true"
+    spack config add "config:db_lock_timeout:300"
+    spack config add "config:connect_timeout:30"
+    spack config add "config:ccache:false"
+
+    # Add Spack binary mirror to speed up installation
+    spack mirror add spack-public https://binaries.spack.io/develop
+    spack buildcache keys --install --trust
+
+    # Bootstrap Spack
+    spack bootstrap root /opt/spack/bootstrap
+    spack bootstrap now
+
+    # Install ecCodes
+    spack env create default
+    spack env activate default
+    spack config add "view:/opt/view"
+    spack add eccodes
+    spack concretize
+    spack install -j4
 
     # Install uv by Astral
     curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
@@ -29,6 +78,10 @@ From: ubuntu:22.04
     uv sync --frozen
 
 %environment
+    # Initialize Spack
+    export PATH="/opt/view/bin:${PATH}"
+    export LD_LIBRARY_PATH="/opt/view/lib:/opt/view/lib64:${LD_LIBRARY_PATH}"
+
     # Add uv environment to PATH
     export PATH="/app/.venv/bin:$PATH"
     

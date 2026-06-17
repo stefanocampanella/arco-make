@@ -17,7 +17,9 @@ variables = [
     '10m_v_component_of_wind',
     '2m_dewpoint_temperature',
     '2m_temperature',
+    'geopotential_at_surface',
     'instantaneous_10m_wind_gust',
+    'land_sea_mask',
     'surface_pressure',
     'surface_solar_radiation_downwards',
     'surface_thermal_radiation_downwards',
@@ -60,40 +62,13 @@ name = 'rename'
 10m_v_component_of_wind = '10v'
 2m_dewpoint_temperature = '2d'
 2m_temperature = '2t'
+geopotential_at_surface = 'z'
 instantaneous_10m_wind_gust = 'i10fg'
+land_sea_mask = 'lsm'
 surface_pressure = 'sp'
 surface_solar_radiation_downwards = 'ssrd'
 surface_thermal_radiation_downwards = 'strd'
 total_precipitation = 'tp'
-
-[[datasets.postprocess]]
-name = 'rename_coordinates'
-name_dict = {latitude = 'lat', longitude = 'lon'}
-
-# ==== ERA5 STATIC ====
-
-[[datasets]]
-name = 'era5_static'
-provider = 'gcs'
-type = 'static'
-tmp_step = '2 W'
-
-[[datasets.parts]]
-url = 'gs://weatherbench2/datasets/era5/1959-2023_01_10-wb13-6h-1440x721_with_derived_variables.zarr'
-storage_options = {token = 'anon'}
-variables = ['land_sea_mask', 'geopotential_at_surface']
-
-[[datasets.postprocess]]
-name = 'drop_vars'
-names = ['time', 'level']
-
-[[datasets.postprocess]]
-name = 'flip'
-dim = 'latitude'
-
-[[datasets.postprocess]]
-name = 'rename'
-name_dict = {land_sea_mask = 'lsm', geopotential_at_surface = 'z'}
 
 [[datasets.postprocess]]
 name = 'rename_coordinates'
