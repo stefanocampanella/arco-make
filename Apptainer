@@ -10,7 +10,7 @@ From: ubuntu:22.04
     pyproject.toml /app/pyproject.toml
     uv.lock /app/uv.lock
     src /app/src
-    configs /app/configs
+    sample_configs /app/sample_configs
     README.md /app/README.md
     LICENSE /app/LICENSE
 

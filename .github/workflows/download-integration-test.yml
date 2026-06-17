@@ -29,6 +29,7 @@ jobs:
       - name: Sync environment
         run: uv sync --frozen
 
+      # If the output is checked against arco-ocean, pull the latest config from its repo
       - name: Run download integration test
         env:
           COPERNICUSMARINE_SERVICE_USERNAME: ${{ secrets.COPERNICUSMARINE_SERVICE_USERNAME }}
