@@ -43,14 +43,6 @@ From: ubuntu:22.04
     # Discover system-installed dependencies
     spack compiler find
     spack external find --all
-    spack config add "concretizer:reuse:true"
-    spack config add "concretizer:duplicates:strategy:none"
-    spack config add "concretizer:targets:granularity:generic"
-    spack config add "concretizer:unify:when_possible"
-    spack config add "packages:all:buildable:true"
-    spack config add "config:db_lock_timeout:300"
-    spack config add "config:connect_timeout:30"
-    spack config add "config:ccache:false"
 
     # Add Spack binary mirror to speed up installation
     spack mirror add spack-public https://binaries.spack.io/develop
