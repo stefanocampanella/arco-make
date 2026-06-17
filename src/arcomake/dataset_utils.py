@@ -48,7 +48,7 @@ def get_dataset(
   with TempStore() as temporary_store:
     def _download_step(date_interval: DateInterval | None, **kwargs):
       if date_interval is not None:
-        logger.info(f"Processing {date_interval}")
+        logger.info(f"Downloading and processing temporary dataset ({date_interval})")
       # When downloading from Copernicus Marine Data Store or Climate Data Store, the typical case is a large dataset,
       # spanning a long time period, with several sets of variables in different datasets (bio, phys, etc.),
       # which needs to be downloaded one piece at a time. Hence, `parts` list in the TOML configuration file
@@ -130,7 +130,7 @@ def parse_timeseries_arguments(
     array_total_time_interval = DateInterval(start=start, end=end)
     array_time_intervals = IterableDateInterval(interval=array_total_time_interval, step=array_step)
     date_interval = array_time_intervals[array_id]
-    output_path = output_path / f"{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
+    output_path = output_path / f"{date_interval.start.strftime('%Y%m%d')}-{date_interval.end.strftime('%Y%m%d')}"
   logger.info(f"Downloading {date_interval} (array id {array_id}) to {output_path}")
 
   return date_interval, output_path
