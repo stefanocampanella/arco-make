@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: ubuntu:22.04
+From: ubuntu:26.04
 
 %labels
     Maintainer Stefano Campanella
@@ -17,47 +17,7 @@ From: ubuntu:22.04
     export DEBIAN_FRONTEND=noninteractive
     export LANG=C.UTF-8
     export LC_ALL=C.UTF-8
-    apt-get update && apt-get install -y --no-install-recommends \
-        file \
-        bzip2 \
-        ca-certificates \
-        curl \
-        g++ \
-        gcc \
-        gfortran \
-        git \
-        gzip \
-        lsb-release \
-        patch \
-        python3 \
-        tar \
-        unzip \
-        xz-utils \
-        zstd
-
-    # Install Spack
-    export SPACK_ROOT=/opt/spack
-    git clone --depth=2 --branch=releases/v1.1 https://github.com/spack/spack.git $SPACK_ROOT
-    . $SPACK_ROOT/share/spack/setup-env.sh
-
-    # Discover system-installed compilers
-    spack compiler find
-
-    # Add Spack binary mirror to speed up installation
-    spack mirror add spack-public https://binaries.spack.io/develop
-    spack buildcache keys --install --trust
-
-    # Bootstrap Spack
-    spack bootstrap root /opt/spack/bootstrap
-    spack bootstrap now
-
-    # Install ecCodes
-    spack env create default
-    spack env activate default
-    spack config add "view:/opt/view"
-    spack add eccodes@2.42.0:
-    spack concretize
-    spack install -j4
+    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libeccodes-dev
 
     # Install uv by Astral
     curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
@@ -69,10 +29,6 @@ From: ubuntu:22.04
     uv sync --frozen
 
 %environment
-    # Initialize Spack
-    export PATH="/opt/view/bin:${PATH}"
-    export LD_LIBRARY_PATH="/opt/view/lib:/opt/view/lib64:${LD_LIBRARY_PATH}"
-
     # Add uv environment to PATH
     export PATH="/app/.venv/bin:$PATH"
     
