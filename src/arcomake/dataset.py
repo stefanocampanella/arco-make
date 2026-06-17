@@ -222,7 +222,7 @@ def download(
       mask = None
     ds = _download_dataset(configs=dataset_conf, date_interval=date_interval, mask=mask)
     if mask_ds is not None:
-      ds = xr.merge([ds, mask_ds])
+      ds = xr.merge([ds, mask_ds], join="exact")
     checks = dataset_conf.get("checks", [])
     if "global_ecmwf_coords" in checks:
       ds = check_global_ecmwf(ds)

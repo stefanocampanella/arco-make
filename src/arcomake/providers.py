@@ -91,7 +91,7 @@ class ClimateDataStore(Provider):
         if len(dates) == 1:
           ds = ds.expand_dims(dim="time", axis=0)
         datasets.append(ds)
-      ds = xr.merge(datasets)
+      ds = xr.concat(datasets, dim="time")
       if date_interval is not None:  # noqa: SIM102
         if not np.array_equal(date_interval.to_numpy(freq=datetime.timedelta(days=1)), ds["time"]):
           warnings.warn(
@@ -151,11 +151,18 @@ class ClimateDataStore(Provider):
       path = pathlib.Path(tmpdir)
       with ZipFile(file.name) as zipfile:
         zipfile.extractall(path=path)
-      # noinspection PyTypeChecker
+      # FIXME: when reading grib files eccodes emits the following warning:
+      #    ECCODES WARNING :  g2date:unpack_long: Date is not valid! year=0 month=0 day=0
+      #  see: https://git.ecmwf.int/users/erds/repos/eccodes/browse/src/accessor/grib_accessor_class_g2date.cc?at=f10d3f3c1be3737a231d4a2c19f45535de4d4424#71-75
       ds = xr.open_mfdataset(
-        list(path.glob("*")), engine="cfgrib", decode_timedelta=True
+        list(path.glob("*.grib")), engine="cfgrib"
       )  # cdsapi download one NetCDF per variable :(
-      # ds = ds.rename(valid_time='time')
+      # TODO: When working with CDS, the meaning of `valid_time` is documented, but the behaviour of the current
+      #  provider implementation is misleading.
+      #  Unfortunately, it was impossible to get documentation on `valid_time` for historical GLOFAS data, hence
+      #  the provider documentation should clarify the difference between the two, e.g., if renaming the time
+      #  coordinate is needed (after appropriately resizing the download time interval)
+      #    ds = ds.rename(valid_time='time')
       if extra_coords := [
         name for name in ds.coords if name not in ["latitude", "longitude", "time"]
       ]:
