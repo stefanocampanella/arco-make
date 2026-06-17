@@ -64,7 +64,7 @@ From: ubuntu:22.04
     spack env create default
     spack env activate default
     spack config add "view:/opt/view"
-    spack add eccodes
+    spack add eccodes@2.42.0
     spack concretize
     spack install -j4
 
