@@ -131,6 +131,7 @@ def parse_timeseries_arguments(
     array_time_intervals = IterableDateInterval(interval=array_total_time_interval, step=array_step)
     date_interval = array_time_intervals[array_id]
     output_path = output_path / f"{start.strftime('%Y%m%d')}-{end.strftime('%Y%m%d')}"
+  logger.info(f"Downloading {date_interval} (array id {array_id}) to {output_path}")
 
   return date_interval, output_path
 
