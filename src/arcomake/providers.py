@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
+import copy
 import datetime
 import logging
 import pathlib
@@ -122,7 +123,7 @@ class ClimateDataStore(Provider):
 
   def _get_request(self, dates=None, **kwargs):
     "Returns a request to the Climate Data Store using the provided dates."
-    request = kwargs.copy()
+    request = copy.deepcopy(kwargs)
     dataset_name = request.pop("dataset")
     if dates is not None:
       request = {
@@ -229,6 +230,8 @@ class RemoteZarr(Provider):
   @override
   def open_dataset(self, backend_kwargs, date_interval=None, tmpdir=None):
     logger.info(f"Opening remote zarr at {backend_kwargs['url']}")
+    # copy backend_kwargs to avoid modifying the original
+    backend_kwargs = copy.deepcopy(backend_kwargs)
     url: str = backend_kwargs.pop("url")
     variables: list[str] | None = backend_kwargs.pop("variables", None)
     ds = xr.open_zarr(url, **backend_kwargs)

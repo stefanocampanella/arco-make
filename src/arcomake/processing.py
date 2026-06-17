@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
+import copy
 import logging
 import warnings
 from collections import OrderedDict
@@ -42,7 +43,7 @@ class Process:
     if steps is not None:
       for step in steps:
         # Copy to avoid mutating the arguments
-        step = step.copy()
+        step = copy.deepcopy(step)
         name = step.pop("name")
         self.configs[name] = step
     self.mask = mask
@@ -257,6 +258,7 @@ class Process:
     return ds
 
   def interpolate_na(self, ds, **kwargs) -> xr.Dataset:
+    kwargs = copy.deepcopy(kwargs)
     dim = kwargs.get("dim", "time")
     output_chunks = kwargs.pop("output_chunks", {})
     ds = ds.chunk({dim: -1})

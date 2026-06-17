@@ -58,7 +58,7 @@ def get_dataset(
         tempdir = pathlib.Path(tempdir)
         fragment_datasets = []
         for ds_conf in configs.get("parts", []):
-          ds = provider.open_dataset(backend_kwargs=ds_conf, date_interval=date_interval, tmpdir=tempdir)  # noqa: B023
+          ds = provider.open_dataset(backend_kwargs=ds_conf, date_interval=date_interval, tmpdir=tempdir)
           fragment_datasets.append(ds)
         fragment = xr.merge(fragment_datasets, join="exact")
         fragment = postprocess(fragment)
@@ -270,6 +270,7 @@ def save_to_zarr(
   progress: bool = False,
 ) -> None:
   logger.info(f"Saving dataset to {path} with {configs}")
+  # No need to copy configs here before popping elements out of it, as it will not be reused
   if rechunk_conf := configs.pop("chunk", {}):
     dataset = dataset.chunk(**rechunk_conf)
     # see: https://github.com/pydata/xarray/issues/4380

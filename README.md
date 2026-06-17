@@ -21,7 +21,7 @@ pip install -e ".[dev]"
 Alternatively, you can pull the latest image from the GitHub Container Registry. For example:
 
 ```bash
-apptainer exec oras://ghcr.io/arco-make:latest arco-make download --help
+apptainer exec oras://ghcr.io/stefanocampanella/arco-make:latest arco-make download --help
 
 ```
 
@@ -55,7 +55,7 @@ Arco-make supports downloading from various data providers (such as Copernicus M
 
 Contrary to what the name might suggest, Arco-make does not use a declarative syntax like GNU Make. Instead, it processes operations sequentially in an imperative style, as its primary purpose is to automate repetitive processing pipelines across multiple data sources simultaneously.
 
-Arco-make was originally built to produce [ARCO-OCEAN](https://github.com/inogs/arco-ocean), utilizing the recipe file located at `configs/arco-ocean_tres-1d_res-0p25_levels-10.toml`. This file serves as an illustrative example of the expected TOML schema. We suggest using it as a template and adapting it to your specific use case.
+Arco-make was originally built to produce [ARCO-OCEAN](https://github.com/inogs/arco-ocean), utilizing the recipe file located at `arco-ocean/configs/download/arco-ocean_tres-1d_res-0p25_levels-10.toml`. This file serves as an illustrative example of the expected TOML schema. We provide samples under `arco-make/sample_configs/` suggest using them as templates and adapting them to your specific use case.
 
 A valid recipe follows this pattern:
 

@@ -41,7 +41,7 @@ jobs:
           --no-progress
           --overwrite
           --
-          configs/arco-ocean_tres-1d_res-0p25_levels-10.toml /tmp/tempfile.zip
+          sample_configs/arco-ocean_tres-1d_res-0p25_levels-10.toml /tmp/tempfile.zip
 
       - name: Verify output
         run: |
