@@ -74,6 +74,9 @@ def get_dataset(
       logger.info(f"Saving temporary dataset to {temporary_store.path}")
       fragment.to_zarr(store=temporary_store, **kwargs)
 
+    # TODO: in terms of memory consumption, it would make more sense to later open lazily the datasets written/appended
+    #  to disk here. However, this would require the caller to pass the temporary directory directory, so that the file
+    #  are not cancelled and the datasets can be opened later on.
     # For each date_interval: download, postprocess, and append the dataset to a temporary Zarr
     if date_intervals is None:
       _download_step(date_interval=None, mode="w")
@@ -86,7 +89,7 @@ def get_dataset(
         else:
           _download_step(date_interval=date_interval, mode="a-", append_dim="time")
 
-    # Load the temporary Zarr into memroy and return it
+    # Load the temporary Zarr into memory and return it
     dataset = xr.load_dataset(temporary_store, engine='zarr',
                               backend_kwargs={"overwrite_encoded_chunks": True})
     return dataset

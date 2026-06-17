@@ -207,6 +207,8 @@ def download(
     )
     return dataset
 
+  # Checks are configured globally, and not per dataset
+  checks = configs.get("checks", [])
   datasets = []
   for dataset_conf in configs.get("datasets", []):
     dataset_name = dataset_conf.get("name")
@@ -223,11 +225,10 @@ def download(
     ds = _download_dataset(configs=dataset_conf, date_interval=date_interval, mask=mask)
     if mask_ds is not None:
       ds = xr.merge([ds, mask_ds], join="exact")
-    checks = dataset_conf.get("checks", [])
     if "global_ecmwf_coords" in checks:
       ds = check_global_ecmwf(ds)
     if "dates" in checks:
-      if freq := dataset_conf.get("freq"):
+      if freq := configs.get("freq"):
         ds = check_dates(
           ds,
           start_date=date_interval.start,
@@ -239,7 +240,7 @@ def download(
     if "values" in checks:
       ds = check_values(ds, mask=mask)
     datasets.append(ds)
-  dataset = xr.merge(datasets, join="inner")
+  dataset = xr.merge(datasets, join="exact")
 
   # Save the dataset in a Zarr using sensible chunking and compression
   save_to_zarr(
