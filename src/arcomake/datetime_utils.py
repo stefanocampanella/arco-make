@@ -80,16 +80,17 @@ class IterableDateInterval(Iterable[DateInterval]):
     step (datetime.timedelta): Datetime resolution. Defaults to 1 day.
   """
 
-  interval: DateInterval
+  start: datetime
+  end: datetime
   step: timedelta
 
   @override
   def __iter__(self) -> Generator["DateInterval", Any]:
 
     def _date_iterator():
-      left = self.interval.start
-      while left < self.interval.end:
-        right = min(left + self.step, self.interval.end)
+      left = self.start
+      while left < self.end:
+        right = min(left + self.step, self.end)
         yield DateInterval(left, right)
         left = right
 

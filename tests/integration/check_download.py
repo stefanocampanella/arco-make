@@ -19,14 +19,14 @@ def main(downloaded_path, reference_url, start_date, end_date, max_diff, rel_dif
     """
     click.echo(f"Opening downloaded dataset at {downloaded_path}")
     # The downloaded dataset is a zipped zarr
-    ds_downloaded = xr.open_dataset(downloaded_path, engine="zarr")
+    ds_downloaded = xr.open_dataset(downloaded_path, engine="zarr", chunks={})
 
     click.echo(f"Opening reference dataset at {reference_url}")
     # Reference is also a zarr store on S3.
     # We use fsspec (via xarray/zarr) to open it.
     # Note: s3fs needs to be installed, and it might need credentials if not public.
     # The issue doesn't specify credentials for reference, assuming it's public or environment handles it.
-    ds_reference_full = xr.open_dataset(reference_url, engine="zarr", storage_options={"anon": True})
+    ds_reference_full = xr.open_dataset(reference_url, engine="zarr", storage_options={"anon": True}, chunks={})
 
     # Select the dates specified by command line arguments
     # The interval should coincide with those of the downloaded dataset
@@ -68,7 +68,52 @@ def main(downloaded_path, reference_url, start_date, end_date, max_diff, rel_dif
             click.echo(f"Reference: {ds_reference[coord].attrs}")
             # sys.exit(1) # Decided not to exit here as it might be too strict, but requirement said "Check"
 
-    # 3. Check close values
+    # 3. Check dimensions order
+    click.echo("Checking dimensions order...")
+    for var in ds_downloaded.data_vars:
+        if ds_downloaded[var].dims != ds_reference[var].dims:
+            click.echo(f"Dimension order mismatch for variable {var}!", err=True)
+            click.echo(f"Downloaded: {ds_downloaded[var].dims}")
+            click.echo(f"Reference: {ds_reference[var].dims}")
+            sys.exit(1)
+
+    # 4. Check chunk sizes
+    click.echo("Checking chunk sizes...")
+    for var in ds_downloaded.data_vars:
+        # For the downloaded dataset, we check the actual chunks if it is dask-backed,
+        # otherwise we might need to check encoding.
+        # However, the requirement specifically asks to check encoding['chunks'] in reference.
+        
+        # ds_downloaded[var].chunks returns a Mapping from dimension names to tuple of chunk sizes
+        # if the dataset is dask-backed.
+        downloaded_chunks = ds_downloaded[var].chunks
+        
+        # Reference chunking is expected to be found in encoding['chunks']
+        reference_chunks_raw = ds_reference[var].encoding.get("chunks")
+        
+        if reference_chunks_raw is not None:
+            # reference_chunks_raw is typically a tuple of integers corresponding to dimensions
+            reference_chunks = dict(zip(ds_reference[var].dims, reference_chunks_raw, strict=False))
+        else:
+            reference_chunks = None
+
+        # Convert downloaded_chunks to a comparable format (dict of single chunk size if uniform)
+        # Note: ds.chunks returns a tuple of chunks for each dimension, e.g., {'time': (5, 5), 'x': (5,)}
+        # We assume uniform chunking for comparison if reference encoding has a single value per dim.
+        if downloaded_chunks is not None:
+            downloaded_chunks_cmp = {dim: chunks[0] for dim, chunks in downloaded_chunks.items()}
+        else:
+            downloaded_chunks_cmp = None
+
+        if downloaded_chunks_cmp != reference_chunks:
+            # Final attempt to match: maybe reference_chunks is a tuple of tuples?
+            # Or maybe downloaded_chunks_cmp and reference_chunks are both not None but differ.
+            click.echo(f"Chunk size mismatch for variable {var}!", err=True)
+            click.echo(f"Downloaded (dask): {downloaded_chunks_cmp}")
+            click.echo(f"Reference (encoding): {reference_chunks}")
+            sys.exit(1)
+
+    # 5. Check close values
     click.echo(f"Checking data values (max_diff={max_diff}, rel_diff={rel_diff})...")
     for var in ds_downloaded.data_vars:
         try:

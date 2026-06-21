@@ -2,15 +2,12 @@
 # SPDX-License-Identifier: MIT
 import logging
 import pathlib
-import pprint
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timedelta
 
 import click
 import dask
 import xarray as xr
 
-from arcomake.checks import check_dates, check_global_ecmwf, check_values
 from arcomake.cli_utils import (
   DictParamType,
   check_output_path,
@@ -18,14 +15,12 @@ from arcomake.cli_utils import (
   set_default_logger,
 )
 from arcomake.dataset_utils import (
-  get_dataset,
+  maybe_checkpointing_open_dataset,
   open_mfdataset,
-  parse_timeseries_arguments,
   save_to_zarr,
   valid_time_coordinate,
 )
-from arcomake.datetime_utils import DateInterval, IterableDateInterval, may_parse_timedelta
-from arcomake.providers import ProvidersRegistry
+from arcomake.datetime_utils import may_parse_timedelta
 
 # TODO:
 #   1. Documentation is missing, fix it.
@@ -39,54 +34,6 @@ logger = logging.getLogger(__name__)
 @click.argument(
   "config_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, file_okay=True, readable=True),
-)
-@click.option(
-  "--start", help="Start of the date interval to download", default=None, type=click.DateTime()
-)
-@click.option(
-  "--end", help="End of the date interval to download", default=None, type=click.DateTime()
-)
-@click.option("--sbatch-flag/--no-sbatch-flag", "sbatch_flag", default=False, is_flag=True)
-def array_range(
-  config_path: pathlib.Path,
-  start: datetime | None = None,
-  end: datetime | None = None,
-  sbatch_flag: bool = False,
-):
-  """
-  Generate an array of date intervals for downloading data from a configuration file.
-
-  This command allows you to specify a configuration file and optionally a date range to generate
-  an array of date intervals for downloading data. The output can be formatted for use with
-  Slurm's --array option or printed in a compact format.
-  """
-
-  # Open the configuration file and load the TOML configs.
-  configs = read_configs(config_path)
-
-  array_id = 0
-  array = []
-  while True:
-    try:
-      date_interval, _ = parse_timeseries_arguments(
-        configs, pathlib.Path(), start=start, end=end, array_id=array_id
-      )
-      array.append(date_interval)
-      array_id += 1
-    except IndexError:
-      break
-
-  if sbatch_flag:
-    print(f"--array=0-{len(array) - 1}")
-  else:
-    pprint.pprint(array, compact=True)
-
-
-@click.command()
-@click.argument(
-  "config_path",
-  required=True,
   type=click.Path(path_type=pathlib.Path, resolve_path=True, file_okay=True, readable=True),
 )
 @click.argument(
@@ -94,21 +41,22 @@ def array_range(
   required=True,
   type=click.Path(path_type=pathlib.Path, resolve_path=True, dir_okay=True, writable=True),
 )
-@click.option("--array-id", help="ID of the SLURM array to download", default=None, type=int)
 @click.option(
   "--start",
-  "start_date",
-  help="Start of the date interval to download",
+  "start_datetime",
   default=None,
+  help="Override start datetime of the timeseries.",
   type=click.DateTime(),
 )
 @click.option(
   "--end",
-  "end_date",
-  help="End of the date interval to download",
+  "end_datetime",
   default=None,
+  help="Override end datetime of the timeseries.",
   type=click.DateTime(),
 )
+@click.option("--array-id", help="ID of the SLURM array to download", default=None, type=int)
+@click.option("--array-step", default=None, type=str)
 @click.option(
   "--overwrite/--no-overwrite",
   help="Whether to overwrite existing outputs",
@@ -137,9 +85,10 @@ def array_range(
 def download(
   config_path: pathlib.Path,
   output_path: pathlib.Path,
+  start_datetime: datetime | None = None,
+  end_datetime: datetime | None = None,
   array_id: int | None = None,
-  start_date: datetime | None = None,
-  end_date: datetime | None = None,
+  array_step: str | timedelta | None = None,
   progress: bool = False,
   log_level: str = "info",
   overwrite: bool = False,
@@ -161,86 +110,33 @@ def download(
   # Open the configuration file and load the TOML configs.
   configs = read_configs(config_path)
 
-  date_interval, output_path = parse_timeseries_arguments(
-    configs, output_path, start=start_date, end=end_date, array_id=array_id
-  )
+  # Update start_datetime and end_datetime based CLI arguments
+  if start_datetime is not None:
+    logger.info(f"Overriding start datetime with {start_datetime}")
+  if end_datetime is not None:
+    logger.info(f"Overriding end datetime with {end_datetime}")
+  start_datetime = start_datetime or configs["start"]
+  end_datetime = end_datetime or configs["end"]
+
+  if array_id is not None and array_step is not None:
+    logger.info(f"Array ID {array_id} with step {array_step}")
+    array_step = may_parse_timedelta(array_step)
+    start_datetime = start_datetime + array_id * array_step
+    end_datetime = min(end_datetime + (array_id + 1) * array_step, configs["end"])
+    output_path = output_path / f"{start_datetime.strftime('%Y%m%d')}-{end_datetime.strftime('%Y%m%d')}"
 
   # Check if the output path exists.
   check_output_path(output_path, overwrite=overwrite)
 
-  def _download_dataset(
-      configs: dict[str, Any],
-      date_interval: DateInterval | None,
-      mask: xr.DataArray | None = None,
-  ) -> xr.Dataset:
-    provider_name = configs.get("provider")
-    if provider_name is None:
-      raise ValueError("The 'provider' key must be specified in the config file.")
-    elif provider_name not in ProvidersRegistry:
-      raise ValueError(f"The 'provider' key value must be one of {ProvidersRegistry.keys()}.")
-    else:
-      provider = ProvidersRegistry[provider_name](
-        progress=progress, log_level=logging.getLevelName(logger.getEffectiveLevel()), client_logger=logger
-      )
-
-    dataset_type = configs.get("type")
-    if dataset_type is None:
-      raise ValueError("The 'type' key must be specified in the config file.")
-    if dataset_type not in ["timeseries", "static"]:
-      raise ValueError("The 'type' key value must be one of 'static' or 'timeseries'.")
-    if date_interval is not None and dataset_type == "timeseries":
-      # Compute the IterableDateInterval which will actually be used to download temporary datasets.
-      tmp_step = configs.get("tmp_step")
-      if tmp_step is None:
-        raise ValueError("`tmp_step` must be specified in the top table of the config file.")
-      tmp_step = may_parse_timedelta(tmp_step)
-      iterable_date_interval = IterableDateInterval(interval=date_interval, step=tmp_step)
-    else:
-      iterable_date_interval = None
-    logger.info(f"Downloading {configs.get('name')} ({dataset_type})")
-    dataset = get_dataset(
-      provider=provider,
-      configs=configs,
-      date_intervals=iterable_date_interval,
-      mask=mask,
-      progress=progress,
-    )
-    return dataset
-
-  # Checks are configured globally, and not per dataset
-  checks = configs.get("checks", [])
-  datasets = []
-  for dataset_conf in configs.get("datasets", []):
-    dataset_name = dataset_conf.get("name")
-    if dataset_conf.get("skip") is True:
+  # Download and postprocess each dataset, possibly using checkpointing to disk
+  dataset = xr.Dataset()
+  for dataset_name, dataset_conf in configs.get("datasets", {}).items():
+    if dataset_conf.get("skip", False) is True:
       logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
       continue
-    if mask_conf := dataset_conf.get("mask"):
-      mask_ds = _download_dataset(configs=mask_conf, date_interval=None, mask=None)
-      mask_name: str = mask_conf["variable"]
-      mask = mask_ds[mask_name]
-    else:
-      mask_ds = None
-      mask = None
-    ds = _download_dataset(configs=dataset_conf, date_interval=date_interval, mask=mask)
-    if mask_ds is not None:
-      ds = xr.merge([ds, mask_ds], join="exact")
-    if "global_ecmwf_coords" in checks:
-      ds = check_global_ecmwf(ds)
-    if "dates" in checks:
-      if freq := configs.get("freq"):
-        ds = check_dates(
-          ds,
-          start_date=date_interval.start,
-          end_date=date_interval.end,
-          freq=freq,
-        )
-      else:
-        raise ValueError("`freq` must be specified in the top table of the config file.")
-    if "values" in checks:
-      ds = check_values(ds, mask=mask)
-    datasets.append(ds)
-  dataset = xr.merge(datasets, join="exact")
+    logger.info(f"Downloading {dataset_name}")
+    with maybe_checkpointing_open_dataset(dataset_conf, start_datetime, end_datetime) as source_dataset:
+      dataset = xr.merge([dataset, source_dataset], join="exact")
 
   # Save the dataset in a Zarr using sensible chunking and compression
   save_to_zarr(

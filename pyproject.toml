@@ -45,6 +45,11 @@ dev = [
     "ty",
 ]
 
+[project.entry-points."xarray.backends"]
+copernicusmarine = "arcomake.backends:CopernicusMarine"
+netcdfoverhttp = "arcomake.backends:NetCDFOverHTTP"
+earlywarningdatastore = "arcomake.backends:EarlyWarningDataStore"
+
 [project.scripts]
 arco-make = "arcomake:cli"
 

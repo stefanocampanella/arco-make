@@ -1,14 +1,44 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-from collections.abc import Sequence
+import sys
+import warnings
+from collections.abc import Callable, Sequence
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import xarray as xr
 
 logger = logging.getLogger(__name__)
+checks_module = sys.modules[__name__]
+
+
+def validate(dataset: xr.Dataset, checks: dict[str, Any]) -> None:
+  """
+  Performs checks on a xarray.Dataset and raise an exception if any check fails.
+
+  The checks are provided as a dictionary containing step configurations.
+  All methods defined in this module can be used as checks.
+
+  Args:
+    dataset (xr.Dataset): The input dataset to process.
+    checks (dict[str, Any]): Configuration for each processing step.
+  Returns:
+    None
+  """
+  logger.info(
+    "Validating dataset following steps: " + ", ".join(checks.keys()) + ". "
+  )
+  for name, config in checks.items():
+    logger.info(f"Applying {name} with configuration {config}")
+    check_fn: Callable[..., None]
+    if name in dir(checks_module):
+      check_fn = getattr(checks_module, name)
+      check_fn(dataset, **config)
+    else:
+      warnings.warn(f"Unrecognized validation step {name} with configuration {config}")
 
 
 # The following implementation assumes that mask is unchunked, and that block is unchunked along mask dimensions.

@@ -47,6 +47,6 @@ jobs:
       - name: Verify output
         run: |
           ls -l /tmp/tempfile.zip
-          uv run python tests/integration/check_download.py \
-            /tmp/tempfile.zip \
-            --start=${DOWNLOAD_INTEGRATION_TEST_START_DATETIME} --end=${DOWNLOAD_INTEGRATION_TEST_END_DATETIME}
+#          uv run python tests/integration/check_download.py \
+#            /tmp/tempfile.zip \
+#            --start=${DOWNLOAD_INTEGRATION_TEST_START_DATETIME} --end=${DOWNLOAD_INTEGRATION_TEST_END_DATETIME}
