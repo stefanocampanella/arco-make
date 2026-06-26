@@ -14,11 +14,11 @@ def read_configs(path: str | pathlib.Path) -> dict[str, Any]:
   path = path if isinstance(path, pathlib.Path) else pathlib.Path(path)
   logger.info(f"Reading configs from {path}")
   with path.open("rb") as file:
-     configs = tomllib.load(file)
+    configs = tomllib.load(file)
   return configs
 
 
-class DictParamType(click.ParamType):
+class DictParamType(click.ParamType[dict[str, Any]]):
   """Click ParamType that parses mappings like "a:1,b:2" into dict[str, int].
 
   Rules:

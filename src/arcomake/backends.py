@@ -5,7 +5,7 @@ import pathlib
 import tempfile
 import warnings
 from collections.abc import Callable, Iterable
-from typing import Any
+from typing import Any, override
 from urllib.parse import urlparse
 from zipfile import ZipFile
 
@@ -20,8 +20,8 @@ from arcomake.datetime_utils import DateInterval
 
 logger = logging.getLogger(__name__)
 
-class CopernicusMarine(BackendEntrypoint):
 
+class CopernicusMarine(BackendEntrypoint):
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
     # Avoid annoying copernicusmarine log handling
@@ -30,23 +30,28 @@ class CopernicusMarine(BackendEntrypoint):
       cm_logger.removeHandler(handler)
     cm_logger.setLevel(level=logging.getLevelName(logger.getEffectiveLevel()))
 
+  @override
   def open_dataset(
-      self,
-      filename_or_obj,
-      *,
-      drop_variables: str | Iterable[str] | None = None,
-      variables: str | Iterable[str] | None = None,
-      start_datetime: str | datetime.datetime | None = None,
-      end_datetime: str | datetime.datetime | None = None,
-      dataset_version: str | None = None,
-      dataset_part: str | None = None,
-      service: str | None = None,
+    self,
+    filename_or_obj,
+    *,
+    drop_variables: str | Iterable[str] | None = None,
+    variables: str | Iterable[str] | None = None,
+    start_datetime: str | datetime.datetime | None = None,
+    end_datetime: str | datetime.datetime | None = None,
+    dataset_version: str | None = None,
+    dataset_part: str | None = None,
+    service: str | None = None,
   ) -> xr.Dataset:
 
     url = urlparse(filename_or_obj)
     if url.path or url.query or url.fragment:
-      warnings.warn(f"Possibly invalid Copernicus Marine URL: {filename_or_obj}. Ignoring path, query and fragment")
+      warnings.warn(
+        f"Possibly invalid Copernicus Marine URL: {filename_or_obj}. Ignoring path, query and fragment"
+      )
     dataset_id = url.netloc
+    if dataset_id == "":
+      raise ValueError("Missing dataset ID.")
 
     if variables is None:
       variables = []
@@ -57,26 +62,26 @@ class CopernicusMarine(BackendEntrypoint):
 
     # As copenicus marine chunks the dataset here we need to load it upfront and return it using numpy arrays as backend
     with cm.open_dataset(
-      dataset_id = dataset_id,
-      dataset_version = dataset_version,
-      variables = variables,
-      dataset_part = dataset_part,
-      service = service,
+      dataset_id=dataset_id,
+      dataset_version=dataset_version,
+      variables=variables,
+      dataset_part=dataset_part,
+      service=service,
       start_datetime=start_datetime,
       end_datetime=end_datetime,
     ) as dataset:
-
       return dataset.compute()
 
+  @override
   def guess_can_open(
-        self,
-        filename_or_obj: str
-        | os.PathLike[Any]
-        | ReadBuffer
-        | bytes
-        | memoryview
-        | AbstractDataStore,
-    ) -> bool:
+    self,
+    filename_or_obj: str
+    | os.PathLike[Any]
+    | ReadBuffer[Any]
+    | bytes
+    | memoryview
+    | AbstractDataStore,
+  ) -> bool:
 
     if not isinstance(filename_or_obj, str):
       return False
@@ -86,28 +91,12 @@ class CopernicusMarine(BackendEntrypoint):
 
 
 class NetCDFOverHTTP(BackendEntrypoint):
-
-  def guess_can_open(
-      self,
-      filename_or_obj: str
-                       | os.PathLike[Any]
-                       | ReadBuffer
-                       | bytes
-                       | memoryview
-                       | AbstractDataStore,
-  ) -> bool:
-
-    if not isinstance(filename_or_obj, str):
-      return False
-    else:
-      url = urlparse(filename_or_obj)
-      return url.scheme == "http" or url.scheme == "https"
-
+  @override
   def open_dataset(
-      self,
-      filename_or_obj,
-      *,
-      drop_variables = None,
+    self,
+    filename_or_obj,
+    *,
+    drop_variables=None,
   ) -> xr.Dataset:
     logger.info(f"Downloading NetCDF from: {filename_or_obj}")
 
@@ -133,6 +122,23 @@ class NetCDFOverHTTP(BackendEntrypoint):
       if pathlib.Path(temp_path).exists():
         pathlib.Path(temp_path).unlink()
 
+  @override
+  def guess_can_open(
+    self,
+    filename_or_obj: str
+    | os.PathLike[Any]
+    | ReadBuffer[Any]
+    | bytes
+    | memoryview
+    | AbstractDataStore,
+  ) -> bool:
+
+    if not isinstance(filename_or_obj, str):
+      return False
+    else:
+      url = urlparse(filename_or_obj)
+      return url.scheme == "http" or url.scheme == "https"
+
 
 class EarlyWarningDataStore(BackendEntrypoint):
   """
@@ -149,37 +155,27 @@ class EarlyWarningDataStore(BackendEntrypoint):
     self.progress = False
     self.client_logger = logger
 
-  def guess_can_open(
-      self,
-      filename_or_obj: str
-                       | os.PathLike[Any]
-                       | ReadBuffer
-                       | bytes
-                       | memoryview
-                       | AbstractDataStore,
-  ) -> bool:
-
-    if not isinstance(filename_or_obj, str):
-      return False
-    else:
-      url = urlparse(filename_or_obj)
-      return url.scheme == "ewds"
-
+  @override
   def open_dataset(
-      self,
-      filename_or_obj,
-      *,
-      drop_variables: str | Iterable[str] | None = None,
-      start_datetime: datetime.datetime | None = None,
-      end_datetime: datetime.datetime | None = None,
-      system_version: str | None = None,
-      hydrological_model: str | None = None,
-      product_type: str | None = None,
-      variable: str | Iterable[str] | None = None,
+    self,
+    filename_or_obj,
+    *,
+    drop_variables: str | Iterable[str] | None = None,
+    start_datetime: datetime.datetime | None = None,
+    end_datetime: datetime.datetime | None = None,
+    system_version: str | None = None,
+    hydrological_model: str | None = None,
+    product_type: str | None = None,
+    variable: str | Iterable[str] | None = None,
+    time_dim: str = "time",
+    latitude_dim: str = "latitude",
+    longitude_dim: str = "longitude",
   ) -> xr.Dataset:
     url = urlparse(filename_or_obj)
     if url.path or url.query or url.fragment:
-      warnings.warn(f"Possibly invalid EWDS URL: {filename_or_obj}. Ignoring path, query and fragment")
+      warnings.warn(
+        f"Possibly invalid EWDS URL: {filename_or_obj}. Ignoring path, query and fragment"
+      )
     dataset_name = url.netloc
     if any(arg is None for arg in [system_version, hydrological_model, product_type, variable]):
       raise ValueError("Missing required argument.")
@@ -187,7 +183,9 @@ class EarlyWarningDataStore(BackendEntrypoint):
       raise ValueError("Missing required argument.")
     logger.info(f"Downloading {dataset_name} from EWDS")
     datasets = []
-    consecutive_dates = self._consecutive_dates_with_same_month_or_year(start_datetime, end_datetime)
+    consecutive_dates = self._consecutive_dates_with_same_month_or_year(
+      start_datetime, end_datetime
+    )
     for dates in consecutive_dates:
       prefix = "h" if dataset_name.endswith("historical") else ""
       request = {
@@ -202,20 +200,29 @@ class EarlyWarningDataStore(BackendEntrypoint):
         "download_format": "zip",
       }
       dataset = self._process_request(dataset_name, request)
+      # TODO:
+      #  Unfortunately, it was impossible to get documentation on `valid_time` for historical GLOFAS data, hence
+      #  the provider documentation should clarify the difference between the two, e.g., if renaming the time
+      #  coordinate is needed (after appropriately resizing the download time interval)
+      #    ds = ds.rename(valid_time='time')
+      if extra_coords := [
+        name for name in dataset.coords if name not in [latitude_dim, longitude_dim, time_dim]
+      ]:
+        dataset = dataset.drop_vars(extra_coords)
       # _process_request drops the time dimension if of length one
       if len(dates) == 1:
-        dataset = dataset.expand_dims(dim="time", axis=0)
+        dataset = dataset.expand_dims(dim=time_dim, axis=0)
         dataset = dataset.assign_coords(time=dates)
       datasets.append(dataset)
-    with xr.concat(datasets, dim="time") as dataset:
+    with xr.concat(datasets, dim=time_dim) as dataset:
       # The dataset must be loaded in memory, since the temporary directory will be deleted with all the NetCDFs within it.
       # However, ds should be rather small. Hence, there should be no need to lazily load the dataset.
       return dataset.compute()
 
   @staticmethod
   def _consecutive_dates_with_same_month_or_year(
-      start_datetime: datetime.datetime,
-      end_datetime:datetime.datetime,
+    start_datetime: datetime.datetime,
+    end_datetime: datetime.datetime,
   ) -> list[list[datetime.datetime]]:
     date_interval = DateInterval(start=start_datetime, end=end_datetime)
     days = date_interval.to_list(freq=datetime.timedelta(days=1))
@@ -244,7 +251,9 @@ class EarlyWarningDataStore(BackendEntrypoint):
     Temporary files are deleted on exit.
     """
     with tempfile.NamedTemporaryFile("w+", suffix=".zip") as file:
-      client = self.get_cdsapi_client(progress=self.progress, client_logger=self.client_logger, **kwargs)
+      client = self.get_cdsapi_client(
+        progress=self.progress, client_logger=self.client_logger, **kwargs
+      )
       client.retrieve(dataset_name, request, file.name)
 
       with tempfile.TemporaryDirectory() as tmpdir:
@@ -256,15 +265,6 @@ class EarlyWarningDataStore(BackendEntrypoint):
         #  see: https://git.ecmwf.int/users/erds/repos/eccodes/browse/src/accessor/grib_accessor_class_g2date.cc?at=f10d3f3c1be3737a231d4a2c19f45535de4d4424#71-75
         #  Also, cdsapi download one NetCDF per variable, ugly. :(
         with xr.open_mfdataset(list(path.glob("*.grib")), engine="cfgrib") as dataset:
-          # TODO:
-          #  Unfortunately, it was impossible to get documentation on `valid_time` for historical GLOFAS data, hence
-          #  the provider documentation should clarify the difference between the two, e.g., if renaming the time
-          #  coordinate is needed (after appropriately resizing the download time interval)
-          #    ds = ds.rename(valid_time='time')
-          if extra_coords := [
-            name for name in dataset.coords if name not in ["latitude", "longitude", "time"]
-          ]:
-            dataset = dataset.drop_vars(extra_coords)
           return dataset.compute()
 
   # Credits to the amazing Stefano Piani from OGS
@@ -326,3 +326,20 @@ class EarlyWarningDataStore(BackendEntrypoint):
         cdsapi_client.logging_decorator = lambda x: x  # ty: ignore
 
     return cdsapi_client
+
+  @override
+  def guess_can_open(
+    self,
+    filename_or_obj: str
+    | os.PathLike[Any]
+    | ReadBuffer[Any]
+    | bytes
+    | memoryview
+    | AbstractDataStore,
+  ) -> bool:
+
+    if not isinstance(filename_or_obj, str):
+      return False
+    else:
+      url = urlparse(filename_or_obj)
+      return url.scheme == "ewds"

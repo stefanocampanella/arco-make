@@ -52,26 +52,52 @@ def process(dataset: xr.Dataset, steps: Sequence[dict[str, Any]]) -> xr.Dataset:
   return dataset
 
 
+def apply_mask(
+  ds: xr.Dataset,
+  mask_name: str,
+  variables: Iterable[str] | None = None,
+) -> xr.Dataset:
+  mask = ds[mask_name]
+  if variables is None:
+    variables: str = ds.data_vars.keys()  # type: ignore
+  data_vars = {}
+  for var in ds.data_vars:
+    if var in variables:
+      data_vars[var] = ds[var].where(mask)
+    else:
+      data_vars[var] = ds[var]
+  ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
+  return ds
+
+
 # TODO: document astype behaviour
 def astype(
-    ds: xr.Dataset,
-    dtype: str | None = None,
-    casting: str | None = None,
-    **kwargs,
+  ds: xr.Dataset,
+  dtype: str | None = None,
+  casting: str | None = None,
+  **kwargs,
 ) -> xr.Dataset:
   if dtype is not None and casting is not None:
     ds = ds.astype(dtype=dtype, casting=casting)
   elif kwargs is not None:
+    data_vars = {}
     for variable, astype_kwargs in kwargs.items():
       if variable in ds.data_vars:
-        ds[variable] = ds[variable].astype(**astype_kwargs)
+        data_vars[variable] = ds[variable].astype(**astype_kwargs)
+      else:
+        data_vars[variable] = ds[variable]
+    ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
   return ds
 
 
 def clip_negative(ds: xr.Dataset, variables: Sequence[str]):
+  data_vars = {}
   for var, da in ds.data_vars.items():
     if var in variables:
-      ds[var] = da.clip(min=0.0)
+      data_vars[var] = da.clip(min=0.0)
+    else:
+      data_vars[var] = da
+  ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
   return ds
 
 
@@ -80,29 +106,40 @@ def flip(ds: xr.Dataset, dim: str) -> xr.Dataset:
 
 
 def get_notnull_mask(
-    ds: xr.Dataset,
-    variable: str,
-    mask_name: str,
+  ds: xr.Dataset,
+  variable: str,
+  mask_name: str,
 ) -> xr.Dataset:
   ds[mask_name] = ds[variable].notnull()
   return ds
 
 
 def get_sea_mask(
-    ds: xr.Dataset,
-    bathymetry="deptho",
-    depth_coordinate="depth",
-    depth_dim="level",
-    mask_name="sea_land_mask",
+  ds: xr.Dataset,
+  bathymetry="deptho",
+  depth_coordinate="depth",
+  depth_dim="level",
+  threshold: float = 0.5,
+  mask_name="sea_land_mask",
 ) -> xr.Dataset:
   bathymetry_values = ds[bathymetry].values
   depth = ds[depth_coordinate].values
+  if threshold < 0.0 or threshold > 1.0:
+    raise ValueError(f"depth_threshold must be between 0.0 and 1.0, got {threshold}")
 
-  def get_mask(depth_map: np.ndarray, column_depths: np.ndarray, dtype="bool") -> np.ndarray:
-    cell_center_depths = np.insert(column_depths[:-1], 0, 0.0) + 0.5 * np.diff(
-      column_depths, prepend=0.0
-    )
-    mask = np.stack([depth_map >= d for d in cell_center_depths], axis=0)
+  def get_mask(bathy: np.ndarray, centroid_depths: np.ndarray, dtype="bool") -> np.ndarray:
+    assert centroid_depths.ndim == 1
+    # The top face depth of the first level is zero meters below the geoid
+    boundary_depths = [0.0]
+    for centroid_depth in centroid_depths:
+      last_boundary_depth = boundary_depths[-1]
+      cell_height = 2 * (centroid_depth - last_boundary_depth)
+      boundary_depths.append(boundary_depths[-1] + cell_height)
+    boundary_depths = np.asarray(boundary_depths)
+    top_face_depths = boundary_depths[:-1]
+    bottom_face_depths = boundary_depths[1:]
+    minimum_depths = threshold * top_face_depths + (1 - threshold) * bottom_face_depths
+    mask = np.stack([bathy > d for d in minimum_depths], axis=0)
     return mask.astype(dtype)
 
   mask = get_mask(bathymetry_values, depth)
@@ -112,70 +149,81 @@ def get_sea_mask(
 
 
 def isel_slice(ds: xr.Dataset, **kwargs) -> xr.Dataset:
-  return ds.isel({dim: slice(slice_kwargs.get("start"), slice_kwargs.get("stop"), slice_kwargs.get("step"))
-                  for dim, slice_kwargs in kwargs.items()})
+  return ds.isel(
+    {
+      dim: slice(slice_kwargs.get("start"), slice_kwargs.get("stop"), slice_kwargs.get("step"))
+      for dim, slice_kwargs in kwargs.items()
+    }
+  )
+
+
+def is_positive_mask(ds: xr.Dataset, variable: str, mask_name: str) -> xr.Dataset:
+  ds[mask_name] = ds[variable] > 0.0
+  return ds
+
+
+def sel_slice(ds: xr.Dataset, **kwargs) -> xr.Dataset:
+  return ds.sel(
+    {
+      dim: slice(slice_kwargs.get("start"), slice_kwargs.get("stop"), slice_kwargs.get("step"))
+      for dim, slice_kwargs in kwargs.items()
+    }
+  )
 
 
 def masked_fill(
-    ds: xr.Dataset,
-    variables: Iterable[str],
-    fill_value: Number,
-    mask_name: str,
+  ds: xr.Dataset,
+  variables: Iterable[str],
+  fill_value: Number,
+  mask_name: str,
 ) -> xr.Dataset:
   if mask_name not in ds.data_vars:
     raise ValueError(f"Mask {mask_name} does not exist")
   mask = ds[mask_name]
+  data_vars = {}
   for var, da in ds.data_vars.items():
     mask = mask.isel({dim: 0 for dim in mask.dims if dim not in da.dims}, drop=True)
     if var in variables:
-      ds[var] = xr.where(da.isnull() & mask, fill_value, da)
+      data_vars[var] = xr.where(da.isnull() & mask, fill_value, da)
+    else:
+      data_vars[var] = da
+  ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
   return ds
 
 
-# FIXME: gauss_fill implementation is problematic for several reasons; for each data array in ds:
-#    1. It assumes that mask has only spatial dimensions and that data array and mask use the same names for spatial
-#    dimensions (however, this is true also for several other processing steps).
-#    2. It assumes that if mask has some dimension but data array does not, then 0-th component of the mask along that
-#    dimension is the one to use (e.g., for the depth/level).
-#    3. It uses map_block, hence need rechunking of both mask and data array.
-#  These assumptions and implementation choices should be revisited or clearly documented.
-def masked_gauss_fill(
-    ds: xr.Dataset,
-    mask_name: str,
-    variables: Iterable[str],
-    latitude_dim: str = "latitude",
-    longitude_dim: str = "longitude",
-    **kwargs,
+def gaussian_blur_extrapolate(
+  ds: xr.Dataset,
+  variables: Iterable[str] | None = None,
+  **kwargs,
 ) -> xr.Dataset:
-  if mask_name not in ds.data_vars:
-    raise ValueError(f"Mask {mask_name} does not exist")
-  mask = ds[mask_name].copy()
+  if variables is None:
+    variables: str = ds.data_vars.keys()  # type: ignore
   gaussian_filter_kwargs = kwargs.get("gaussian_filter_kwargs", {})
 
-  def gauss_filter_nan(data: xr.DataArray, mask: xr.DataArray) -> xr.DataArray:
-    mask = mask.isel({dim: 0 for dim in mask.dims if dim not in data.dims}, drop=True)
-    data_u = xr.where(data.isnull() | np.logical_not(mask), 0.0, data)
-    data_u.values = gaussian_filter(data_u.values, **gaussian_filter_kwargs)
-    data_v = xr.where(data.isnull() | np.logical_not(mask), 0.0, 1.0)
-    data_v.values = gaussian_filter(data_v.values, **gaussian_filter_kwargs)
-    data_u = data_u / data_v
-    data = xr.where(data.isnull() & mask, data_u, data)
+  def gauss_fill_nan(data: xr.DataArray) -> xr.DataArray:
+    data_u = xr.where(data.isnull(), 0.0, data)
+    data_u = xr.apply_ufunc(gaussian_filter, data_u, kwargs=gaussian_filter_kwargs)
+    valid_frac = xr.where(data.isnull(), 0.0, 1.0)
+    valid_frac = xr.apply_ufunc(gaussian_filter, valid_frac, kwargs=gaussian_filter_kwargs)
+    data_u = data_u / valid_frac
+    data = xr.where(data.isnull(), data_u, data)
     return data
 
-  mask = mask.chunk(chunks={latitude_dim: -1, longitude_dim: -1})
+  data_vars = {}
   for var, da in ds.data_vars.items():
     if var in variables:
-      # Note: ensuring that da is not chunked along mask dimensions is crucial, otherwise map_block will fail!
-      da = da.chunk(chunks={latitude_dim: -1, longitude_dim: -1})
-      ds[var] = da.map_blocks(gauss_filter_nan, args=(mask,), template=da)
+      data_vars[var] = da.map_blocks(gauss_fill_nan, template=da)
+    else:
+      data_vars[var] = da
+    ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
   return ds
 
 
 def regrid(
   ds: xr.Dataset,
   grid: dict[str, Any],
-  latitude_dim: str= "latitude",
-  longitude_dim: str= "longitude",
+  latitude_dim: str = "latitude",
+  longitude_dim: str = "longitude",
   **kwargs,
 ) -> xr.Dataset:
   """
@@ -193,9 +241,7 @@ def regrid(
     ValueError: If grid is not specified.
   """
   new_grid = xarray_regrid.Grid(**grid)
-  target_dataset = new_grid.create_regridding_dataset(
-    lat_name=latitude_dim, lon_name=longitude_dim
-  )
+  target_dataset = new_grid.create_regridding_dataset(lat_name=latitude_dim, lon_name=longitude_dim)
   method = kwargs.get("method", "nearest")
   target_dataset = target_dataset.assign_coords(
     {
@@ -211,9 +257,9 @@ def regrid(
 
 
 def rename_coordinates(
-    ds: xr.Dataset,
-    name_dict: dict[str, str],
-    set_new_coordinate: dict[str, str | Iterable[Number]] | None = None,
+  ds: xr.Dataset,
+  name_dict: dict[str, str],
+  set_new_coordinate: dict[str, str | Iterable[Number]] | None = None,
 ) -> xr.Dataset:
   name_dict = {
     old_name: new_name for old_name, new_name in name_dict.items() if old_name in ds.coords
@@ -225,7 +271,7 @@ def rename_coordinates(
       old_coordinate = ds.coords[new_name]
       new_coordinate = set_new_coordinate[new_name]
       if isinstance(new_coordinate, str):
-        if new_coordinate == 'auto':
+        if new_coordinate == "auto":
           new_coordinate = list(range(len(old_coordinate.data)))
         else:
           raise ValueError(f"Invalid value for new coordinate: {new_coordinate}")
@@ -257,14 +303,18 @@ def resample(ds: xr.Dataset, reduce: str, **kwargs) -> xr.Dataset:
 
 
 def rescale(ds: xr.Dataset, values: dict[str, Number]) -> xr.Dataset:
+  data_vars = {}
   for var, da in ds.data_vars.items():
     if var in values:
-      ds[var] = values[var] * da # ty: ignore
+      data_vars[var] = values[var] * da  # type: ignore
+    else:
+      data_vars[var] = da
+  ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
   return ds
 
 
 def select_variables(ds: xr.Dataset, variables: Iterable[str]) -> xr.Dataset:
-  return ds[variables] # ty: ignore
+  return ds[variables]  # type: ignore
 
 
 def transpose(ds: xr.Dataset, dims: Sequence[str], **kwargs) -> xr.Dataset:

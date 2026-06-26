@@ -5,7 +5,7 @@ from typing import Literal
 import numpy as np
 import xarray as xr
 
-from arcomake.dataset_utils import valid_time_coordinate
+from arcomake.checks import valid_time_coordinate
 
 
 def compute_mean(dataset: xr.Dataset, time_dim: str = "time", **kwargs) -> xr.Dataset:
@@ -31,14 +31,20 @@ def compute_climatology(
   dataset: xr.Dataset,
   time_dim: str = "time",
   climatology_dim: str = "dayofyear",
+  freq: str = "1D",
   calendar: Literal["365_day", "366_day", "360_day"] = "365_day",
   skipna=False,
   **kwargs,
 ) -> xr.Dataset:
   # The current implementation assumes that, among other things, the time coordinate is daily, contiguous and without
   # duplicates. Finally, that it contains a whole number of years. Incomplete years data is considered as missing.
-  if not valid_time_coordinate(dataset, time_dim):
-    raise ValueError("Dataset has invalid time coordinate.")
+  valid_time_coordinate(
+    dataset,
+    start_datetime=dataset[time_dim].to_index().min().to_pydatetime(),
+    end_datetime=dataset[time_dim].to_index().max().to_pydatetime(),
+    freq=freq,
+    time_dim=time_dim,
+  )
 
   # Here we handle leap years.
   # See: https://github.com/pydata/xarray/issues/1844#issuecomment-417855365

@@ -3,11 +3,10 @@
 import logging
 import sys
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
-import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -15,7 +14,17 @@ logger = logging.getLogger(__name__)
 checks_module = sys.modules[__name__]
 
 
-def validate(dataset: xr.Dataset, checks: dict[str, Any]) -> None:
+class ValidationError(Exception):
+  """Raised when validation fails."""
+
+
+def validate(
+  dataset: xr.Dataset,
+  checks: dict[str, Any],
+  start_datetime: datetime,
+  end_datetime: datetime,
+  should_raise: bool = False,
+) -> None:
   """
   Performs checks on a xarray.Dataset and raise an exception if any check fails.
 
@@ -28,104 +37,158 @@ def validate(dataset: xr.Dataset, checks: dict[str, Any]) -> None:
   Returns:
     None
   """
-  logger.info(
-    "Validating dataset following steps: " + ", ".join(checks.keys()) + ". "
-  )
+  logger.info("Validating dataset with the following checks: " + ", ".join(checks.keys()) + ". ")
   for name, config in checks.items():
-    logger.info(f"Applying {name} with configuration {config}")
-    check_fn: Callable[..., None]
-    if name in dir(checks_module):
-      check_fn = getattr(checks_module, name)
+    if not hasattr(checks_module, name):
+      warnings.warn(f"Unrecognized validation check {name} with configuration {config}")
+      continue
+    if name == "valid_time_coordinate":
+      config = config | {"start_datetime": start_datetime, "end_datetime": end_datetime}
+    check_fn: Callable[..., None] = getattr(checks_module, name)
+    try:
       check_fn(dataset, **config)
-    else:
-      warnings.warn(f"Unrecognized validation step {name} with configuration {config}")
+    except Exception as exc:
+      failure_message = f"Validation step {name} failed: {exc}"
+      if should_raise:
+        raise ValidationError(failure_message) from exc
+      warnings.warn(failure_message)
 
 
 # The following implementation assumes that mask is unchunked, and that block is unchunked along mask dimensions.
-def check_values(
+def ensure_no_nans(
   ds: xr.Dataset,
-  variables: None | Sequence[str] = None,
-  mask: None | xr.DataArray = None,
-) -> xr.Dataset:
-  logger.info("Checking for Nans.")
-  allowed_variables = variables or ds.data_vars
-  for var, da in ds.data_vars.items():
-    if var in allowed_variables:
-      if mask is not None:
-        mask_ = mask.isel({dim: 0 for dim in mask.dims if dim not in da.dims}, drop=True)
-        masked_data = da.where(mask_, 0.0)
-        nonvalid_values = masked_data.isnull()
+  **kwargs,
+) -> None:
+  variable_mask_mapping = {}
+  for mask_name, variable_names in kwargs.items():
+    for variable_name in variable_names:
+      if variable_name in ds.data_vars:
+        variable_mask_mapping[variable_name] = mask_name
       else:
-        nonvalid_values = da.isnull()
-      if nonvalid_values.any():
-        raise ValueError(
-          f"{nonvalid_values.sum().values} NaN values found "
-          f"for variable {da.name or 'unknown'}"
-        )
-  return ds
+        warnings.warn(f"Variable {variable_name} not found in dataset")
 
-
-def check_dates(
-  ds: xr.Dataset,
-  start_date: datetime,
-  end_date: datetime,
-  freq: str = "D",
-) -> xr.Dataset:
-  """
-  Check that all dates in a dataset are within the specified range
-  and that each day is included in the interval.
-
-  Args:
-    ds: The dataset to check
-    start_date: Start date (required)
-    end_date: End date (required)
-    dataset_name: Optional name of the dataset for the warning message
-  """
-
-  logger.info("Checking for missing dates.")
-  if "time" in ds.dims:
-    # Check that each day is included in the interval
-    expected_dates = pd.date_range(start=start_date, end=end_date, freq=freq, inclusive="left")
-    time_values: np.ndarray = ds.time.values
-    dataset_dates: pd.DatetimeIndex = pd.to_datetime(time_values)
-
-    # Find missing dates within the expected range
-    missing_dates = []
-    for expected_date in expected_dates:
-      if expected_date not in dataset_dates:
-        missing_dates.append(expected_date)
-
-    if missing_dates:
-      missing_str = [date.strftime("%Y-%m-%d") for date in missing_dates[:10]]  # Show first 10
-      if len(missing_dates) > 10:
-        missing_str.append(f"... and {len(missing_dates) - 10} more")
-      raise ValueError(
-        f"Dataset is missing {len(missing_dates)} dates "
-        f"from the expected interval [{start_date}, {end_date}]: {missing_str}"
+  logger.info("Checking for Nans.")
+  for variable_name, da in ds.data_vars.items():
+    if variable_name in variable_mask_mapping:
+      mask_name = variable_mask_mapping[variable_name]
+      mask_da = ds[mask_name]
+      mask_da = mask_da.isel({dim: 0 for dim in mask_da.dims if dim not in da.dims}, drop=True)
+      masked_data = da.where(mask_da, 0.0)
+      invalid_values = masked_data.isnull()
+    else:
+      invalid_values = da.isnull()
+    if invalid_values.any():
+      raise ValidationError(
+        f"{invalid_values.sum().values} NaN values found for variable {variable_name}"
       )
 
-  return ds
 
-
-def check_global_ecmwf(ds: xr.Dataset) -> xr.Dataset:
+def valid_global_ecmwf_coordinates(
+  ds: xr.Dataset, latitude_dim: str = "latitude", longitude_dim: str = "longitude"
+) -> None:
   logger.info("Checking that coordinates use ECMWF global convention.")
 
-  # Check that each dataset uses the [0, 360) convention for longitude
-  if "longitude" in ds.dims or "lon" in ds.dims:
-    lon_dim = "longitude" if "longitude" in ds.dims else "lon"
-    if ds[lon_dim].min().item() < 0 or ds[lon_dim].max().item() >= 360:
-      raise ValueError(
-        "Dataset does not use the [0, 360) convention for longitude"
-      )
-
   # Check that each dataset contains all latitudes in [-90, 90], and use the [-90, 90] convention
-  if "latitude" in ds.dims or "lat" in ds.dims:
-    lat_dim = "latitude" if "latitude" in ds.dims else "lat"
-    if ds[lat_dim].min().item() < -90 or ds[lat_dim].max().item() > 90:
-      raise ValueError("Dataset has latitudes outside the [-90, 90] range")
-    if ds[lat_dim][0].item() > ds[lat_dim][-1].item():
-      raise ValueError(
-        "Dataset does not use the [90, -90] convention for latitude"
-      )
+  if latitude_dim not in ds.dims:
+    raise ValidationError(f"Latitude dimension {latitude_dim} not found in dataset")
+  if ds[latitude_dim].min().item() < -90 or ds[latitude_dim].max().item() > 90:
+    raise ValueError("Dataset has latitudes outside the [-90, 90] range")
+  if ds[latitude_dim][0].item() > ds[latitude_dim][-1].item():
+    raise ValueError("Dataset does not use the [90, -90] convention for latitude")
 
-  return ds
+  # Check that each dataset uses the [0, 360) convention for longitude
+  if longitude_dim not in ds.dims:
+    raise ValidationError(f"Longitude dimension {longitude_dim} not found in dataset")
+  if ds[longitude_dim].min().item() < 0 or ds[longitude_dim].max().item() >= 360:
+    raise ValueError("Dataset does not use the [0, 360) convention for longitude")
+
+
+def valid_time_coordinate(
+  dataset: xr.Dataset,
+  start_datetime: datetime,
+  end_datetime: datetime,
+  freq: str = "D",
+  time_dim="time",
+) -> None:
+  """
+  Check that time coordinate is sorted, that all dates are within the specified range, and that there are no duplicates
+  or missing dates.
+
+  Args:
+    dataset: The dataset to check
+    start_datetime: Start date (required)
+    end_datetime: End date (required)
+    dataset_name: Optional name of the dataset for the warning message
+  """
+  assert end_datetime >= start_datetime, "End date must be after start date"
+  logger.info(
+    f"Checking that time coordinate contains all dates between {start_datetime} and {end_datetime}, with frequency {freq}."
+  )
+  idx = dataset[time_dim].to_index()
+  if isinstance(idx, pd.DatetimeIndex):
+    valid_datetime_index(idx, start_datetime, end_datetime, freq)
+  elif isinstance(idx, xr.CFTimeIndex):
+    valid_cftime_index(idx, start_datetime, end_datetime, freq)
+  else:
+    raise ValueError(f"Unexpected index type: {type(idx).__name__}")
+
+
+# TODO: Check that the following implementation works for both DateTimeIndex and CFTimeIndex
+def valid_datetime_index(
+  idx: pd.DatetimeIndex, start_datetime: datetime, end_datetime: datetime, freq: str = "1D"
+) -> None:
+
+  # Check that the time coordinate is sorted
+  if not idx.is_monotonic_increasing:
+    raise ValidationError("Time coordinate is not sorted")
+
+  # Check for duplicates
+  if idx.has_duplicates:
+    dups = idx[idx.duplicated()]
+    dup_values = pd.DatetimeIndex(dups.unique())
+    preview = ", ".join(str(ts) for ts in dup_values[:5])
+    more = "" if len(dup_values) <= 5 else f" and {len(dup_values) - 5} more"
+    raise ValidationError(f"Duplicate timestamps found in time coordinate: {preview}{more}")
+
+  # Check for missings
+  expected = pd.date_range(
+    start=start_datetime, end=end_datetime, freq=freq, inclusive="left", tz=getattr(idx, "tz", None)
+  )
+  if not idx.equals(expected):
+    # Report missing or irregular timestamps for easier debugging
+    # Compute missing by comparing against the sorted unique expected sequence
+    missing = expected.difference(idx)
+    preview = ", ".join(str(ts) for ts in missing[:5])
+    more = "" if len(missing) <= 5 else f" and {len(missing) - 5} more"
+    raise ValidationError(f"Missing or irregular dates detected: {preview}{more}")
+
+
+def valid_cftime_index(
+  idx: xr.CFTimeIndex, start_date: datetime, end_date: datetime, freq: str = "1D"
+) -> None:
+  # Equivalent checks for xarray.CFTimeIndex (cftime-based calendars)
+
+  # Check that the time coordinate is sorted
+  if not idx.is_monotonic_increasing:
+    raise ValidationError("Time coordinate is not sorted")
+
+  # Duplicates check
+  if idx.has_duplicates:
+    dups = idx[idx.duplicated()]
+    dup_values = dups.unique()  # CFTimeIndex of unique duplicate timestamps
+    preview = ", ".join(str(ts) for ts in dup_values[:5])
+    more = "" if len(dup_values) <= 5 else f" and {len(dup_values) - 5} more"
+    raise ValidationError(f"Duplicate timestamps found in time coordinate: {preview}{more}")
+
+  # Regularity check (daily frequency across CF calendars)
+  calendar = getattr(idx, "calendar", None)
+  # Build expected daily sequence with same calendar
+  expected = xr.cftime_range(
+    start=start_date, end=end_date, freq=freq, inclusive="left", calendar=calendar
+  )
+  if not idx.equals(expected):
+    # Compute missing days between min and max dates for helpful diagnostics
+    missing = expected.difference(idx)
+    preview = ", ".join(str(ts) for ts in missing[:5])
+    more = "" if len(missing) <= 5 else f" and {len(missing) - 5} more"
+    raise ValidationError(f"Missing or irregular dates detected: {preview}{more}")

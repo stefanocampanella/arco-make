@@ -4,18 +4,15 @@ import datetime
 import logging
 import pathlib
 import tempfile
-import warnings
 from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Any
 
-import pandas as pd
 import xarray as xr
 from dask.diagnostics import ProgressBar
 from numcodecs import Blosc
 from zarr.storage import DirectoryStore, ZipStore
 
-from arcomake.checks import validate
 from arcomake.datetime_utils import (
   IterableDateInterval,
   may_parse_timedelta,
@@ -33,9 +30,9 @@ def bar(progress):
 
 
 def open_dataset(
-    configs: dict[str, Any],
-    start_datetime: datetime.datetime,
-    end_datetime: datetime.datetime,
+  configs: dict[str, Any],
+  start_datetime: datetime.datetime,
+  end_datetime: datetime.datetime,
 ) -> xr.Dataset:
   """
   Downloads and pre-processes a dataset based on provided configurations.
@@ -61,6 +58,7 @@ def maybe_checkpointing_open_dataset(
   configs: dict[str, Any],
   start_datetime: datetime.datetime,
   end_datetime: datetime.datetime,
+  time_dim: str = "time",
 ) -> xr.Dataset:
   checkpointing_step = configs.get("checkpointing_step", "")
   if not checkpointing_step:
@@ -83,14 +81,14 @@ def maybe_checkpointing_open_dataset(
         dataset.to_zarr(store=checkpoint_store, mode="w", compute=True)
         is_first_checkpoint = False
       else:
-        dataset.to_zarr(store=checkpoint_store, mode="a-", append_dim="time", compute=True)
+        dataset.to_zarr(store=checkpoint_store, mode="a-", append_dim=time_dim, compute=True)
     del dataset
 
   # Open the checkpointed dataset, set the close function to remove the temporary directory when done
   logger.info(f"Opening checkpointed dataset from {checkpoint.name}")
-  dataset = xr.open_zarr(store=checkpoint_store,
-                         overwrite_encoded_chunks=True,
-                         chunks=configs.get("chunks"))
+  dataset = xr.open_zarr(
+    store=checkpoint_store, overwrite_encoded_chunks=True, chunks=configs.get("chunks")
+  )
   dataset.set_close(checkpoint.cleanup)
   return dataset
 
@@ -248,82 +246,7 @@ def save_to_zarr(
     store = ZipStore(path=str(path), mode="w", compression=0, allowZip64=True)
   else:
     store = DirectoryStore(path=str(path))
-  if preprocess_conf := configs.pop("preprocess", None):
-    dataset = process(dataset=dataset, steps=preprocess_conf)
   with bar(progress):
-    validate(dataset=dataset, checks=configs.pop("checks", {}))
     dataset.to_zarr(store=store, compute=True, mode="w", **configs)
-
-
-def valid_datetime_index(idx: pd.DatetimeIndex) -> bool:
-  # Check that the following implementation works for both DateTimeIndex and CFTimeIndex
-  if idx.has_duplicates:
-    dups = idx[idx.duplicated()]
-    dup_values = pd.DatetimeIndex(dups.unique())
-    preview = ", ".join(str(ts) for ts in dup_values[:5])
-    more = "" if len(dup_values) <= 5 else f" and {len(dup_values) - 5} more"
-    warnings.warn(f"Duplicate timestamps found in time coordinate: {preview}{more}")
-    return False
-
-  if len(idx) > 0:
-    # noinspection PyTypeChecker
-    expected = pd.date_range(start=idx[0], periods=len(idx), freq="D", tz=getattr(idx, "tz", None))
-    if not idx.equals(expected):
-      # Report missing or irregular timestamps for easier debugging
-      # Compute missing by comparing against the sorted unique expected sequence
-      sorted_idx = idx.sort_values()
-      expected_full = pd.date_range(
-        start=sorted_idx[0],
-        end=sorted_idx[-1],
-        freq="D",
-        tz=getattr(sorted_idx, "tz", None),
-      )
-      missing = expected_full.difference(sorted_idx)
-      preview = ", ".join(str(ts) for ts in missing[:5])
-      more = "" if len(missing) <= 5 else f" and {len(missing) - 5} more"
-      warnings.warn(f"Missing or irregular dates detected: {preview}{more}")
-      return False
-
-  return True
-
-
-def valid_cftime_index(idx: xr.CFTimeIndex) -> bool:
-  # Equivalent checks for xarray.CFTimeIndex (cftime-based calendars)
-  # Duplicates check
-  if idx.has_duplicates:
-    dups = idx[idx.duplicated()]
-    dup_values = dups.unique()  # CFTimeIndex of unique duplicate timestamps
-    preview = ", ".join(str(ts) for ts in dup_values[:5])
-    more = "" if len(dup_values) <= 5 else f" and {len(dup_values) - 5} more"
-    warnings.warn(f"Duplicate timestamps found in time coordinate: {preview}{more}")
-    return False
-
-  # Regularity check (daily frequency across CF calendars)
-  if len(idx) > 0:
-    calendar = getattr(idx, "calendar", None)
-    # Build expected daily sequence with same calendar
-    expected = xr.cftime_range(start=idx[0], periods=len(idx), freq="D", calendar=calendar)
-    if not idx.equals(expected):
-      # Compute missing days between min and max dates for helpful diagnostics
-      sorted_idx = idx.sort_values()
-      expected_full = xr.cftime_range(
-        start=sorted_idx[0], end=sorted_idx[-1], freq="D", calendar=calendar
-      )
-      missing = expected_full.difference(sorted_idx)
-      preview = ", ".join(str(ts) for ts in missing[:5])
-      more = "" if len(missing) <= 5 else f" and {len(missing) - 5} more"
-      warnings.warn(f"Missing or irregular dates detected: {preview}{more}")
-      return False
-
-  return True
-
-
-def valid_time_coordinate(dataset: xr.Dataset, time_dim: str = "time") -> bool:
-  idx = dataset[time_dim].to_index()
-  if isinstance(idx, pd.DatetimeIndex):
-    passed = valid_datetime_index(idx)
-  elif isinstance(idx, xr.CFTimeIndex):
-    passed = valid_cftime_index(idx)
-  else:
-    raise ValueError(f"Unexpected index type: {type(idx).__name__}")
-  return passed
+  store.close()
+  dataset.close()

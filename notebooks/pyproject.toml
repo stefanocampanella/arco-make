@@ -1,0 +1,16 @@
+[project]
+name = "arcomake-notebooks"
+version = "0.1.0"
+description = "Documentation notebooks for arcomake"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "arcomake",
+    "geoviews>=1.15.1",
+    "hvplot>=0.12.2",
+    "ipywidgets>=8.1.8",
+    "jupyterlab>=4.6.0",
+]
+
+[tool.uv.sources]
+arcomake = { path = "..", editable = true }

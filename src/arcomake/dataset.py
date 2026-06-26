@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: MIT
 import logging
 import pathlib
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import click
 import dask
 import xarray as xr
 
+from arcomake.checks import valid_time_coordinate, validate
 from arcomake.cli_utils import (
   DictParamType,
   check_output_path,
@@ -18,9 +19,8 @@ from arcomake.dataset_utils import (
   maybe_checkpointing_open_dataset,
   open_mfdataset,
   save_to_zarr,
-  valid_time_coordinate,
 )
-from arcomake.datetime_utils import may_parse_timedelta
+from arcomake.processing import process
 
 # TODO:
 #   1. Documentation is missing, fix it.
@@ -55,8 +55,6 @@ logger = logging.getLogger(__name__)
   help="Override end datetime of the timeseries.",
   type=click.DateTime(),
 )
-@click.option("--array-id", help="ID of the SLURM array to download", default=None, type=int)
-@click.option("--array-step", default=None, type=str)
 @click.option(
   "--overwrite/--no-overwrite",
   help="Whether to overwrite existing outputs",
@@ -64,12 +62,13 @@ logger = logging.getLogger(__name__)
   is_flag=True,
 )
 @click.option(
-  "--progress/--no-progress",
-  "progress",
-  help="Whether to display a progress bar",
-  default=False,
+  "--should-raise/--no-should-raise",
+  "should_raise",
+  help="Whether to raise an exception if validation fails",
+  default=True,
   is_flag=True,
 )
+@click.option("--time-dim", help="Time dimension name used in the input dataset", default="time")
 @click.option(
   "--log-level",
   default="info",
@@ -82,20 +81,27 @@ logger = logging.getLogger(__name__)
   default=False,
   is_flag=True,
 )
+@click.option(
+  "--progress/--no-progress",
+  "progress",
+  help="Whether to display a progress bar",
+  default=False,
+  is_flag=True,
+)
 def download(
   config_path: pathlib.Path,
   output_path: pathlib.Path,
   start_datetime: datetime | None = None,
   end_datetime: datetime | None = None,
-  array_id: int | None = None,
-  array_step: str | timedelta | None = None,
-  progress: bool = False,
-  log_level: str = "info",
   overwrite: bool = False,
+  should_raise: bool = True,
+  time_dim: str = "time",
+  log_level: str = "info",
   debug: bool = False,
+  progress: bool = False,
 ):
   """
-  Download an process multiple datasets into a single ARCO dataset.
+  Download and process multiple datasets into a single ARCO dataset.
 
   The function reads dataset configurations, applies necessary postprocessing steps,
   and saves the merged dataset to a Zarr store.
@@ -110,20 +116,18 @@ def download(
   # Open the configuration file and load the TOML configs.
   configs = read_configs(config_path)
 
-  # Update start_datetime and end_datetime based CLI arguments
-  if start_datetime is not None:
-    logger.info(f"Overriding start datetime with {start_datetime}")
-  if end_datetime is not None:
-    logger.info(f"Overriding end datetime with {end_datetime}")
+  # Update start_datetime and end_datetime based on CLI arguments
   start_datetime = start_datetime or configs["start"]
   end_datetime = end_datetime or configs["end"]
-
-  if array_id is not None and array_step is not None:
-    logger.info(f"Array ID {array_id} with step {array_step}")
-    array_step = may_parse_timedelta(array_step)
-    start_datetime = start_datetime + array_id * array_step
-    end_datetime = min(end_datetime + (array_id + 1) * array_step, configs["end"])
-    output_path = output_path / f"{start_datetime.strftime('%Y%m%d')}-{end_datetime.strftime('%Y%m%d')}"
+  if (
+    not isinstance(start_datetime, datetime)
+    or not isinstance(end_datetime, datetime)
+    or start_datetime > end_datetime
+  ):
+    raise ValueError(
+      "start_datetime and end_datetime must be datetime objects, and end_datetime must be after start_datetime"
+    )
+  logger.info(f"Downloading data from {start_datetime} to {end_datetime}")
 
   # Check if the output path exists.
   check_output_path(output_path, overwrite=overwrite)
@@ -135,13 +139,33 @@ def download(
       logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
       continue
     logger.info(f"Downloading {dataset_name}")
-    with maybe_checkpointing_open_dataset(dataset_conf, start_datetime, end_datetime) as source_dataset:
-      dataset = xr.merge([dataset, source_dataset], join="exact")
+    with maybe_checkpointing_open_dataset(
+      dataset_conf, start_datetime, end_datetime, time_dim=time_dim
+    ) as source_dataset:
+      dataset = xr.merge([dataset, source_dataset], join="exact", compat="no_conflicts")
+
+  # Postprocess the merged dataset (e.g., apply masks)
+  if postprocess_conf := configs.pop("postprocess", []):
+    dataset = process(dataset=dataset, steps=postprocess_conf)
 
   # Save the dataset in a Zarr using sensible chunking and compression
   save_to_zarr(
-    dataset=dataset, path=output_path, configs=configs.get("save", {}), progress=progress
+    dataset=dataset,
+    path=output_path,
+    configs=configs.get("save", {}),
+    progress=progress,
   )
+
+  # Validate the dataset
+  if checks := configs.pop("checks", {}):
+    with xr.open_dataset(output_path, engine="zarr") as dataset:
+      validate(
+        dataset=dataset,
+        checks=checks,
+        start_datetime=start_datetime,
+        end_datetime=end_datetime,
+        should_raise=should_raise,
+      )
 
 
 @click.command()
@@ -170,6 +194,7 @@ def download(
   default=None,
   type=click.DateTime(),
 )
+@click.option("--freq", help="Time frequency of the timeseries", default="1D")
 @click.option(
   "--chunks",
   default=None,
@@ -205,9 +230,10 @@ def unpack_zips(
   input_path: pathlib.Path,
   output_path: pathlib.Path,
   time_dim: str = "time",
-  start_date: datetime | None = None,
-  end_date: datetime | None = None,
-  chunks: dict | None = None,
+  start_datetime: datetime | None = None,
+  end_datetime: datetime | None = None,
+  freq: str = "1D",
+  chunks: dict[str, int] | None = None,
   cname: str = "lz4",
   clevel: int = 1,
   overwrite: bool = False,
@@ -241,12 +267,19 @@ def unpack_zips(
   logger.info(f"Reading {len(paths)} zipped Zarrs from {input_path}")
 
   dataset = open_mfdataset(paths, chunks=chunks)
-  if not valid_time_coordinate(dataset, time_dim=time_dim):
-    raise ValueError(
-      f"Time coordinate {time_dim} is not valid (contains duplicates or missing dates)"
-    )
-  dataset = dataset.sel(time=slice(start_date, end_date))
-  dataset = dataset.chunk({dim: (1 if dim == "time" else -1) for dim in dataset.dims})
+  valid_time_coordinate(
+    dataset,
+    start_datetime=start_datetime
+    if start_datetime is not None
+    else dataset[time_dim].to_index().min().to_pydatetime(),
+    end_datetime=end_datetime
+    if end_datetime is not None
+    else dataset[time_dim].to_index().max().to_pydatetime(),
+    freq=freq,
+    time_dim=time_dim,
+  )
+  dataset = dataset.arcomake.time_sel(start_datetime=start_datetime, end_datetime=end_datetime)
+  dataset = dataset.chunk({dim: (1 if dim == time_dim else -1) for dim in dataset.dims})
 
   save_to_zarr(
     dataset=dataset,
