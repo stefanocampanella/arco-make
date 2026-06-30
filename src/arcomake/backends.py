@@ -60,7 +60,6 @@ class CopernicusMarine(BackendEntrypoint):
     else:
       variables = list(variables)
 
-    # As copenicus marine chunks the dataset here we need to load it upfront and return it using numpy arrays as backend
     with cm.open_dataset(
       dataset_id=dataset_id,
       dataset_version=dataset_version,
@@ -69,6 +68,9 @@ class CopernicusMarine(BackendEntrypoint):
       service=service,
       start_datetime=start_datetime,
       end_datetime=end_datetime,
+      # IMPORTANT: Copernicus Marine force chunking (it's not clear why),
+      # unless `chunk_size_limit` is set to False (a bit of a hack).
+      # `chunk_size_limit` is an experimental feature and might break in the future. Crossing fingers...
       chunk_size_limit=False,
     ) as dataset:
       return dataset

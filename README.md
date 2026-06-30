@@ -39,9 +39,8 @@ Detailed documentation for these commands is available directly via the command-
 
 The download phase is the most critical part of the workflow. Most of its design choices were motivated by the constraints of running workflows on HPC clusters, where nodes with internet access face strict limits on memory, I/O, and compute time. To navigate these limitations, `arco-make download` takes the following actions:
 
-1. **Parallelized Segments:** It allows you to download different segments of long timeseries in parallel using SLURM job arrays. The length of these segments is specified in the top-level table of the TOML configuration using the `array_step` key, allowing you to tune jobs to stay within maximum walltime limits.
-2. **Memory Management:** High-resolution spatial or temporal source datasets can yield segments that exceed available memory. To prevent this, `arco-make` downloads and postprocesses from each source separately, saving regridded/resampled intermediate results to disk. To reduce the memory footprint further, it splits timeseries segments into smaller, temporary segments defined by the `tmp_step` key for each dataset.
-3. **Storage Optimization:** It can save the resulting Zarr datasets directly into zip archives. This prevents the creation of a plethora of small files, which would otherwise degrade performance on parallel filesystems like Lustre or on tape storage systems.
+1. **Memory Management:** High-resolution spatial or temporal source datasets can yield segments that exceed available memory. To prevent this, `arco-make` downloads and postprocesses from each source separately, saving regridded/resampled intermediate results to disk. To reduce the memory footprint further, it splits timeseries segments into smaller, temporary segments defined by the `checkpointing_step` key for each dataset.
+2. **Storage Optimization:** It can save the resulting Zarr datasets directly into zip archives. This prevents the creation of a plethora of small files, which would otherwise degrade performance on parallel filesystems like Lustre or on tape storage systems.
 
 Arco-make supports downloading from various data providers (such as Copernicus Marine or the Climate Data Store) and online resources (including Google Cloud Storage or remote NetCDF files served over HTTP).
 
@@ -63,45 +62,30 @@ A valid recipe follows this pattern:
 # Top table contains info related to the whole dataset
 start = 1970-01-01T00:00:00
 end = 2026-06-01T00:00:00
-array_step = '10 W'
 
-[[datasets]]
-name = 'fictitious-dataset'
-provider = 'gcs'
-type = 'timeseries'
-tmp_step = '2 W'
+[datasets.fictitious-dataset]
+checkpointing_step = '2W'
 
-[[datasets.parts]]
+[[datasets.fictitious-dataset.parts]]
 # Info to download dataset part 1
 
-[[datasets.parts]]
+[[datasets.fictitious-dataset.parts]]
 # Info to download dataset part 2
 
-[[datasets.parts]]
-# Info to download dataset part 3
+[[datasets.fictitious-dataset.postprocess]]
+# Preprocessing step 1 (applies to parts 1 and 2)
 
-[[datasets.postprocess]]
-# Preprocessing step 1 (applies to parts 1, 2, and 3; also, dataset postprocessing steps can use mask, when defined)
-
-[[datasets.postprocess]]
+[[datasets.fictitious-dataset.postprocess]]
 # Preprocessing step 2
 
-[datasets.mask]
-provider = 'cm'
-type = 'static'
-variable = 'mask_variable_name'
-
-[[datasets.mask.parts]]
-# Info to download mask for 'fictitious-dataset'
-
-[[datasets.mask.postprocess]]
-# Preprocessing step 1 applied to mask
-
-[[datasets.mask.postprocess]]
-# Preprocessing step 2 applied to mask
+[[postprocess]]
+# Preprocessing applied to all datasets 
 
 [save]
 # Save options
+
+[checks]
+# Validation options
 
 ```
 
