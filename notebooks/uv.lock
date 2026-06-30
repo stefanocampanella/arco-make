@@ -221,6 +221,7 @@ requires-dist = [
     { name = "google-cloud-storage" },
     { name = "h5netcdf" },
     { name = "matplotlib" },
+    { name = "memray", marker = "extra == 'dev'" },
     { name = "mpi4py" },
     { name = "nc-time-axis" },
     { name = "netcdf4" },

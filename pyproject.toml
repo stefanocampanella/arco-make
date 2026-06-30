@@ -43,6 +43,7 @@ dev = [
     "pre-commit",
     "ruff",
     "ty",
+    "memray",
 ]
 
 [project.entry-points."xarray.backends"]

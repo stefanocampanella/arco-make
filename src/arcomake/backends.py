@@ -69,8 +69,9 @@ class CopernicusMarine(BackendEntrypoint):
       service=service,
       start_datetime=start_datetime,
       end_datetime=end_datetime,
+      chunk_size_limit=False,
     ) as dataset:
-      return dataset.compute()
+      return dataset
 
   @override
   def guess_can_open(

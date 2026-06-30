@@ -6,6 +6,7 @@ from datetime import datetime
 
 import click
 import dask
+import dask.distributed
 import xarray as xr
 
 from arcomake.checks import valid_time_coordinate, validate
@@ -109,6 +110,8 @@ def download(
 
   if debug:
     dask.config.set(scheduler="synchronous")
+  else:
+    local_cluster = dask.distributed.LocalCluster(processes=False)  # noqa
 
   # Set up logging.
   set_default_logger(log_level)
