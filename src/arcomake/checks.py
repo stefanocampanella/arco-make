@@ -89,7 +89,7 @@ def ensure_no_nans(
     return block
 
   logger.info("Checking for Nans.")
-  dataset.map_blocks(_ensure_no_nans, template=dataset).compute()
+  dataset.map_blocks(_ensure_no_nans, template=dataset)
 
 
 def valid_global_ecmwf_coordinates(
