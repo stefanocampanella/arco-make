@@ -249,7 +249,7 @@ set_new_coordinate = {'level' = [0, 4, 8, 12, 16, 20, 24, 28, 32, 34]}
 # ==== WAVERYS SECTION ====
 
 [datasets.waverys]
-checkpointing_step = '32D'
+checkpointing_step = '64D'
 
 [[datasets.waverys.parts]]
 filename_or_obj = 'cm://cmems_mod_glo_wav_my_0.2deg_PT3H-i'
@@ -258,7 +258,7 @@ variables = ['VHM0', 'VTM02', 'VMDR', 'VSDX', 'VSDY']
 dataset_version = '202411'
 dataset_part = 'default'
 service = 'arco-geo-series'
-chunks = {time = 24, latitude = -1, longitude = -1}
+chunks = {time = 8, latitude = -1, longitude = -1}
 
 [[datasets.waverys.postprocess]]
 name = 'regrid'
@@ -326,6 +326,13 @@ name_dict = {latitude = 'lat', longitude = 'lon'}
 # ==== SAVING SECTION ====
 
 [[postprocess]]
+name = 'chunk'
+time = 1
+level = -1
+lat = -1
+lon = -1
+
+[[postprocess]]
 name = 'masked_fill'
 mask_name = 'glorys_mask'
 fill_value = 0.0
@@ -335,7 +342,6 @@ variables = ['usi', 'vsi', 'sithick', 'siconc']
 name = 'gaussian_blur_extrapolate'
 variables = ['so', 'thetao', 'vo', 'uo']
 gaussian_filter_kwargs = {sigma = 6.0, radius = 6, mode = 'nearest', output = 'float32'}
-output_chunks = {time = 1, level = 1, lat = -1, lon = -1}
 
 [[postprocess]]
 name = 'apply_mask'

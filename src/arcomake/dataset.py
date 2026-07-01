@@ -136,16 +136,18 @@ def download(
   check_output_path(output_path, overwrite=overwrite)
 
   # Download and postprocess each dataset, possibly using checkpointing to disk
-  dataset = xr.Dataset()
+  datasets = []
   for dataset_name, dataset_conf in configs.get("datasets", {}).items():
     if dataset_conf.get("skip", False) is True:
       logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
       continue
     logger.info(f"Downloading {dataset_name}")
-    with maybe_checkpointing_open_dataset(
-      dataset_conf, start_datetime, end_datetime, time_dim=time_dim
-    ) as source_dataset:
-      dataset = xr.merge([dataset, source_dataset], join="exact", compat="no_conflicts")
+    datasets.append(
+      maybe_checkpointing_open_dataset(
+        dataset_conf, start_datetime, end_datetime, time_dim=time_dim
+      )
+    )
+  dataset = xr.merge(datasets, join="exact", compat="no_conflicts")
 
   # Postprocess the merged dataset (e.g., apply masks)
   if postprocess_conf := configs.pop("postprocess", []):
@@ -158,6 +160,10 @@ def download(
     configs=configs.get("save", {}),
     progress=progress,
   )
+
+  # Clean-up temporary files
+  for source_dataset in datasets:
+    source_dataset.close()
 
   # Validate the dataset
   if checks := configs.pop("checks", {}):
