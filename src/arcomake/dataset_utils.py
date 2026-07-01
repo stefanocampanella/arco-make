@@ -60,12 +60,16 @@ def maybe_checkpointing_open_dataset(
   end_datetime: datetime.datetime,
   time_dim: str = "time",
 ) -> xr.Dataset:
-  checkpointing_step = configs.get("checkpointing_step", "")
-  if not checkpointing_step:
+  checkpointing_conf = configs.get("checkpointing", {})
+  checkpointing_step = checkpointing_conf.get("step")
+  if checkpointing_step is None:
     return open_dataset(configs, start_datetime, end_datetime)
   checkpointing_step = may_parse_timedelta(checkpointing_step)
   if checkpointing_step >= end_datetime - start_datetime:
     return open_dataset(configs, start_datetime, end_datetime)
+
+  compressor_conf = checkpointing_conf.get("compressor")
+  compressor = None if compressor_conf is None else Blosc(**compressor_conf)
 
   checkpoint = tempfile.TemporaryDirectory(suffix=".zarr", delete=False)
   logger.info(f"Checkpointing to {checkpoint.name} every {checkpointing_step}")
@@ -75,7 +79,7 @@ def maybe_checkpointing_open_dataset(
   for date_interval in date_intervals:
     with open_dataset(configs, date_interval.start, date_interval.end) as dataset:
       for var in dataset.data_vars:
-        dataset[var].encoding["compressor"] = None
+        dataset[var].encoding["compressor"] = compressor
       logger.info(f"Saving checkpoint {date_interval}")
       if is_first_checkpoint:
         dataset.to_zarr(store=checkpoint_store, mode="w", compute=True)
