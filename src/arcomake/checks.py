@@ -54,33 +54,42 @@ def validate(
       warnings.warn(failure_message)
 
 
-# The following implementation assumes that mask is unchunked, and that block is unchunked along mask dimensions.
 def ensure_no_nans(
-  ds: xr.Dataset,
+  dataset: xr.Dataset,
+  time_dim: str = "time",
   **kwargs,
 ) -> None:
   variable_mask_mapping = {}
   for mask_name, variable_names in kwargs.items():
     for variable_name in variable_names:
-      if variable_name in ds.data_vars:
+      if variable_name in dataset.data_vars:
         variable_mask_mapping[variable_name] = mask_name
       else:
         warnings.warn(f"Variable {variable_name} not found in dataset")
 
+  # Assuming that mask does not have time dimension
+  dataset = dataset.chunk({dim: 1 if dim == time_dim else -1 for dim in dataset.dims})
+
+  def _ensure_no_nans(block: xr.Dataset):
+    for variable_name, da in block.data_vars.items():
+      if variable_name in variable_mask_mapping:
+        mask_name = variable_mask_mapping[variable_name]
+        mask_da = block[mask_name]
+        # ensure_no_nans assumes that if data does not have a mask dimension, then the 0th component of the mask along
+        # that dimension is the proper mask (e.g., surface data should be masked using the first depth level)
+        mask_da = mask_da.isel({dim: 0 for dim in mask_da.dims if dim not in da.dims}, drop=True)
+        masked_data = da.where(mask_da, 0.0)
+        invalid_values = masked_data.isnull()
+      else:
+        invalid_values = da.isnull()
+      if invalid_values.any():
+        raise ValidationError(
+          f"{invalid_values.sum().values} NaN values found for variable {variable_name}"
+        )
+    return block
+
   logger.info("Checking for Nans.")
-  for variable_name, da in ds.data_vars.items():
-    if variable_name in variable_mask_mapping:
-      mask_name = variable_mask_mapping[variable_name]
-      mask_da = ds[mask_name]
-      mask_da = mask_da.isel({dim: 0 for dim in mask_da.dims if dim not in da.dims}, drop=True)
-      masked_data = da.where(mask_da, 0.0)
-      invalid_values = masked_data.isnull()
-    else:
-      invalid_values = da.isnull()
-    if invalid_values.any():
-      raise ValidationError(
-        f"{invalid_values.sum().values} NaN values found for variable {variable_name}"
-      )
+  dataset.map_blocks(_ensure_no_nans, template=dataset).compute()
 
 
 def valid_global_ecmwf_coordinates(
