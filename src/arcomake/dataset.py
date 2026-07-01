@@ -137,33 +137,34 @@ def download(
 
   # Download and postprocess each dataset, possibly using checkpointing to disk
   datasets = []
-  for dataset_name, dataset_conf in configs.get("datasets", {}).items():
-    if dataset_conf.get("skip", False) is True:
-      logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
-      continue
-    logger.info(f"Downloading {dataset_name}")
-    datasets.append(
-      maybe_checkpointing_open_dataset(
-        dataset_conf, start_datetime, end_datetime, time_dim=time_dim
+  try:
+    for dataset_name, dataset_conf in configs.get("datasets", {}).items():
+      if dataset_conf.get("skip", False) is True:
+        logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
+        continue
+      logger.info(f"Downloading {dataset_name}")
+      datasets.append(
+        maybe_checkpointing_open_dataset(
+          dataset_conf, start_datetime, end_datetime, time_dim=time_dim
+        )
       )
+    dataset: xr.Dataset = xr.merge(datasets, join="exact", compat="no_conflicts")
+
+    # Postprocess the merged dataset (e.g., apply masks)
+    if postprocess_conf := configs.pop("postprocess", []):
+      dataset = process(dataset=dataset, steps=postprocess_conf)
+
+    # Save the dataset in a Zarr using sensible chunking and compression
+    save_to_zarr(
+      dataset=dataset,
+      path=output_path,
+      configs=configs.get("save", {}),
+      progress=progress,
     )
-  dataset = xr.merge(datasets, join="exact", compat="no_conflicts")
-
-  # Postprocess the merged dataset (e.g., apply masks)
-  if postprocess_conf := configs.pop("postprocess", []):
-    dataset = process(dataset=dataset, steps=postprocess_conf)
-
-  # Save the dataset in a Zarr using sensible chunking and compression
-  save_to_zarr(
-    dataset=dataset,
-    path=output_path,
-    configs=configs.get("save", {}),
-    progress=progress,
-  )
-
-  # Clean-up temporary files
-  for source_dataset in datasets:
-    source_dataset.close()
+  finally:
+    # Clean up temporary files
+    for source_dataset in datasets:
+      source_dataset.close()
 
   # Validate the dataset
   if checks := configs.pop("checks", {}):
