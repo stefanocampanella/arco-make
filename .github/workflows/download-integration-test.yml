@@ -29,7 +29,15 @@ jobs:
       - name: Sync environment
         run: uv sync --frozen
 
-      # If the output is checked against arco-ocean, pull the latest config from its repo
+      # Pull the latest config from the arco-ocean repo so the output is checked against it
+      - name: Download configuration file
+        uses: actions/checkout@v6
+        with:
+          repository: inogs/arco-ocean
+          path: arco-ocean
+          sparse-checkout: configs/arco-ocean_tres-1d_res-0p25_levels-10.toml
+          sparse-checkout-cone-mode: false
+
       - name: Run download integration test
         env:
           COPERNICUSMARINE_SERVICE_USERNAME: ${{ secrets.COPERNICUSMARINE_SERVICE_USERNAME }}
@@ -42,7 +50,7 @@ jobs:
           --no-progress
           --overwrite
           --
-          sample_configs/arco-ocean_tres-1d_res-0p25_levels-10.toml /tmp/tempfile.zip
+          arco-ocean/configs/arco-ocean_tres-1d_res-0p25_levels-10.toml /tmp/tempfile.zip
 
       - name: Verify output
         run: |

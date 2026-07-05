@@ -148,13 +148,8 @@ def get_sea_mask(
   return ds
 
 
-def isel_slice(ds: xr.Dataset, **kwargs) -> xr.Dataset:
-  return ds.isel(
-    {
-      dim: slice(slice_kwargs.get("start"), slice_kwargs.get("stop"), slice_kwargs.get("step"))
-      for dim, slice_kwargs in kwargs.items()
-    }
-  )
+def isel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
+  return ds.isel({dim: _get_selection(values) for dim, values in kwargs.items()})
 
 
 def is_positive_mask(ds: xr.Dataset, variable: str, mask_name: str) -> xr.Dataset:
@@ -162,13 +157,8 @@ def is_positive_mask(ds: xr.Dataset, variable: str, mask_name: str) -> xr.Datase
   return ds
 
 
-def sel_slice(ds: xr.Dataset, **kwargs) -> xr.Dataset:
-  return ds.sel(
-    {
-      dim: slice(slice_kwargs.get("start"), slice_kwargs.get("stop"), slice_kwargs.get("step"))
-      for dim, slice_kwargs in kwargs.items()
-    }
-  )
+def sel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
+  return ds.sel({dim: _get_selection(values) for dim, values in kwargs.items()})
 
 
 def masked_fill(
@@ -319,3 +309,10 @@ def select_variables(ds: xr.Dataset, variables: Iterable[str]) -> xr.Dataset:
 
 def transpose(ds: xr.Dataset, dims: Sequence[str], **kwargs) -> xr.Dataset:
   return ds.transpose(*dims, **kwargs)
+
+
+def _get_selection[T: int | float](values: dict[str, T] | list[T] | T) -> slice | list[T] | T:
+  if isinstance(values, dict):
+    return slice(values.get("start"), values.get("stop"), values.get("step"))
+  else:
+    return values
