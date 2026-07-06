@@ -220,7 +220,9 @@ def open_mfdataset(
   if static_vars:
     static_ds = xr.Dataset({k: v for k, v in static_vars.items()})
     # xr.merge will align coordinates as needed; prefer dynamic attrs
-    ds_dynamic = xr.merge([ds_dynamic, static_ds], combine_attrs="override")
+    ds_dynamic: xr.Dataset = xr.merge(
+      [ds_dynamic, static_ds], compat="no_conficts", combine_attrs="override"
+    )  # type: ignore
 
   return ds_dynamic
 

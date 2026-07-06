@@ -15,7 +15,7 @@ from scipy.ndimage import gaussian_filter
 logger = logging.getLogger(__name__)
 processing_module = sys.modules[__name__]
 
-Number = int | float | np.float32 | np.float64
+Number = int | float
 
 
 def process(dataset: xr.Dataset, steps: Sequence[dict[str, Any]]) -> xr.Dataset:

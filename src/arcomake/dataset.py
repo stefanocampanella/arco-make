@@ -3,7 +3,7 @@
 import logging
 import pathlib
 from datetime import datetime
-from typing import get_args
+from typing import Literal, get_args
 
 import click
 import xarray as xr
@@ -251,7 +251,7 @@ def unpack(
   start_datetime: datetime | None = None,
   end_datetime: datetime | None = None,
   freq: str = "1D",
-  chunks: dict[str, int] | None = None,
+  chunks: dict[str, int | Literal["auto"]] | None = None,
   cname: str = "lz4",
   clevel: int = 1,
   overwrite: bool = False,
@@ -274,6 +274,12 @@ def unpack(
 
   # Check if the output path exists.
   check_output_path(output_path, overwrite=overwrite)
+
+  # Validate chunks argument
+  if chunks is not None and not all(
+    isinstance(value, int) or value == "auto" for value in chunks.values()
+  ):
+    raise ValueError("chunks must be a dictionary with integer or 'auto' values")
 
   def build_paths(path: pathlib.Path):
     if path.is_dir():

@@ -18,45 +18,64 @@ def read_configs(path: str | pathlib.Path) -> dict[str, Any]:
   return configs
 
 
-class DictParamType(click.ParamType[dict[str, Any]]):
-  """Click ParamType that parses mappings like "a:1,b:2" into dict[str, int].
+class DictParamType(click.ParamType):
+  """Click ParamType that parses mappings like "a:1,b:2.5,c:true,d:x" into dict[str, int | float | bool | str].
 
   Rules:
-  - Comma-separated items, each as key:value.
+  - Comma-separated items, each given as "key:value".
   - Keys are non-empty strings; surrounding whitespace is ignored.
-  - Values must be integers; surrounding whitespace is ignored.
+  - Values are parsed, in order, as booleans ("true"/"false", case-insensitive),
+    integers, floats, and finally strings; surrounding whitespace is ignored.
   - Empty string yields an empty dict.
   - Duplicate keys: later values overwrite earlier ones.
 
   Example:
-    --param=a:1,b:2,c:3  -> {"a": 1, "b": 2, "c": 3}
+    --param=a:1,b:2.5,c:true,d:x -> {"a": 1, "b": 2.5, "c": True, "d": "x"}
   """
 
-  name = "dict"
+  name = "dictionary"
+
+  @staticmethod
+  def _parse_value(val: str) -> int | float | bool | str:
+    """Parse a string into an int, float, bool, or str (in that order)."""
+    lowered = val.lower()
+    if lowered == "true":
+      return True
+    if lowered == "false":
+      return False
+    try:
+      return int(val)
+    except ValueError:
+      pass
+    try:
+      return float(val)
+    except ValueError:
+      pass
+    return val
 
   @override
   def convert(self, value, param, ctx):  # type: ignore[override]
     if isinstance(value, dict):
-      # Assume it's already a mapping of str->int; perform minimal validation
+      # Assume it's already a mapping of str->int | float | bool | str and perform minimal validation
       result = {}
       for k, v in value.items():
         if not isinstance(k, str) or k.strip() == "":
           self.fail(f"Invalid key in mapping: {k!r}", param, ctx)
-        try:
-          result[k.strip()] = int(v)
-        except Exception:
-          self.fail(f"Invalid integer value for key {k!r}: {v!r}", param, ctx)
+        if not isinstance(v, (int, float, bool, str)):
+          self.fail(f"Invalid value for key {k!r}: {v!r}", param, ctx)
+        result[k.strip()] = v
       return result
 
     if not isinstance(value, str):
-      self.fail(f"Expected string for {self.name}, got {type(value).__name__}", param, ctx)
+      self.fail(f"Expected string for {self.name.upper()}, got {type(value).__name__}", param, ctx)
 
     text = value.strip()
+    # Special case: empty string is treated as empty dict
     if text == "":
       return {}
 
     items = [p for p in (s.strip() for s in text.split(",")) if p != ""]
-    result: dict[str, int] = {}
+    result = {}
     for item in items:
       if ":" not in item:
         self.fail(
@@ -69,10 +88,7 @@ class DictParamType(click.ParamType[dict[str, Any]]):
       val = val.strip()
       if key == "":
         self.fail("Empty key is not allowed in mapping.", param, ctx)
-      try:
-        result[key] = int(val)
-      except Exception:
-        self.fail(f"Value for key {key!r} must be an integer, got {val!r}.", param, ctx)
+      result[key] = self._parse_value(val)
     return result
 
 
