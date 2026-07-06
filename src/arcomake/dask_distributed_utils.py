@@ -4,12 +4,15 @@ import functools
 import inspect
 import logging
 import socket
+from typing import Literal
 
 import dask
 import dask_mpi
 import distributed
 
 logger = logging.getLogger(__name__)
+
+SchedulerOptionType = Literal["synchronous", "threads", "processes", "mpi", "localcluster"]
 
 
 class DummyClient:
@@ -21,7 +24,9 @@ MaybeClient = distributed.Client | DummyClient
 
 
 def get_dask_env_options(suffix=None, inherit_params_from=None):
+
   def decorator(func):
+
     @functools.wraps(func)
     def wrapped(*args, **kwargs):
       dask_config = dask.config.collect_env()
@@ -49,32 +54,32 @@ def filter_kwargs(kwargs, func):
   return filtered
 
 
-@get_dask_env_options(suffix="mpi")
+@get_dask_env_options(suffix="mpi", inherit_params_from=[dask_mpi.initialize])
 def dask_mpi_initialize(*args, **kwargs):
   return dask_mpi.initialize(*args, **kwargs)
 
 
-@get_dask_env_options()
+@get_dask_env_options(inherit_params_from=[distributed.LocalCluster])
 def LocalCluster(*args, **kwargs):
   return distributed.LocalCluster(*args, **kwargs)
 
 
-def get_client(local=False, debug=False) -> MaybeClient:
-  if debug:
-    dask.config.set(scheduler="synchronous")
-
+def get_client(scheduler_type: SchedulerOptionType = "threads") -> MaybeClient:
+  if scheduler_type in ("synchronous", "threads", "processes"):
+    dask.config.set(scheduler=scheduler_type)
     client = DummyClient()
-    logger.info("Using synchronous Dask scheduler.")
-  elif local:
-    # FIXME: LocalCluster logging is not working as intended.
-    cluster = distributed.LocalCluster()
-    client = distributed.Client(cluster)
-    logger.info("Using local Dask cluster")
-  else:
+    logger.info(f"Using Dask scheduler: {scheduler_type}.")
+  elif scheduler_type == "mpi":
     dask_mpi_initialize()
     client = distributed.Client()
     host = client.run_on_scheduler(socket.gethostname)
     port = client.scheduler_info()["services"]["dashboard"]
     logger.info(f"Using dask_mpi, Dask dashboard available at {host}:{port}")
+  elif scheduler_type == "localcluster":
+    cluster = LocalCluster()
+    client = distributed.Client(cluster)
+    logger.info(f"Using local Dask cluster, dashboard available at: {cluster.dashboard_link}")
+  else:
+    raise ValueError(f"Invalid scheduler type: {scheduler_type}")
 
   return client

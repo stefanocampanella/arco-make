@@ -34,11 +34,12 @@
 # the value of the mean.
 import logging
 import pathlib
+from typing import get_args
 
 import click
 
 from arcomake.cli_utils import DictParamType
-from arcomake.dask_distributed_utils import get_client
+from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import open_dataset_wo_static, save_to_zarr
 from arcomake.stats_utils import Stats, StatsRegistry
 
@@ -92,16 +93,13 @@ logger = logging.getLogger(__name__)
   show_default=True,
 )
 @click.option(
-  "--overwrite/--no-overwrite",
-  default=False,
-  is_flag=True,
-  help="Whether to overwrite existing outputs.",
-)
-@click.option(
-  "--debug/--no-debug",
-  default=False,
-  is_flag=True,
-  help="Whether to use the serial Dask scheduler.",
+  "--scheduler-type",
+  default="mpi",
+  type=click.Choice(
+    get_args(SchedulerOptionType),
+    case_sensitive=False,
+  ),
+  help="Type of Dask scheduler to use.",
 )
 @click.option(
   "--log-level",
@@ -113,13 +111,11 @@ def compute(
   stats: Stats,
   input: pathlib.Path,
   output: pathlib.Path,
-  local: bool = False,
   time_dim: str = "time",
-  chunks: str | None = None,
+  chunks: dict[str, int] | None = None,
   skipna: bool = False,
-  debug: bool = False,
   log_level: str = "info",
-  overwrite: bool = False,
+  scheduler_type: SchedulerOptionType = "mpi",
   cname: str = "lz4",
   clevel: int = 1,
 ):
@@ -151,7 +147,7 @@ def compute(
     force=True,
   )
 
-  client = get_client(debug=debug, local=local)
+  client = get_client(scheduler_type=scheduler_type)
 
   if not input.exists():
     raise ValueError(f"Input path {input} does not exist")

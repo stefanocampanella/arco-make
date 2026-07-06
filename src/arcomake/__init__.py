@@ -3,7 +3,7 @@
 import click
 
 import arcomake.xarray_accessors  # noqa: F401
-from arcomake.dataset import download, unpack_zips
+from arcomake.dataset import download, unpack
 from arcomake.stats import compute
 
 
@@ -13,7 +13,7 @@ def cli():
 
 
 cli.add_command(download)
-cli.add_command(unpack_zips)
+cli.add_command(unpack)
 cli.add_command(compute)
 
 if __name__ == "__main__":

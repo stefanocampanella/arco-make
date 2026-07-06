@@ -3,10 +3,9 @@
 import logging
 import pathlib
 from datetime import datetime
+from typing import get_args
 
 import click
-import dask
-import dask.distributed
 import xarray as xr
 
 from arcomake.checks import valid_time_coordinate, validate
@@ -16,17 +15,13 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
+from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import (
   maybe_checkpointing_open_dataset,
   open_mfdataset,
   save_to_zarr,
 )
 from arcomake.processing import process
-
-# TODO:
-#   1. Documentation is missing, fix it.
-#   2. Should download should use Dask MPI?
-
 
 logger = logging.getLogger(__name__)
 
@@ -76,11 +71,13 @@ logger = logging.getLogger(__name__)
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
 )
 @click.option(
-  "--debug/--no-debug",
-  "debug",
-  help="Use synchronous Dask scheduler",
-  default=False,
-  is_flag=True,
+  "--scheduler-type",
+  default="threads",
+  type=click.Choice(
+    get_args(SchedulerOptionType),
+    case_sensitive=False,
+  ),
+  help="Type of Dask scheduler to use, for remote downloads the choice is between 'synchronous' or 'threads'.",
 )
 @click.option(
   "--progress/--no-progress",
@@ -98,7 +95,7 @@ def download(
   should_raise: bool = True,
   time_dim: str = "time",
   log_level: str = "info",
-  debug: bool = False,
+  scheduler_type: SchedulerOptionType = "threads",
   progress: bool = False,
 ):
   """
@@ -108,13 +105,16 @@ def download(
   and saves the merged dataset to a Zarr store.
   """
 
-  if debug:
-    dask.config.set(scheduler="synchronous")
-  else:
-    local_cluster = dask.distributed.LocalCluster(processes=False)  # noqa
-
   # Set up logging.
   set_default_logger(log_level)
+
+  # Set up the Dask client. Notice: distributed dask clusters are not available due to serialization issues.
+  client = get_client(scheduler_type=scheduler_type)
+  if scheduler_type in ("processes", "mpi", "localcluster"):
+    logger.warning(
+      f"Using {scheduler_type} scheduler, which is not compatible with remote arco-make xarray backends. "
+      "Please use 'threads' or 'synchronous' instead."
+    )
 
   # Open the configuration file and load the TOML configs.
   configs = read_configs(config_path)
@@ -177,6 +177,8 @@ def download(
         should_raise=should_raise,
       )
 
+  client.close()
+
 
 @click.command()
 @click.argument(
@@ -192,14 +194,14 @@ def download(
 @click.option("--time-dim", help="Time dimension name used in the input dataset", default="time")
 @click.option(
   "--start",
-  "start_date",
+  "start_datetime",
   help="Override start of the date interval",
   default=None,
   type=click.DateTime(),
 )
 @click.option(
   "--end",
-  "end_date",
+  "end_datetime",
   help="Override end of the date interval",
   default=None,
   type=click.DateTime(),
@@ -229,14 +231,20 @@ def download(
   is_flag=True,
 )
 @click.option(
-  "--debug/--no-debug", default=False, help="Use synchronous Dask scheduler", is_flag=True
+  "--scheduler-type",
+  default="mpi",
+  type=click.Choice(
+    get_args(SchedulerOptionType),
+    case_sensitive=False,
+  ),
+  help="Type of Dask scheduler to use.",
 )
 @click.option(
   "--log-level",
   default="info",
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
 )
-def unpack_zips(
+def unpack(
   input_path: pathlib.Path,
   output_path: pathlib.Path,
   time_dim: str = "time",
@@ -247,7 +255,7 @@ def unpack_zips(
   cname: str = "lz4",
   clevel: int = 1,
   overwrite: bool = False,
-  debug: bool = False,
+  scheduler_type: SchedulerOptionType = "mpi",
   log_level: str = "info",
 ):
   """
@@ -258,11 +266,11 @@ def unpack_zips(
   given output path.
   """
 
-  if debug:
-    dask.config.set(scheduler="synchronous")
-
   # Set up logging.
   set_default_logger(log_level)
+
+  # Set up Dask client.
+  client = get_client(scheduler_type=scheduler_type)
 
   # Check if the output path exists.
   check_output_path(output_path, overwrite=overwrite)
@@ -296,3 +304,5 @@ def unpack_zips(
     path=output_path,
     configs={"compressor": {"cname": cname, "clevel": clevel}},
   )
+
+  client.close()
