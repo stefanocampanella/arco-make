@@ -105,6 +105,41 @@ def flip(ds: xr.Dataset, dim: str) -> xr.Dataset:
   return ds.isel({dim: slice(None, None, -1)})
 
 
+def gaussian_blur_extrapolate(
+  ds: xr.Dataset,
+  variables: Iterable[str] | None = None,
+  **kwargs,
+) -> xr.Dataset:
+  if variables is None:
+    variables: str = ds.data_vars.keys()  # type: ignore
+  gaussian_filter_kwargs = kwargs.get("gaussian_filter_kwargs", {})
+
+  def gauss_fill_nan(data: xr.DataArray) -> xr.DataArray:
+    data_u = xr.where(data.isnull(), 0.0, data)
+    data_u = xr.apply_ufunc(gaussian_filter, data_u, kwargs=gaussian_filter_kwargs)
+    valid_frac = xr.where(data.isnull(), 0.0, 1.0)
+    valid_frac = xr.apply_ufunc(gaussian_filter, valid_frac, kwargs=gaussian_filter_kwargs)
+    data_u = data_u / valid_frac
+    data = xr.where(data.isnull(), data_u, data)
+    return data
+
+  data_vars = {}
+  for var, da in ds.data_vars.items():
+    if var in variables:
+      data_vars[var] = da.map_blocks(gauss_fill_nan, template=da)
+    else:
+      data_vars[var] = da
+    ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
+  return ds
+
+
+def get_bottom(ds: xr.Dataset, depth_dim: str) -> xr.Dataset:
+  for var, da in ds.data_vars.items():
+    ds[var] = _get_bottom_values(da, depth_dim)
+  ds = ds.drop_vars(depth_dim)
+  return ds
+
+
 def get_notnull_mask(
   ds: xr.Dataset,
   variable: str,
@@ -157,14 +192,10 @@ def is_positive_mask(ds: xr.Dataset, variable: str, mask_name: str) -> xr.Datase
   return ds
 
 
-def sel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
-  return ds.sel({dim: _get_selection(values) for dim, values in kwargs.items()})
-
-
 def masked_fill(
   ds: xr.Dataset,
   variables: Iterable[str],
-  fill_value: Number,
+  fill_value: Number | str | dict[str, Number | str],
   mask_name: str,
 ) -> xr.Dataset:
   if mask_name not in ds.data_vars:
@@ -172,40 +203,18 @@ def masked_fill(
   mask = ds[mask_name]
   data_vars = {}
   for var, da in ds.data_vars.items():
-    mask = mask.isel({dim: 0 for dim in mask.dims if dim not in da.dims}, drop=True)
+    _mask = mask.isel({dim: 0 for dim in mask.dims if dim not in da.dims}, drop=True)
     if var in variables:
-      data_vars[var] = xr.where(da.isnull() & mask, fill_value, da)
+      # Check if the fill value is per variable
+      _fill_name_or_value = fill_value[var] if isinstance(fill_value, dict) else fill_value # type: ignore
+      #  Check if the fill value is constant or a dataset variable
+      _fill_value = (
+        ds[_fill_name_or_value] if isinstance(_fill_name_or_value, str) else _fill_name_or_value
+      )
+      data_vars[var] = xr.where(da.isnull() & _mask, _fill_value, da)
     else:
       data_vars[var] = da
   ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
-  return ds
-
-
-def gaussian_blur_extrapolate(
-  ds: xr.Dataset,
-  variables: Iterable[str] | None = None,
-  **kwargs,
-) -> xr.Dataset:
-  if variables is None:
-    variables: str = ds.data_vars.keys()  # type: ignore
-  gaussian_filter_kwargs = kwargs.get("gaussian_filter_kwargs", {})
-
-  def gauss_fill_nan(data: xr.DataArray) -> xr.DataArray:
-    data_u = xr.where(data.isnull(), 0.0, data)
-    data_u = xr.apply_ufunc(gaussian_filter, data_u, kwargs=gaussian_filter_kwargs)
-    valid_frac = xr.where(data.isnull(), 0.0, 1.0)
-    valid_frac = xr.apply_ufunc(gaussian_filter, valid_frac, kwargs=gaussian_filter_kwargs)
-    data_u = data_u / valid_frac
-    data = xr.where(data.isnull(), data_u, data)
-    return data
-
-  data_vars = {}
-  for var, da in ds.data_vars.items():
-    if var in variables:
-      data_vars[var] = da.map_blocks(gauss_fill_nan, template=da)
-    else:
-      data_vars[var] = da
-    ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
   return ds
 
 
@@ -303,12 +312,68 @@ def rescale(ds: xr.Dataset, values: dict[str, Number]) -> xr.Dataset:
   return ds
 
 
+def sel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
+  return ds.sel({dim: _get_selection(values) for dim, values in kwargs.items()})
+
+
 def select_variables(ds: xr.Dataset, variables: Iterable[str]) -> xr.Dataset:
   return ds[variables]  # type: ignore
 
 
 def transpose(ds: xr.Dataset, dims: Sequence[str], **kwargs) -> xr.Dataset:
   return ds.transpose(*dims, **kwargs)
+
+
+def _get_bottom_values(da: xr.DataArray, depth_dim: str = "depth") -> xr.DataArray:
+  """
+  Extract the deepest valid (non-NaN) value along `depth_dim` for every
+  (time, latitude, longitude) point.
+
+  Assumes:
+      - `da` has dims (time, depth, latitude, longitude) (order doesn't matter).
+      - `depth_dim` coordinate is sorted.
+      - `da` may be dask-backed and chunked along `time` and `depth_dim`.
+
+  Returns
+  -------
+  xr.DataArray
+      Same dims as `da` minus `depth_dim`, i.e. (time, latitude, longitude).
+  """
+
+  # apply_ufunc needs the full core dimension (depth) in a single chunk.
+  # We only rechunk depth (usually small), keeping time/lat/lon chunking
+  # untouched so we don't lose parallelism there.
+  if da.chunks is not None:
+    da = da.chunk({depth_dim: -1})
+
+  def _last_valid_along_last_axis(block: np.ndarray) -> np.ndarray:
+    # `block` has `depth` as its last axis (apply_ufunc moves core dims
+    # to the end automatically).
+    valid = ~np.isnan(block)
+    has_valid = valid.any(axis=-1)
+
+    # Index of the last True (deepest valid) along the depth axis.
+    # argmax on the reversed mask finds the first True from the end,
+    # in O(depth) with no Python-level loop.
+    reversed_valid = valid[..., ::-1]
+    idx_from_end = np.argmax(reversed_valid, axis=-1)
+    last_idx = valid.shape[-1] - 1 - idx_from_end
+
+    result = np.take_along_axis(block, last_idx[..., np.newaxis], axis=-1)[..., 0]
+
+    # Profiles with no valid value at all should stay NaN.
+    return np.where(has_valid, result, np.nan)
+
+  bottom = xr.apply_ufunc(
+    _last_valid_along_last_axis,
+    da,
+    input_core_dims=[[depth_dim]],
+    output_core_dims=[[]],
+    dask="parallelized",
+    output_dtypes=[da.dtype],
+  )
+
+  return bottom
 
 
 def _get_selection[T: int | float](values: dict[str, T] | list[T] | T) -> slice | list[T] | T:

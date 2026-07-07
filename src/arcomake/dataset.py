@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
   is_flag=True,
 )
 @click.option(
-  "--should-raise/--no-should-raise",
+  "--raise/--no-raise",
   "should_raise",
   help="Whether to raise an exception if validation fails",
   default=True,

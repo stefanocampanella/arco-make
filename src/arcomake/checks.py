@@ -47,11 +47,12 @@ def validate(
     check_fn: Callable[..., None] = getattr(checks_module, name)
     try:
       check_fn(dataset, **config)
-    except Exception as exc:
+    except ValidationError as exc:
       failure_message = f"Validation step {name} failed: {exc}"
       if should_raise:
         raise ValidationError(failure_message) from exc
-      warnings.warn(failure_message)
+      else:
+        warnings.warn(failure_message)
 
 
 def ensure_no_nans(
@@ -67,14 +68,12 @@ def ensure_no_nans(
       else:
         warnings.warn(f"Variable {variable_name} not found in dataset")
 
-  # Assuming that mask does not have time dimension
-  dataset = dataset.chunk({dim: 1 if dim == time_dim else -1 for dim in dataset.dims})
-
-  def _ensure_no_nans(block: xr.Dataset):
-    for variable_name, da in block.data_vars.items():
+  def _get_nan_errors(ds: xr.Dataset):
+    errors = []
+    for variable_name, da in ds.data_vars.items():
       if variable_name in variable_mask_mapping:
         mask_name = variable_mask_mapping[variable_name]
-        mask_da = block[mask_name]
+        mask_da = ds[mask_name]
         # ensure_no_nans assumes that if data does not have a mask dimension, then the 0th component of the mask along
         # that dimension is the proper mask (e.g., surface data should be masked using the first depth level)
         mask_da = mask_da.isel({dim: 0 for dim in mask_da.dims if dim not in da.dims}, drop=True)
@@ -83,13 +82,23 @@ def ensure_no_nans(
       else:
         invalid_values = da.isnull()
       if invalid_values.any():
-        raise ValidationError(
+        errors.append(
           f"{invalid_values.sum().values} NaN values found for variable {variable_name}"
         )
-    return block
+    return errors
 
   logger.info("Checking for Nans.")
-  dataset.map_blocks(_ensure_no_nans, template=dataset)
+  dataset_errors = []
+  datetimes = dataset[time_dim].to_index()
+  for d in datetimes:
+    errors_on_datetime = _get_nan_errors(dataset.sel({time_dim: d}))
+    if errors_on_datetime:
+      message = f"{len(errors_on_datetime)} errors found for time {d}: " + ", ".join(
+        errors_on_datetime
+      )
+      dataset_errors.append(message)
+  if dataset_errors:
+    raise ValidationError("\n".join(dataset_errors))
 
 
 def valid_global_ecmwf_coordinates(
