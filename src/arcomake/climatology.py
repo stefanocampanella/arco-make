@@ -40,17 +40,30 @@ logger = logging.getLogger(__name__)
   show_default=True,
 )
 @click.option(
-  "--chunks",
+  "--in-chunks",
   default=None,
   show_default=True,
   type=DictParamType(),
-  help="String containing chunking specs used when reading.",
+  help="Dict containing chunking specs used when reading.",
 )
 @click.option(
   "--overwrite/--no-overwrite",
   help="Whether to overwrite existing outputs",
   default=False,
   is_flag=True,
+)
+@click.option(
+  "--out-chunks",
+  default=None,
+  show_default=True,
+  type=DictParamType(),
+  help="Dict containing chunking specs used when writing.",
+)
+@click.option(
+  "--climatology-bin-dim",
+  default="dayofyear",
+  help="Name of the binning dimension of the resulting climatology.",
+  show_default=True,
 )
 @click.option(
   "--compressor-name",
@@ -70,6 +83,12 @@ logger = logging.getLogger(__name__)
     case_sensitive=False,
   ),
   help="Type of Dask scheduler to use.",
+)
+@click.option(
+  "--calendar",
+  default="365_day",
+  type=click.Choice(["365_day", "366_day", "360_day"], case_sensitive=False),
+  help="Fixed-day calendar the dataset is converted to before binning.",
 )
 @click.option(
   "--skipna/--no-skipna",
