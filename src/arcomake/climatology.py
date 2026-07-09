@@ -11,6 +11,7 @@ from arcomake.checks import ValidationError, valid_time_coordinate
 from arcomake.cli_utils import DictParamType, check_output_path, set_default_logger
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import save_to_zarr
+from arcomake.datetime_utils import may_parse_timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -233,9 +234,10 @@ def compute_climatology(
     else:
       warnings.warn(f"Datetimes validation failed: {exc}")
 
-  if n_days % int(freq.split("D")[0]) != 0:
+  freq = may_parse_timedelta(freq)
+  if n_days % freq.days != 0:
     raise ValueError(f"Invalid frequency: {freq}. Must be a multiple of {n_days} days.")
-  step_size = n_days // int(freq.split("D")[0])
+  step_size = n_days // freq.days
 
   # Here we handle leap years.
   # See: https://github.com/pydata/xarray/issues/1844#issuecomment-417855365
@@ -249,7 +251,7 @@ def compute_climatology(
     climatology_bin_dim=climatology_bin_dim,
     skipna=skipna,
   )
-  logger.info(f"Saving {freq}-climatology ({calendar=}, {skipna=}) to {climatology_output}")
+  logger.info(f"Saving {step_size}D-climatology ({calendar=}, {skipna=}) to {climatology_output}")
   save_configs = {
     "compressor": {"cname": cname, "clevel": clevel},
     "chunk": out_chunks,
@@ -289,7 +291,7 @@ def compute_climatology(
   )
   anomaly_std = xr.ufuncs.sqrt(anomaly_var)
 
-  logger.info(f"Saving {freq}-anomaly std ({calendar=}, {skipna=}) to {anomaly_std_output}")
+  logger.info(f"Saving {step_size}D-anomaly std ({calendar=}, {skipna=}) to {anomaly_std_output}")
   save_to_zarr(anomaly_std, anomaly_std_output, configs=save_configs)
 
   client.close()
