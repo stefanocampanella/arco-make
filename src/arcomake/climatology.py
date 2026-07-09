@@ -340,7 +340,7 @@ def climatological_average(
   counter = 1
   dataset = dataset.assign_coords({climatology_bin_dim: dataset[time_dim].dt.dayofyear})
   avg = dataset.isel({time_dim: slice(start, end)})
-  avg = avg.drop(time_dim)
+  avg = avg.drop_vars(time_dim)
   avg = avg.swap_dims({time_dim: climatology_bin_dim})
   avg = avg.reindex({climatology_bin_dim: 1 + np.arange(step_size, dtype=int)}, copy=False)
   while True:
@@ -349,7 +349,7 @@ def climatological_average(
     if start < size:
       counter += 1
       value = dataset.isel({time_dim: slice(start, end)})
-      value = value.drop(time_dim)
+      value = value.drop_vars(time_dim)
       value = value.swap_dims({time_dim: climatology_bin_dim})
       if skipna:
         value = value.reindex(
