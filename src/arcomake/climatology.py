@@ -218,6 +218,8 @@ def compute_climatology(
     raise ValueError("Could not infer frequency from time index")
   if not freq.endswith("D"):
     raise ValueError(f"Unsupported frequency: {freq}")
+  # Pandas has troubles parsing unit abbreviations w/o a number
+  freq = "1D" if freq == "D" else freq
 
   try:
     valid_time_coordinate(
