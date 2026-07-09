@@ -125,7 +125,7 @@ def valid_time_coordinate(
   dataset: xr.Dataset,
   start_datetime: datetime,
   end_datetime: datetime,
-  freq: str = "D",
+  freq: str = "1D",
   time_dim="time",
 ) -> None:
   """

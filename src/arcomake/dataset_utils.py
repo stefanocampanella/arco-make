@@ -4,7 +4,6 @@ import datetime
 import logging
 import pathlib
 import tempfile
-from collections.abc import Sequence
 from contextlib import nullcontext
 from typing import Any
 
@@ -98,7 +97,9 @@ def maybe_checkpointing_open_dataset(
 
 
 # FIXME: the code should handle both Zarr (using a DirectoryStore or a ZipStore) and NetCDF files.
-def open_dataset_wo_static(path: pathlib.Path, time_dim: str = "time", chunks=None) -> xr.Dataset:
+def open_dataset_wo_static(
+  path: str | pathlib.Path, time_dim: str = "time", chunks=None
+) -> xr.Dataset:
   """
   Open a dataset from a single Zarr file/store or a directory containing multiple Zarr zip files.
 
@@ -108,8 +109,6 @@ def open_dataset_wo_static(path: pathlib.Path, time_dim: str = "time", chunks=No
   Returns a xarray.Dataset filtered to only data variables that include the provided time dimension.
   """
   path = pathlib.Path(path)
-  if not path.exists():
-    raise ValueError(f"Input path {path} does not exist")
 
   def _drop_static_vars(ds: xr.Dataset, time_dim: str) -> xr.Dataset:
     ds = ds.drop_vars([name for (name, var) in ds.data_vars.items() if time_dim not in var.dims])
@@ -137,9 +136,7 @@ def open_dataset_wo_static(path: pathlib.Path, time_dim: str = "time", chunks=No
   return ds
 
 
-def open_mfdataset(
-  paths: Sequence[str | pathlib.Path], time_dim: str = "time", chunks=None
-) -> xr.Dataset:
+def open_archive(path: str | pathlib.Path, time_dim: str = "time", **kwargs) -> xr.Dataset:
   """
   Open multiple zipped Zarr datasets and combine them as xarray.open_mfdataset would, with a
   specific behavior for static variables (those without the provided time dimension):
@@ -151,13 +148,10 @@ def open_mfdataset(
 
   Parameters
   ---------
-  paths: Sequence[str | pathlib.Path]
-      List of paths to zipped Zarr stores (.zip). They must exist. The function does not support
-      directories; pass individual .zip paths instead.
+  path: str | pathlib.Path
+      Directory of .zip Zarr datasets.
   time_dim: str
       Name of the time dimension. Variables that do not include this dimension are considered static.
-  chunks: Any
-      Chunking specification forwarded to xarray open calls. Use None to keep existing chunking.
 
   Returns
   -------
@@ -165,63 +159,52 @@ def open_mfdataset(
       Dataset obtained by combining the time-varying variables by coordinates and adding the static
       variables (validated to be equal across inputs) unchanged.
   """
-  if not isinstance(paths, (list, tuple)):
-    raise TypeError("paths must be a sequence of path-like strings pointing to zipped Zarr stores")
-  if len(paths) == 0:
-    raise ValueError("paths cannot be empty")
-
-  str_paths = [str(pathlib.Path(p)) for p in paths]
-  for p in str_paths:
-    if not pathlib.Path(p).exists():
-      raise ValueError(f"Input path {p} does not exist")
-
-  # Phase 1: scan inputs to collect and validate static variables (no `time_dim`).
-  static_vars: dict[str, xr.DataArray] = {}
-
-  def _collect_and_validate_static(ds: xr.Dataset):
-    nonlocal static_vars
-    for name, var in ds.data_vars.items():
-      if time_dim not in var.dims:
-        if name in static_vars:
-          # Ensure equality (values and coordinates). Attributes are ignored.
-          if not var.equals(static_vars[name]):  # ty: ignore
-            raise ValueError(
-              f"Static variable '{name}' differs across inputs. All static variables must be identical."
-            )
-        else:
-          static_vars[name] = var  # ty: ignore
+  path = pathlib.Path(path)
+  zip_file_paths = [str(file_path) for file_path in sorted(path.glob("*.zip"))]
+  if len(zip_file_paths) == 0:
+    raise ValueError("Provided path does not contain any .zip files.")
+  logger.info(f"Reading {len(zip_file_paths)} .zip datasets from {path}")
 
   # Open each dataset quickly to inspect static variables. Keep inline_array=False to avoid huge graphs.
-  for p in str_paths:
-    ds = xr.open_dataset(p, engine="zarr", inline_array=False, chunks=chunks)
-    try:
-      _collect_and_validate_static(ds)
-    finally:
-      ds.close()
+  static_vars: dict[str, xr.DataArray] = {}
+  for file_path in zip_file_paths:
+    with xr.open_dataset(file_path, engine="zarr", inline_array=False, **kwargs) as ds:
+      for name, var in ds.data_vars.items():
+        if time_dim not in var.dims:
+          if name in static_vars:
+            try:
+              xr.testing.assert_identical(var, static_vars[name])  # type: ignore
+            except AssertionError as exc:
+              raise ValueError(
+                f"Static variable '{name}' differs across inputs. All static variables must be identical."
+              ) from exc
+          else:
+            static_vars[name] = var  # type: ignore
 
-  # Phase 2: combine time-varying variables by coordinates using open_mfdataset
+  # Combine time-varying variables by coordinates using open_mfdataset
   def _drop_static(ds: xr.Dataset) -> xr.Dataset:
     to_drop = [name for name, var in ds.data_vars.items() if time_dim not in var.dims]
     if to_drop:
       # Drop only those present to avoid errors if some files lack certain static vars
-      ds = ds.drop_vars(to_drop, errors="ignore")
+      ds = ds.drop_vars(to_drop)
     return ds
 
   ds_dynamic = xr.open_mfdataset(
-    str_paths,
+    zip_file_paths,
     engine="zarr",
     combine="by_coords",
+    combine_attrs="no_conflicts",
     preprocess=_drop_static,
     inline_array=False,
-    chunks=chunks,
+    **kwargs,
   )
 
   # Merge back the validated static variables (if any)
   if static_vars:
-    static_ds = xr.Dataset({k: v for k, v in static_vars.items()})
+    ds_static = xr.Dataset({k: v for k, v in static_vars.items()})
     # xr.merge will align coordinates as needed; prefer dynamic attrs
     ds_dynamic: xr.Dataset = xr.merge(
-      [ds_dynamic, static_ds], compat="no_conflicts", combine_attrs="override"
+      [ds_dynamic, ds_static], compat="no_conflicts", combine_attrs="no_conflicts"
     )
 
   return ds_dynamic

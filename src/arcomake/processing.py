@@ -206,7 +206,7 @@ def masked_fill(
     _mask = mask.isel({dim: 0 for dim in mask.dims if dim not in da.dims}, drop=True)
     if var in variables:
       # Check if the fill value is per variable
-      _fill_name_or_value = fill_value[var] if isinstance(fill_value, dict) else fill_value # type: ignore
+      _fill_name_or_value = fill_value[var] if isinstance(fill_value, dict) else fill_value  # type: ignore
       #  Check if the fill value is constant or a dataset variable
       _fill_value = (
         ds[_fill_name_or_value] if isinstance(_fill_name_or_value, str) else _fill_name_or_value

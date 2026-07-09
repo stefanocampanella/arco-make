@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: MIT
 import logging
 import pathlib
+import warnings
 from datetime import datetime
 from typing import Literal, get_args
 
 import click
 import xarray as xr
 
-from arcomake.checks import valid_time_coordinate, validate
+from arcomake.checks import ValidationError, valid_time_coordinate, validate
 from arcomake.cli_utils import (
   DictParamType,
   check_output_path,
@@ -18,7 +19,7 @@ from arcomake.cli_utils import (
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import (
   maybe_checkpointing_open_dataset,
-  open_mfdataset,
+  open_archive,
   save_to_zarr,
 )
 from arcomake.processing import process
@@ -256,10 +257,11 @@ def unpack(
   clevel: int = 1,
   overwrite: bool = False,
   scheduler_type: SchedulerOptionType = "mpi",
+  should_raise: bool = False,
   log_level: str = "info",
 ):
   """
-  Unpack a collection of zipped Zarr datasets into a single directory Zarr store.
+  Unpack a collection of zip files containing Zarr datasets into a single Zarr dataset.
 
   The command reads zipped Zarr fragments with xarray.open_mfdataset(engine='zarr'),
   optionally slices the time range, rechunks, and saves to a DirectoryStore at the
@@ -272,37 +274,37 @@ def unpack(
   # Set up Dask client.
   client = get_client(scheduler_type=scheduler_type)
 
-  # Check if the output path exists.
+  # Check input and ouput paths
+  if not input_path.exists() or not input_path.is_dir():
+    raise ValueError(f"Invalid input path: {input_path} does not exist or is not a directory")
   check_output_path(output_path, overwrite=overwrite)
 
   # Validate chunks argument
   if chunks is not None and not all(
     isinstance(value, int) or value == "auto" for value in chunks.values()
   ):
-    raise ValueError("chunks must be a dictionary with integer or 'auto' values")
+    raise ValueError("Chunk option value must be a dictionary with integer or 'auto' values")
 
-  def build_paths(path: pathlib.Path):
-    if path.is_dir():
-      return sorted(path.glob("*.zip"))
+  dataset = open_archive(input_path, chunks=chunks)
+
+  try:
+    valid_time_coordinate(
+      dataset,
+      start_datetime=start_datetime
+      if start_datetime is not None
+      else dataset[time_dim].to_index().min().to_pydatetime(),
+      end_datetime=end_datetime
+      if end_datetime is not None
+      else dataset[time_dim].to_index().max().to_pydatetime(),
+      freq=freq,
+      time_dim=time_dim,
+    )
+  except ValidationError as exc:
+    if should_raise:
+      raise exc from None
     else:
-      return [path.with_suffix(".zip")]
+      warnings.warn(f"Datetimes validation failed: {exc}")
 
-  paths = build_paths(input_path)
-  logger.info(f"Reading {len(paths)} zipped Zarrs from {input_path}")
-
-  dataset = open_mfdataset(paths, chunks=chunks)
-  valid_time_coordinate(
-    dataset,
-    start_datetime=start_datetime
-    if start_datetime is not None
-    else dataset[time_dim].to_index().min().to_pydatetime(),
-    end_datetime=end_datetime
-    if end_datetime is not None
-    else dataset[time_dim].to_index().max().to_pydatetime(),
-    freq=freq,
-    time_dim=time_dim,
-  )
-  dataset = dataset.arcomake.time_sel(start_datetime=start_datetime, end_datetime=end_datetime)
   dataset = dataset.chunk({dim: (1 if dim == time_dim else -1) for dim in dataset.dims})
 
   save_to_zarr(
