@@ -5,7 +5,7 @@ import sys
 import warnings
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 import pandas as pd
 import xarray as xr
@@ -126,6 +126,7 @@ def valid_time_coordinate(
   start_datetime: datetime,
   end_datetime: datetime,
   freq: str = "1D",
+  inclusive: Literal["left", "right", "both", "neither"] = "left",
   time_dim="time",
 ) -> None:
   """
@@ -144,16 +145,20 @@ def valid_time_coordinate(
   )
   idx = dataset[time_dim].to_index()
   if isinstance(idx, pd.DatetimeIndex):
-    valid_datetime_index(idx, start_datetime, end_datetime, freq)
+    valid_datetime_index(idx, start_datetime, end_datetime, freq=freq, inclusive=inclusive)
   elif isinstance(idx, xr.CFTimeIndex):
-    valid_cftime_index(idx, start_datetime, end_datetime, freq)
+    valid_cftime_index(idx, start_datetime, end_datetime, freq=freq, inclusive=inclusive)
   else:
     raise ValueError(f"Unexpected index type: {type(idx).__name__}")
 
 
 # TODO: Check that the following implementation works for both DateTimeIndex and CFTimeIndex
 def valid_datetime_index(
-  idx: pd.DatetimeIndex, start_datetime: datetime, end_datetime: datetime, freq: str = "1D"
+  idx: pd.DatetimeIndex,
+  start_datetime: datetime,
+  end_datetime: datetime,
+  freq: str = "1D",
+  inclusive: Literal["left", "right", "both", "neither"] = "left",
 ) -> None:
 
   # Check that the time coordinate is sorted
@@ -170,7 +175,11 @@ def valid_datetime_index(
 
   # Check for missings
   expected = pd.date_range(
-    start=start_datetime, end=end_datetime, freq=freq, inclusive="left", tz=getattr(idx, "tz", None)
+    start=start_datetime,
+    end=end_datetime,
+    freq=freq,
+    inclusive=inclusive,
+    tz=getattr(idx, "tz", None),
   )
   if not idx.equals(expected):
     # Report missing or irregular timestamps for easier debugging
@@ -182,7 +191,11 @@ def valid_datetime_index(
 
 
 def valid_cftime_index(
-  idx: xr.CFTimeIndex, start_date: datetime, end_date: datetime, freq: str = "1D"
+  idx: xr.CFTimeIndex,
+  start_date: datetime,
+  end_date: datetime,
+  freq: str = "1D",
+  inclusive: Literal["left", "right", "both", "neither"] = "left",
 ) -> None:
   # Equivalent checks for xarray.CFTimeIndex (cftime-based calendars)
 
@@ -202,7 +215,7 @@ def valid_cftime_index(
   calendar = getattr(idx, "calendar", None)
   # Build expected daily sequence with same calendar
   expected = xr.cftime_range(
-    start=start_date, end=end_date, freq=freq, inclusive="left", calendar=calendar
+    start=start_date, end=end_date, freq=freq, inclusive=inclusive, calendar=calendar
   )
   if not idx.equals(expected):
     # Compute missing days between min and max dates for helpful diagnostics

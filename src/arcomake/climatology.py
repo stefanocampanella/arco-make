@@ -224,6 +224,7 @@ def compute_climatology(
       start_datetime=datetime_index.min().to_pydatetime(),
       end_datetime=datetime_index.max().to_pydatetime(),
       freq=freq,
+      inclusive="both",
       time_dim=time_dim,
     )
   except ValidationError as exc:
