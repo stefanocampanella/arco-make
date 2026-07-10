@@ -246,6 +246,7 @@ def compute_climatology(
   dataset = dataset.convert_calendar(calendar)
   dataset = dataset.chunk({time_dim: step_size})
 
+  logger.info(f"Computing {freq.days}D-climatology ({calendar=}, {skipna=})")
   dataset_climatology = climatological_average(
     dataset,
     time_dim=time_dim,
@@ -253,7 +254,6 @@ def compute_climatology(
     climatology_bin_dim=climatology_bin_dim,
     skipna=skipna,
   )
-  logger.info(f"Saving {step_size}D-climatology ({calendar=}, {skipna=}) to {climatology_output}")
   save_configs = {
     "compressor": {"cname": cname, "clevel": clevel},
     "chunk": out_chunks,
@@ -282,6 +282,7 @@ def compute_climatology(
   dataset_climatology = dataset_climatology.rename_dims({climatology_bin_dim: time_dim})
   dataset_climatology = dataset_climatology.chunk({time_dim: step_size})
 
+  logger.info(f"Computing {freq.days}D-climatology anomaly std ({calendar=}, {skipna=})")
   anomaly = dataset - dataset_climatology
   anomaly_sq = anomaly * anomaly
   anomaly_var = climatological_average(
@@ -293,7 +294,6 @@ def compute_climatology(
   )
   anomaly_std = xr.ufuncs.sqrt(anomaly_var)
 
-  logger.info(f"Saving {step_size}D-anomaly std ({calendar=}, {skipna=}) to {anomaly_std_output}")
   save_to_zarr(anomaly_std, anomaly_std_output, configs=save_configs)
 
   client.close()
@@ -357,6 +357,7 @@ def climatological_average(
         )
         value = value.where(value.notnull(), avg)
       avg += (value - avg) / float(counter)
+      avg.persist()
     else:
       break
 
