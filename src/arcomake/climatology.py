@@ -368,7 +368,7 @@ def climatological_average(
         value = value.where(value.notnull(), avg)
       avg += (value - avg) / float(counter)
       if persist:
-        avg.persist()
+        avg = avg.persist()
     else:
       break
 
