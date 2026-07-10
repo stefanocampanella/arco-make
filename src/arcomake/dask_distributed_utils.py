@@ -7,8 +7,8 @@ import socket
 from typing import Literal
 
 import dask
+import dask.distributed as distributed
 import dask_mpi
-import distributed
 
 logger = logging.getLogger(__name__)
 
@@ -83,3 +83,34 @@ def get_client(scheduler_type: SchedulerOptionType = "threads") -> MaybeClient:
     raise ValueError(f"Invalid scheduler type: {scheduler_type}")
 
   return client
+
+
+def maybe_wait(*args, **kwargs):
+  """
+  Call ``dask.distributed.wait`` only if a distributed client is currently active.
+
+  This is a no-op (returns ``None`` immediately) when no
+  ``distributed.Client`` is running, e.g. when using the default
+  synchronous/threaded/multiprocessing Dask schedulers without a cluster.
+  In that case, computations are already fully materialized by the time
+  ``.persist()``/``.compute()`` return, so there is nothing to wait for.
+
+  Parameters
+  ----------
+  *args
+      Positional arguments forwarded to ``dask.distributed.wait``.
+  **kwargs
+      Keyword arguments forwarded to ``dask.distributed.wait``.
+
+  Returns
+  -------
+  Any or None
+      The result of ``dask.distributed.wait(*args, **kwargs)`` if a client
+      is active, otherwise ``None``.
+  """
+  try:
+    distributed.get_client()
+  except ValueError:
+    # No distributed client is running; nothing to wait for.
+    return None
+  return distributed.wait(*args, **kwargs)

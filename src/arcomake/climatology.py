@@ -9,7 +9,7 @@ import xarray as xr
 
 from arcomake.checks import ValidationError, valid_time_coordinate
 from arcomake.cli_utils import DictParamType, check_output_path, set_default_logger
-from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
+from arcomake.dask_distributed_utils import SchedulerOptionType, get_client, maybe_wait
 from arcomake.dataset_utils import save_to_zarr
 from arcomake.datetime_utils import may_parse_timedelta
 
@@ -98,7 +98,7 @@ logger = logging.getLogger(__name__)
   show_default=True,
 )
 @click.option(
-  "--persist/--no-persist",
+  "--sync/--no-sync",
   default=False,
   help="Whether to persist the result in memory during climatology computation.",
   show_default=True,
@@ -130,7 +130,7 @@ def compute_climatology(
   scheduler_type: SchedulerOptionType = "mpi",
   calendar: Literal["365_day", "366_day", "360_day"] = "365_day",
   skipna: bool = False,
-  persist: bool = False,
+  sync: bool = False,
   should_raise: bool = False,
   log_level: str = "info",
 ):
@@ -260,7 +260,7 @@ def compute_climatology(
     step_size=step_size,
     climatology_bin_dim=climatology_bin_dim,
     skipna=skipna,
-    persist=persist,
+    sync=sync,
   )
   save_configs = {
     "compressor": {"cname": cname, "clevel": clevel},
@@ -299,7 +299,7 @@ def compute_climatology(
     step_size=step_size,
     climatology_bin_dim=climatology_bin_dim,
     skipna=skipna,
-    persist=persist,
+    sync=sync,
   )
   anomaly_std = xr.ufuncs.sqrt(anomaly_var)
 
@@ -314,7 +314,7 @@ def climatological_average(
   time_dim: str = "time",
   climatology_bin_dim: str = "dayofyear",
   skipna=False,
-  persist=False,
+  sync=False,
 ) -> xr.Dataset:
   """
   Average a dataset over consecutive windows of ``step_size`` steps along time.
@@ -367,8 +367,9 @@ def climatological_average(
         )
         value = value.where(value.notnull(), avg)
       avg += (value - avg) / float(counter)
-      if persist:
+      if sync:
         avg = avg.persist()
+        maybe_wait(avg)
     else:
       break
 
