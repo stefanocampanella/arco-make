@@ -98,6 +98,12 @@ logger = logging.getLogger(__name__)
   show_default=True,
 )
 @click.option(
+  "--persist/--no-persist",
+  default=False,
+  help="Whether to persist the result in memory during climatology computation.",
+  show_default=True,
+)
+@click.option(
   "--raise/--no-raise",
   "should_raise",
   help="Whether to raise an exception if validation fails",
@@ -124,6 +130,7 @@ def compute_climatology(
   scheduler_type: SchedulerOptionType = "mpi",
   calendar: Literal["365_day", "366_day", "360_day"] = "365_day",
   skipna: bool = False,
+  persist: bool = False,
   should_raise: bool = False,
   log_level: str = "info",
 ):
@@ -253,6 +260,7 @@ def compute_climatology(
     step_size=step_size,
     climatology_bin_dim=climatology_bin_dim,
     skipna=skipna,
+    persist=persist,
   )
   save_configs = {
     "compressor": {"cname": cname, "clevel": clevel},
@@ -291,6 +299,7 @@ def compute_climatology(
     step_size=step_size,
     climatology_bin_dim=climatology_bin_dim,
     skipna=skipna,
+    persist=persist,
   )
   anomaly_std = xr.ufuncs.sqrt(anomaly_var)
 
