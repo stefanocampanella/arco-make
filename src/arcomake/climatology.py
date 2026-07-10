@@ -290,7 +290,7 @@ def compute_climatology(
   # bin_index is already a DataArray indexed by time_dim (inherited from doy),
   # so this is a vectorized/pointwise selection: the result will be indexed
   # by time_dim instead of climatology_bin_dim.
-  dataset_climatology = dataset_climatology.sel(climatology_dim=bin_index)
+  dataset_climatology = dataset_climatology.sel({climatology_bin_dim: bin_index})
   dataset_climatology = dataset_climatology.rename_dims({climatology_bin_dim: time_dim})
 
   logger.info(f"Computing {freq.days}D-climatology anomaly std ({calendar=}, {skipna=})")
