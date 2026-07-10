@@ -121,9 +121,9 @@ def compute_climatology(
   climatology_output: pathlib.Path,
   anomaly_std_output: pathlib.Path,
   time_dim: str = "time",
-  in_chunks: dict[str, int] | None = None,
+  in_chunks: dict[str, int | Literal["auto"]] | None = None,
   overwrite: bool = False,
-  out_chunks: dict[str, int] | None = None,
+  out_chunks: dict[str, int | Literal["auto"]] | None = None,
   climatology_bin_dim: str = "dayofyear",
   cname: str = "lz4",
   clevel: int = 1,
@@ -268,7 +268,12 @@ def compute_climatology(
   save_to_zarr(dataset_climatology, climatology_output, configs=save_configs)
 
   # Read back the climatology to compute the anomaly std.
-  dataset_climatology = xr.open_dataset(climatology_output, engine="zarr", chunks=in_chunks)
+  if in_chunks is None:
+    climatology_in_chunks = {}
+  else:
+    climatology_in_chunks = {dim: chunk for dim, chunk in in_chunks.items() if dim != time_dim}
+    climatology_in_chunks[climatology_bin_dim] = "auto"
+  dataset_climatology = xr.open_dataset(climatology_output, engine="zarr", chunks=climatology_in_chunks)
 
   # Number of bins in the climatology (must match how climatology_bin_dim was constructed)
   nbins = dataset_climatology.sizes[climatology_bin_dim]
