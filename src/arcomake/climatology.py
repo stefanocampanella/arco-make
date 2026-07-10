@@ -251,7 +251,6 @@ def compute_climatology(
   # Here we handle leap years.
   # See: https://github.com/pydata/xarray/issues/1844#issuecomment-417855365
   dataset = dataset.convert_calendar(calendar)
-  dataset = dataset.chunk({time_dim: step_size})
 
   logger.info(f"Computing {freq.days}D-climatology ({calendar=}, {skipna=})")
   dataset_climatology = climatological_average(
@@ -288,7 +287,6 @@ def compute_climatology(
   # by time_dim instead of climatology_bin_dim.
   dataset_climatology = dataset_climatology.sel(climatology_dim=bin_index)
   dataset_climatology = dataset_climatology.rename_dims({climatology_bin_dim: time_dim})
-  dataset_climatology = dataset_climatology.chunk({time_dim: step_size})
 
   logger.info(f"Computing {freq.days}D-climatology anomaly std ({calendar=}, {skipna=})")
   anomaly = dataset - dataset_climatology
