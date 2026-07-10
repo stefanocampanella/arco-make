@@ -305,6 +305,7 @@ def climatological_average(
   time_dim: str = "time",
   climatology_bin_dim: str = "dayofyear",
   skipna=False,
+  persist=False,
 ) -> xr.Dataset:
   """
   Average a dataset over consecutive windows of ``step_size`` steps along time.
@@ -357,7 +358,8 @@ def climatological_average(
         )
         value = value.where(value.notnull(), avg)
       avg += (value - avg) / float(counter)
-      avg.persist()
+      if persist:
+        avg.persist()
     else:
       break
 

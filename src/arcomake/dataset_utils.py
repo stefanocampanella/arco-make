@@ -217,13 +217,20 @@ def save_to_zarr(
   progress: bool = False,
 ) -> None:
   logger.info(f"Saving dataset to {path} with {configs}")
-  # No need to copy configs here before popping elements out of it, as it will not be reused
+  # Copy configs before popping elements out of it as, for example, so that save_to_zarr can be called multiple times.
+  configs = configs.copy()
   if rechunk_conf := configs.pop("chunk", {}):
-    dataset = dataset.chunk(**rechunk_conf)
+    # Set the on-disk Zarr chunk layout via encoding, without altering the
+    # underlying Dask chunking. This requires the existing Dask chunks to be
+    # an integer multiple of (and evenly divide into) the requested chunks
+    # along each dimension; otherwise to_zarr will raise a ValueError.
     # see: https://github.com/pydata/xarray/issues/4380
     for var in dataset.data_vars:
-      if dataset[var].encoding and dataset[var].encoding.get("chunks"):
-        del dataset[var].encoding["chunks"]
+      dims = dataset[var].dims
+      chunk_sizes = tuple(
+        rechunk_conf[dim] if dim in rechunk_conf else dataset[var].sizes[dim] for dim in dims
+      )
+      dataset[var].encoding["chunks"] = chunk_sizes
   if compressor_conf := configs.pop("compressor", {}):
     for var in dataset.data_vars:
       dataset[var].encoding["compressor"] = Blosc(**compressor_conf)
