@@ -13,6 +13,7 @@ dependencies = [
     "dask_mpi",
     "eccodes",
     "etils",
+    "flox",
     "gcsfs",
     "google-cloud-storage",
     "h5netcdf",
@@ -31,6 +32,7 @@ dependencies = [
     "xarray-regrid[accel]",
     # TODO: Port to Zarr v3
     "zarr >= 2, < 3",
+    "flox>=0.11.2",
 ]
 authors = [{name = "Stefano Campanella", email = "scampanella@ogs.it"}]
 description = "Utility to download and preprocess data into ARCO format."
