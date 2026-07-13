@@ -490,7 +490,7 @@ def _flox_climatology(
     func="mean",
     expected_groups=expected_groups,
     method="cohorts",
-    engine="flux",
+    engine="flox",
     skipna=skipna,
     keep_attrs=True,
   )
@@ -502,7 +502,7 @@ def _flox_climatology(
     expected_groups=expected_groups,
     skipna=skipna,
     method="cohorts",
-    engine="flux",
+    engine="flox",
     ddof=1,
     keep_attrs=True,
   )
