@@ -7,6 +7,7 @@ import tempfile
 from contextlib import nullcontext
 from typing import Any
 
+import dask.distributed as distributed
 import xarray as xr
 from dask.diagnostics import ProgressBar
 from numcodecs import Blosc
@@ -215,7 +216,8 @@ def save_to_zarr(
   path: pathlib.Path,
   configs: dict[str, Any],
   progress: bool = False,
-) -> None:
+  compute: bool = True,
+) -> distributed.Future[None] | None:
   logger.info(f"Saving dataset to {path} with {configs}")
   # Copy configs before popping elements out of it as, for example, so that save_to_zarr can be called multiple times.
   configs = configs.copy()
@@ -242,7 +244,21 @@ def save_to_zarr(
     store = ZipStore(path=str(path), mode="w", compression=0, allowZip64=True)
   else:
     store = DirectoryStore(path=str(path))
-  with bar(progress):
-    dataset.to_zarr(store=store, compute=True, mode="w", **configs)
-  store.close()
-  dataset.close()
+  try:
+    client = distributed.get_client()
+  except ValueError:
+    client = None
+  if client is None or compute:
+    with bar(progress):
+      dataset.to_zarr(store=store, compute=True, mode="w", **configs)
+    store.close()
+    dataset.close()
+    return None
+  else:
+
+    def _to_zarr() -> None:
+      dataset.to_zarr(store=store, compute=False, mode="w", **configs)
+      store.close()
+      dataset.close()
+
+    return client.submit(_to_zarr)

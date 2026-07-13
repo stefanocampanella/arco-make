@@ -193,6 +193,7 @@ requires-dist = [
     { name = "dask-mpi" },
     { name = "eccodes" },
     { name = "etils" },
+    { name = "flox" },
     { name = "flox", specifier = ">=0.11.2" },
     { name = "gcsfs" },
     { name = "google-cloud-storage" },

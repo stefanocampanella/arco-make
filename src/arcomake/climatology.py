@@ -4,6 +4,7 @@ import warnings
 from typing import Literal, get_args
 
 import click
+import dask
 import numpy as np
 import xarray as xr
 from flox.xarray import xarray_reduce
@@ -298,12 +299,15 @@ def compute_climatology(
     "compressor": {"cname": cname, "clevel": clevel},
     "chunk": out_chunks,
   }
-  save_to_zarr(dataset_climatology, climatology_output, configs=save_configs)
+  _delayed_climatology_save = save_to_zarr(
+    dataset_climatology, climatology_output, compute=False, configs=save_configs
+  )
+  _delayed_anomaly_std_save = xr.ufuncs.sqrt(anomaly_var)
+  save_anomaly_std = save_to_zarr(
+    _delayed_anomaly_std_save, anomaly_std_output, compute=False, configs=save_configs
+  )
 
-  logger.info(f"Computing {freq.days}D-climatology anomaly std ({calendar=}, {skipna=})")
-  anomaly_std = xr.ufuncs.sqrt(anomaly_var)
-
-  save_to_zarr(anomaly_std, anomaly_std_output, configs=save_configs)
+  dask.compute(_delayed_climatology_save, save_anomaly_std)
 
   client.close()
 
@@ -453,7 +457,10 @@ def _flox_climatology(
     labels,
     func="mean",
     expected_groups=expected_groups,
+    method="cohorts",
+    engine="flux",
     skipna=skipna,
+    keep_attrs=True,
   )
   # Unbiased sample variance (normalised by n - 1).
   variance = xarray_reduce(
@@ -462,7 +469,10 @@ def _flox_climatology(
     func="var",
     expected_groups=expected_groups,
     skipna=skipna,
+    method="cohorts",
+    engine="flux",
     ddof=1,
+    keep_attrs=True,
   )
 
   avg = avg.assign_coords({climatology_bin_dim: first_window_doy})
