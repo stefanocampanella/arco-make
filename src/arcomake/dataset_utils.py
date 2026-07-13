@@ -7,6 +7,7 @@ import tempfile
 from typing import Any
 
 import xarray as xr
+from dask.delayed import Delayed
 from numcodecs import Blosc
 from zarr.storage import DirectoryStore, ZipStore
 
@@ -205,7 +206,8 @@ def save_to_zarr(
   dataset: xr.Dataset,
   path: pathlib.Path,
   configs: dict[str, Any],
-) -> None:
+  compute=True,
+) -> xr.backends.ZarrStore | Delayed:
   logger.info(f"Saving dataset to {path} with {configs}")
   # Copy configs before popping elements out of it as, for example, so that save_to_zarr can be called multiple times.
   configs = configs.copy()
@@ -232,7 +234,4 @@ def save_to_zarr(
     store = ZipStore(path=str(path), mode="w", compression=0, allowZip64=True)
   else:
     store = DirectoryStore(path=str(path))
-  try:
-    dataset.to_zarr(store=store, compute=True, mode="w", **configs)
-  finally:
-    store.close()
+  return dataset.to_zarr(store=store, compute=compute, mode="w", **configs)

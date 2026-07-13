@@ -191,8 +191,11 @@ def compute_stats(
   save_configs = {
     "compressor": {"cname": cname, "clevel": clevel},
     "chunk": out_chunks,
+    "consolidated": True,
   }
-  save_to_zarr(stats_ds, output, configs=save_configs)
+  store = save_to_zarr(stats_ds, output, configs=save_configs, compute=True)
 
+  # Clean up
+  store.close()
   stats_ds.close()
   client.close()

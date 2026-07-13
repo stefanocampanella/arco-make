@@ -326,7 +326,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
     # context manager that changes the configuration of the logger
     if cdsapi_client.__class__.__name__.startswith("Legacy"):  # noqa: SIM102
       if hasattr(cdsapi_client, "logging_decorator"):
-        cdsapi_client.logging_decorator = lambda x: x  # ty: ignore
+        cdsapi_client.logging_decorator = lambda x: x  # type: ignore
 
     return cdsapi_client
 

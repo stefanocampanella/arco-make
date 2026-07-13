@@ -18,7 +18,7 @@ def read_configs(path: str | pathlib.Path) -> dict[str, Any]:
   return configs
 
 
-class DictParamType(click.ParamType):
+class DictParamType(click.ParamType[dict[str, int | float | bool | str]]):
   """Click ParamType that parses mappings like "a:1,b:2.5,c:true,d:x" into dict[str, int | float | bool | str].
 
   Rules:

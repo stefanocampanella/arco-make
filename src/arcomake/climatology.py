@@ -42,6 +42,7 @@ import warnings
 from typing import Literal, get_args
 
 import click
+import dask
 import numpy as np
 import xarray as xr
 from flox.xarray import xarray_reduce
@@ -336,9 +337,18 @@ def compute_climatology(
     "compressor": {"cname": cname, "clevel": clevel},
     "chunk": out_chunks,
   }
-  save_to_zarr(dataset_climatology, climatology_output, configs=save_configs)
+  _climatology_delayed_save = save_to_zarr(
+    dataset_climatology, climatology_output, configs=save_configs
+  )
   anomaly_std = xr.ufuncs.sqrt(anomaly_var)
-  save_to_zarr(anomaly_std, anomaly_std_output, configs=save_configs)
+  _anomaly_std_delayed_save = save_to_zarr(anomaly_std, anomaly_std_output, configs=save_configs)
+
+  # Compute and save the climatology and anomaly std in parallel.
+  dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
+
+  # Clean up.
+  _climatology_delayed_save.close()
+  _anomaly_std_delayed_save.close()
   dataset_climatology.close()
   anomaly_std.close()
   client.close()

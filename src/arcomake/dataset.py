@@ -166,11 +166,15 @@ def download(
 
     # Save the dataset in a Zarr using sensible chunking and compression
     with bar(progress):
-      save_to_zarr(
+      store = save_to_zarr(
         dataset=dataset,
         path=output_path,
         configs=configs.get("save", {}),
+        compute=True,
       )
+
+    # Clean up
+    store.close()
     dataset.close()
   finally:
     # Clean up temporary files
@@ -317,10 +321,14 @@ def unpack(
 
   dataset = dataset.chunk({dim: (1 if dim == time_dim else -1) for dim in dataset.dims})
 
-  save_to_zarr(
+  store = save_to_zarr(
     dataset=dataset,
     path=output_path,
-    configs={"compressor": {"cname": cname, "clevel": clevel}},
+    configs=dict(compressor={"cname": cname, "clevel": clevel}, consolidated=True),
+    compute=True,
   )
 
+  # Clean up
+  store.close()
+  dataset.close()
   client.close()

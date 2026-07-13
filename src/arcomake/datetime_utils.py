@@ -124,7 +124,11 @@ def may_parse_timedelta(delta: timedelta | str) -> timedelta:
   if isinstance(delta, timedelta):
     return delta
   elif isinstance(delta, str):
-    return pd.Timedelta(delta).to_pytimedelta()
+    parsed_timedelta = pd.Timedelta(delta)
+    if isinstance(parsed_timedelta, pd.Timedelta):
+      return parsed_timedelta.to_pytimedelta()
+    else:
+      raise ValueError(f"Invalid timedelta format: {delta}. Must be a valid timedelta string.")
   else:
     raise ValueError(
       f"Invalid timedelta format: {delta}. Must be a timedelta or a string in ISO format."
