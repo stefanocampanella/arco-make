@@ -4,12 +4,9 @@ import datetime
 import logging
 import pathlib
 import tempfile
-from contextlib import nullcontext
 from typing import Any
 
-import dask.distributed as distributed
 import xarray as xr
-from dask.diagnostics import ProgressBar
 from numcodecs import Blosc
 from zarr.storage import DirectoryStore, ZipStore
 
@@ -20,13 +17,6 @@ from arcomake.datetime_utils import (
 from arcomake.processing import process
 
 logger = logging.getLogger(__name__)
-
-
-def bar(progress):
-  if progress:
-    return ProgressBar()
-  else:
-    return nullcontext()
 
 
 def open_dataset(
@@ -215,9 +205,7 @@ def save_to_zarr(
   dataset: xr.Dataset,
   path: pathlib.Path,
   configs: dict[str, Any],
-  progress: bool = False,
-  compute: bool = True,
-) -> distributed.Future[None] | None:
+) -> None:
   logger.info(f"Saving dataset to {path} with {configs}")
   # Copy configs before popping elements out of it as, for example, so that save_to_zarr can be called multiple times.
   configs = configs.copy()
@@ -245,20 +233,6 @@ def save_to_zarr(
   else:
     store = DirectoryStore(path=str(path))
   try:
-    client = distributed.get_client()
-  except ValueError:
-    client = None
-  if client is None or compute:
-    with bar(progress):
-      dataset.to_zarr(store=store, compute=True, mode="w", **configs)
+    dataset.to_zarr(store=store, compute=True, mode="w", **configs)
+  finally:
     store.close()
-    dataset.close()
-    return None
-  else:
-
-    def _to_zarr() -> None:
-      dataset.to_zarr(store=store, compute=False, mode="w", **configs)
-      store.close()
-      dataset.close()
-
-    return client.submit(_to_zarr)

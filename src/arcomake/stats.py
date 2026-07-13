@@ -1,49 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
-#
-#  The implementation of stats computing routines in what follows is the result of a number of experiments,
-#  which failed due to performance problems. In most cases, Dask created huge task graphs (22GB), and jobs died.
-#  Notice, even in local tests using a partial dataset with about one week of data, the graph was still huge
-#  (about 2.3GB). This was probably related to the Dask client lazily opening datasets or embedding the results in the graph.
-#  However, the main issues were related to `groupby` in the computation of the climatology.
-#  Early on optimizations reusing intermediate results[1] made things worse, making the task graph even bigger and more
-#  complex, and (un)surprisingly turned out to be detrimental.
-#
-#  I henceforth tried the following:
-#    1. Compute one stat (climatology, mean, std, diff) at a time.
-#    2. Read datasets using different chunking than on disk.
-#    3. Investigate the use of flox, and in general optimizations related to groupby operations (turned out not useful).
-#
-# Regarding the latter, see, for example:
-#    1. https://discourse.pangeo.io/t/optimizing-climatology-calculation-with-xarray-and-dask/2453
-#    2. https://flox.readthedocs.io/en/latest/user-stories/climatology.html
-#    3. https://xarray.dev/blog/flox
-#
-#  With these and other optimizations, now we're able to get the job to the end without errors and compute the stats.
-#  However, the performance is still horrible and dominated by communication, even for the mean.
-#  The other optimizations mentioned above include:
-#    1. Compute the climatology using loops.
-#    1. Compute, then save.
-#
-#  Further optimization might be:
-#   1. For climatology, prepare a dataset using `day_365` calendar, then read the dataset using chunks of 365 days (to
-#   avoid task reshuffles).
-#   2. Try to set up a Dask cluster using UCX (which appears to be experimental) to reduce communication time.
-#   3. Instead of point 1, rechunk using TimeResampler, after converting to calendar='365_day' (probably not effective).
-#
-# [1]: mean could be computed, using a reasonable approximation, as the mean of the climatology, and the std could reuse
-# the value of the mean.
-#
-# Say you have a collection of values {x_i} and labels {l_i} so that each label corresponds to multiple values.
-# Then you can compute the mean of the whole collection x_mean, or the mean of the averages for each label x_clim_mean.
-# If the number of values for each label is the same, then the two quantities are strictly equal.
-# But it's not true in general.
-# Indeed, in the case of a daily climatology, the two would differ because of leap years, which would introduce a
-# relative error of the order of 1/365.
-# Finally, the dataset might not start on the 1st of January or end before the 31 of December,
-# which would further distort the results. However, the quantities computed here are aimed at standardizing the input
-# features in a deep-learning model, and therefore such approximations are reasonably acceptable.
-
 import logging
 import pathlib
 from typing import get_args
@@ -238,4 +194,5 @@ def compute_stats(
   }
   save_to_zarr(stats_ds, output, configs=save_configs)
 
+  stats_ds.close()
   client.close()

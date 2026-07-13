@@ -3,11 +3,13 @@
 import logging
 import pathlib
 import warnings
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Literal, get_args
 
 import click
 import xarray as xr
+from dask.diagnostics import ProgressBar
 
 from arcomake.checks import ValidationError, valid_time_coordinate, validate
 from arcomake.cli_utils import (
@@ -25,6 +27,13 @@ from arcomake.dataset_utils import (
 from arcomake.processing import process
 
 logger = logging.getLogger(__name__)
+
+
+def bar(progress):
+  if progress:
+    return ProgressBar()
+  else:
+    return nullcontext()
 
 
 @click.command()
@@ -156,12 +165,13 @@ def download(
       dataset = process(dataset=dataset, steps=postprocess_conf)
 
     # Save the dataset in a Zarr using sensible chunking and compression
-    save_to_zarr(
-      dataset=dataset,
-      path=output_path,
-      configs=configs.get("save", {}),
-      progress=progress,
-    )
+    with bar(progress):
+      save_to_zarr(
+        dataset=dataset,
+        path=output_path,
+        configs=configs.get("save", {}),
+      )
+    dataset.close()
   finally:
     # Clean up temporary files
     for source_dataset in datasets:

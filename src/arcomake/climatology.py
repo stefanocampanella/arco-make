@@ -1,10 +1,47 @@
+# SPDX-FileCopyrightText: 2026 Stefano Campanella
+# SPDX-License-Identifier: MIT
+#
+#  The following implementation is the result of a number of experiments, mostly to overcome performance issues.
+#  In most cases, (injudicious) re-chunking was the source of these issues.
+#  Indeed, in that case Dask ended up creating huge task graphs (22GB), and jobs died, even with small timeseries.
+#  In particular, the `groupby` in the computation of the climatology is sensitive to the chunking of the dataset.
+#  Early on optimizations reusing intermediate results[1] made things worse, making the task graph even bigger and more
+#  complex, and (un)surprisingly turned out to be detrimental.
+#
+#  I tried the following:
+#    1. Compute one stat (climatology, mean, std, diff) at a time; which is the current approach.
+#    2. Adjust chunking when reading from disk, and avoid ZipStore.
+#    3. Investigate the use of flox, and in general optimizations related to groupby operations.
+#
+# Regarding the latter, see, for example:
+#    1. https://discourse.pangeo.io/t/optimizing-climatology-calculation-with-xarray-and-dask/2453
+#    2. https://flox.readthedocs.io/en/latest/user-stories/climatology.html
+#    3. https://xarray.dev/blog/flox
+#
+#  With these and other optimizations, now we're able to get the job to the end without errors and compute the all the
+#  stats, including the climatology. Optionally, the climatology can now be computed using Welford's algorithm.
+#
+#  Even without rechunking, the communication is still a bottleneck. Hence, further optimization might be:
+#   1. Try to set up a Dask cluster using UCX (which appears to be experimental) to reduce communication time.
+#
+# [1]: mean could be computed, using a reasonable approximation, as the mean of the climatology, and the std could reuse
+# the value of the mean.
+#
+# Say you have a collection of values {x_i} and labels {l_i} so that each label corresponds to multiple values.
+# Then you can compute the mean of the whole collection x_mean, or the mean of the averages for each label x_clim_mean.
+# If the number of values for each label is the same, then the two quantities are strictly equal.
+# But it's not true in general.
+# Indeed, in the case of a daily climatology, the two would differ because of leap years, which would introduce a
+# relative error of the order of 1/365.
+# Finally, the dataset might not start on the 1st of January or end before the 31 of December,
+# which would further distort the results. However, the quantities computed here are aimed at standardizing the input
+# features in a deep-learning model, and therefore such approximations are reasonably acceptable.
 import logging
 import pathlib
 import warnings
 from typing import Literal, get_args
 
 import click
-import dask
 import numpy as np
 import xarray as xr
 from flox.xarray import xarray_reduce
@@ -299,16 +336,11 @@ def compute_climatology(
     "compressor": {"cname": cname, "clevel": clevel},
     "chunk": out_chunks,
   }
-  _delayed_climatology_save = save_to_zarr(
-    dataset_climatology, climatology_output, compute=False, configs=save_configs
-  )
-  _delayed_anomaly_std_save = xr.ufuncs.sqrt(anomaly_var)
-  save_anomaly_std = save_to_zarr(
-    _delayed_anomaly_std_save, anomaly_std_output, compute=False, configs=save_configs
-  )
-
-  dask.compute(_delayed_climatology_save, save_anomaly_std)
-
+  save_to_zarr(dataset_climatology, climatology_output, configs=save_configs)
+  anomaly_std = xr.ufuncs.sqrt(anomaly_var)
+  save_to_zarr(anomaly_std, anomaly_std_output, configs=save_configs)
+  dataset_climatology.close()
+  anomaly_std.close()
   client.close()
 
 
