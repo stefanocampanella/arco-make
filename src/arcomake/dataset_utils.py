@@ -234,4 +234,6 @@ def save_to_zarr(
     store = ZipStore(path=str(path), mode="w", compression=0, allowZip64=True)
   else:
     store = DirectoryStore(path=str(path))
-  return dataset.to_zarr(store=store, compute=compute, mode="w", **configs)
+  xarray_zarr_store = dataset.to_zarr(store=store, compute=compute, mode="w", **configs)
+  xarray_zarr_store._close_store_on_close = True
+  return xarray_zarr_store
