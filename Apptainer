@@ -26,8 +26,7 @@ From: ubuntu:26.04
         libaec-dev \
         libnetcdf-dev \
         libpng-dev \
-        libopenjp2-7-dev \
-        libjasper-dev
+        libopenjp2-7-dev
 
     # Build and install ecCodes from source
     ECCODES_VERSION=2.48.0
