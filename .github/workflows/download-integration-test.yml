@@ -47,12 +47,16 @@ jobs:
           COPERNICUSMARINE_SERVICE_PASSWORD: ${{ secrets.COPERNICUSMARINE_SERVICE_PASSWORD }}
           CDSAPI_URL: ${{ secrets.CDSAPI_URL }}
           CDSAPI_KEY: ${{ secrets.CDSAPI_KEY }}
-        # NOTE: `--no-home` disables Apptainer's default bind-mount of the
-        # home directory. The test must exercise the image exactly as built,
-        # without any host state leaking in (stale caches, credentials, or
-        # files that could shadow paths inside the image). The image itself is
-        # self-contained: the uv-managed interpreter lives in /opt/uv/python,
-        # outside of $HOME.
+          # `--no-home` disables Apptainer's default bind-mount of the home
+          # directory, so the image is exercised exactly as built, with no host
+          # state leaking in. The flip side is that $HOME (/root, inside the
+          # read-only SIF) is not writable, so any tool writing to the default
+          # cache location under $HOME fails (uv: "Could not acquire lock ...
+          # Read-only file system ... /root/.cache/uv"). Point the caches at
+          # /tmp, which Apptainer always mounts writable. APPTAINERENV_* /
+          # SINGULARITYENV_* variables are forwarded into the container.
+          APPTAINERENV_UV_CACHE_DIR: /tmp/uv-cache
+          APPTAINERENV_XDG_CACHE_HOME: /tmp/cache
         run: >
           apptainer run --no-home container.sif download
           --start=${DOWNLOAD_INTEGRATION_TEST_START_DATETIME} --end=${DOWNLOAD_INTEGRATION_TEST_END_DATETIME}
