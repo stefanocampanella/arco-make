@@ -47,8 +47,14 @@ jobs:
           COPERNICUSMARINE_SERVICE_PASSWORD: ${{ secrets.COPERNICUSMARINE_SERVICE_PASSWORD }}
           CDSAPI_URL: ${{ secrets.CDSAPI_URL }}
           CDSAPI_KEY: ${{ secrets.CDSAPI_KEY }}
+        # NOTE: `--no-home` disables Apptainer's default bind-mount of the
+        # home directory. The test must exercise the image exactly as built,
+        # without any host state leaking in (stale caches, credentials, or
+        # files that could shadow paths inside the image). The image itself is
+        # self-contained: the uv-managed interpreter lives in /opt/uv/python,
+        # outside of $HOME.
         run: >
-          apptainer run container.sif download
+          apptainer run --no-home container.sif download
           --start=${DOWNLOAD_INTEGRATION_TEST_START_DATETIME} --end=${DOWNLOAD_INTEGRATION_TEST_END_DATETIME}
           --no-progress
           --overwrite

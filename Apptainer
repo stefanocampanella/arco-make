@@ -52,6 +52,11 @@ From: ubuntu:26.04
     # Install uv by Astral
     curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
 
+    # Install the uv-managed Python outside of $HOME, so that Apptainer's
+    # automatic bind-mount of the home directory cannot shadow the interpreter
+    # the virtual environment symlinks to (see %environment below).
+    export UV_PYTHON_INSTALL_DIR=/opt/uv/python
+
     # Create uv environment
     cd /app
     # The pyproject.toml specifies python >= 3.13
@@ -61,6 +66,11 @@ From: ubuntu:26.04
 %environment
     # Add uv environment to PATH
     export PATH="/app/.venv/bin:$PATH"
+    # Point uv at the interpreter installed under /opt during %post: /app/.venv
+    # only holds symlinks to it, and a location under $HOME would be hidden by
+    # Apptainer's default home bind-mount, forcing uv to re-create the
+    # (read-only) virtual environment at runtime.
+    export UV_PYTHON_INSTALL_DIR=/opt/uv/python
     
 %runscript
     cd /app
