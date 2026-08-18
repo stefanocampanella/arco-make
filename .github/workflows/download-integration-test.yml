@@ -48,12 +48,12 @@ jobs:
           CDSAPI_URL: ${{ secrets.CDSAPI_URL }}
           CDSAPI_KEY: ${{ secrets.CDSAPI_KEY }}
         run: >
-          apptainer run container.sif arco-make download
+          apptainer run container.sif download
           --start=${DOWNLOAD_INTEGRATION_TEST_START_DATETIME} --end=${DOWNLOAD_INTEGRATION_TEST_END_DATETIME}
           --no-progress
           --overwrite
           --
-          arco-ocean/configs/arco-ocean_tres-1d_res-0p25_levels-10.toml /tmp/tempfile.zip
+          "${PWD}/arco-ocean/configs/arco-ocean_tres-1d_res-0p25_levels-10.toml" /tmp/tempfile.zip
 
       - name: Verify output
         run: |

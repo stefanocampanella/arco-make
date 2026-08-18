@@ -67,7 +67,7 @@ From: ubuntu:26.04
     if [ $# -eq 0 ]; then
         /bin/bash
     else
-        exec uv run --no-sync "$@"
+        exec uv run --no-sync arco-make "$@"
     fi
 
 %help
@@ -75,4 +75,4 @@ From: ubuntu:26.04
 
     USAGE EXAMPLE:
 
-      apptainer exec arco-make.sif download /path/to/config.toml /path/to/output.zip
+      apptainer run arco-make.sif download /absolute/path/to/config.toml /absolute/path/to/output.zip
