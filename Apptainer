@@ -67,7 +67,7 @@ From: ubuntu:26.04
     if [ $# -eq 0 ]; then
         /bin/bash
     else
-        exec uv run "$@"
+        exec uv run --no-sync "$@"
     fi
 
 %help
