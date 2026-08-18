@@ -1,33 +1,36 @@
 name: Download Integration Test
 
 on:
-  push:
-    branches: [ master ]
-  pull_request:
-    branches: [ master ]
+  workflow_run:
+    workflows: [ "Build Apptainer Image" ]
+    types:
+      - completed
 
 jobs:
   download-integration-test:
+    # Only run if the Apptainer image build succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/apptainer/apptainer:latest
+      options: --privileged
     env:
       DOWNLOAD_INTEGRATION_TEST_START_DATETIME: '2001-01-01T00:00:00'
       DOWNLOAD_INTEGRATION_TEST_END_DATETIME: '2001-01-02T00:00:00'
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install system dependencies
+      - name: Log in to the container registry
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libeccodes-dev
+          echo ${{ secrets.GITHUB_TOKEN }} | apptainer registry login -u ${{ github.repository_owner }} --password-stdin oras://ghcr.io
 
-      - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
-
-      - name: Set up Python
-        run: uv python install
-
-      - name: Sync environment
-        run: uv sync --frozen
+      - name: Pull the Apptainer image built by the previous workflow
+        run: |
+          repo=$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')
+          apptainer pull container.sif oras://ghcr.io/${repo}:${tag}
 
       # Pull the latest config from the arco-ocean repo so the output is checked against it
       - name: Download configuration file
@@ -45,7 +48,7 @@ jobs:
           CDSAPI_URL: ${{ secrets.CDSAPI_URL }}
           CDSAPI_KEY: ${{ secrets.CDSAPI_KEY }}
         run: >
-          uv run arco-make download
+          apptainer run container.sif arco-make download
           --start=${DOWNLOAD_INTEGRATION_TEST_START_DATETIME} --end=${DOWNLOAD_INTEGRATION_TEST_END_DATETIME}
           --no-progress
           --overwrite
@@ -55,6 +58,6 @@ jobs:
       - name: Verify output
         run: |
           ls -l /tmp/tempfile.zip
-#          uv run python tests/integration/check_download.py \
+#          apptainer exec container.sif python tests/integration/check_download.py \
 #            /tmp/tempfile.zip \
 #            --start=${DOWNLOAD_INTEGRATION_TEST_START_DATETIME} --end=${DOWNLOAD_INTEGRATION_TEST_END_DATETIME}
