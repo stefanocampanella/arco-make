@@ -169,6 +169,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
     system_version: str | None = None,
     hydrological_model: str | None = None,
     product_type: str | None = None,
+    timespan: str | None = None,
     variable: str | Iterable[str] | None = None,
     time_dim: str = "time",
     latitude_dim: str = "latitude",
@@ -180,7 +181,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
         f"Possibly invalid EWDS URL: {filename_or_obj}. Ignoring path, query and fragment"
       )
     dataset_name = url.netloc
-    if any(arg is None for arg in [system_version, hydrological_model, product_type, variable]):
+    if any(arg is None for arg in [system_version, hydrological_model, product_type, timespan, variable]):
       raise ValueError("Missing required argument.")
     if start_datetime is None or end_datetime is None:
       raise ValueError("Missing required argument.")
@@ -190,15 +191,15 @@ class EarlyWarningDataStore(BackendEntrypoint):
       start_datetime, end_datetime
     )
     for dates in consecutive_dates:
-      prefix = "h" if dataset_name.endswith("historical") else ""
       request = {
         "system_version": [system_version],
         "hydrological_model": [hydrological_model],
         "product_type": [product_type],
+        "timespan": [timespan],
         "variable": [variable] if isinstance(variable, str) else variable,
-        prefix + "year": f"{dates[0].year}",
-        prefix + "month": [f"{dates[0].month:02}"],
-        prefix + "day": [f"{date.day:02}" for date in dates],
+        "year": f"{dates[0].year}",
+        "month": [f"{dates[0].month:02}"],
+        "day": [f"{date.day:02}" for date in dates],
         "data_format": "grib2",
         "download_format": "zip",
       }
