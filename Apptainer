@@ -1,10 +1,10 @@
 Bootstrap: docker
-From: ubuntu:26.04
+From: ubuntu:24.04
 
 %labels
     Maintainer Stefano Campanella
     Version 0.1
-    Description Apptainer image for arco-make based on Ubuntu 26.04 (using uv).
+    Description Apptainer image for arco-make based on Ubuntu 24.04 and using uv.
 
 %files
     pyproject.toml /app/pyproject.toml
@@ -26,7 +26,9 @@ From: ubuntu:26.04
         libaec-dev \
         libnetcdf-dev \
         libpng-dev \
-        libopenjp2-7-dev
+        libopenjp2-7-dev \
+        libopenmpi-dev \
+        openmpi-bin
 
     # Build and install ecCodes from source
     ECCODES_VERSION=2.48.0
@@ -66,6 +68,15 @@ From: ubuntu:26.04
 %environment
     # Add uv environment to PATH
     export PATH="/app/.venv/bin:$PATH"
+    # mpi4py loads libmpi.so.* dynamically at runtime; an Open MPI runtime is
+    # installed inside the image so the container works standalone. On an HPC
+    # cluster you can instead use the host MPI (bind model) by launching with
+    # the host `mpirun` and bind-mounting the host MPI, e.g.:
+    #   mpirun -n <N> apptainer run \
+    #       --bind /path/to/host/openmpi/lib:/opt/host-mpi/lib \
+    #       --env LD_LIBRARY_PATH=/opt/host-mpi/lib:$LD_LIBRARY_PATH \
+    #       arco-make.sif ...
+    # (the host MPI must be ABI-compatible, i.e. also expose libmpi.so.40).
     # Point uv at the interpreter installed under /opt during %post: /app/.venv
     # only holds symlinks to it, and a location under $HOME would be hidden by
     # Apptainer's default home bind-mount, forcing uv to re-create the
