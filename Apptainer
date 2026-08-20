@@ -1,10 +1,10 @@
 Bootstrap: docker
-From: ubuntu:24.04
+From: ubuntu:26.04
 
 %labels
     Maintainer Stefano Campanella
     Version 0.1
-    Description Apptainer image for arco-make based on Ubuntu 24.04 and using uv.
+    Description Apptainer image for arco-make based on Ubuntu 26.04, using uv and Open MPI 4.1.6 (built from source with UCX and Slurm support).
 
 %files
     pyproject.toml /app/pyproject.toml
@@ -27,8 +27,26 @@ From: ubuntu:24.04
         libnetcdf-dev \
         libpng-dev \
         libopenjp2-7-dev \
-        libopenmpi-dev \
-        openmpi-bin
+        libucx-dev
+
+    # Build and install Open MPI from source with UCX and Slurm support.
+    # UCX provides high-performance transports (e.g. InfiniBand) and
+    # --with-slurm enables launching under Slurm (srun). This replaces the
+    # distribution-provided Open MPI so the version and features are pinned.
+    OPENMPI_VERSION=4.1.6
+    OPENMPI_SERIES=v4.1
+    cd /tmp
+    curl -LsSf -o openmpi.tar.gz \
+        "https://download.open-mpi.org/release/open-mpi/${OPENMPI_SERIES}/openmpi-${OPENMPI_VERSION}.tar.gz"
+    tar -xzf openmpi.tar.gz
+    cd "openmpi-${OPENMPI_VERSION}"
+    ./configure --prefix=/usr/local \
+                --with-ucx \
+                --with-slurm
+    make -j"$(nproc)"
+    make install
+    ldconfig
+    cd /tmp && rm -rf openmpi.tar.gz "openmpi-${OPENMPI_VERSION}"
 
     # Build and install ecCodes from source
     ECCODES_VERSION=2.48.0
@@ -68,8 +86,9 @@ From: ubuntu:24.04
 %environment
     # Add uv environment to PATH
     export PATH="/app/.venv/bin:$PATH"
-    # mpi4py loads libmpi.so.* dynamically at runtime; an Open MPI runtime is
-    # installed inside the image so the container works standalone. On an HPC
+    # mpi4py loads libmpi.so.* dynamically at runtime; the Open MPI 4.1.6
+    # runtime built from source (with UCX and Slurm support) is installed inside
+    # the image so the container works standalone. On an HPC
     # cluster you can instead use the host MPI (bind model) by launching with
     # the host `mpirun` and bind-mounting the host MPI, e.g.:
     #   mpirun -n <N> apptainer run \
