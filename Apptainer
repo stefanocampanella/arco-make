@@ -27,12 +27,11 @@ From: ubuntu:26.04
         libnetcdf-dev \
         libpng-dev \
         libopenjp2-7-dev \
-        libucx-dev
+        libucx-dev \
+        libhwloc-dev
 
-    # Build and install Open MPI from source with UCX and Slurm support.
-    # UCX provides high-performance transports (e.g. InfiniBand) and
-    # --with-slurm enables launching under Slurm (srun). This replaces the
-    # distribution-provided Open MPI so the version and features are pinned.
+    # Build Open MPI from source with UCX (high-performance transports, e.g.
+    # InfiniBand) and Slurm (launching via srun) support, pinning the version.
     OPENMPI_VERSION=4.1.6
     OPENMPI_SERIES=v4.1
     cd /tmp
@@ -45,6 +44,8 @@ From: ubuntu:26.04
                 --with-slurm
     make -j"$(nproc)"
     make install
+    # Register the install prefix so libmpi.so.* is found via the linker cache.
+    echo "/usr/local/lib" > /etc/ld.so.conf.d/openmpi.conf
     ldconfig
     cd /tmp && rm -rf openmpi.tar.gz "openmpi-${OPENMPI_VERSION}"
 
@@ -66,15 +67,16 @@ From: ubuntu:26.04
     make -j"$(nproc)"
     ctest -j"$(nproc)"
     make install
+    # Register the install prefix so libeccodes.so.* is found via the linker cache.
+    echo "/usr/local/lib" > /etc/ld.so.conf.d/eccodes.conf
     ldconfig
     cd /tmp && rm -rf eccodes.tar.gz eccodes-build "eccodes-${ECCODES_VERSION}-Source"
 
     # Install uv by Astral
     curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh
 
-    # Install the uv-managed Python outside of $HOME, so that Apptainer's
-    # automatic bind-mount of the home directory cannot shadow the interpreter
-    # the virtual environment symlinks to (see %environment below).
+    # Install the uv-managed Python outside $HOME so Apptainer's home
+    # bind-mount cannot shadow the interpreter the venv symlinks to.
     export UV_PYTHON_INSTALL_DIR=/opt/uv/python
 
     # Create uv environment
@@ -86,25 +88,21 @@ From: ubuntu:26.04
 %environment
     # Add uv environment to PATH
     export PATH="/app/.venv/bin:$PATH"
-    # mpi4py loads libmpi.so.* dynamically at runtime; the Open MPI 4.1.6
-    # runtime built from source (with UCX and Slurm support) is installed inside
-    # the image so the container works standalone. On an HPC
-    # cluster you can instead use the host MPI (bind model) by launching with
-    # the host `mpirun` and bind-mounting the host MPI, e.g.:
+    # Expose the in-image Open MPI 4.1.6 (see %post) so mpi4py finds libmpi.so.*
+    # at runtime and the container works standalone.
+    export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"
+    # On HPC you can instead use the host MPI (bind model), e.g.:
     #   mpirun -n <N> apptainer run \
     #       --bind /path/to/host/openmpi/lib:/opt/host-mpi/lib \
     #       --env LD_LIBRARY_PATH=/opt/host-mpi/lib:$LD_LIBRARY_PATH \
     #       arco-make.sif ...
     # (the host MPI must be ABI-compatible, i.e. also expose libmpi.so.40).
-    # Point uv at the interpreter installed under /opt during %post: /app/.venv
-    # only holds symlinks to it, and a location under $HOME would be hidden by
-    # Apptainer's default home bind-mount, forcing uv to re-create the
-    # (read-only) virtual environment at runtime.
+    # Point uv at the interpreter installed under /opt during %post; /app/.venv
+    # only holds symlinks to it (a $HOME location would be hidden by the home
+    # bind-mount, forcing uv to re-create the read-only venv at runtime).
     export UV_PYTHON_INSTALL_DIR=/opt/uv/python
-    # Everything inside the SIF is read-only, and $HOME may not be writable
-    # either (e.g. HOME=/root with --no-home). Redirect uv's cache/lock
-    # directory and the generic XDG cache to /tmp, which Apptainer always
-    # provides as a writable location. Both can be overridden by the caller.
+    # The SIF is read-only and $HOME may not be writable (e.g. --no-home), so
+    # redirect uv and XDG caches to the always-writable /tmp. Overridable.
     export UV_CACHE_DIR="${UV_CACHE_DIR:-/tmp/uv-cache}"
     export XDG_CACHE_HOME="${XDG_CACHE_HOME:-/tmp/cache}"
     
