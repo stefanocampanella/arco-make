@@ -4,7 +4,7 @@ From: ubuntu:26.04
 %labels
     Maintainer Stefano Campanella
     Version 0.1
-    Description Apptainer image for arco-make based on Ubuntu 26.04, using uv and Open MPI 4.1.6 (built from source with UCX and Slurm support).
+    Description Apptainer image for arco-make based on Ubuntu 26.04, using uv and Open MPI 4.1.6 (built from source with UCX, Slurm and external PMIx v3 support).
 
 %files
     pyproject.toml /app/pyproject.toml
@@ -28,10 +28,30 @@ From: ubuntu:26.04
         libpng-dev \
         libopenjp2-7-dev \
         libucx-dev \
-        libhwloc-dev
+        libhwloc-dev \
+        libevent-dev
+
+    # Build PMIx 3.x from source so Open MPI can launch under Slurm via the
+    # pmix_v3 plugin (srun --mpi=pmix_v3). Open MPI links against this external
+    # PMIx below, which requires external libevent and hwloc to match.
+    PMIX_VERSION=3.2.5
+    cd /tmp
+    curl -LsSf -o pmix.tar.gz \
+        "https://github.com/openpmix/openpmix/releases/download/v${PMIX_VERSION}/pmix-${PMIX_VERSION}.tar.gz"
+    tar -xzf pmix.tar.gz
+    cd "pmix-${PMIX_VERSION}"
+    ./configure --prefix=/usr/local \
+                --with-libevent \
+                --with-hwloc
+    make -j"$(nproc)"
+    make install
+    echo "/usr/local/lib" > /etc/ld.so.conf.d/pmix.conf
+    ldconfig
+    cd /tmp && rm -rf pmix.tar.gz "pmix-${PMIX_VERSION}"
 
     # Build Open MPI from source with UCX (high-performance transports, e.g.
-    # InfiniBand) and Slurm (launching via srun) support, pinning the version.
+    # InfiniBand), Slurm (launching via srun) and the external PMIx v3 above
+    # (pmix_v3), pinning the version.
     OPENMPI_VERSION=4.1.6
     OPENMPI_SERIES=v4.1
     cd /tmp
@@ -41,7 +61,10 @@ From: ubuntu:26.04
     cd "openmpi-${OPENMPI_VERSION}"
     ./configure --prefix=/usr/local \
                 --with-ucx \
-                --with-slurm
+                --with-slurm \
+                --with-pmix=/usr/local \
+                --with-libevent=external \
+                --with-hwloc=external
     make -j"$(nproc)"
     make install
     # Register the install prefix so libmpi.so.* is found via the linker cache.
