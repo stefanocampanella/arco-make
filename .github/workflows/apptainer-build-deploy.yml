@@ -34,7 +34,7 @@ jobs:
           # Use the branch name as the image tag, sanitizing characters
           # that are not allowed in OCI/registry tags (e.g. "/").
           raw_ref="${{ github.head_ref || github.ref_name }}"
-          tag="${raw_ref//\//-}"
+          tag="$(echo "$raw_ref" | tr '/' '-')"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
       - name: Login and Deploy Container
