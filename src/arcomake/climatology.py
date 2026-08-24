@@ -133,7 +133,7 @@ logger = logging.getLogger(__name__)
 )
 @click.option(
   "--skipna/--no-skipna",
-  default=False,
+  default=True,
   help="Whether to skip NaNs when averaging.",
   show_default=True,
 )
@@ -178,7 +178,7 @@ def compute_climatology(
   clevel: int = 1,
   scheduler_type: SchedulerOptionType = "mpi",
   calendar: Literal["365_day", "366_day", "360_day"] = "365_day",
-  skipna: bool = False,
+  skipna: bool = True,
   sync_step: bool = False,
   method: Literal["online", "flox"] = "online",
   should_raise: bool = False,
@@ -222,7 +222,7 @@ def compute_climatology(
       Type of Dask scheduler to use.
   calendar : {"365_day", "366_day", "360_day"}, default "365_day"
       Fixed-day calendar the dataset is converted to before binning.
-  skipna : bool, default False
+  skipna : bool, default True
       Whether to skip NaNs when averaging.
   sync_step : bool, default False
       Whether to persist the result in memory during climatology computation
