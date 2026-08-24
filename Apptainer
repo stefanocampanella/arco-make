@@ -4,7 +4,7 @@ From: ubuntu:26.04
 %labels
     Maintainer Stefano Campanella
     Version 0.1
-    Description Apptainer image for arco-make based on Ubuntu 26.04, using uv and Open MPI 4.1.6 (built from source with UCX, Slurm and external PMIx v3 support).
+    Description Apptainer image for arco-make compatible with CINECA Leonardo OpenMPI.
 
 %files
     pyproject.toml /app/pyproject.toml
@@ -114,12 +114,6 @@ From: ubuntu:26.04
     # Expose the in-image Open MPI 4.1.6 (see %post) so mpi4py finds libmpi.so.*
     # at runtime and the container works standalone.
     export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"
-    # On HPC you can instead use the host MPI (bind model), e.g.:
-    #   mpirun -n <N> apptainer run \
-    #       --bind /path/to/host/openmpi/lib:/opt/host-mpi/lib \
-    #       --env LD_LIBRARY_PATH=/opt/host-mpi/lib:$LD_LIBRARY_PATH \
-    #       arco-make.sif ...
-    # (the host MPI must be ABI-compatible, i.e. also expose libmpi.so.40).
     # Point uv at the interpreter installed under /opt during %post; /app/.venv
     # only holds symlinks to it (a $HOME location would be hidden by the home
     # bind-mount, forcing uv to re-create the read-only venv at runtime).
