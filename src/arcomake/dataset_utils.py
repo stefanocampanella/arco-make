@@ -162,6 +162,8 @@ def open_archive(path: str | pathlib.Path, time_dim: str = "time", **kwargs) -> 
   for file_path in zip_file_paths:
     with xr.open_dataset(file_path, engine="zarr", inline_array=False, **kwargs) as ds:
       for name, var in ds.data_vars.items():
+        # 'last_updated' attribute can differ across inputs, so remove it
+        var.attrs.pop('last_updated', None)
         if time_dim not in var.dims:
           if name in static_vars:
             try:
@@ -179,6 +181,9 @@ def open_archive(path: str | pathlib.Path, time_dim: str = "time", **kwargs) -> 
     if to_drop:
       # Drop only those present to avoid errors if some files lack certain static vars
       ds = ds.drop_vars(to_drop)
+    # Drop the possibly conflicting 'last_updated' attribute so that combining with
+    # combine_attrs="no_conflicts" does not fail when it differs across inputs.
+    ds.attrs.pop("last_updated", None)
     return ds
 
   ds_dynamic = xr.open_mfdataset(
