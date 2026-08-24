@@ -128,7 +128,7 @@ def open_dataset_wo_static(
   return ds
 
 
-def open_archive(path: str | pathlib.Path, time_dim: str = "time", **kwargs) -> xr.Dataset:
+def open_archive(path: str | pathlib.Path, time_dim: str = "time", attrs_to_drop: list[str] | None = None, **kwargs) -> xr.Dataset:
   """
   Open multiple zipped Zarr datasets and combine them as xarray.open_mfdataset would, with a
   specific behavior for static variables (those without the provided time dimension):
@@ -157,13 +157,17 @@ def open_archive(path: str | pathlib.Path, time_dim: str = "time", **kwargs) -> 
     raise ValueError("Provided path does not contain any .zip files.")
   logger.info(f"Reading {len(zip_file_paths)} .zip datasets from {path}")
 
+  # Drop the possibly conflicting attributes so that combining with
+  # combine_attrs="no_conflicts" does not fail when it differs across inputs.
+  attrs_to_drop: list[str] = [] if attrs_to_drop is None else attrs_to_drop
+
   # Open each dataset quickly to inspect static variables. Keep inline_array=False to avoid huge graphs.
   static_vars: dict[str, xr.DataArray] = {}
   for file_path in zip_file_paths:
     with xr.open_dataset(file_path, engine="zarr", inline_array=False, **kwargs) as ds:
       for name, var in ds.data_vars.items():
-        # 'last_updated' attribute can differ across inputs, so remove it
-        var.attrs.pop('last_updated', None)
+        for key in attrs_to_drop:
+          var.attrs.pop(key, None)
         if time_dim not in var.dims:
           if name in static_vars:
             try:
@@ -183,7 +187,8 @@ def open_archive(path: str | pathlib.Path, time_dim: str = "time", **kwargs) -> 
       ds = ds.drop_vars(to_drop)
     # Drop the possibly conflicting 'last_updated' attribute so that combining with
     # combine_attrs="no_conflicts" does not fail when it differs across inputs.
-    ds.attrs.pop("last_updated", None)
+    for key in attrs_to_drop:
+      ds.attrs.pop(key, None)
     return ds
 
   ds_dynamic = xr.open_mfdataset(

@@ -14,6 +14,7 @@ from dask.diagnostics import ProgressBar
 from arcomake.checks import ValidationError, valid_time_coordinate, validate
 from arcomake.cli_utils import (
   DictParamType,
+  ListParamType,
   check_output_path,
   read_configs,
   set_default_logger,
@@ -230,6 +231,13 @@ def download(
   help="String containing chunking specs used when reading.",
 )
 @click.option(
+  "--attrs-to-drop",
+  default=None,
+  show_default=True,
+  type=ListParamType(),
+  help="List of attributes to drop from the dataset.",
+)
+@click.option(
   "--compressor-name",
   "cname",
   default="lz4",
@@ -267,6 +275,7 @@ def unpack(
   end_datetime: datetime | None = None,
   freq: str = "1D",
   chunks: dict[str, int | Literal["auto"]] | None = None,
+  attrs_to_drop: list[str] | None = None,
   cname: str = "lz4",
   clevel: int = 1,
   overwrite: bool = False,
@@ -299,7 +308,7 @@ def unpack(
   ):
     raise ValueError("Chunk option value must be a dictionary with integer or 'auto' values")
 
-  dataset = open_archive(input_path, chunks=chunks)
+  dataset = open_archive(input_path, chunks=chunks, attrs_to_drop=attrs_to_drop)
 
   try:
     valid_time_coordinate(

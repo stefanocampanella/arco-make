@@ -92,6 +92,62 @@ class DictParamType(click.ParamType[dict[str, int | float | bool | str]]):
     return result
 
 
+class ListParamType(click.ParamType[list[int | float | bool | str]]):
+  """Click ParamType that parses lists like "foo,bar,1,2.5,true" into list[int | float | bool | str].
+
+  Rules:
+  - Comma-separated items; surrounding whitespace of each item is ignored.
+  - Values are parsed, in order, as booleans ("true"/"false", case-insensitive),
+    integers, floats, and finally strings.
+  - Empty string yields an empty list.
+
+  Example:
+    --param=foo,bar,1,2.5,true -> ["foo", "bar", 1, 2.5, True]
+  """
+
+  name = "list"
+
+  @staticmethod
+  def _parse_value(val: str) -> int | float | bool | str:
+    """Parse a string into an int, float, bool, or str (in that order)."""
+    lowered = val.lower()
+    if lowered == "true":
+      return True
+    if lowered == "false":
+      return False
+    try:
+      return int(val)
+    except ValueError:
+      pass
+    try:
+      return float(val)
+    except ValueError:
+      pass
+    return val
+
+  @override
+  def convert(self, value, param, ctx):  # type: ignore[override]
+    if isinstance(value, (list, tuple)):
+      # Assume it's already a sequence of int | float | bool | str and perform minimal validation
+      result = []
+      for v in value:
+        if not isinstance(v, (int, float, bool, str)):
+          self.fail(f"Invalid value in list: {v!r}", param, ctx)
+        result.append(v)
+      return result
+
+    if not isinstance(value, str):
+      self.fail(f"Expected string for {self.name.upper()}, got {type(value).__name__}", param, ctx)
+
+    text = value.strip()
+    # Special case: empty string is treated as empty list
+    if text == "":
+      return []
+
+    items = [p for p in (s.strip() for s in text.split(",")) if p != ""]
+    return [self._parse_value(item) for item in items]
+
+
 def check_output_path(path: pathlib.Path, overwrite: bool = False) -> None:
   # If destination exists and should not overwrite, raise and exit.
   if path.exists():
