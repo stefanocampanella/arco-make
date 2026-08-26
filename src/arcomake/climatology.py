@@ -415,6 +415,7 @@ def _online_climatology(
         # Welford's aggregated squared distance from the running mean (M2 accumulator).
         m2 = xr.zeros_like(avg)
         continue
+      shifted = shifted.where(shifted.notnull(), avg)
       # Welford's online update for mean and squared-distance accumulator.
       delta = shifted - avg
       avg = avg + delta / float(counter)
