@@ -424,8 +424,7 @@ def _online_climatology(
     if sync_step:
       avg = avg.persist() # ty: ignore
       m2 = m2.persist() # ty: ignore
-      maybe_wait(avg)
-      maybe_wait(m2)
+      maybe_wait([avg, m2], rebalance=True)
     start = end
 
   # Unbiased sample variance (normalised by n - 1).

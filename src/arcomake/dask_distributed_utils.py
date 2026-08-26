@@ -85,7 +85,7 @@ def get_client(scheduler_type: SchedulerOptionType = "threads") -> MaybeClient:
   return client
 
 
-def maybe_wait(*args, **kwargs):
+def maybe_wait(futures, rebalance=False, **kwargs):
   """
   Call ``dask.distributed.wait`` only if a distributed client is currently active.
 
@@ -109,8 +109,11 @@ def maybe_wait(*args, **kwargs):
       is active, otherwise ``None``.
   """
   try:
-    distributed.get_client()
+    client = distributed.get_client()
   except ValueError:
     # No distributed client is running; nothing to wait for.
     return None
-  return distributed.wait(*args, **kwargs)
+  result = distributed.wait(futures, **kwargs)
+  if rebalance:
+    client.rebalance(futures)
+  return result
