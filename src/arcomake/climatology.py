@@ -45,7 +45,6 @@ import click
 import dask
 import numpy as np
 import xarray as xr
-from flox.xarray import xarray_reduce
 
 from arcomake.checks import ValidationError, valid_time_coordinate
 from arcomake.cli_utils import DictParamType, check_output_path, set_default_logger
@@ -107,6 +106,13 @@ logger = logging.getLogger(__name__)
   show_default=True,
 )
 @click.option(
+  "--window",
+  default=15,
+  type=click.IntRange(min=1),
+  show_default=True,
+  help="Size in days of the centered window over which statistics are computed for each bin.",
+)
+@click.option(
   "--compressor-name",
   "cname",
   default="lz4",
@@ -132,24 +138,10 @@ logger = logging.getLogger(__name__)
   help="Fixed-day calendar the dataset is converted to before binning.",
 )
 @click.option(
-  "--skipna/--no-skipna",
-  default=True,
-  help="Whether to skip NaNs when averaging.",
-  show_default=True,
-)
-@click.option(
   "--sync-step/--no-sync-step",
   "sync_step",
   default=False,
   help="Whether to persist the result in memory during climatology computation.",
-  show_default=True,
-)
-@click.option(
-  "--method",
-  default="online",
-  type=click.Choice(["online", "flox"], case_sensitive=False),
-  help="Algorithm used to compute the climatology: Welford's online algorithm "
-  "or flox-optimized groupby reductions.",
   show_default=True,
 )
 @click.option(
@@ -174,13 +166,12 @@ def compute_climatology(
   overwrite: bool = False,
   out_chunks: dict[str, int | Literal["auto"]] | None = None,
   climatology_bin_dim: str = "dayofyear",
+  window: int = 15,
   cname: str = "lz4",
   clevel: int = 1,
   scheduler_type: SchedulerOptionType = "mpi",
   calendar: Literal["365_day", "366_day", "360_day"] = "365_day",
-  skipna: bool = True,
   sync_step: bool = False,
-  method: Literal["online", "flox"] = "online",
   should_raise: bool = False,
   log_level: str = "info",
 ):
@@ -214,6 +205,10 @@ def compute_climatology(
       Chunking specs used when writing the output dataset.
   climatology_bin_dim : str, default "dayofyear"
       Name of the binning dimension of the resulting climatology.
+  window : int, default 1
+      Size in days of the centered window over which averages and standard
+      deviation are computed for each bin. ``window=1`` computes plain per-day
+      statistics.
   cname : str, default "lz4"
       Name of the compressor used when writing the outputs.
   clevel : int, default 1
@@ -222,15 +217,8 @@ def compute_climatology(
       Type of Dask scheduler to use.
   calendar : {"365_day", "366_day", "360_day"}, default "365_day"
       Fixed-day calendar the dataset is converted to before binning.
-  skipna : bool, default True
-      Whether to skip NaNs when averaging.
   sync_step : bool, default False
-      Whether to persist the result in memory during climatology computation
-      (only used by the ``"online"`` method).
-  method : {"online", "flox"}, default "online"
-      Algorithm used to compute the climatology. ``"online"`` uses Welford's
-      online algorithm (a single streaming pass over the data), while
-      ``"flox"`` uses flox-optimized groupby reductions.
+      Whether to persist the result in memory during climatology computation.
   should_raise : bool, default False
       Whether to raise an exception if time coordinate validation fails,
       instead of emitting a warning.
@@ -305,34 +293,26 @@ def compute_climatology(
     raise ValueError(f"Invalid frequency: {freq}. Must be a multiple of {n_days} days.")
   step_size = n_days // freq.days
 
+  # Convert the window size from days to time steps.
+  if window % freq.days != 0:
+    raise ValueError(f"Invalid window: {window} days. Must be a multiple of {freq.days} days.")
+  window_size = window // freq.days
+
   # Here we handle leap years.
   # See: https://github.com/pydata/xarray/issues/1844#issuecomment-417855365
   dataset = dataset.convert_calendar(calendar)
 
-  logger.info(f"Computing {freq.days}D-climatology ({calendar=}, {skipna=}, {method=})")
-  if method == "online":
-    # Welford's online algorithm yields both the climatological mean and the
-    # unbiased sample variance of the anomalies in a single pass over the data.
-    dataset_climatology, anomaly_var = _online_climatology(
-      dataset,
-      time_dim=time_dim,
-      step_size=step_size,
-      climatology_bin_dim=climatology_bin_dim,
-      skipna=skipna,
-      sync_step=sync_step,
-    )
-  elif method == "flox":
-    # flox-optimized groupby reductions yield the climatological mean and the
-    # unbiased sample variance of the anomalies.
-    dataset_climatology, anomaly_var = _flox_climatology(
-      dataset,
-      time_dim=time_dim,
-      step_size=step_size,
-      climatology_bin_dim=climatology_bin_dim,
-      skipna=skipna,
-    )
-  else:
-    raise ValueError(f"Unsupported method: {method}")
+  logger.info(f"Computing {freq.days}D-climatology ({calendar=})")
+  # Welford's online algorithm yields both the climatological mean and the
+  # unbiased sample variance of the anomalies in a single pass over the data.
+  dataset_climatology, anomaly_var = _online_climatology(
+    dataset,
+    time_dim=time_dim,
+    step_size=step_size,
+    window=window_size,
+    climatology_bin_dim=climatology_bin_dim,
+    sync_step=sync_step,
+  )
   save_configs = {
     "compressor": {"cname": cname, "clevel": clevel},
     "chunk": out_chunks,
@@ -357,9 +337,9 @@ def compute_climatology(
 def _online_climatology(
   dataset: xr.Dataset,
   step_size: int,
+  window: int = 1,
   time_dim: str = "time",
   climatology_bin_dim: str = "dayofyear",
-  skipna=False,
   sync_step=False,
 ) -> tuple[xr.Dataset, xr.Dataset]:
   """
@@ -373,6 +353,15 @@ def _online_climatology(
   dimension is replaced by ``climatology_bin_dim``, labelled with the day of
   year of the first window.
 
+  Optionally, statistics can be computed over a ``window`` of steps centered on
+  each bin, rather than over a single bin. In that case, for each yearly window
+  and each bin, the ``window`` neighbouring steps (wrapped around the calendar
+  year) are folded into the running statistics, so that each bin aggregates the
+  values of a ``window``-step window centered on it, across all years. For
+  example, with a centered window of 15 days on daily data, the statistics of
+  the 8th of January are computed from the 1st to the 15th of January of every
+  year.
+
   Parameters
   ----------
   dataset : xr.Dataset
@@ -380,12 +369,14 @@ def _online_climatology(
       dimension.
   step_size : int
       Number of time steps in each window (i.e., per calendar year).
+  window : int, default 1
+      Number of steps of the (centered) window over which statistics are
+      computed for each bin. ``window=1`` reduces to the plain per-bin
+      climatology.
   time_dim : str, default "time"
       Name of the time dimension to average over.
   climatology_bin_dim : str, default "dayofyear"
       Name of the binning dimension replacing the time dimension in the result.
-  skipna : bool, default False
-      Whether to skip NaNs when averaging, replacing them with the running mean.
 
   Returns
   -------
@@ -396,128 +387,48 @@ def _online_climatology(
       (i.e., normalised by ``n - 1``).
   """
   size = dataset.sizes[time_dim]
-  start = 0
-  end = min(step_size, size)
-  counter = 1
+  bins = 1 + np.arange(step_size, dtype=int)
+  # Offsets of a `window`-step window centered on each bin.
+  half = window // 2
+  offsets = range(-half, window - half)
   dataset = dataset.assign_coords({climatology_bin_dim: dataset[time_dim].dt.dayofyear})
-  avg = dataset.isel({time_dim: slice(start, end)})
-  avg = avg.drop_vars(time_dim)
-  avg = avg.swap_dims({time_dim: climatology_bin_dim})
-  avg = avg.reindex({climatology_bin_dim: 1 + np.arange(step_size, dtype=int)}, copy=False)
-  # Welford's aggregated squared distance from the running mean (M2 accumulator).
-  m2 = xr.zeros_like(avg)
-  while True:
-    start = end
+
+  avg = None
+  m2 = None
+  counter = 0
+  start = 0
+
+  while start < size:
     end = min(start + step_size, size)
-    if start < size:
+    value = dataset.isel({time_dim: slice(start, end)})
+    value = value.drop_vars(time_dim)
+    value = value.swap_dims({time_dim: climatology_bin_dim})
+    value = value.reindex({climatology_bin_dim: bins}, copy=False)
+    # Inner loop over the steps of the window centered on each bin. Each offset
+    # contributes the value `offset` steps away (wrapped around the year), so
+    # that every bin aggregates a `window`-step window centered on it.
+    for offset in offsets:
+      shifted = value.roll({climatology_bin_dim: -offset}, roll_coords=False)
       counter += 1
-      value = dataset.isel({time_dim: slice(start, end)})
-      value = value.drop_vars(time_dim)
-      value = value.swap_dims({time_dim: climatology_bin_dim})
-      if skipna:
-        value = value.reindex(
-          {climatology_bin_dim: 1 + np.arange(step_size, dtype=int)}, copy=False
-        )
-        value = value.where(value.notnull(), avg)
+      if avg is None:
+        avg = shifted
+        # Welford's aggregated squared distance from the running mean (M2 accumulator).
+        m2 = xr.zeros_like(avg)
+        continue
       # Welford's online update for mean and squared-distance accumulator.
-      delta = value - avg
-      avg += delta / float(counter)
-      delta2 = value - avg
-      m2 += delta * delta2
-      if sync_step:
-        avg = avg.persist()
-        m2 = m2.persist()
-        maybe_wait(avg)
-        maybe_wait(m2)
-    else:
-      break
+      delta = shifted - avg
+      avg = avg + delta / float(counter)
+      delta2 = shifted - avg
+      m2 = m2 + delta * delta2 # ty: ignore
+    if sync_step:
+      avg = avg.persist() # ty: ignore
+      m2 = m2.persist() # ty: ignore
+      maybe_wait(avg)
+      maybe_wait(m2)
+    start = end
 
   # Unbiased sample variance (normalised by n - 1).
   # noinspection PyTypeChecker
-  variance: xr.Dataset = m2 / float(counter - 1)
+  variance: xr.Dataset = m2 / float(counter - 1) # ty: ignore
 
-  return avg, variance
-
-
-def _flox_climatology(
-  dataset: xr.Dataset,
-  step_size: int,
-  time_dim: str = "time",
-  climatology_bin_dim: str = "dayofyear",
-  skipna: bool = False,
-) -> tuple[xr.Dataset, xr.Dataset]:
-  """
-  Compute the climatology and anomaly variance using flox groupby reductions.
-
-  The dataset is grouped along the time dimension by the position of each time
-  step within its calendar year (one group per calendar year, given a fixed-day
-  calendar), and the groups are reduced with the flox-optimized ``mean`` and
-  ``var`` (with ``ddof=1``) aggregations. This yields both the climatological
-  average across windows and the unbiased sample variance of the anomalies. The
-  time dimension is replaced by ``climatology_bin_dim``, labelled with the day
-  of year of the first window.
-
-  Parameters
-  ----------
-  dataset : xr.Dataset
-      Input dataset, assumed to be sorted and uniformly spaced along the time
-      dimension.
-  step_size : int
-      Number of time steps in each window (i.e., per calendar year).
-  time_dim : str, default "time"
-      Name of the time dimension to group by.
-  climatology_bin_dim : str, default "dayofyear"
-      Name of the binning dimension replacing the time dimension in the result.
-  skipna : bool, default False
-      Whether to skip NaNs when averaging.
-
-  Returns
-  -------
-  tuple[xr.Dataset, xr.Dataset]
-      A pair ``(mean, variance)``, each of size ``step_size`` along
-      ``climatology_bin_dim``. ``mean`` is the climatological average across
-      windows and ``variance`` is the unbiased sample variance across windows
-      (i.e., normalised by ``n - 1``).
-  """
-  size = dataset.sizes[time_dim]
-  # Position of each time step within its calendar year (0-based). Given a
-  # fixed-day calendar and uniformly spaced time steps, this identifies the
-  # window (calendar year) each time step belongs to.
-  labels = xr.DataArray(
-    np.arange(size, dtype=int) % step_size,
-    dims=time_dim,
-    name=climatology_bin_dim,
-  )
-  expected_groups = np.arange(step_size, dtype=int)
-
-  # Day of year of the first window, used to label the resulting bins so that
-  # the output matches the one produced by ``_online_climatology``.
-  first_window_doy = dataset[time_dim].dt.dayofyear.isel({time_dim: slice(0, step_size)}).values
-
-  avg = xarray_reduce(
-    dataset,
-    labels,
-    func="mean",
-    expected_groups=expected_groups,
-    method="cohorts",
-    engine="flox",
-    skipna=skipna,
-    keep_attrs=True,
-  )
-  # Unbiased sample variance (normalised by n - 1).
-  variance = xarray_reduce(
-    dataset,
-    labels,
-    func="var",
-    expected_groups=expected_groups,
-    skipna=skipna,
-    method="cohorts",
-    engine="flox",
-    ddof=1,
-    keep_attrs=True,
-  )
-
-  avg = avg.assign_coords({climatology_bin_dim: first_window_doy})
-  variance = variance.assign_coords({climatology_bin_dim: first_window_doy})
-
-  return avg, variance
+  return avg, variance # ty: ignore
