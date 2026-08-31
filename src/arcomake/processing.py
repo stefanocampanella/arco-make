@@ -126,7 +126,7 @@ def gaussian_blur_extrapolate(
   data_vars = {}
   for var, da in ds.data_vars.items():
     if var in variables:
-      data_vars[var] = da.map_blocks(gauss_fill_nan, template=da)
+      data_vars[var] = da.map_blocks(gauss_fill_nan, template=da).assign_attrs(da.attrs)
     else:
       data_vars[var] = da
     ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
@@ -211,7 +211,7 @@ def masked_fill(
       _fill_value = (
         ds[_fill_name_or_value] if isinstance(_fill_name_or_value, str) else _fill_name_or_value
       )
-      data_vars[var] = xr.where(da.isnull() & _mask, _fill_value, da)
+      data_vars[var] = xr.where(da.notnull() | ~_mask, da, _fill_value, keep_attrs='override')
     else:
       data_vars[var] = da
   ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
