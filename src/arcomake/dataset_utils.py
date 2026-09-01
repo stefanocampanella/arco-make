@@ -40,6 +40,8 @@ def open_dataset(
     part = xr.open_dataset(**part_conf)
     part = part.arcomake.time_sel(start_datetime, end_datetime)
     parts.append(part)
+  if not parts:
+    raise ValueError("No parts found in the dataset configuration")
   dataset: xr.Dataset = xr.merge(parts, join="exact")
   dataset = process(dataset=dataset, steps=configs.get("postprocess", []))
   return dataset
