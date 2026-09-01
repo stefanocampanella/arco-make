@@ -128,7 +128,9 @@ def open_dataset_wo_static(
   return ds
 
 
-def open_archive(path: str | pathlib.Path, time_dim: str = "time", attrs_to_drop: list[str] | None = None, **kwargs) -> xr.Dataset:
+def open_archive(
+  path: str | pathlib.Path, time_dim: str = "time", attrs_to_drop: list[str] | None = None, **kwargs
+) -> xr.Dataset:
   """
   Open multiple zipped Zarr datasets and combine them as xarray.open_mfdataset would, with a
   specific behavior for static variables (those without the provided time dimension):

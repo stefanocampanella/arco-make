@@ -181,7 +181,9 @@ class EarlyWarningDataStore(BackendEntrypoint):
         f"Possibly invalid EWDS URL: {filename_or_obj}. Ignoring path, query and fragment"
       )
     dataset_name = url.netloc
-    if any(arg is None for arg in [system_version, hydrological_model, product_type, timespan, variable]):
+    if any(
+      arg is None for arg in [system_version, hydrological_model, product_type, timespan, variable]
+    ):
       raise ValueError("Missing required argument.")
     if start_datetime is None or end_datetime is None:
       raise ValueError("Missing required argument.")
