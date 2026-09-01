@@ -159,7 +159,9 @@ def download(
           dataset_conf, start_datetime, end_datetime, time_dim=time_dim
         )
       )
-    dataset: xr.Dataset = xr.merge(datasets, join="exact", compat="no_conflicts")
+    dataset: xr.Dataset = xr.merge(
+      datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
+    )
 
     # Postprocess the merged dataset (e.g., apply masks)
     if postprocess_conf := configs.pop("postprocess", []):

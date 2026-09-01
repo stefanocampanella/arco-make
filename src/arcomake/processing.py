@@ -70,6 +70,13 @@ def apply_mask(
   return ds
 
 
+def assign_var_attrs(ds: xr.Dataset, **kwargs) -> xr.Dataset:
+  ds = ds.copy(deep=False)
+  for key, attrs in kwargs.items():
+    ds[key].attrs = attrs
+  return ds
+
+
 # TODO: document astype behaviour
 def astype(
   ds: xr.Dataset,
@@ -98,6 +105,13 @@ def clip_negative(ds: xr.Dataset, variables: Sequence[str]):
     else:
       data_vars[var] = da
   ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
+  return ds
+
+
+def drop_var_attrs(ds: xr.Dataset, variables: Sequence[str]) -> xr.Dataset:
+  ds = ds.copy(deep=False)
+  for key in variables:
+    ds[key] = ds[key].drop_attrs()
   return ds
 
 
@@ -211,7 +225,7 @@ def masked_fill(
       _fill_value = (
         ds[_fill_name_or_value] if isinstance(_fill_name_or_value, str) else _fill_name_or_value
       )
-      data_vars[var] = xr.where(da.notnull() | ~_mask, da, _fill_value, keep_attrs='override')
+      data_vars[var] = xr.where(da.notnull() | ~_mask, da, _fill_value, keep_attrs="override")
     else:
       data_vars[var] = da
   ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
@@ -301,11 +315,11 @@ def resample(ds: xr.Dataset, reduce: str, **kwargs) -> xr.Dataset:
   return ds
 
 
-def rescale(ds: xr.Dataset, values: dict[str, Number]) -> xr.Dataset:
+def rescale(ds: xr.Dataset, **kwargs) -> xr.Dataset:
   data_vars = {}
   for var, da in ds.data_vars.items():
-    if var in values:
-      data_vars[var] = values[var] * da  # type: ignore
+    if var in kwargs:
+      data_vars[var] = kwargs[var] * da  # type: ignore
     else:
       data_vars[var] = da
   ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
