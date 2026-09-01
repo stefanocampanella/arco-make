@@ -5,6 +5,7 @@ import pathlib
 import tempfile
 import warnings
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, override
 from urllib.parse import urlparse
 from zipfile import ZipFile
@@ -187,12 +188,11 @@ class EarlyWarningDataStore(BackendEntrypoint):
       raise ValueError("Missing required argument.")
     if start_datetime is None or end_datetime is None:
       raise ValueError("Missing required argument.")
-    logger.info(f"Downloading {dataset_name} from EWDS")
-    datasets = []
     consecutive_dates = self._consecutive_dates_with_same_month_or_year(
       start_datetime, end_datetime
     )
-    for dates in consecutive_dates:
+
+    def _get_dataset_from_dates(dates: list[datetime.datetime]) -> xr.Dataset:
       request = {
         "system_version": [system_version],
         "hydrological_model": [hydrological_model],
@@ -205,6 +205,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
         "data_format": "grib2",
         "download_format": "zip",
       }
+
       dataset = self._process_request(dataset_name, request)
       # TODO:
       #  Unfortunately, it was impossible to get documentation on `valid_time` for historical GLOFAS data, hence
@@ -219,11 +220,15 @@ class EarlyWarningDataStore(BackendEntrypoint):
       if len(dates) == 1:
         dataset = dataset.expand_dims(dim=time_dim, axis=0)
         dataset = dataset.assign_coords(time=dates)
-      datasets.append(dataset)
-    with xr.concat(datasets, dim=time_dim) as dataset:
-      # The dataset must be loaded in memory, since the temporary directory will be deleted with all the NetCDFs within it.
-      # However, ds should be rather small. Hence, there should be no need to lazily load the dataset.
-      return dataset.compute()
+      return dataset
+
+    with ThreadPoolExecutor() as executor:
+      logger.info(f"Downloading {dataset_name} from EWDS using {executor._max_workers} threads")
+      datasets = executor.map(_get_dataset_from_dates, consecutive_dates)
+      with xr.concat(datasets, dim=time_dim) as dataset:
+        # The dataset must be loaded in memory, since the temporary directory will be deleted with all the NetCDFs within it.
+        # However, ds should be rather small. Hence, there should be no need to lazily load the dataset.
+        return dataset.compute()
 
   @staticmethod
   def _consecutive_dates_with_same_month_or_year(
