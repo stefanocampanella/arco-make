@@ -4,8 +4,9 @@ import click
 
 import arcomake.xarray_accessors  # noqa: F401
 from arcomake.climatology import compute_climatology
-from arcomake.dataset import download, unpack
+from arcomake.download import download
 from arcomake.stats import compute_stats
+from arcomake.unpack import unpack
 
 
 @click.group()
