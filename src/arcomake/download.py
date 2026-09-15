@@ -10,7 +10,7 @@ import click
 import xarray as xr
 from dask.diagnostics import ProgressBar
 
-from arcomake.checks import validate
+from arcomake.checks import ValidationError, validate
 from arcomake.cli_utils import (
   check_output_path,
   read_configs,
@@ -124,7 +124,7 @@ def download(
     )
 
   # Open the configuration file and load the TOML configs.
-  configs = read_configs(config_path)
+  configs = read_configs(config_path, schema_name="download_config")
 
   # Update start_datetime and end_datetime based on CLI arguments
   start_datetime = start_datetime or configs["start"]
@@ -134,7 +134,7 @@ def download(
     or not isinstance(end_datetime, datetime)
     or start_datetime > end_datetime
   ):
-    raise ValueError(
+    raise click.ClickException(
       "start_datetime and end_datetime must be datetime objects, and end_datetime must be after start_datetime"
     )
   logger.info(f"Downloading data from {start_datetime} to {end_datetime}")
@@ -175,6 +175,11 @@ def download(
     # Clean up
     store.close()
     dataset.close()
+  except Exception as exc:
+    logger.exception("An error occurred during download")
+    raise click.ClickException(
+      f"An error occurred during download ({type(exc).__name__}). Aborting."
+    ) from exc
   finally:
     # Clean up temporary files
     for source_dataset in datasets:
@@ -183,12 +188,15 @@ def download(
   # Validate the dataset
   if checks := configs.get("checks", {}):
     with xr.open_dataset(output_path, engine="zarr") as dataset:
-      validate(
-        dataset=dataset,
-        checks=checks,
-        start_datetime=start_datetime,
-        end_datetime=end_datetime,
-        should_raise=should_raise,
-      )
+      try:
+        validate(
+          dataset=dataset,
+          checks=checks,
+          start_datetime=start_datetime,
+          end_datetime=end_datetime,
+          should_raise=should_raise,
+        )
+      except ValidationError as exc:
+        raise click.ClickException(f"Validation failed: {exc}") from exc
 
   client.close()

@@ -17,6 +17,7 @@ dependencies = [
     "gcsfs",
     "google-cloud-storage",
     "h5netcdf",
+    "jsonschema",
     "matplotlib",
     "mpi4py",
     "nc-time-axis",
