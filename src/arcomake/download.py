@@ -61,7 +61,7 @@ def bar(progress):
 @click.argument(
   "output_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, file_okay=False, writable=True),
+  type=click.Path(path_type=pathlib.Path, resolve_path=True, writable=True),
 )
 @click.option(
   "--start",
