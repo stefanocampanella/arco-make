@@ -4,24 +4,188 @@ import datetime
 import logging
 import pathlib
 import tempfile
-from typing import Any
+from collections.abc import Hashable, Iterable, Mapping
+from typing import Any, Literal
 
 import xarray as xr
 from dask.delayed import Delayed
 from numcodecs import Blosc
+from pydantic import BaseModel, ConfigDict, Field
+from xarray.backends.common import BackendEntrypoint
+from xarray.coders import CFDatetimeCoder, CFTimedeltaCoder
 from zarr.storage import DirectoryStore, ZipStore
 
 from arcomake.datetime_utils import (
   IterableDateInterval,
   may_parse_timedelta,
 )
-from arcomake.processing import process
+from arcomake.processing import ProcessingStepConfig, process
 
 logger = logging.getLogger(__name__)
 
 
+EngineType = (
+  Literal["netcdf4", "scipy", "pydap", "h5netcdf", "zarr"] | type[BackendEntrypoint] | str
+)
+
+
+ChunksConfig = (
+  int | str | dict[Hashable, int | Literal["auto"] | tuple[int, ...] | None] | tuple[int, ...]
+)
+
+
+class ReadConfig(BaseModel):
+  model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+
+  engine: EngineType | None = None
+  chunks: ChunksConfig | None = None
+  cache: bool | None = None
+  decode_cf: bool | None = None
+  mask_and_scale: bool | Mapping[str, bool] | None = None
+  decode_times: bool | CFDatetimeCoder | Mapping[str, bool | CFDatetimeCoder] | None = None
+  decode_timedelta: bool | CFTimedeltaCoder | Mapping[str, bool | CFTimedeltaCoder] | None = None
+  use_cftime: bool | Mapping[str, bool] | None = None
+  concat_characters: bool | Mapping[str, bool] | None = None
+  decode_coords: Literal["coordinates", "all"] | bool | None = None
+  drop_variables: str | Iterable[str] | None = None
+  create_default_indexes: bool = True
+  inline_array: bool = False
+  chunked_array_type: str | None = None
+  from_array_kwargs: dict[str, Any] | None = None
+  backend_kwargs: dict[str, Any] | None = None
+
+  # @model_validator(mode="after")
+  # def validate_chunks(self) -> Self:
+  #   if (
+  #     self.chunks is not None
+  #     and isinstance(self.chunks, dict)
+  #     and not all(isinstance(value, int) or value == "auto" for value in self.chunks.values())
+  #   ):
+  #     raise ValueError("Chunk option value must be a dictionary with integer or 'auto' values")
+  #   return self
+
+
+class CompressorConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  cname: Literal["lz4", "lz4hc", "zstd", "zlib", "snappy"]
+  clevel: int = Field(ge=0, le=9)
+  shuffle: Literal[0, 1, 2] | None = None
+  blocksize: int | None = Field(default=None, ge=0)
+
+
+class CopernicusMarinePartConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  filename_or_obj: str
+  engine: Literal["copernicusmarine"] | None = "copernicusmarine"
+  variables: str | list[str] | None = None
+  drop_variables: str | list[str] | None = None
+  dataset_version: str | None = None
+  dataset_part: str | None = None
+  service: str | None = None
+  start_datetime: datetime.datetime | str | None = None
+  end_datetime: datetime.datetime | str | None = None
+  chunks: ChunksConfig | None = None
+  storage_options: dict[str, Any] | None = None
+
+
+class NetCDFOverHTTPPartConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  filename_or_obj: str
+  engine: Literal["netcdfoverhttp"] | None = "netcdfoverhttp"
+  drop_variables: str | list[str] | None = None
+  chunks: ChunksConfig | None = None
+
+
+class EarlyWarningDataStorePartConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  filename_or_obj: str
+  engine: Literal["earlywarningdatastore"] | None = "earlywarningdatastore"
+  system_version: str | None = None
+  hydrological_model: str | None = None
+  product_type: str | None = None
+  timespan: str | None = None
+  variable: str | list[str] | None = None
+  variables: str | list[str] | None = None
+  drop_variables: str | list[str] | None = None
+  start_datetime: datetime.datetime | str | None = None
+  end_datetime: datetime.datetime | str | None = None
+  time_dim: str | None = None
+  latitude_dim: str | None = None
+  longitude_dim: str | None = None
+  chunks: ChunksConfig | None = None
+
+
+class ZarrPartConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  filename_or_obj: str
+  engine: Literal["zarr"] | None = "zarr"
+  consolidated: bool | None = None
+  storage_options: dict[str, Any] | None = None
+  chunks: ChunksConfig | None = None
+  drop_variables: str | list[str] | None = None
+
+
+class GenericPartConfig(BaseModel):
+  model_config = ConfigDict(extra="allow")
+
+  filename_or_obj: str
+  engine: str | None = None
+  chunks: ChunksConfig | None = None
+  drop_variables: str | list[str] | None = None
+
+
+DatasetPartConfig = (
+  CopernicusMarinePartConfig
+  | NetCDFOverHTTPPartConfig
+  | EarlyWarningDataStorePartConfig
+  | ZarrPartConfig
+  | GenericPartConfig
+)
+
+
+class CheckpointingConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  step: str | None = None
+  compressor: CompressorConfig | None = None
+
+
+class DatasetConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  skip: bool = False
+  checkpointing: CheckpointingConfig | None = None
+  parts: list[DatasetPartConfig] = Field(default_factory=list)
+  postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
+
+
+class VariableEncodingConfig(BaseModel):
+  model_config = ConfigDict(extra="allow")
+
+  units: str | None = None
+  calendar: str | None = None
+  dtype: str | None = None
+  chunks: list[int] | None = None
+  compressor: CompressorConfig | None = None
+  fill_value: float | int | str | bool | None = None
+
+
+class SaveConfig(BaseModel):
+  model_config = ConfigDict(extra="allow")
+
+  consolidated: bool | None = None
+  chunks: ChunksConfig | None = None
+  compressor: CompressorConfig | None = None
+  encoding: dict[str, VariableEncodingConfig] | None = None
+
+
 def open_dataset(
-  configs: dict[str, Any],
+  configs: DatasetConfig,
   start_datetime: datetime.datetime,
   end_datetime: datetime.datetime,
 ) -> xr.Dataset:
@@ -33,8 +197,9 @@ def open_dataset(
   # which needs to be downloaded one piece at a time. Hence, `parts` list in the TOML configuration file
   # represents different pieces of the same dataset.
   parts = []
-  for part_conf in configs.get("parts", []):
-    engine = part_conf.get("engine")
+  for raw_part in configs.parts:
+    part_conf = raw_part.model_dump(exclude_unset=True)
+    engine = getattr(raw_part, "engine", None) or part_conf.get("engine")
     if engine == "earlywarningdatastore" or engine == "copernicusmarine":
       part_conf.update(start_datetime=start_datetime, end_datetime=end_datetime)
     part = xr.open_dataset(**part_conf)
@@ -43,31 +208,34 @@ def open_dataset(
   if not parts:
     raise ValueError("No parts found in the dataset configuration")
   dataset: xr.Dataset = xr.merge(parts, join="exact")
-  dataset = process(dataset=dataset, steps=configs.get("postprocess", []))
+  if configs.postprocess:
+    dataset = process(dataset=dataset, steps=configs.postprocess)
   return dataset
 
 
 def maybe_checkpointing_open_dataset(
-  configs: dict[str, Any],
+  configs: DatasetConfig,
   start_datetime: datetime.datetime,
   end_datetime: datetime.datetime,
   time_dim: str = "time",
 ) -> xr.Dataset:
-  checkpointing_conf = configs.get("checkpointing", {})
-  checkpointing_step = checkpointing_conf.get("step")
+  checkpointing_conf = configs.checkpointing
+  checkpointing_step = checkpointing_conf.step if checkpointing_conf else None
+  compressor_conf = checkpointing_conf.compressor if checkpointing_conf else None
+  compressor = (
+    Blosc(**compressor_conf.model_dump(exclude_none=True)) if compressor_conf is not None else None
+  )
+
   if checkpointing_step is None:
     return open_dataset(configs, start_datetime, end_datetime)
-  checkpointing_step = may_parse_timedelta(checkpointing_step)
-  if checkpointing_step >= end_datetime - start_datetime:
+  parsed_step = may_parse_timedelta(checkpointing_step)
+  if parsed_step >= end_datetime - start_datetime:
     return open_dataset(configs, start_datetime, end_datetime)
 
-  compressor_conf = checkpointing_conf.get("compressor")
-  compressor = None if compressor_conf is None else Blosc(**compressor_conf)
-
   checkpoint = tempfile.TemporaryDirectory(suffix=".zarr", delete=False)
-  logger.info(f"Checkpointing to {checkpoint.name} every {checkpointing_step}")
+  logger.info(f"Checkpointing to {checkpoint.name} every {parsed_step}")
   checkpoint_store = DirectoryStore(checkpoint.name)
-  date_intervals = IterableDateInterval(start_datetime, end_datetime, checkpointing_step)
+  date_intervals = IterableDateInterval(start_datetime, end_datetime, parsed_step)
   is_first_checkpoint = True
   for date_interval in date_intervals:
     with open_dataset(configs, date_interval.start, date_interval.end) as dataset:
@@ -83,9 +251,7 @@ def maybe_checkpointing_open_dataset(
 
   # Open the checkpointed dataset, set the close function to remove the temporary directory when done
   logger.info(f"Opening checkpointed dataset from {checkpoint.name}")
-  dataset = xr.open_zarr(
-    store=checkpoint_store, overwrite_encoded_chunks=True, chunks=configs.get("chunks")
-  )
+  dataset = xr.open_zarr(store=checkpoint_store, overwrite_encoded_chunks=True)
   dataset.set_close(checkpoint.cleanup)
   return dataset
 
@@ -219,13 +385,22 @@ def open_archive(
 def save_to_zarr(
   dataset: xr.Dataset,
   path: pathlib.Path,
-  configs: dict[str, Any],
-  compute=True,
+  configs: SaveConfig | None = None,
+  compute: bool = True,
 ) -> xr.backends.ZarrStore | Delayed:
+  if configs is None:
+    configs = SaveConfig()
+
   logger.info(f"Saving dataset to {path} with {configs}")
-  # Copy configs before popping elements out of it as, for example, so that save_to_zarr can be called multiple times.
-  configs = configs.copy()
-  if rechunk_conf := configs.pop("chunk", {}):
+  rechunk_conf = configs.chunks
+  compressor = (
+    Blosc(**configs.compressor.model_dump(exclude_none=True))
+    if configs.compressor is not None
+    else None
+  )
+  to_zarr_kwargs = configs.model_dump(exclude_none=True, exclude={"chunk", "compressor"})
+
+  if rechunk_conf:
     # Set the on-disk Zarr chunk layout via encoding, without altering the
     # underlying Dask chunking. This requires the existing Dask chunks to be
     # an integer multiple of (and evenly divide into) the requested chunks
@@ -233,21 +408,28 @@ def save_to_zarr(
     # see: https://github.com/pydata/xarray/issues/4380
     for var in dataset.data_vars:
       dims = dataset[var].dims
-      chunk_sizes = tuple(
-        rechunk_conf[dim] if dim in rechunk_conf else dataset[var].sizes[dim] for dim in dims
-      )
+      if isinstance(rechunk_conf, dict):
+        chunk_sizes = tuple(
+          rechunk_conf[dim] if dim in rechunk_conf else dataset[var].sizes[dim] for dim in dims
+        )
+      elif isinstance(rechunk_conf, tuple):
+        chunk_sizes = rechunk_conf
+      else:
+        chunk_sizes = tuple(rechunk_conf for _ in dims)
       dataset[var].encoding["chunks"] = chunk_sizes
-  if compressor_conf := configs.pop("compressor", {}):
-    for var in dataset.data_vars:
-      dataset[var].encoding["compressor"] = Blosc(**compressor_conf)
-  else:
-    for var in dataset.data_vars:
-      dataset[var].encoding["compressor"] = None
+  for var in dataset.data_vars:
+    dataset[var].encoding["compressor"] = compressor
+
+  if "encoding" in to_zarr_kwargs and isinstance(to_zarr_kwargs["encoding"], dict):
+    for var_enc in to_zarr_kwargs["encoding"].values():
+      if isinstance(var_enc, dict) and isinstance(var_enc.get("compressor"), dict):
+        var_enc["compressor"] = Blosc(**var_enc["compressor"])
+
   if path.suffix == ".zip":
     # Notice that parallel writes to Zarr using zip store are (apparently) not supported.
     store = ZipStore(path=str(path), mode="w", compression=0, allowZip64=True)
   else:
     store = DirectoryStore(path=str(path))
-  xarray_zarr_store = dataset.to_zarr(store=store, compute=compute, mode="w", **configs)
+  xarray_zarr_store = dataset.to_zarr(store=store, compute=compute, mode="w", **to_zarr_kwargs)
   xarray_zarr_store._close_store_on_close = True
   return xarray_zarr_store

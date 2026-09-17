@@ -7,6 +7,7 @@ from arcomake.climatology import compute_climatology
 from arcomake.download import download
 from arcomake.stats import compute_stats
 from arcomake.unpack import unpack
+from arcomake.validate import validate
 
 
 @click.group()
@@ -18,6 +19,7 @@ cli.add_command(download)
 cli.add_command(unpack)
 cli.add_command(compute_stats)
 cli.add_command(compute_climatology)
+cli.add_command(validate)
 
 if __name__ == "__main__":
   cli()

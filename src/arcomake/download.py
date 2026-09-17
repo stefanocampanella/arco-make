@@ -4,13 +4,13 @@ import logging
 import pathlib
 from contextlib import nullcontext
 from datetime import datetime
-from typing import get_args
+from typing import Self, get_args
 
 import click
 import xarray as xr
 from dask.diagnostics import ProgressBar
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from arcomake.checks import ValidationError, validate
 from arcomake.cli_utils import (
   check_output_path,
   read_configs,
@@ -18,12 +18,31 @@ from arcomake.cli_utils import (
 )
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import (
+  DatasetConfig,
+  SaveConfig,
   maybe_checkpointing_open_dataset,
   save_to_zarr,
 )
-from arcomake.processing import process
+from arcomake.processing import ProcessingStepConfig, process
 
 logger = logging.getLogger(__name__)
+
+
+class DownloadConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  time_dim: str = "time"
+  start: datetime
+  end: datetime
+  datasets: dict[str, DatasetConfig]
+  postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
+  save: SaveConfig
+
+  @model_validator(mode="after")
+  def validate_date_range(self) -> Self:
+    if self.start > self.end:
+      raise ValueError("start datetime must be before or equal to end datetime")
+    return self
 
 
 def bar(progress):
@@ -37,12 +56,12 @@ def bar(progress):
 @click.argument(
   "config_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, file_okay=True, readable=True),
+  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True, dir_okay=False),
 )
 @click.argument(
   "output_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, dir_okay=True, writable=True),
+  type=click.Path(path_type=pathlib.Path, resolve_path=True, file_okay=False, writable=True),
 )
 @click.option(
   "--start",
@@ -64,14 +83,6 @@ def bar(progress):
   default=False,
   is_flag=True,
 )
-@click.option(
-  "--raise/--no-raise",
-  "should_raise",
-  help="Whether to raise an exception if validation fails",
-  default=True,
-  is_flag=True,
-)
-@click.option("--time-dim", help="Time dimension name used in the input dataset", default="time")
 @click.option(
   "--log-level",
   default="info",
@@ -99,8 +110,6 @@ def download(
   start_datetime: datetime | None = None,
   end_datetime: datetime | None = None,
   overwrite: bool = False,
-  should_raise: bool = True,
-  time_dim: str = "time",
   log_level: str = "info",
   scheduler_type: SchedulerOptionType = "threads",
   progress: bool = False,
@@ -123,80 +132,63 @@ def download(
       "Please use 'threads' or 'synchronous' instead."
     )
 
-  # Open the configuration file and load the TOML configs.
-  configs = read_configs(config_path, schema_name="download_config")
-
-  # Update start_datetime and end_datetime based on CLI arguments
-  start_datetime = start_datetime or configs["start"]
-  end_datetime = end_datetime or configs["end"]
-  if (
-    not isinstance(start_datetime, datetime)
-    or not isinstance(end_datetime, datetime)
-    or start_datetime > end_datetime
-  ):
-    raise click.ClickException(
-      "start_datetime and end_datetime must be datetime objects, and end_datetime must be after start_datetime"
-    )
-  logger.info(f"Downloading data from {start_datetime} to {end_datetime}")
+  # Read configs and inject start and end time.
+  update_time_interval = {}
+  if start_datetime is not None:
+    update_time_interval["start"] = start_datetime
+  if end_datetime is not None:
+    update_time_interval["end"] = end_datetime
+  configs = read_configs(config_path, inject=update_time_interval, schema=DownloadConfig)
 
   # Check if the output path exists.
   check_output_path(output_path, overwrite=overwrite)
 
-  # Download and postprocess each dataset, possibly using checkpointing to disk
-  datasets = []
+  # Download and postprocess each dataset, possibly using checkpointing to disk.
+  logger.info(f"Downloading data from {configs.start} to {configs.end}")
+  dataset = xr.Dataset()
+  datasets: list[xr.Dataset] = []
+  store = None
   try:
-    for dataset_name, dataset_conf in configs.get("datasets", {}).items():
-      if dataset_conf.get("skip", False) is True:
+    for dataset_name, dataset_conf in configs.datasets.items():
+      if dataset_conf.skip:
         logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
         continue
       logger.info(f"Downloading {dataset_name}")
       datasets.append(
         maybe_checkpointing_open_dataset(
-          dataset_conf, start_datetime, end_datetime, time_dim=time_dim
+          dataset_conf,
+          configs.start,
+          configs.end,
+          time_dim=configs.time_dim,
         )
       )
-    dataset: xr.Dataset = xr.merge(
-      datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
-    )
+    dataset = xr.merge(datasets, join="exact", compat="no_conflicts", combine_attrs="identical")
 
-    # Postprocess the merged dataset (e.g., apply masks)
-    if postprocess_conf := configs.get("postprocess", []):
-      dataset = process(dataset=dataset, steps=postprocess_conf)
+    # Postprocess the merged dataset
+    if configs.postprocess:
+      dataset = process(
+        dataset=dataset,
+        steps=configs.postprocess,
+      )
 
     # Save the dataset in a Zarr using sensible chunking and compression
     with bar(progress):
       store = save_to_zarr(
         dataset=dataset,
         path=output_path,
-        configs=configs.get("save", {}),
+        configs=configs.save,
         compute=True,
       )
-
-    # Clean up
-    store.close()
-    dataset.close()
   except Exception as exc:
     logger.exception("An error occurred during download")
-    raise click.ClickException(
-      f"An error occurred during download ({type(exc).__name__}). Aborting."
-    ) from exc
+    raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
   finally:
+    # Close dataset and store
+    dataset.close()
+    if hasattr(store, "close"):
+      store.close()
     # Clean up temporary files
     for source_dataset in datasets:
       source_dataset.close()
-
-  # Validate the dataset
-  if checks := configs.get("checks", {}):
-    with xr.open_dataset(output_path, engine="zarr") as dataset:
-      try:
-        validate(
-          dataset=dataset,
-          checks=checks,
-          start_datetime=start_datetime,
-          end_datetime=end_datetime,
-          should_raise=should_raise,
-        )
-      except ValidationError as exc:
-        raise click.ClickException(f"Validation failed: {exc}") from exc
 
   client.close()

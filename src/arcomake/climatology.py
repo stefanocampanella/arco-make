@@ -38,89 +38,81 @@
 # features in a deep-learning model, and therefore such approximations are reasonably acceptable.
 import logging
 import pathlib
-import warnings
 from typing import Literal, get_args
 
 import click
 import dask
 import numpy as np
 import xarray as xr
+from pydantic import BaseModel, ConfigDict, Field
 
-from arcomake.checks import ValidationError, valid_time_coordinate
-from arcomake.cli_utils import DictParamType, check_output_path, set_default_logger
+from arcomake.cli_utils import (
+  check_output_path,
+  read_configs,
+  set_default_logger,
+)
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client, maybe_wait
-from arcomake.dataset_utils import save_to_zarr
-from arcomake.datetime_utils import may_parse_timedelta
+from arcomake.dataset_utils import ReadConfig, SaveConfig, save_to_zarr
+from arcomake.processing import ProcessingStepConfig, process
 
 logger = logging.getLogger(__name__)
+
+# Weighting scheme applied to the steps of the (centered) window used to
+# compute the climatology. The weights depend only on the distance from the
+# center of the window and are therefore constant from one year to the next.
+WeightingType = Literal["constant", "gaussian", "geometric"]
+
+
+class PostprocessConfig(BaseModel):
+  model_config = ConfigDict(extra="allow")
+
+  postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
+
+
+class ClimatologyConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  time_dim: str = "time"
+  period: int = Field(description="Period of the climatology bins")
+  climatology_bin_dim: str = "dayofyear"
+  window: int = Field(ge=1, description="Number of bins to average over")
+  weighting: WeightingType
+  weighting_scale: float | None = Field(
+    default=None, ge=0.0, description="Scale of the weighting function in bins"
+  )
+  read: ReadConfig
+  preprocess: list[ProcessingStepConfig] = Field(default_factory=list)
+  postprocess_climatology: list[ProcessingStepConfig] = Field(default_factory=list)
+  postprocess_anomaly_std: list[ProcessingStepConfig] = Field(default_factory=list)
+  save: SaveConfig
 
 
 @click.command()
 @click.argument(
-  "input",
+  "config_path",
   required=True,
-  type=click.Path(
-    path_type=pathlib.Path, file_okay=True, dir_okay=True, exists=True, readable=True
-  ),
+  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True, dir_okay=False),
 )
 @click.argument(
-  "climatology_output",
+  "input_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, file_okay=True, dir_okay=True, writable=True),
+  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True),
 )
 @click.argument(
-  "anomaly_std_output",
+  "climatology_output_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, file_okay=True, dir_okay=True, writable=True),
+  type=click.Path(path_type=pathlib.Path, writable=True),
 )
-@click.option(
-  "--time-dim",
-  default="time",
-  help="Name of the time dimension to average over.",
-  show_default=True,
-)
-@click.option(
-  "--in-chunks",
-  default=None,
-  show_default=True,
-  type=DictParamType(),
-  help="Dict containing chunking specs used when reading.",
+@click.argument(
+  "anomaly_std_output_path",
+  required=True,
+  type=click.Path(path_type=pathlib.Path, writable=True),
 )
 @click.option(
   "--overwrite/--no-overwrite",
   help="Whether to overwrite existing outputs",
   default=False,
   is_flag=True,
-)
-@click.option(
-  "--out-chunks",
-  default=None,
-  show_default=True,
-  type=DictParamType(),
-  help="Dict containing chunking specs used when writing.",
-)
-@click.option(
-  "--climatology-bin-dim",
-  default="dayofyear",
-  help="Name of the binning dimension of the resulting climatology.",
-  show_default=True,
-)
-@click.option(
-  "--window",
-  default=15,
-  type=click.IntRange(min=1),
-  show_default=True,
-  help="Size in days of the centered window over which statistics are computed for each bin.",
-)
-@click.option(
-  "--compressor-name",
-  "cname",
-  default="lz4",
-  show_default=True,
-  help="Name of the compressor to use.",
-)
-@click.option(
-  "--compressor-level", "clevel", default=1, show_default=True, help="Compressor level to use."
 )
 @click.option(
   "--scheduler-type",
@@ -132,24 +124,11 @@ logger = logging.getLogger(__name__)
   help="Type of Dask scheduler to use.",
 )
 @click.option(
-  "--calendar",
-  default="365_day",
-  type=click.Choice(["365_day", "366_day", "360_day"], case_sensitive=False),
-  help="Fixed-day calendar the dataset is converted to before binning.",
-)
-@click.option(
   "--sync-step/--no-sync-step",
   "sync_step",
   default=False,
   help="Whether to persist the result in memory during climatology computation.",
   show_default=True,
-)
-@click.option(
-  "--raise/--no-raise",
-  "should_raise",
-  help="Whether to raise an exception if validation fails",
-  default=True,
-  is_flag=True,
 )
 @click.option(
   "--log-level",
@@ -158,21 +137,13 @@ logger = logging.getLogger(__name__)
   show_default=True,
 )
 def compute_climatology(
-  input: pathlib.Path,
-  climatology_output: pathlib.Path,
-  anomaly_std_output: pathlib.Path,
-  time_dim: str = "time",
-  in_chunks: dict[str, int | Literal["auto"]] | None = None,
+  config_path: pathlib.Path,
+  input_path: pathlib.Path,
+  climatology_output_path: pathlib.Path,
+  anomaly_std_output_path: pathlib.Path,
   overwrite: bool = False,
-  out_chunks: dict[str, int | Literal["auto"]] | None = None,
-  climatology_bin_dim: str = "dayofyear",
-  window: int = 15,
-  cname: str = "lz4",
-  clevel: int = 1,
   scheduler_type: SchedulerOptionType = "mpi",
-  calendar: Literal["365_day", "366_day", "360_day"] = "365_day",
   sync_step: bool = False,
-  should_raise: bool = False,
   log_level: str = "info",
 ):
   """
@@ -182,46 +153,26 @@ def compute_climatology(
   uniformly spaced with a daily-multiple frequency dividing the calendar year)
   and the dataset is converted to the given fixed-day calendar to handle leap
   years. Data variables without the time dimension (e.g., static masks) are
-  dropped. Two outputs are written, derived from ``output`` by appending
-  ``_climatology`` and ``_anomaly_std`` to its stem: the climatological average
-  over calendar-year bins, and the standard deviation of the anomalies with
+  dropped. Two outputs are written: the climatological average over
+  calendar-year bins, and the standard deviation of the anomalies with
   respect to that climatology.
 
   Parameters
   ----------
-  input : pathlib.Path
+  config_path : pathlib.Path
+      Path to TOML configuration file containing configuration options.
+  input_path : pathlib.Path
       Path to the input Zarr dataset.
-  climatology_output : pathlib.Path
+  climatology_output_path : pathlib.Path
       Path to the climatology output.
-  anomaly_std_output : pathlib.Path
+  anomaly_std_output_path : pathlib.Path
       Path to the anomaly std output.
-  time_dim : str, default "time"
-      Name of the time dimension to reduce or group by.
-  in_chunks : dict[str, int] or None, default None
-      Chunking specs used when reading the input dataset.
   overwrite : bool, default False
       Whether to overwrite the outputs if they already exist.
-  out_chunks : dict[str, int] or None, default None
-      Chunking specs used when writing the output dataset.
-  climatology_bin_dim : str, default "dayofyear"
-      Name of the binning dimension of the resulting climatology.
-  window : int, default 1
-      Size in days of the centered window over which averages and standard
-      deviation are computed for each bin. ``window=1`` computes plain per-day
-      statistics.
-  cname : str, default "lz4"
-      Name of the compressor used when writing the outputs.
-  clevel : int, default 1
-      Compression level used when writing the outputs.
   scheduler_type : SchedulerOptionType, default "mpi"
       Type of Dask scheduler to use.
-  calendar : {"365_day", "366_day", "360_day"}, default "365_day"
-      Fixed-day calendar the dataset is converted to before binning.
   sync_step : bool, default False
       Whether to persist the result in memory during climatology computation.
-  should_raise : bool, default False
-      Whether to raise an exception if time coordinate validation fails,
-      instead of emitting a warning.
   log_level : {"debug", "info", "warning", "error", "critical"}, default "info"
       Logging verbosity.
   """
@@ -232,112 +183,135 @@ def compute_climatology(
   # Set up Dask client.
   client = get_client(scheduler_type=scheduler_type)
 
-  # Compute and check paths.
-  if not input.exists():
-    raise ValueError(f"Input path {input} does not exist")
-  check_output_path(climatology_output, overwrite=overwrite)
-  check_output_path(anomaly_std_output, overwrite=overwrite)
+  # Check output paths.
+  check_output_path(climatology_output_path, overwrite=overwrite)
+  check_output_path(anomaly_std_output_path, overwrite=overwrite)
 
-  logger.info(f"Opening input dataset from {input} with chunks={in_chunks}")
-  # As the Dask graph tends to be huge, it's important to avoid inline_array=True,
-  # see: https://docs.dask.org/en/latest/generated/dask.array.from_array.html#dask.array.from_array
-  dataset = xr.open_dataset(input, engine="zarr", inline_array=False, chunks=in_chunks)
+  # Read configs
+  configs = read_configs(config_path, schema=ClimatologyConfig)
 
-  # Drop static variables (e.g., masks)
-  dataset = dataset.drop_vars(
-    [name for name, var in dataset.data_vars.items() if time_dim not in var.dims]
-  )
-
-  # Get the number of days in the calendar year.
-  if calendar == "360_day":
-    n_days = 360
-  elif calendar == "365_day":
-    n_days = 365
-  elif calendar == "366_day":
-    n_days = 366
-  else:
-    raise ValueError(f"Unsupported calendar: {calendar}")
-
-  # Check that the time coordinate is:
-  #   1. sorted
-  #   2. without missing dates or duplicates
-  #   3. uniformly spaced, with a frequency that is a multiple of one day.
-  #   4. the frequency in days divides the number of days in the calendar year.
-  # Finally, it does not have to contain a whole number of years: incomplete years will have missing data.
-  datetime_index = dataset[time_dim].to_index()
-  freq = xr.infer_freq(datetime_index)
-  if freq is None:
-    raise ValueError("Could not infer frequency from time index")
-  if not freq.endswith("D"):
-    raise ValueError(f"Unsupported frequency: {freq}")
-  # Pandas has troubles parsing unit abbreviations w/o a number
-  freq = "1D" if freq == "D" else freq
-
+  # Compute climatology and anomaly standard deviation
+  climatology = xr.Dataset()
+  anomaly_std = xr.Dataset()
+  _climatology_delayed_save = None
+  _anomaly_std_delayed_save = None
   try:
-    valid_time_coordinate(
-      dataset,
-      start_datetime=datetime_index.min().to_pydatetime(),
-      end_datetime=datetime_index.max().to_pydatetime(),
-      freq=freq,
-      inclusive="both",
-      time_dim=time_dim,
-    )
-  except ValidationError as exc:
-    if should_raise:
-      raise exc from None
-    else:
-      warnings.warn(f"Datetimes validation failed: {exc}")
+    logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
 
-  freq = may_parse_timedelta(freq)
-  if n_days % freq.days != 0:
-    raise ValueError(f"Invalid frequency: {freq}. Must be a multiple of {n_days} days.")
-  step_size = n_days // freq.days
+    with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
+      # Preprocessing dataset
+      if configs.preprocess:
+        dataset = process(dataset=dataset, steps=configs.preprocess)
 
-  # Convert the window size from days to time steps.
-  if window % freq.days != 0:
-    raise ValueError(f"Invalid window: {window} days. Must be a multiple of {freq.days} days.")
-  window_size = window // freq.days
+      # We assume that the time coordinate of the dataset is:
+      #   1. sorted,
+      #   2. without missing dates or duplicates,
+      #   3. uniformly spaced,
+      #   4. that all variables have a time dimension,
+      #   5. that period times the size of a climatology bin divides the calendar year,
+      #   6. that the dataset contains an integer number of periods.
+      # We just check for the latter.
+      assert dataset[configs.time_dim].size % configs.period == 0, (
+        "Dataset does not contain a whole number of periods."
+      )
 
-  # Here we handle leap years.
-  # See: https://github.com/pydata/xarray/issues/1844#issuecomment-417855365
-  dataset = dataset.convert_calendar(calendar)
+      # Welford's online algorithm yields both the climatological mean and the
+      # unbiased sample variance of the anomalies in a single pass over the data.
+      climatology, anomaly_var = _online_climatology(
+        dataset,
+        time_dim=configs.time_dim,
+        period=configs.period,
+        window=configs.window,
+        weighting=configs.weighting,
+        weighting_scale=configs.weighting_scale,
+        climatology_bin_dim=configs.climatology_bin_dim,
+        sync_step=sync_step,
+      )
 
-  logger.info(f"Computing {freq.days}D-climatology ({calendar=})")
-  # Welford's online algorithm yields both the climatological mean and the
-  # unbiased sample variance of the anomalies in a single pass over the data.
-  dataset_climatology, anomaly_var = _online_climatology(
-    dataset,
-    time_dim=time_dim,
-    step_size=step_size,
-    window=window_size,
-    climatology_bin_dim=climatology_bin_dim,
-    sync_step=sync_step,
-  )
-  save_configs = {
-    "compressor": {"cname": cname, "clevel": clevel},
-    "chunk": out_chunks,
-  }
-  _climatology_delayed_save = save_to_zarr(
-    dataset_climatology, climatology_output, configs=save_configs
-  )
-  anomaly_std = xr.ufuncs.sqrt(anomaly_var)
-  _anomaly_std_delayed_save = save_to_zarr(anomaly_std, anomaly_std_output, configs=save_configs)
+      if configs.postprocess_climatology:
+        climatology = process(dataset=climatology, steps=configs.postprocess_climatology)
 
-  # Compute and save the climatology and anomaly std in parallel.
-  dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
+      anomaly_std = xr.ufuncs.sqrt(anomaly_var)
+      if configs.postprocess_anomaly_std:
+        anomaly_std = process(dataset=anomaly_std, steps=configs.postprocess_anomaly_std)
 
-  # Clean up.
-  _climatology_delayed_save.close()
-  _anomaly_std_delayed_save.close()
-  dataset_climatology.close()
-  anomaly_std.close()
+      # Compute and save the climatology and anomaly std in parallel.
+      _climatology_delayed_save = save_to_zarr(
+        climatology, climatology_output_path, configs=configs.save
+      )
+      _anomaly_std_delayed_save = save_to_zarr(
+        anomaly_std, anomaly_std_output_path, configs=configs.save
+      )
+      dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
+  except Exception as exc:
+    logger.exception("An error occurred while processing the climatology and anomaly std.")
+    raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
+  finally:
+    # Clean up.
+    if hasattr(_climatology_delayed_save, "close"):
+      _climatology_delayed_save.close()
+    if hasattr(_anomaly_std_delayed_save, "close"):
+      _anomaly_std_delayed_save.close()
+    climatology.close()
+    anomaly_std.close()
+
   client.close()
+
+
+def _window_weights(
+  offsets: list[int], weighting: WeightingType, scale: float | None = None
+) -> np.ndarray:
+  """
+  Compute the weights of the steps of the (centered) window.
+
+  The weight of a step depends only on its (signed) distance in steps from the
+  center of the window, and is therefore constant from one year to the next.
+
+  Parameters
+  ----------
+  offsets : list[int]
+      Signed offsets of the window steps relative to its center.
+  weighting : {"constant", "gaussian", "geometric"}
+      Weighting scheme. ``"constant"`` gives equal weights (plain average),
+      ``"gaussian"`` uses a Gaussian smoothing kernel, and ``"geometric"`` uses
+      weights decaying geometrically with the distance from the center.
+  scale : float or None, default None
+      Scale of the kernel, in step units. For ``"gaussian"`` it is the standard
+      deviation of the kernel, and for ``"geometric"`` it is the per-step decay
+      ratio (in ``(0, 1]``). If ``None``, a default derived from the window size
+      is used: half the window half-width for ``"gaussian"``, and the ratio
+      reaching one tenth at the window edge for ``"geometric"``. Ignored for
+      ``"constant"``.
+
+  Returns
+  -------
+  np.ndarray
+      Array of weights aligned with ``offsets``. Only the relative magnitude of
+      the weights matters, hence they are left unnormalised.
+  """
+  positions = np.asarray(offsets, dtype=float)
+  half = int(np.abs(positions).max()) if positions.size else 0
+  if weighting == "constant" or half == 0:
+    return np.ones_like(positions)
+  if weighting == "gaussian":
+    sigma = scale if scale is not None else half / 2.0
+    if sigma <= 0:
+      raise ValueError(f"Gaussian scale (standard deviation) must be positive, got {sigma}")
+    return np.exp(-0.5 * (positions / sigma) ** 2)
+  if weighting == "geometric":
+    ratio = scale if scale is not None else 0.1 ** (1.0 / half)
+    if not 0.0 < ratio <= 1.0:
+      raise ValueError(f"Geometric scale (decay ratio) must be in (0, 1], got {ratio}")
+    return ratio ** np.abs(positions)
+  raise ValueError(f"Unsupported weighting scheme: {weighting}")
 
 
 def _online_climatology(
   dataset: xr.Dataset,
-  step_size: int,
+  period: int,
   window: int = 1,
+  weighting: WeightingType = "constant",
+  weighting_scale: float | None = None,
   time_dim: str = "time",
   climatology_bin_dim: str = "dayofyear",
   sync_step=False,
@@ -346,12 +320,11 @@ def _online_climatology(
   Average a dataset over consecutive windows of ``step_size`` steps along time.
 
   The dataset is split along the time dimension into consecutive windows of
-  ``step_size`` steps (one per calendar year, given a fixed-day calendar), and
-  the windows are combined elementwise using Welford's online algorithm, so
-  that only one window is combined at a time. This yields both the running
-  (streaming) mean and the unbiased sample variance across windows. The time
-  dimension is replaced by ``climatology_bin_dim``, labelled with the day of
-  year of the first window.
+  ``period`` steps, and the windows are combined elementwise using a weighted
+  Welford online algorithm, so that only one window is combined at a time.
+  This yields both the running (streaming) weighted mean and the unbiased weighted
+  sample variance across windows. The time dimension is replaced by
+  ``climatology_bin_dim``, labelled with the day of year of the first window.
 
   Optionally, statistics can be computed over a ``window`` of steps centered on
   each bin, rather than over a single bin. In that case, for each yearly window
@@ -362,17 +335,30 @@ def _online_climatology(
   the 8th of January are computed from the 1st to the 15th of January of every
   year.
 
+  Each step of the window is weighted according to ``weighting`` by a factor
+  that depends only on its distance from the center of the window (see
+  ``_window_weights``). Since these weights are the same for every yearly
+  window, they are constant from one year to the next. With ``"constant"``
+  weighting the algorithm reduces to the plain (unweighted) Welford algorithm.
+
   Parameters
   ----------
   dataset : xr.Dataset
       Input dataset, assumed to be sorted and uniformly spaced along the time
       dimension.
-  step_size : int
+  period : int
       Number of time steps in each window (i.e., per calendar year).
   window : int, default 1
       Number of steps of the (centered) window over which statistics are
       computed for each bin. ``window=1`` reduces to the plain per-bin
       climatology.
+  weighting : {"constant", "gaussian", "geometric"}, default "constant"
+      Weighting scheme applied to the steps of the window. See
+      ``_window_weights`` for details.
+  weighting_scale : float or None, default None
+      Scale of the weighting kernel, in step units (Gaussian standard deviation
+      or geometric decay ratio). If ``None``, a default derived from the window
+      size is used. See ``_window_weights`` for details.
   time_dim : str, default "time"
       Name of the time dimension to average over.
   climatology_bin_dim : str, default "dayofyear"
@@ -382,53 +368,68 @@ def _online_climatology(
   -------
   tuple[xr.Dataset, xr.Dataset]
       A pair ``(mean, variance)``, each of size ``step_size`` along
-      ``climatology_bin_dim``. ``mean`` is the climatological average across
-      windows and ``variance`` is the unbiased sample variance across windows
-      (i.e., normalised by ``n - 1``).
+      ``climatology_bin_dim``. ``mean`` is the weighted climatological average
+      across windows and ``variance`` is the unbiased weighted sample variance
+      across windows (with reliability weights, i.e. normalised by
+      ``W - (sum of squared weights) / W``, which reduces to ``n - 1`` for
+      constant weights).
   """
   size = dataset.sizes[time_dim]
-  bins = 1 + np.arange(step_size, dtype=int)
+  bins = 1 + np.arange(period, dtype=int)
   # Offsets of a `window`-step window centered on each bin.
   half = window // 2
-  offsets = range(-half, window - half)
+  offsets = list(range(-half, window - half))
+  # Per-step weights, constant from one year to the next.
+  weights = _window_weights(offsets, weighting, scale=weighting_scale)
   dataset = dataset.assign_coords({climatology_bin_dim: dataset[time_dim].dt.dayofyear})
 
-  avg = None
-  m2 = None
-  counter = 0
+  avg: xr.Dataset | None = None
+  m2: xr.Dataset | None = None
+  # Running sums of the weights and of the squared weights (West's algorithm).
+  weight_total = 0.0
+  weight_sq_total = 0.0
   start = 0
 
   while start < size:
-    end = min(start + step_size, size)
+    end = min(start + period, size)
     value = dataset.isel({time_dim: slice(start, end)})
     value = value.drop_vars(time_dim)
     value = value.swap_dims({time_dim: climatology_bin_dim})
     value = value.reindex({climatology_bin_dim: bins}, copy=False)
     # Inner loop over the steps of the window centered on each bin. Each offset
-    # contributes the value `offset` steps away (wrapped around the year), so
-    # that every bin aggregates a `window`-step window centered on it.
-    for offset in offsets:
+    # contributes the value `offset` steps away (wrapped around the year),
+    # weighted by `weight`, so that every bin aggregates a weighted
+    # `window`-step window centered on it.
+    for offset, weight in zip(offsets, weights, strict=True):
+      weight = float(weight)
       shifted = value.roll({climatology_bin_dim: -offset}, roll_coords=False)
-      counter += 1
-      if avg is None:
+      weight_total += weight
+      weight_sq_total += weight * weight
+      if avg is None or m2 is None:
         avg = shifted
         # Welford's aggregated squared distance from the running mean (M2 accumulator).
         m2 = xr.zeros_like(avg)
         continue
+      # It is assumed that the dataset contains an integer number of periods.
+      # However, here we deal with missing values in case assertions are disabled.
       shifted = shifted.where(shifted.notnull(), avg)
-      # Welford's online update for mean and squared-distance accumulator.
+      # Weighted Welford (West) online update for mean and squared-distance accumulator.
       delta = shifted - avg
-      avg = avg + delta / float(counter)
+      avg = avg + delta * (weight / weight_total)
       delta2 = shifted - avg
-      m2 = m2 + delta * delta2 # ty: ignore
-    if sync_step:
-      avg = avg.persist() # ty: ignore
-      m2 = m2.persist() # ty: ignore
+      m2 = m2 + weight * delta * delta2
+    if sync_step and avg is not None and m2 is not None:
+      avg = avg.persist()
+      m2 = m2.persist()
       maybe_wait([avg, m2], rebalance=True)
     start = end
 
-  # Unbiased sample variance (normalised by n - 1).
-  # noinspection PyTypeChecker
-  variance: xr.Dataset = m2 / float(counter - 1) # ty: ignore
+  if avg is None or m2 is None:
+    raise ValueError("Cannot compute climatology on an empty dataset.")
 
-  return avg, variance # ty: ignore
+  # Unbiased weighted sample variance with reliability weights (normalised by
+  # W - (sum of squared weights) / W, which reduces to n - 1 for constant weights).
+  # noinspection PyTypeChecker
+  variance: xr.Dataset = m2 / (weight_total - weight_sq_total / weight_total)
+
+  return avg, variance

@@ -17,7 +17,6 @@ dependencies = [
     "gcsfs",
     "google-cloud-storage",
     "h5netcdf",
-    "jsonschema",
     "matplotlib",
     "mpi4py",
     "nc-time-axis",
@@ -25,6 +24,7 @@ dependencies = [
     "numcodecs < 0.16",
     "numpy",
     "pandas",
+    "pydantic",
     "requests",
     "s3fs>2026",
     "scipy",
@@ -61,7 +61,7 @@ arco-make = "arcomake:cli"
 Homepage = "https://github.com/stefanocampanella/arco-make"
 
 [build-system]
-requires = ["uv_build >= 0.11.7, <0.12.0"]
+requires = ["uv_build >= 0.11.7"]
 build-backend = "uv_build"
 
 [tool.ruff]

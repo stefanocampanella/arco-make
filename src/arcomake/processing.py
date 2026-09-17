@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
-import copy
 import logging
 import sys
 import warnings
@@ -10,6 +9,7 @@ from typing import Any
 import numpy as np
 import xarray as xr
 import xarray_regrid
+from pydantic import BaseModel, ConfigDict
 from scipy.ndimage import gaussian_filter
 
 logger = logging.getLogger(__name__)
@@ -18,26 +18,34 @@ processing_module = sys.modules[__name__]
 Number = int | float
 
 
-def process(dataset: xr.Dataset, steps: Sequence[dict[str, Any]]) -> xr.Dataset:
+class ProcessingStepConfig(BaseModel):
+  model_config = ConfigDict(extra="allow")
+
+  name: str
+
+
+def process(
+  dataset: xr.Dataset,
+  steps: Sequence[ProcessingStepConfig],
+) -> xr.Dataset:
   """
   Applies a sequence of postprocessing steps to a xarray.Dataset.
 
-  The steps are provided as a list of dictionaries containing step configurations.
+  The steps are provided as a list of ProcessingStepConfig configurations.
   All methods defined on a xarray.Dataset can be used as processing steps, in addition to the
   methods defined in this module (which have precedence).
 
   Args:
     dataset (xr.Dataset): The input dataset to process.
-    steps (Sequence[dict[str, Any]]): Configuration for each processing step.
+    steps (Sequence[ProcessingStepConfig]): Configuration for each processing step.
   Returns:
     xr.Dataset: The processed dataset.
   """
 
-  logger.info(
-    "Postprocessing dataset following steps: " + ", ".join(step["name"] for step in steps) + ". "
-  )
-  for config in steps:
-    config = copy.deepcopy(config)
+  step_names = [step.name for step in steps]
+  logger.info("Postprocessing dataset following steps: " + ", ".join(step_names) + ". ")
+  for raw_step in steps:
+    config = raw_step.model_dump(exclude_unset=True)
     name = config.pop("name")
     logger.info(f"Applying {name} with configuration {config}")
     step_fn: Callable[..., xr.Dataset]
@@ -105,6 +113,11 @@ def clip_negative(ds: xr.Dataset, variables: Sequence[str]):
     else:
       data_vars[var] = da
   ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
+  return ds
+
+
+def drop_static_vars(ds: xr.Dataset, time_dim: str = "time") -> xr.Dataset:
+  ds = ds.drop_vars([name for name, var in ds.data_vars.items() if time_dim not in var.dims])
   return ds
 
 

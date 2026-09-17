@@ -5,10 +5,11 @@ import sys
 import warnings
 from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Literal
+from typing import Literal
 
 import pandas as pd
 import xarray as xr
+from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger(__name__)
 checks_module = sys.modules[__name__]
@@ -18,30 +19,71 @@ class ValidationError(Exception):
   """Raised when validation fails."""
 
 
+class ValidGlobalECMWFCoordinatesCheck(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  latitude_dim: str = "lat"
+  longitude_dim: str = "lon"
+
+
+class ValidTimeCoordinateCheck(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  freq: str | None = None
+  time_dim: str = "time"
+
+
+class EnsureNoNansCheck(BaseModel):
+  model_config = ConfigDict(extra="allow")
+
+  time_dim: str | None = None
+
+
+class ChecksConfig(BaseModel):
+  model_config = ConfigDict(extra="allow")
+
+  valid_global_ecmwf_coordinates: ValidGlobalECMWFCoordinatesCheck | None = None
+  valid_time_coordinate: ValidTimeCoordinateCheck | None = None
+  ensure_no_nans: EnsureNoNansCheck | None = None
+
+
+ValidGlobalECMWFCoordinates = ValidGlobalECMWFCoordinatesCheck
+ValidTimeCoordinate = ValidTimeCoordinateCheck
+EnsureNoNans = EnsureNoNansCheck
+
+
 def validate(
   dataset: xr.Dataset,
-  checks: dict[str, Any],
-  start_datetime: datetime,
-  end_datetime: datetime,
-  should_raise: bool = False,
+  checks: ChecksConfig,
+  start_datetime: datetime | None = None,
+  end_datetime: datetime | None = None,
+  warn=False,
 ) -> None:
   """
   Performs checks on a xarray.Dataset and raise an exception if any check fails.
 
-  The checks are provided as a dictionary containing step configurations.
+  The checks are provided as a ChecksConfig model containing step configurations.
   All methods defined in this module can be used as checks.
 
   Args:
     dataset (xr.Dataset): The input dataset to process.
-    checks (dict[str, Any]): Configuration for each processing step.
+    checks (ChecksConfig): Configuration for each validation step.
+    start_datetime (datetime | None): Start datetime for time coordinate validation.
+    end_datetime (datetime | None): End datetime for time coordinate validation.
+    should_raise (bool): Whether to raise an exception if validation fails.
   Returns:
     None
   """
-  logger.info("Validating dataset with the following checks: " + ", ".join(checks.keys()) + ". ")
-  for name, config in checks.items():
+  checks_dict = checks.model_dump(exclude_none=True)
+  logger.info(
+    "Validating dataset with the following checks: " + ", ".join(checks_dict.keys()) + ". "
+  )
+  for name, config in checks_dict.items():
     if not hasattr(checks_module, name):
       warnings.warn(f"Unrecognized validation check {name} with configuration {config}")
       continue
+    if not isinstance(config, dict):
+      config = {}
     if name == "valid_time_coordinate":
       config = config | {"start_datetime": start_datetime, "end_datetime": end_datetime}
     check_fn: Callable[..., None] = getattr(checks_module, name)
@@ -49,10 +91,10 @@ def validate(
       check_fn(dataset, **config)
     except ValidationError as exc:
       failure_message = f"Validation step {name} failed: {exc}"
-      if should_raise:
-        raise ValidationError(failure_message) from exc
-      else:
+      if warn:
         warnings.warn(failure_message)
+      else:
+        raise ValidationError(failure_message) from exc
 
 
 def ensure_no_nans(

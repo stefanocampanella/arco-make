@@ -2,14 +2,20 @@
 # SPDX-License-Identifier: MIT
 import logging
 import pathlib
-from typing import get_args
+from typing import Literal, get_args
 
 import click
 import xarray as xr
+from pydantic import BaseModel, ConfigDict, Field
 
-from arcomake.cli_utils import DictParamType, check_output_path, set_default_logger
+from arcomake.cli_utils import (
+  check_output_path,
+  read_configs,
+  set_default_logger,
+)
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
-from arcomake.dataset_utils import save_to_zarr
+from arcomake.dataset_utils import ReadConfig, SaveConfig, save_to_zarr
+from arcomake.processing import ProcessingStepConfig, process
 
 logger = logging.getLogger(__name__)
 
@@ -47,56 +53,50 @@ StatsRegistry = {
   "diff_std": diff_std,
 }
 
+StatsType = Literal["mean", "std", "diff_std"]
+
+
+class StatsConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+  time_dim: str = "time"
+  skipna: bool = Field(
+    default=False,
+    description="Whether to skip NaNs when computing the statistic.",
+  )
+  read: ReadConfig = Field(default_factory=ReadConfig)
+  preprocess: list[ProcessingStepConfig] = Field(default_factory=list)
+  postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
+  save: SaveConfig = Field(default_factory=SaveConfig)
+
 
 @click.command()
-@click.argument("stats", required=True, type=click.Choice(StatsRegistry.keys()))
 @click.argument(
-  "input",
+  "config_path",
   required=True,
   type=click.Path(
-    path_type=pathlib.Path, file_okay=True, dir_okay=True, exists=True, readable=True
+    path_type=pathlib.Path,
+    resolve_path=True,
+    exists=True,
+    dir_okay=False,
   ),
 )
+@click.argument("stats", required=True, type=click.Choice(get_args(StatsType)))
 @click.argument(
-  "output",
+  "input_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, file_okay=True, dir_okay=True, writable=True),
+  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True),
 )
-@click.option(
-  "--time-dim",
-  default="time",
-  help="Name of the time dimension to average over.",
-  show_default=True,
-)
-@click.option(
-  "--in-chunks",
-  default=None,
-  show_default=True,
-  type=DictParamType(),
-  help="Dict containing chunking specs used when reading.",
+@click.argument(
+  "output_path",
+  required=True,
+  type=click.Path(path_type=pathlib.Path, writable=True),
 )
 @click.option(
   "--overwrite/--no-overwrite",
   help="Whether to overwrite existing outputs",
   default=False,
   is_flag=True,
-)
-@click.option(
-  "--out-chunks",
-  default=None,
-  show_default=True,
-  type=DictParamType(),
-  help="Dict containing chunking specs used when writing.",
-)
-@click.option(
-  "--compressor-name",
-  "cname",
-  default="lz4",
-  show_default=True,
-  help="Name of the compressor to use.",
-)
-@click.option(
-  "--compressor-level", "clevel", default=1, show_default=True, help="Compressor level to use."
 )
 @click.option(
   "--scheduler-type",
@@ -108,61 +108,39 @@ StatsRegistry = {
   help="Type of Dask scheduler to use.",
 )
 @click.option(
-  "--skipna/--no-skipna",
-  default=False,
-  help="Whether to skip NaNs when averaging.",
-  show_default=True,
-)
-@click.option(
   "--log-level",
   default="info",
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
   show_default=True,
 )
 def compute_stats(
-  stats: str,
-  input: pathlib.Path,
-  output: pathlib.Path,
-  time_dim: str = "time",
-  in_chunks: dict[str, int] | None = None,
+  config_path: pathlib.Path,
+  stats: StatsType,
+  input_path: pathlib.Path,
+  output_path: pathlib.Path,
   overwrite: bool = False,
-  out_chunks: dict[str, int] | None = None,
-  cname: str = "lz4",
-  clevel: int = 1,
   scheduler_type: SchedulerOptionType = "mpi",
-  skipna: bool = False,
   log_level: str = "info",
 ):
   """
   Compute a statistic of a Zarr dataset over time and save it to Zarr.
 
-  Data variables without the time dimension (e.g., static masks) are dropped
-  before computing the statistic. The output is overwritten if it already exists.
-
   Parameters
   ----------
+  config_path : pathlib.Path
+      Path to TOML configuration file containing configuration options.
   stats : {"mean", "std", "diff_std"}
       Statistic to compute.
-  input : pathlib.Path
+  input_path : pathlib.Path
       Path to the input Zarr dataset.
-  output : pathlib.Path
+  output_path : pathlib.Path
       Path to the output Zarr dataset.
-  time_dim : str, default "time"
-      Name of the time dimension to reduce over.
-  in_chunks : dict[str, int] or None, default None
-      Chunking specs used when reading the input dataset.
-  out_chunks : dict[str, int] or None, default None
-      Chunking specs used when writing the output dataset.
-  skipna : bool, default False
-      Whether to skip NaNs when computing the statistic.
-  log_level : {"debug", "info", "warning", "error", "critical"}, default "info"
-      Logging verbosity.
+  overwrite : bool, default False
+      Whether to overwrite existing output.
   scheduler_type : SchedulerOptionType, default "mpi"
       Type of Dask scheduler to use.
-  cname : str, default "lz4"
-      Name of the compressor used when writing the output.
-  clevel : int, default 1
-      Compression level used when writing the output.
+  log_level : {"debug", "info", "warning", "error", "critical"}, default "info"
+      Logging verbosity.
   """
 
   # Set up logging.
@@ -172,30 +150,43 @@ def compute_stats(
   client = get_client(scheduler_type=scheduler_type)
 
   if stats not in StatsRegistry:
-    raise ValueError(f"Invalid stats type: {stats}")
+    raise click.ClickException(f"Invalid stats type: {stats}")
 
-  # Check paths.
-  if not input.exists():
-    raise ValueError(f"Input path {input} does not exist")
-  check_output_path(output, overwrite=overwrite)
+  # Check output path.
+  check_output_path(output_path, overwrite=overwrite)
 
-  logger.info(f"Opening input dataset from {input} with chunks={in_chunks}")
-  # As the Dask graph tends to be huge it's important to avoid inline_array=True,
-  # see: https://docs.dask.org/en/latest/generated/dask.array.from_array.html#dask.array.from_array
-  dataset = xr.open_dataset(input, engine="zarr", inline_array=False, chunks=in_chunks)
-  dataset = dataset.drop_vars(
-    [name for name, var in dataset.data_vars.items() if time_dim not in var.dims]
-  )
+  # Read configs
+  configs = read_configs(config_path, schema=StatsConfig)
 
-  stats_ds = StatsRegistry[stats](dataset, time_dim=time_dim, skipna=skipna, keep_attrs=True)
-  save_configs = {
-    "compressor": {"cname": cname, "clevel": clevel},
-    "chunk": out_chunks,
-    "consolidated": True,
-  }
-  store = save_to_zarr(stats_ds, output, configs=save_configs, compute=True)
+  # Compute stats
+  stats_ds = xr.Dataset()
+  store = None
+  try:
+    logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
+    with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
+      if configs.preprocess:
+        dataset = process(dataset=dataset, steps=configs.preprocess)
 
-  # Clean up
-  store.close()
-  stats_ds.close()
+      stats_ds = StatsRegistry[stats](
+        dataset, time_dim=configs.time_dim, skipna=configs.skipna, keep_attrs=True
+      )
+
+      if configs.postprocess:
+        stats_ds = process(dataset=stats_ds, steps=configs.postprocess)
+
+      store = save_to_zarr(
+        dataset=stats_ds,
+        path=output_path,
+        configs=configs.save,
+        compute=True,
+      )
+  except Exception as exc:
+    logger.exception(f"An error occurred while computing {stats}")
+    raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
+  finally:
+    # Clean up
+    if hasattr(store, "close"):
+      store.close()
+    stats_ds.close()
+
   client.close()

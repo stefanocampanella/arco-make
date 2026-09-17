@@ -1,76 +1,61 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
+import logging
 import pathlib
-import warnings
-from datetime import datetime
-from typing import Literal, get_args
+from typing import get_args
 
 import click
+from pydantic import BaseModel, ConfigDict, Field
 
-from arcomake.checks import ValidationError, valid_time_coordinate
 from arcomake.cli_utils import (
-  DictParamType,
-  ListParamType,
   check_output_path,
+  read_configs,
   set_default_logger,
 )
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import (
+  ReadConfig,
+  SaveConfig,
   open_archive,
   save_to_zarr,
 )
+from arcomake.processing import ProcessingStepConfig, process
+
+logger = logging.getLogger(__name__)
+
+
+class ArchiveConfig(BaseModel):
+  model_config = ConfigDict(extra="allow")
+
+  attrs_to_drop: list[str] | None = None
+  read: ReadConfig
+
+
+class UnpackConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+  time_dim: str = "time"
+  attrs_to_drop: list[str] | None = None
+  read: ReadConfig
+  postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
+  save: SaveConfig
 
 
 @click.command()
 @click.argument(
+  "config_path",
+  required=True,
+  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True, dir_okay=False),
+)
+@click.argument(
   "input_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, dir_okay=True, readable=True),
+  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True),
 )
 @click.argument(
   "output_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, dir_okay=True, writable=True),
-)
-@click.option("--time-dim", help="Time dimension name used in the input dataset", default="time")
-@click.option(
-  "--start",
-  "start_datetime",
-  help="Override start of the date interval",
-  default=None,
-  type=click.DateTime(),
-)
-@click.option(
-  "--end",
-  "end_datetime",
-  help="Override end of the date interval",
-  default=None,
-  type=click.DateTime(),
-)
-@click.option("--freq", help="Time frequency of the timeseries", default="1D")
-@click.option(
-  "--chunks",
-  default=None,
-  show_default=True,
-  type=DictParamType(),
-  help="String containing chunking specs used when reading.",
-)
-@click.option(
-  "--attrs-to-drop",
-  default=None,
-  show_default=True,
-  type=ListParamType(),
-  help="List of attributes to drop from the dataset.",
-)
-@click.option(
-  "--compressor-name",
-  "cname",
-  default="lz4",
-  show_default=True,
-  help="Name of the compressor to use.",
-)
-@click.option(
-  "--compressor-level", "clevel", default=1, show_default=True, help="Compressor level to use."
+  type=click.Path(path_type=pathlib.Path, resolve_path=True, writable=True),
 )
 @click.option(
   "--overwrite/--no-overwrite",
@@ -93,19 +78,11 @@ from arcomake.dataset_utils import (
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
 )
 def unpack(
+  config_path: pathlib.Path,
   input_path: pathlib.Path,
   output_path: pathlib.Path,
-  time_dim: str = "time",
-  start_datetime: datetime | None = None,
-  end_datetime: datetime | None = None,
-  freq: str = "1D",
-  chunks: dict[str, int | Literal["auto"]] | None = None,
-  attrs_to_drop: list[str] | None = None,
-  cname: str = "lz4",
-  clevel: int = 1,
   overwrite: bool = False,
   scheduler_type: SchedulerOptionType = "mpi",
-  should_raise: bool = False,
   log_level: str = "info",
 ):
   """
@@ -122,47 +99,34 @@ def unpack(
   # Set up Dask client.
   client = get_client(scheduler_type=scheduler_type)
 
-  # Check input and ouput paths
-  if not input_path.exists() or not input_path.is_dir():
-    raise ValueError(f"Invalid input path: {input_path} does not exist or is not a directory")
+  # Check output path
   check_output_path(output_path, overwrite=overwrite)
 
-  # Validate chunks argument
-  if chunks is not None and not all(
-    isinstance(value, int) or value == "auto" for value in chunks.values()
-  ):
-    raise ValueError("Chunk option value must be a dictionary with integer or 'auto' values")
+  # Read configs
+  configs = read_configs(config_path, schema=UnpackConfig)
 
-  dataset = open_archive(input_path, chunks=chunks, attrs_to_drop=attrs_to_drop)
-
+  # Unpack archive
   try:
-    valid_time_coordinate(
-      dataset,
-      start_datetime=start_datetime
-      if start_datetime is not None
-      else dataset[time_dim].to_index().min().to_pydatetime(),
-      end_datetime=end_datetime
-      if end_datetime is not None
-      else dataset[time_dim].to_index().max().to_pydatetime(),
-      freq=freq,
-      time_dim=time_dim,
-    )
-  except ValidationError as exc:
-    if should_raise:
-      raise exc from None
-    else:
-      warnings.warn(f"Datetimes validation failed: {exc}")
+    with open_archive(
+      input_path,
+      time_dim=configs.time_dim,
+      attrs_to_drop=configs.attrs_to_drop,
+      **configs.read.model_dump(exclude_unset=True),
+    ) as dataset:
+      if configs.postprocess:
+        dataset = process(dataset=dataset, steps=configs.postprocess)
+      store = save_to_zarr(
+        dataset=dataset,
+        path=output_path,
+        configs=configs.save,
+        compute=True,
+      )
+  except Exception as exc:
+    logger.exception("An error occurred while unpacking the archive")
+    raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
+  finally:
+    # Clean up
+    if hasattr(store, "close"):
+      store.close()
 
-  dataset = dataset.chunk({dim: (1 if dim == time_dim else -1) for dim in dataset.dims})
-
-  store = save_to_zarr(
-    dataset=dataset,
-    path=output_path,
-    configs=dict(compressor={"cname": cname, "clevel": clevel}, consolidated=True),
-    compute=True,
-  )
-
-  # Clean up
-  store.close()
-  dataset.close()
   client.close()

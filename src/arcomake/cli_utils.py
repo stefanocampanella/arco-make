@@ -1,39 +1,47 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
-import datetime
-import json
 import logging
 import pathlib
 import tomllib
-from importlib.resources import files
-from typing import Any, override
+from typing import Any, TypeVar, overload, override
 
 import click
-import jsonschema
-from jsonschema.validators import extend, validator_for
+from pydantic import BaseModel, ValidationError
 
 logger = logging.getLogger(__name__)
 
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
-def read_configs(path: str | pathlib.Path, schema_name: str | None = None) -> dict[str, Any]:
+
+@overload
+def read_configs(
+  path: str | pathlib.Path, schema: type[ModelT], inject: dict[str, Any] | None = None
+) -> ModelT: ...
+
+
+@overload
+def read_configs(
+  path: str | pathlib.Path, schema: None = None, inject: dict[str, Any] | None = None
+) -> dict[str, Any]: ...
+
+
+def read_configs(
+  path: str | pathlib.Path,
+  schema: type[ModelT] | None = None,
+  inject: dict[str, Any] | None = None,
+) -> ModelT | dict[str, Any]:
   path = path if isinstance(path, pathlib.Path) else pathlib.Path(path)
   logger.info(f"Reading configs from {path}")
-  with path.open("rb") as schema_file:
-    configs = tomllib.load(schema_file)
-  if schema_name:
+  with path.open("rb") as config_file:
+    configs = tomllib.load(config_file)
+  if inject is not None:
+    logger.info(f"Updating configs with {inject}")
+    configs.update(inject)
+  if schema is not None:
     try:
-      schema_file_path = files("arcomake").joinpath("schemas", schema_name + ".schema.json")
-      with schema_file_path.open("r", encoding="utf-8") as schema_file:
-        schema = json.load(schema_file)
-        base_validator = validator_for(schema)
-        type_checker = base_validator.TYPE_CHECKER.redefine(
-          "datetime.datetime",
-          lambda checker, instance: isinstance(instance, datetime.datetime),
-        )
-        validator_cls = extend(base_validator, type_checker=type_checker)
-        validator_cls(schema).validate(configs)
-    except jsonschema.ValidationError as exc:
-      raise click.ClickException(f"Invalid config at {path}: {exc.message}") from exc
+      return schema.model_validate(configs)
+    except ValidationError as exc:
+      raise click.ClickException(f"Invalid config at {path}:\n{exc}") from exc
   return configs
 
 
@@ -173,7 +181,7 @@ def check_output_path(path: pathlib.Path, overwrite: bool = False) -> None:
     if overwrite:
       logger.info(f"Overwriting existing output destination {path}")
     else:
-      raise ValueError(f"Output destination {path} already exists")
+      raise click.ClickException(f"Output destination {path} already exists")
   # Ensure parent directory exists
   path.parent.mkdir(parents=True, exist_ok=True)
 
