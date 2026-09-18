@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 import logging
 import pathlib
+import warnings
 from contextlib import nullcontext
 from datetime import datetime
 from typing import Self, get_args
@@ -165,20 +166,30 @@ def download(
       with xr.merge(
         datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
       ) as dataset:
-        # Postprocess the merged dataset
-        if configs.postprocess:
-          dataset = process(
-            dataset=dataset,
-            steps=configs.postprocess,
+        # During postprocessing computation, which may even happen during `save_to_zarr`, if each operation does not
+        # trigger dask computations (e.g., no calls to persist or compute) some RuntimeWarnings may be issued.
+        # This happens frequently with certain algorithms when regridding masked data (containing NaNs).
+        # We filter them to avoid cluttering the log.
+        with warnings.catch_warnings():
+          warnings.filterwarnings(
+            "ignore",
+            message="invalid value encountered in divide",
+            category=RuntimeWarning,
           )
-        # Save the dataset in a Zarr using sensible chunking and compression
-        with bar(progress):
-          store = save_to_zarr(
-            dataset=dataset,
-            path=output_path,
-            configs=configs.save,
-            compute=True,
-          )
+          # Postprocess the merged dataset
+          if configs.postprocess:
+            dataset = process(
+              dataset=dataset,
+              steps=configs.postprocess,
+            )
+          # Save the dataset in a Zarr using sensible chunking and compression
+          with bar(progress):
+            store = save_to_zarr(
+              dataset=dataset,
+              path=output_path,
+              configs=configs.save,
+              compute=True,
+            )
         # Close the store, see: https://github.com/pydata/xarray/issues/4076
         store.close()
     except Exception as exc:

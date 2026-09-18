@@ -398,9 +398,10 @@ def _online_climatology(
         # Welford's aggregated squared distance from the running mean (M2 accumulator).
         m2 = xr.zeros_like(avg)
         continue
-      # It is assumed that the dataset contains an integer number of periods.
-      # However, here we deal with missing values in case assertions are disabled.
-      shifted = shifted.where(shifted.notnull(), avg)
+      # Notice: it is assumed that the dataset contains an integer number of periods.
+      # However, in the case of missing values, it would be enough to set them to avg
+      # shifted = shifted.where(shifted.notnull(), avg)
+      # We don't do that to not hurt the performance.
       # Weighted Welford (West) online update for mean and squared-distance accumulator.
       delta = shifted - avg
       avg = avg + delta * (weight / weight_total)
