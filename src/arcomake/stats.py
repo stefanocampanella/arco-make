@@ -146,9 +146,6 @@ def compute_stats(
   # Set up logging.
   set_default_logger(log_level)
 
-  # Set up Dask client.
-  client = get_client(scheduler_type=scheduler_type)
-
   if stats not in StatsRegistry:
     raise click.ClickException(f"Invalid stats type: {stats}")
 
@@ -158,35 +155,30 @@ def compute_stats(
   # Read configs
   configs = read_configs(config_path, schema=StatsConfig)
 
-  # Compute stats
-  stats_ds = xr.Dataset()
-  store = None
-  try:
-    logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
-    with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
-      if configs.preprocess:
-        dataset = process(dataset=dataset, steps=configs.preprocess)
-
-      stats_ds = StatsRegistry[stats](
-        dataset, time_dim=configs.time_dim, skipna=configs.skipna, keep_attrs=True
-      )
-
-      if configs.postprocess:
-        stats_ds = process(dataset=stats_ds, steps=configs.postprocess)
-
-      store = save_to_zarr(
-        dataset=stats_ds,
-        path=output_path,
-        configs=configs.save,
-        compute=True,
-      )
-  except Exception as exc:
-    logger.exception(f"An error occurred while computing {stats}")
-    raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
-  finally:
-    # Clean up
-    if hasattr(store, "close"):
-      store.close()
-    stats_ds.close()
-
-  client.close()
+  # Set up Dask client.
+  with get_client(scheduler_type=scheduler_type):
+    try:
+      logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
+      with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
+        # Preprocess input dataset
+        if configs.preprocess:
+          dataset = process(dataset=dataset, steps=configs.preprocess)
+        # Compute stats
+        with StatsRegistry[stats](
+          dataset, time_dim=configs.time_dim, skipna=configs.skipna, keep_attrs=True
+        ) as stats_ds:
+          # Postprocess stats
+          if configs.postprocess:
+            stats_ds = process(dataset=stats_ds, steps=configs.postprocess)
+          # Save stats
+          store = save_to_zarr(
+            dataset=stats_ds,
+            path=output_path,
+            configs=configs.save,
+            compute=True,
+          )
+          # Close the store, see: https://github.com/pydata/xarray/issues/4076
+          store.close()
+    except Exception as exc:
+      logger.exception(f"An error occurred while computing {stats}")
+      raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

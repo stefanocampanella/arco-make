@@ -96,37 +96,34 @@ def unpack(
   # Set up logging.
   set_default_logger(log_level)
 
-  # Set up Dask client.
-  client = get_client(scheduler_type=scheduler_type)
-
   # Check output path
   check_output_path(output_path, overwrite=overwrite)
 
   # Read configs
   configs = read_configs(config_path, schema=UnpackConfig)
 
-  # Unpack archive
-  try:
-    with open_archive(
-      input_path,
-      time_dim=configs.time_dim,
-      attrs_to_drop=configs.attrs_to_drop,
-      **configs.read.model_dump(exclude_unset=True),
-    ) as dataset:
-      if configs.postprocess:
-        dataset = process(dataset=dataset, steps=configs.postprocess)
-      store = save_to_zarr(
-        dataset=dataset,
-        path=output_path,
-        configs=configs.save,
-        compute=True,
-      )
-  except Exception as exc:
-    logger.exception("An error occurred while unpacking the archive")
-    raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
-  finally:
-    # Clean up
-    if hasattr(store, "close"):
-      store.close()
-
-  client.close()
+  # Set up Dask client.
+  with get_client(scheduler_type=scheduler_type):
+    # Unpack archive
+    try:
+      with open_archive(
+        input_path,
+        time_dim=configs.time_dim,
+        attrs_to_drop=configs.attrs_to_drop,
+        **configs.read.model_dump(exclude_unset=True),
+      ) as dataset:
+        # Postproces unpacked dataset
+        if configs.postprocess:
+          dataset = process(dataset=dataset, steps=configs.postprocess)
+        # Save unpacked dataset
+        store = save_to_zarr(
+          dataset=dataset,
+          path=output_path,
+          configs=configs.save,
+          compute=True,
+        )
+        # Close the store, see: https://github.com/pydata/xarray/issues/4076
+        store.close()
+    except Exception as exc:
+      logger.exception("An error occurred while unpacking the archive")
+      raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

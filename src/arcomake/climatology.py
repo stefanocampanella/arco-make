@@ -180,9 +180,6 @@ def compute_climatology(
   # Set up logging.
   set_default_logger(log_level)
 
-  # Set up Dask client.
-  client = get_client(scheduler_type=scheduler_type)
-
   # Check output paths.
   check_output_path(climatology_output_path, overwrite=overwrite)
   check_output_path(anomaly_std_output_path, overwrite=overwrite)
@@ -190,72 +187,63 @@ def compute_climatology(
   # Read configs
   configs = read_configs(config_path, schema=ClimatologyConfig)
 
-  # Compute climatology and anomaly standard deviation
-  climatology = xr.Dataset()
-  anomaly_std = xr.Dataset()
-  _climatology_delayed_save = None
-  _anomaly_std_delayed_save = None
-  try:
-    logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
-
-    with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
-      # Preprocessing dataset
-      if configs.preprocess:
-        dataset = process(dataset=dataset, steps=configs.preprocess)
-
-      # We assume that the time coordinate of the dataset is:
-      #   1. sorted,
-      #   2. without missing dates or duplicates,
-      #   3. uniformly spaced,
-      #   4. that all variables have a time dimension,
-      #   5. that period times the size of a climatology bin divides the calendar year,
-      #   6. that the dataset contains an integer number of periods.
-      # We just check for the latter.
-      assert dataset[configs.time_dim].size % configs.period == 0, (
-        "Dataset does not contain a whole number of periods."
-      )
-
-      # Welford's online algorithm yields both the climatological mean and the
-      # unbiased sample variance of the anomalies in a single pass over the data.
-      climatology, anomaly_var = _online_climatology(
-        dataset,
-        time_dim=configs.time_dim,
-        period=configs.period,
-        window=configs.window,
-        weighting=configs.weighting,
-        weighting_scale=configs.weighting_scale,
-        climatology_bin_dim=configs.climatology_bin_dim,
-        sync_step=sync_step,
-      )
-
-      if configs.postprocess_climatology:
-        climatology = process(dataset=climatology, steps=configs.postprocess_climatology)
-
-      anomaly_std = xr.ufuncs.sqrt(anomaly_var)
-      if configs.postprocess_anomaly_std:
-        anomaly_std = process(dataset=anomaly_std, steps=configs.postprocess_anomaly_std)
-
-      # Compute and save the climatology and anomaly std in parallel.
-      _climatology_delayed_save = save_to_zarr(
-        climatology, climatology_output_path, configs=configs.save
-      )
-      _anomaly_std_delayed_save = save_to_zarr(
-        anomaly_std, anomaly_std_output_path, configs=configs.save
-      )
-      dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
-  except Exception as exc:
-    logger.exception("An error occurred while processing the climatology and anomaly std.")
-    raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
-  finally:
-    # Clean up.
-    if hasattr(_climatology_delayed_save, "close"):
-      _climatology_delayed_save.close()
-    if hasattr(_anomaly_std_delayed_save, "close"):
-      _anomaly_std_delayed_save.close()
-    climatology.close()
-    anomaly_std.close()
-
-  client.close()
+  # Set up Dask client.
+  with get_client(scheduler_type=scheduler_type):
+    climatology = xr.Dataset()
+    anomaly_std = xr.Dataset()
+    try:
+      logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
+      with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
+        # Preprocess input dataset
+        if configs.preprocess:
+          dataset = process(dataset=dataset, steps=configs.preprocess)
+        # We assume that after preprocessing the time coordinate of the dataset is:
+        #   1. sorted,
+        #   2. without missing dates or duplicates,
+        #   3. uniformly spaced,
+        #   4. that all variables have a time dimension,
+        #   5. that period times the size of a climatology bin divides the calendar year,
+        #   6. that the dataset contains an integer number of periods.
+        # We just check for the latter.
+        assert dataset[configs.time_dim].size % configs.period != 0, (
+          "Dataset does not contain a whole number of periods."
+        )
+        # Welford's online algorithm yields both the climatological mean and the
+        # unbiased sample variance of the anomalies in a single pass over the data.
+        climatology, anomaly_var = _online_climatology(
+          dataset,
+          time_dim=configs.time_dim,
+          period=configs.period,
+          window=configs.window,
+          weighting=configs.weighting,
+          weighting_scale=configs.weighting_scale,
+          climatology_bin_dim=configs.climatology_bin_dim,
+          sync_step=sync_step,
+        )
+        # Postprocess climatology and anomaly standard deviation.
+        if configs.postprocess_climatology:
+          climatology = process(dataset=climatology, steps=configs.postprocess_climatology)
+        anomaly_std = xr.ufuncs.sqrt(anomaly_var)
+        if configs.postprocess_anomaly_std:
+          anomaly_std = process(dataset=anomaly_std, steps=configs.postprocess_anomaly_std)
+        # Compute and save the climatology and anomaly std in parallel.
+        _climatology_delayed_save = save_to_zarr(
+          climatology, climatology_output_path, configs=configs.save
+        )
+        _anomaly_std_delayed_save = save_to_zarr(
+          anomaly_std, anomaly_std_output_path, configs=configs.save
+        )
+        dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
+        # Manually close the store, see: https://github.com/pydata/xarray/issues/4076
+        _climatology_delayed_save.close()
+        _anomaly_std_delayed_save.close()
+    except Exception as exc:
+      logger.exception("An error occurred while processing the climatology and anomaly std.")
+      raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
+    finally:
+      # Close datasets.
+      climatology.close()
+      anomaly_std.close()
 
 
 def _window_weights(

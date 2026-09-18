@@ -4,6 +4,7 @@ import functools
 import inspect
 import logging
 import socket
+from contextlib import nullcontext
 from typing import Literal
 
 import dask
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 SchedulerOptionType = Literal["synchronous", "threads", "processes", "mpi", "localcluster"]
 
 
-class DummyClient:
+class DummyClient(nullcontext):
   def close(self):
     pass
 

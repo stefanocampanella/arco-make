@@ -124,14 +124,6 @@ def download(
   # Set up logging.
   set_default_logger(log_level)
 
-  # Set up the Dask client. Notice: distributed dask clusters are not available due to serialization issues.
-  client = get_client(scheduler_type=scheduler_type)
-  if scheduler_type in ("processes", "mpi", "localcluster"):
-    logger.warning(
-      f"Using {scheduler_type} scheduler, which is not compatible with remote arco-make xarray backends. "
-      "Please use 'threads' or 'synchronous' instead."
-    )
-
   # Read configs and inject start and end time.
   update_time_interval = {}
   if start_datetime is not None:
@@ -143,52 +135,56 @@ def download(
   # Check if the output path exists.
   check_output_path(output_path, overwrite=overwrite)
 
-  # Download and postprocess each dataset, possibly using checkpointing to disk.
-  logger.info(f"Downloading data from {configs.start} to {configs.end}")
-  dataset = xr.Dataset()
-  datasets: list[xr.Dataset] = []
-  store = None
-  try:
-    for dataset_name, dataset_conf in configs.datasets.items():
-      if dataset_conf.skip:
-        logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
-        continue
-      logger.info(f"Downloading {dataset_name}")
-      datasets.append(
-        maybe_checkpointing_open_dataset(
-          dataset_conf,
-          configs.start,
-          configs.end,
-          time_dim=configs.time_dim,
+  # Set up the Dask client. Notice: distributed dask clusters are not available due to serialization issues.
+  with get_client(scheduler_type=scheduler_type):
+    if scheduler_type in ("processes", "mpi", "localcluster"):
+      logger.warning(
+        f"Using {scheduler_type} scheduler, which is not compatible with remote arco-make xarray backends. "
+        "Please use 'threads' or 'synchronous' instead."
+      )
+
+    logger.info(f"Downloading data from {configs.start} to {configs.end}")
+    datasets: list[xr.Dataset] = []
+    store = None
+    try:
+      # Download and postprocess each dataset, possibly using checkpointing to disk.
+      for dataset_name, dataset_conf in configs.datasets.items():
+        if dataset_conf.skip:
+          logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
+          continue
+        logger.info(f"Downloading {dataset_name}")
+        datasets.append(
+          maybe_checkpointing_open_dataset(
+            dataset_conf,
+            configs.start,
+            configs.end,
+            time_dim=configs.time_dim,
+          )
         )
-      )
-    dataset = xr.merge(datasets, join="exact", compat="no_conflicts", combine_attrs="identical")
-
-    # Postprocess the merged dataset
-    if configs.postprocess:
-      dataset = process(
-        dataset=dataset,
-        steps=configs.postprocess,
-      )
-
-    # Save the dataset in a Zarr using sensible chunking and compression
-    with bar(progress):
-      store = save_to_zarr(
-        dataset=dataset,
-        path=output_path,
-        configs=configs.save,
-        compute=True,
-      )
-  except Exception as exc:
-    logger.exception("An error occurred during download")
-    raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
-  finally:
-    # Close dataset and store
-    dataset.close()
-    if hasattr(store, "close"):
-      store.close()
-    # Clean up temporary files
-    for source_dataset in datasets:
-      source_dataset.close()
-
-  client.close()
+      # Merge the datasets
+      with xr.merge(
+        datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
+      ) as dataset:
+        # Postprocess the merged dataset
+        if configs.postprocess:
+          dataset = process(
+            dataset=dataset,
+            steps=configs.postprocess,
+          )
+        # Save the dataset in a Zarr using sensible chunking and compression
+        with bar(progress):
+          store = save_to_zarr(
+            dataset=dataset,
+            path=output_path,
+            configs=configs.save,
+            compute=True,
+          )
+        # Close the store, see: https://github.com/pydata/xarray/issues/4076
+        store.close()
+    except Exception as exc:
+      logger.exception("An error occurred during download")
+      raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
+    finally:
+      # Clean up temporary files
+      for source_dataset in datasets:
+        source_dataset.close()
