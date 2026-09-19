@@ -171,14 +171,12 @@ def compute_stats(
           if configs.postprocess:
             stats_ds = process(dataset=stats_ds, steps=configs.postprocess)
           # Save stats
-          store = save_to_zarr(
+          save_to_zarr(
             dataset=stats_ds,
             path=output_path,
             configs=configs.save,
             compute=True,
           )
-          # Close the store, see: https://github.com/pydata/xarray/issues/4076
-          store.close()
     except Exception as exc:
       logger.exception(f"An error occurred while computing {stats}")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

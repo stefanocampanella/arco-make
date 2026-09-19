@@ -38,6 +38,7 @@
 # features in a deep-learning model, and therefore such approximations are reasonably acceptable.
 import logging
 import pathlib
+from contextlib import ExitStack
 from itertools import cycle
 from typing import Literal, get_args
 
@@ -189,8 +190,6 @@ def compute_climatology(
 
   # Set up Dask client.
   with get_client(scheduler_type=scheduler_type):
-    climatology = xr.Dataset()
-    anomaly_std = xr.Dataset()
     try:
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
       with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
@@ -226,23 +225,28 @@ def compute_climatology(
         if configs.postprocess_anomaly_std:
           anomaly_std = process(dataset=anomaly_std, steps=configs.postprocess_anomaly_std)
         # Compute and save the climatology and anomaly std in parallel.
-        _climatology_delayed_save = save_to_zarr(
-          climatology, climatology_output_path, configs=configs.save, compute=False
-        )
-        _anomaly_std_delayed_save = save_to_zarr(
-          anomaly_std, anomaly_std_output_path, configs=configs.save, compute=False
-        )
-        dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
-        # Manually close the store, see: https://github.com/pydata/xarray/issues/4076
-        _climatology_delayed_save.close()
-        _anomaly_std_delayed_save.close()
+        with ExitStack() as store_stack:
+          _climatology_delayed_save = save_to_zarr(
+            climatology,
+            climatology_output_path,
+            configs=configs.save,
+            compute=False,
+            store_stack=store_stack,
+          )
+          _anomaly_std_delayed_save = save_to_zarr(
+            anomaly_std,
+            anomaly_std_output_path,
+            configs=configs.save,
+            compute=False,
+            store_stack=store_stack,
+          )
+          dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
+        logger.info("Climatology writes completed; output stores closed.")
+      logger.info("Input dataset closed; closing Dask client.")
     except Exception as exc:
       logger.exception("An error occurred while processing the climatology and anomaly std.")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
-    finally:
-      # Close datasets.
-      climatology.close()
-      anomaly_std.close()
+  logger.info("Climatology complete; Dask client closed.")
 
 
 def _window_weights(

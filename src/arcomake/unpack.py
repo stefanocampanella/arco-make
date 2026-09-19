@@ -116,14 +116,12 @@ def unpack(
         if configs.postprocess:
           dataset = process(dataset=dataset, steps=configs.postprocess)
         # Save unpacked dataset
-        store = save_to_zarr(
+        save_to_zarr(
           dataset=dataset,
           path=output_path,
           configs=configs.save,
           compute=True,
         )
-        # Close the store, see: https://github.com/pydata/xarray/issues/4076
-        store.close()
     except Exception as exc:
       logger.exception("An error occurred while unpacking the archive")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

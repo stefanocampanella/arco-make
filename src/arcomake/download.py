@@ -3,7 +3,7 @@
 import logging
 import pathlib
 import warnings
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import datetime
 from typing import Self, get_args
 
@@ -145,32 +145,36 @@ def download(
       )
 
     logger.info(f"Downloading data from {configs.start} to {configs.end}")
-    datasets: list[xr.Dataset] = []
-    store = None
     try:
       # Download and postprocess each dataset, possibly using checkpointing to disk.
-      for dataset_name, dataset_conf in configs.datasets.items():
-        if dataset_conf.skip:
-          logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
-          continue
-        logger.info(f"Downloading {dataset_name}")
-        datasets.append(
-          maybe_checkpointing_open_dataset(
-            dataset_conf,
-            configs.start,
-            configs.end,
-            time_dim=configs.time_dim,
+      with ExitStack() as stack:
+        datasets: list[xr.Dataset] = []
+        for dataset_name, dataset_conf in configs.datasets.items():
+          if dataset_conf.skip:
+            logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
+            continue
+          logger.info(f"Downloading {dataset_name}")
+          datasets.append(
+            stack.enter_context(
+              maybe_checkpointing_open_dataset(
+                dataset_conf,
+                configs.start,
+                configs.end,
+                time_dim=configs.time_dim,
+              )
+            )
           )
-        )
-      # Merge the datasets
-      with xr.merge(
-        datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
-      ) as dataset:
-        # During postprocessing computation, which may even happen during `save_to_zarr`, if each operation does not
-        # trigger dask computations (e.g., no calls to persist or compute) some RuntimeWarnings may be issued.
-        # This happens frequently with certain algorithms when regridding masked data (containing NaNs).
-        # We filter them to avoid cluttering the log.
-        with warnings.catch_warnings():
+        # Merge the datasets
+        with (
+          xr.merge(
+            datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
+          ) as dataset,
+          warnings.catch_warnings(),
+        ):
+          # During postprocessing computation, which may even happen during `save_to_zarr`, if each operation does not
+          # trigger dask computations (e.g., no calls to persist or compute) some RuntimeWarnings may be issued.
+          # This happens frequently with certain algorithms when regridding masked data (containing NaNs).
+          # We filter them to avoid cluttering the log.
           warnings.filterwarnings(
             "ignore",
             message="invalid value encountered in divide",
@@ -184,14 +188,12 @@ def download(
             )
           # Save the dataset in a Zarr using sensible chunking and compression
           with bar(progress):
-            store = save_to_zarr(
+            save_to_zarr(
               dataset=dataset,
               path=output_path,
               configs=configs.save,
               compute=True,
             )
-        # Close the store, see: https://github.com/pydata/xarray/issues/4076
-        store.close()
     except Exception as exc:
       logger.exception("An error occurred during download")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

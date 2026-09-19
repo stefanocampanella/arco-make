@@ -5,6 +5,7 @@ import logging
 import pathlib
 import tempfile
 from collections.abc import Hashable, Iterable, Mapping
+from contextlib import ExitStack
 from typing import Any, Literal
 
 import xarray as xr
@@ -387,7 +388,23 @@ def save_to_zarr(
   path: pathlib.Path,
   configs: SaveConfig | None = None,
   compute: bool = True,
+  *,
+  store_stack: ExitStack | None = None,
 ) -> xr.backends.ZarrStore | Delayed:
+  """Write a dataset, explicitly managing the underlying store's lifetime.
+
+  Eager writes close their store before returning, including on failure. The
+  returned Xarray backend is already closed and needs no further cleanup.
+  For ``compute=False``, the caller must supply an active ``ExitStack`` and
+  finish computing the returned task before leaving it. The stack closes the
+  original store even if graph construction or computation fails, or the task
+  is never computed. Calling ``close`` on a Delayed object is not cleanup.
+
+  Zip stores must not be written from multiple processes; use directory stores
+  for distributed writes and archive the completed output separately.
+  """
+  if not compute and store_stack is None:
+    raise ValueError("Delayed writes require a store_stack kept open through computation")
   if configs is None:
     configs = SaveConfig()
 
@@ -398,7 +415,7 @@ def save_to_zarr(
     if configs.compressor is not None
     else None
   )
-  to_zarr_kwargs = configs.model_dump(exclude_none=True, exclude={"chunk", "compressor"})
+  to_zarr_kwargs = configs.model_dump(exclude_none=True, exclude={"chunks", "compressor"})
 
   if rechunk_conf:
     # Set the on-disk Zarr chunk layout via encoding, without altering the
@@ -430,6 +447,10 @@ def save_to_zarr(
     store = ZipStore(path=str(path), mode="w", compression=0, allowZip64=True)
   else:
     store = DirectoryStore(path=str(path))
-  xarray_zarr_store = dataset.to_zarr(store=store, compute=compute, mode="w", **to_zarr_kwargs)
-  xarray_zarr_store._close_store_on_close = True
-  return xarray_zarr_store
+  if not compute:
+    store_stack.callback(store.close)  # ty: ignore
+    return dataset.to_zarr(store=store, compute=False, mode="w", **to_zarr_kwargs)
+  try:
+    return dataset.to_zarr(store=store, compute=True, mode="w", **to_zarr_kwargs)
+  finally:
+    store.close()
