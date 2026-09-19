@@ -38,6 +38,7 @@
 # features in a deep-learning model, and therefore such approximations are reasonably acceptable.
 import logging
 import pathlib
+from itertools import cycle
 from typing import Literal, get_args
 
 import click
@@ -74,7 +75,6 @@ class ClimatologyConfig(BaseModel):
 
   time_dim: str = "time"
   period: int = Field(description="Period of the climatology bins")
-  climatology_bin_dim: str = "dayofyear"
   window: int = Field(ge=1, description="Number of bins to average over")
   weighting: WeightingType
   weighting_scale: float | None = Field(
@@ -205,8 +205,8 @@ def compute_climatology(
         #   5. that period times the size of a climatology bin divides the calendar year,
         #   6. that the dataset contains an integer number of periods.
         # We just check for the latter.
-        assert dataset[configs.time_dim].size % configs.period != 0, (
-          "Dataset does not contain a whole number of periods."
+        assert dataset[configs.time_dim].size % configs.period == 0, (
+          "Dataset must contain an integer number of full periods."
         )
         # Welford's online algorithm yields both the climatological mean and the
         # unbiased sample variance of the anomalies in a single pass over the data.
@@ -217,21 +217,20 @@ def compute_climatology(
           window=configs.window,
           weighting=configs.weighting,
           weighting_scale=configs.weighting_scale,
-          climatology_bin_dim=configs.climatology_bin_dim,
           sync_step=sync_step,
         )
         # Postprocess climatology and anomaly standard deviation.
         if configs.postprocess_climatology:
           climatology = process(dataset=climatology, steps=configs.postprocess_climatology)
-        anomaly_std = xr.ufuncs.sqrt(anomaly_var)
+        anomaly_std = np.sqrt(anomaly_var.clip(min=0.0))
         if configs.postprocess_anomaly_std:
           anomaly_std = process(dataset=anomaly_std, steps=configs.postprocess_anomaly_std)
         # Compute and save the climatology and anomaly std in parallel.
         _climatology_delayed_save = save_to_zarr(
-          climatology, climatology_output_path, configs=configs.save
+          climatology, climatology_output_path, configs=configs.save, compute=False
         )
         _anomaly_std_delayed_save = save_to_zarr(
-          anomaly_std, anomaly_std_output_path, configs=configs.save
+          anomaly_std, anomaly_std_output_path, configs=configs.save, compute=False
         )
         dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
         # Manually close the store, see: https://github.com/pydata/xarray/issues/4076
@@ -301,7 +300,6 @@ def _online_climatology(
   weighting: WeightingType = "constant",
   weighting_scale: float | None = None,
   time_dim: str = "time",
-  climatology_bin_dim: str = "dayofyear",
   sync_step=False,
 ) -> tuple[xr.Dataset, xr.Dataset]:
   """
@@ -311,8 +309,7 @@ def _online_climatology(
   ``period`` steps, and the windows are combined elementwise using a weighted
   Welford online algorithm, so that only one window is combined at a time.
   This yields both the running (streaming) weighted mean and the unbiased weighted
-  sample variance across windows. The time dimension is replaced by
-  ``climatology_bin_dim``, labelled with the day of year of the first window.
+  sample variance across windows.
 
   Optionally, statistics can be computed over a ``window`` of steps centered on
   each bin, rather than over a single bin. In that case, for each yearly window
@@ -349,54 +346,51 @@ def _online_climatology(
       size is used. See ``_window_weights`` for details.
   time_dim : str, default "time"
       Name of the time dimension to average over.
-  climatology_bin_dim : str, default "dayofyear"
-      Name of the binning dimension replacing the time dimension in the result.
 
   Returns
   -------
   tuple[xr.Dataset, xr.Dataset]
       A pair ``(mean, variance)``, each of size ``step_size`` along
-      ``climatology_bin_dim``. ``mean`` is the weighted climatological average
+      ``time_dim``. ``mean`` is the weighted climatological average
       across windows and ``variance`` is the unbiased weighted sample variance
       across windows (with reliability weights, i.e. normalised by
       ``W - (sum of squared weights) / W``, which reduces to ``n - 1`` for
       constant weights).
   """
   size = dataset.sizes[time_dim]
-  bins = 1 + np.arange(period, dtype=int)
+  bins = np.arange(period, dtype=int)
+  dataset = dataset.assign_coords({time_dim: np.fromiter(cycle(bins), dtype=int, count=size)})
   # Offsets of a `window`-step window centered on each bin.
   half = window // 2
   offsets = list(range(-half, window - half))
   # Per-step weights, constant from one year to the next.
   weights = _window_weights(offsets, weighting, scale=weighting_scale)
-  dataset = dataset.assign_coords({climatology_bin_dim: dataset[time_dim].dt.dayofyear})
 
-  avg: xr.Dataset | None = None
-  m2: xr.Dataset | None = None
+  avg = xr.Dataset()
+  m2 = xr.Dataset()
   # Running sums of the weights and of the squared weights (West's algorithm).
   weight_total = 0.0
   weight_sq_total = 0.0
   start = 0
+  first_iteration = True
 
   while start < size:
     end = min(start + period, size)
     value = dataset.isel({time_dim: slice(start, end)})
-    value = value.drop_vars(time_dim)
-    value = value.swap_dims({time_dim: climatology_bin_dim})
-    value = value.reindex({climatology_bin_dim: bins}, copy=False)
     # Inner loop over the steps of the window centered on each bin. Each offset
     # contributes the value `offset` steps away (wrapped around the year),
     # weighted by `weight`, so that every bin aggregates a weighted
     # `window`-step window centered on it.
     for offset, weight in zip(offsets, weights, strict=True):
       weight = float(weight)
-      shifted = value.roll({climatology_bin_dim: -offset}, roll_coords=False)
       weight_total += weight
       weight_sq_total += weight * weight
-      if avg is None or m2 is None:
-        avg = shifted
+      shifted = value.roll({time_dim: -offset}, roll_coords=False)
+      if first_iteration:
+        avg: xr.Dataset = shifted
         # Welford's aggregated squared distance from the running mean (M2 accumulator).
         m2 = xr.zeros_like(avg)
+        first_iteration = False
         continue
       # Notice: it is assumed that the dataset contains an integer number of periods.
       # However, in the case of missing values, it would be enough to set them to avg
@@ -404,21 +398,19 @@ def _online_climatology(
       # We don't do that to not hurt the performance.
       # Weighted Welford (West) online update for mean and squared-distance accumulator.
       delta = shifted - avg
-      avg = avg + delta * (weight / weight_total)
+      avg = avg + (weight / weight_total) * delta
       delta2 = shifted - avg
-      m2 = m2 + weight * delta * delta2
-    if sync_step and avg is not None and m2 is not None:
+      m2 = m2 + delta * delta2 * weight
+    if sync_step:
       avg = avg.persist()
       m2 = m2.persist()
       maybe_wait([avg, m2], rebalance=True)
     start = end
 
-  if avg is None or m2 is None:
-    raise ValueError("Cannot compute climatology on an empty dataset.")
-
   # Unbiased weighted sample variance with reliability weights (normalised by
   # W - (sum of squared weights) / W, which reduces to n - 1 for constant weights).
   # noinspection PyTypeChecker
-  variance: xr.Dataset = m2 / (weight_total - weight_sq_total / weight_total)
+  denom = weight_total - (weight_sq_total / weight_total)
+  variance = m2 / denom if denom > 0.0 else xr.zeros_like(m2)
 
   return avg, variance

@@ -34,7 +34,7 @@ def read_configs(
   logger.info(f"Reading configs from {path}")
   with path.open("rb") as config_file:
     configs = tomllib.load(config_file)
-  if inject is not None:
+  if inject:
     logger.info(f"Updating configs with {inject}")
     configs.update(inject)
   if schema is not None:
