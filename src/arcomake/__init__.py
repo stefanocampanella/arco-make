@@ -5,7 +5,7 @@ import click
 import arcomake.xarray_accessors  # noqa: F401
 from arcomake.climatology import compute_climatology
 from arcomake.download import download
-from arcomake.stats import compute_stats
+from arcomake.process import process
 from arcomake.unpack import unpack
 from arcomake.validate import validate
 
@@ -17,7 +17,7 @@ def cli():
 
 cli.add_command(download)
 cli.add_command(unpack)
-cli.add_command(compute_stats)
+cli.add_command(process)
 cli.add_command(compute_climatology)
 cli.add_command(validate)
 

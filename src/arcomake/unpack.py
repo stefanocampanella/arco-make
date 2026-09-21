@@ -19,7 +19,7 @@ from arcomake.dataset_utils import (
   open_archive,
   save_to_zarr,
 )
-from arcomake.processing import ProcessingStepConfig, process
+from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +114,7 @@ def unpack(
       ) as dataset:
         # Postproces unpacked dataset
         if configs.postprocess:
-          dataset = process(dataset=dataset, steps=configs.postprocess)
+          dataset = dataset.arcomake.process(steps=configs.postprocess)
         # Save unpacked dataset
         save_to_zarr(
           dataset=dataset,

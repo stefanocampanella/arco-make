@@ -21,10 +21,10 @@ from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
-  maybe_checkpointing_open_dataset,
+  maybe_checkpointing_open_and_process,
   save_to_zarr,
 )
-from arcomake.processing import ProcessingStepConfig, process
+from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +156,7 @@ def download(
           logger.info(f"Downloading {dataset_name}")
           datasets.append(
             stack.enter_context(
-              maybe_checkpointing_open_dataset(
+              maybe_checkpointing_open_and_process(
                 dataset_conf,
                 configs.start,
                 configs.end,
@@ -182,8 +182,7 @@ def download(
           )
           # Postprocess the merged dataset
           if configs.postprocess:
-            dataset = process(
-              dataset=dataset,
+            dataset = dataset.arcomake.process(
               steps=configs.postprocess,
             )
           # Save the dataset in a Zarr using sensible chunking and compression

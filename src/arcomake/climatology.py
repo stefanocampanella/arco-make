@@ -55,7 +55,7 @@ from arcomake.cli_utils import (
 )
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client, maybe_wait
 from arcomake.dataset_utils import ReadConfig, SaveConfig, save_to_zarr
-from arcomake.processing import ProcessingStepConfig, process
+from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
 
@@ -195,7 +195,7 @@ def compute_climatology(
       with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
         # Preprocess input dataset
         if configs.preprocess:
-          dataset = process(dataset=dataset, steps=configs.preprocess)
+          dataset = dataset.arcomake.process(steps=configs.preprocess)
         # We assume that after preprocessing the time coordinate of the dataset is:
         #   1. sorted,
         #   2. without missing dates or duplicates,
@@ -220,10 +220,10 @@ def compute_climatology(
         )
         # Postprocess climatology and anomaly standard deviation.
         if configs.postprocess_climatology:
-          climatology = process(dataset=climatology, steps=configs.postprocess_climatology)
-        anomaly_std = np.sqrt(anomaly_var.clip(min=0.0))
+          climatology = climatology.arcomake.process(steps=configs.postprocess_climatology)
+        anomaly_std: xr.Dataset = np.sqrt(anomaly_var.clip(min=0.0))
         if configs.postprocess_anomaly_std:
-          anomaly_std = process(dataset=anomaly_std, steps=configs.postprocess_anomaly_std)
+          anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
         # Compute and save the climatology and anomaly std in parallel.
         with ExitStack() as store_stack:
           _climatology_delayed_save = save_to_zarr(

@@ -1,9 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-import sys
-import warnings
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import numpy as np
@@ -13,7 +11,6 @@ from pydantic import BaseModel, ConfigDict
 from scipy.ndimage import gaussian_filter
 
 logger = logging.getLogger(__name__)
-processing_module = sys.modules[__name__]
 
 Number = int | float
 
@@ -22,42 +19,6 @@ class ProcessingStepConfig(BaseModel):
   model_config = ConfigDict(extra="allow")
 
   name: str
-
-
-def process(
-  dataset: xr.Dataset,
-  steps: Sequence[ProcessingStepConfig],
-) -> xr.Dataset:
-  """
-  Applies a sequence of postprocessing steps to a xarray.Dataset.
-
-  The steps are provided as a list of ProcessingStepConfig configurations.
-  All methods defined on a xarray.Dataset can be used as processing steps, in addition to the
-  methods defined in this module (which have precedence).
-
-  Args:
-    dataset (xr.Dataset): The input dataset to process.
-    steps (Sequence[ProcessingStepConfig]): Configuration for each processing step.
-  Returns:
-    xr.Dataset: The processed dataset.
-  """
-
-  step_names = [step.name for step in steps]
-  logger.info("Postprocessing dataset following steps: " + ", ".join(step_names) + ". ")
-  for raw_step in steps:
-    config = raw_step.model_dump(exclude_unset=True)
-    name = config.pop("name")
-    logger.info(f"Applying {name} with configuration {config}")
-    step_fn: Callable[..., xr.Dataset]
-    if name in dir(processing_module):
-      step_fn = getattr(processing_module, name)
-      dataset = step_fn(dataset, **config)
-    elif name in dir(dataset):
-      step_fn = getattr(dataset, name)
-      dataset = step_fn(**config)
-    else:
-      warnings.warn(f"Unrecognized processing step {name} with configuration {config}")
-  return dataset
 
 
 def apply_mask(
@@ -114,6 +75,25 @@ def clip_negative(ds: xr.Dataset, variables: Sequence[str]):
       data_vars[var] = da
   ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
   return ds
+
+
+def diff_std(dataset: xr.Dataset, time_dim: str = "time", **kwargs) -> xr.Dataset:
+  """
+  Compute the standard deviation of one-step differences along the time dimension.
+
+  Notes
+  -----
+  Given a sequence ``{x_i}_{i = 1, ..., N}``, the mean of the diffs
+  ``{x_i - x_{i-1}}`` is the sum of a telescopic series divided by the number of
+  terms, i.e. ``(x_N - x_1) / (N - 1)``, which becomes negligible for large N.
+  Also, GraphCast-like models compute the increment between the present and next
+  system state rescaled by diff_std, which amounts to standardizing the targets.
+  Whatever the rationale, one can reasonably approximate the mean with zero here.
+  """
+  dataset_diff = dataset.diff(dim=time_dim)
+  dataset_diff_var = (dataset_diff * dataset_diff).mean(dim=time_dim, **kwargs)
+  dataset_diff_std = xr.ufuncs.sqrt(dataset_diff_var)
+  return dataset_diff_std
 
 
 def drop_static_vars(ds: xr.Dataset, time_dim: str = "time") -> xr.Dataset:
