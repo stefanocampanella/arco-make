@@ -189,7 +189,7 @@ requires-dist = [
     { name = "cfgrib" },
     { name = "cftime" },
     { name = "click" },
-    { name = "copernicusmarine" },
+    { name = "copernicusmarine", git = "https://github.com/stefanocampanella/copernicus-marine-toolbox.git?rev=arco-make" },
     { name = "dask" },
     { name = "dask-mpi" },
     { name = "eccodes" },
@@ -693,7 +693,7 @@ wheels = [
 [[package]]
 name = "copernicusmarine"
 version = "2.4.1"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/stefanocampanella/copernicus-marine-toolbox.git?rev=arco-make#dba2d6a3ddc0d6e4979e99cfc8f4306f7baab5d7" }
 dependencies = [
     { name = "arcosparse" },
     { name = "boto3" },
@@ -708,10 +708,6 @@ dependencies = [
     { name = "tqdm" },
     { name = "xarray" },
     { name = "zarr" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/8d/1d/af62923754b8bad9ab114321b62a46d3e870edf4122c4f91708574ef87ec/copernicusmarine-2.4.1.tar.gz", hash = "sha256:3e9bc466de65abdfa38fb48dae107cec5b58f9dc7f84bab563f94ad379d632e8", size = 98662, upload-time = "2026-05-11T08:37:13.362Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e6/7d/fae36b221be3b491bb46ff59817e452dd3f3d842aefef399d77253ff8259/copernicusmarine-2.4.1-py3-none-any.whl", hash = "sha256:e13fb4a50e469aca4063a0de5d984af9c3da4a7343c605021b86e247613079a5", size = 130541, upload-time = "2026-05-11T08:37:11.55Z" },
 ]
 
 [[package]]

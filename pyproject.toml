@@ -8,7 +8,7 @@ dependencies = [
     "cfgrib",
     "cftime",
     "click",
-    "copernicusmarine",
+    "copernicusmarine@git+https://github.com/stefanocampanella/copernicus-marine-toolbox.git@arco-make",
     "dask",
     "dask_mpi",
     "eccodes",
