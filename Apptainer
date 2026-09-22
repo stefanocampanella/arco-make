@@ -22,6 +22,7 @@ From: ubuntu:26.04
         ca-certificates \
         build-essential \
         cmake \
+        git \
         gfortran \
         libaec-dev \
         libnetcdf-dev \
