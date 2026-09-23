@@ -48,13 +48,6 @@ def get_dask_env_options(suffix=None, inherit_params_from=None):
   return decorator
 
 
-def filter_kwargs(kwargs, func):
-  filtered = {
-    p.name: kwargs[p.name] for p in inspect.signature(func).parameters.values() if p.name in kwargs
-  }
-  return filtered
-
-
 @get_dask_env_options(suffix="mpi", inherit_params_from=[dask_mpi.initialize])
 def dask_mpi_initialize(*args, **kwargs):
   return dask_mpi.initialize(*args, **kwargs)
