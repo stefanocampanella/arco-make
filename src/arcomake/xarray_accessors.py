@@ -6,6 +6,7 @@ from datetime import datetime
 
 import xarray as xr
 
+from arcomake.checks import ChecksConfig, ValidationError
 from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
@@ -13,7 +14,8 @@ logger = logging.getLogger(__name__)
 
 @xr.register_dataset_accessor("arcomake")
 class ArcoMakeSelector:
-  processing_module = sys.modules["arcomake.processing_utils"]
+  _processing_module = sys.modules["arcomake.processing_utils"]
+  _checks_module = sys.modules["arcomake.checks"]
 
   def __init__(self, dataset: xr.Dataset):
     self._dataset = dataset
@@ -44,21 +46,20 @@ class ArcoMakeSelector:
     methods defined in this module (which have precedence).
 
     Args:
-      dataset (xr.Dataset): The input dataset to process.
       steps (Sequence[ProcessingStepConfig]): Configuration for each processing step.
     Returns:
       xr.Dataset: The processed dataset.
     """
     dataset = self._dataset
     step_names = [step.name for step in steps]
-    logger.info("Postprocessing dataset following steps: " + ", ".join(step_names) + ". ")
+    logger.info("Processing dataset following steps: " + ", ".join(step_names) + ". ")
     for raw_step in steps:
       config = raw_step.model_dump(exclude_unset=True)
       name = config.pop("name")
       logger.info(f"Applying {name} with configuration {config}")
       step_fn: Callable[..., xr.Dataset]
-      if name in dir(self.processing_module):
-        step_fn = getattr(self.processing_module, name)
+      if name in dir(self._processing_module):
+        step_fn = getattr(self._processing_module, name)
         dataset = step_fn(dataset, **config)
       elif name in dir(dataset):
         step_fn = getattr(dataset, name)
@@ -66,3 +67,41 @@ class ArcoMakeSelector:
       else:
         warnings.warn(f"Unrecognized processing step {name} with configuration {config}")
     return dataset
+
+  def validate(
+    self,
+    checks: ChecksConfig,
+    fail=False,
+  ) -> None:
+    """
+    Performs checks on a xarray.Dataset and raise an exception if any check fails.
+
+    The checks are provided as a ChecksConfig model containing step configurations.
+    All methods defined in this module can be used as checks.
+
+    Args:
+      checks (ChecksConfig): Configuration for each validation step.
+      should_raise (bool): Whether to raise an exception if validation fails.
+    Returns:
+      None
+    """
+    dataset = self._dataset
+    checks_dict = checks.model_dump(exclude_none=True)
+    logger.info(
+      "Validating dataset with the following checks: " + ", ".join(checks_dict.keys()) + ". "
+    )
+    for name, config in checks_dict.items():
+      if not hasattr(self._checks_module, name):
+        warnings.warn(f"Unrecognized validation check {name} with configuration {config}")
+        continue
+      check_fn: Callable[..., None] = getattr(self._checks_module, name)
+      if not isinstance(config, dict):
+        config = {}
+      try:
+        check_fn(dataset, **config)
+      except ValidationError as exc:
+        failure_message = f"Validation step {name} failed: {exc}"
+        if fail:
+          raise ValidationError(failure_message) from exc
+        else:
+          warnings.warn(failure_message)

@@ -2,15 +2,12 @@
 # SPDX-License-Identifier: MIT
 import logging
 import pathlib
-from datetime import datetime
-from typing import Self
 
 import click
 import xarray as xr
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict
 
 from arcomake.checks import ChecksConfig, ValidationError
-from arcomake.checks import validate as validate_dataset
 from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
@@ -23,16 +20,8 @@ logger = logging.getLogger(__name__)
 class ValidateConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
-  start: datetime | None = Field(default=None)
-  end: datetime | None = Field(default=None)
   read: ReadConfig
   checks: ChecksConfig
-
-  @model_validator(mode="after")
-  def validate_date_range(self) -> Self:
-    if self.start is not None and self.end is not None and self.start > self.end:
-      raise ValueError("start datetime must be before or equal to end datetime")
-    return self
 
 
 @click.command()
@@ -46,20 +35,7 @@ class ValidateConfig(BaseModel):
   required=True,
   type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True),
 )
-@click.option(
-  "--start",
-  "start_datetime",
-  default=None,
-  help="Override start datetime of the timeseries.",
-  type=click.DateTime(),
-)
-@click.option(
-  "--end",
-  "end_datetime",
-  default=None,
-  help="Override end datetime of the timeseries.",
-  type=click.DateTime(),
-)
+@click.option("--fail/--no-fail", default=False)
 @click.option(
   "--log-level",
   default="info",
@@ -68,8 +44,7 @@ class ValidateConfig(BaseModel):
 def validate(
   config_path: pathlib.Path,
   input_path: pathlib.Path,
-  start_datetime: datetime | None = None,
-  end_datetime: datetime | None = None,
+  fail: bool = False,
   log_level: str = "info",
 ):
   """
@@ -81,23 +56,19 @@ def validate(
   # Set up logging.
   set_default_logger(log_level)
 
-  # Read configs and inject start and end time.
-  update_time_interval = {}
-  if start_datetime is not None:
-    update_time_interval["start"] = start_datetime
-  if end_datetime is not None:
-    update_time_interval["end"] = end_datetime
-  configs = read_configs(config_path, inject=update_time_interval, schema=ValidateConfig)
+  # Read configs
+  configs = read_configs(config_path, schema=ValidateConfig)
 
   # Validate the dataset
   if configs.checks:
     try:
       with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
-        validate_dataset(
-          dataset=dataset,
+        dataset.arcomake.validate(
           checks=configs.checks,
-          start_datetime=start_datetime,
-          end_datetime=end_datetime,
+          fail=fail,
         )
     except ValidationError as exc:
       raise click.ClickException(f"Validation failed: {exc}") from exc
+    except Exception as exc:
+      logger.exception("An error occurred during validation")
+      raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

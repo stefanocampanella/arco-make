@@ -3,13 +3,12 @@
 import logging
 import sys
 import warnings
-from collections.abc import Callable
 from datetime import datetime
-from typing import Literal
+from typing import Literal, Self
 
 import pandas as pd
 import xarray as xr
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 logger = logging.getLogger(__name__)
 checks_module = sys.modules[__name__]
@@ -28,9 +27,16 @@ class ValidGlobalECMWFCoordinatesCheck(BaseModel):
 
 class ValidTimeCoordinateCheck(BaseModel):
   model_config = ConfigDict(extra="forbid")
-
+  start: datetime
+  end: datetime
   freq: str | None = None
   time_dim: str = "time"
+
+  @model_validator(mode="after")
+  def validate_date_range(self) -> Self:
+    if self.start > self.end:
+      raise ValueError("start datetime must be before or equal to end datetime")
+    return self
 
 
 class EnsureNoNansCheck(BaseModel):
@@ -50,51 +56,6 @@ class ChecksConfig(BaseModel):
 ValidGlobalECMWFCoordinates = ValidGlobalECMWFCoordinatesCheck
 ValidTimeCoordinate = ValidTimeCoordinateCheck
 EnsureNoNans = EnsureNoNansCheck
-
-
-def validate(
-  dataset: xr.Dataset,
-  checks: ChecksConfig,
-  start_datetime: datetime | None = None,
-  end_datetime: datetime | None = None,
-  warn=False,
-) -> None:
-  """
-  Performs checks on a xarray.Dataset and raise an exception if any check fails.
-
-  The checks are provided as a ChecksConfig model containing step configurations.
-  All methods defined in this module can be used as checks.
-
-  Args:
-    dataset (xr.Dataset): The input dataset to process.
-    checks (ChecksConfig): Configuration for each validation step.
-    start_datetime (datetime | None): Start datetime for time coordinate validation.
-    end_datetime (datetime | None): End datetime for time coordinate validation.
-    should_raise (bool): Whether to raise an exception if validation fails.
-  Returns:
-    None
-  """
-  checks_dict = checks.model_dump(exclude_none=True)
-  logger.info(
-    "Validating dataset with the following checks: " + ", ".join(checks_dict.keys()) + ". "
-  )
-  for name, config in checks_dict.items():
-    if not hasattr(checks_module, name):
-      warnings.warn(f"Unrecognized validation check {name} with configuration {config}")
-      continue
-    if not isinstance(config, dict):
-      config = {}
-    if name == "valid_time_coordinate":
-      config = config | {"start_datetime": start_datetime, "end_datetime": end_datetime}
-    check_fn: Callable[..., None] = getattr(checks_module, name)
-    try:
-      check_fn(dataset, **config)
-    except ValidationError as exc:
-      failure_message = f"Validation step {name} failed: {exc}"
-      if warn:
-        warnings.warn(failure_message)
-      else:
-        raise ValidationError(failure_message) from exc
 
 
 def ensure_no_nans(
@@ -165,8 +126,8 @@ def valid_global_ecmwf_coordinates(
 
 def valid_time_coordinate(
   dataset: xr.Dataset,
-  start_datetime: datetime,
-  end_datetime: datetime,
+  start: datetime,
+  end: datetime,
   freq: str = "1D",
   inclusive: Literal["left", "right", "both", "neither"] = "left",
   time_dim="time",
@@ -181,15 +142,14 @@ def valid_time_coordinate(
     end_datetime: End date (required)
     dataset_name: Optional name of the dataset for the warning message
   """
-  assert end_datetime >= start_datetime, "End date must be after start date"
   logger.info(
-    f"Checking that time coordinate contains all dates between {start_datetime} and {end_datetime}, with frequency {freq}."
+    f"Checking that time coordinate contains all dates between {start} and {end}, with frequency {freq}."
   )
   idx = dataset[time_dim].to_index()
   if isinstance(idx, pd.DatetimeIndex):
-    valid_datetime_index(idx, start_datetime, end_datetime, freq=freq, inclusive=inclusive)
+    valid_datetime_index(idx, start, end, freq=freq, inclusive=inclusive)
   elif isinstance(idx, xr.CFTimeIndex):
-    valid_cftime_index(idx, start_datetime, end_datetime, freq=freq, inclusive=inclusive)
+    valid_cftime_index(idx, start, end, freq=freq, inclusive=inclusive)
   else:
     raise ValueError(f"Unexpected index type: {type(idx).__name__}")
 
