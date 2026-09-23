@@ -225,6 +225,7 @@ def compute_climatology(
         if configs.postprocess_anomaly_std:
           anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
         # Compute and save the climatology and anomaly std in parallel.
+        logger.info("Processing climatology and anomaly standard deviation.")
         with ExitStack() as store_stack:
           _climatology_delayed_save = save_to_zarr(
             climatology,
