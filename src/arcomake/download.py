@@ -13,9 +13,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from arcomake.cli_utils import (
   check_if_overwriting,
+  check_path,
   read_configs,
   set_default_logger,
-  validate_configs_path,
 )
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import (
@@ -58,7 +58,7 @@ def bar(progress):
   "configs_path",
   required=True,
   type=str,
-  callback=validate_configs_path,
+  callback=check_path(dir_okay=False),
 )
 @click.argument(
   "output_path",

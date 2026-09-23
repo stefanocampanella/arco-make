@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-import pathlib
 from typing import get_args
 
 import click
@@ -10,9 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from arcomake.cli_utils import (
   check_if_overwriting,
+  check_path,
   read_configs,
   set_default_logger,
-  validate_configs_path,
 )
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import ReadConfig, SaveConfig, safe_to_zarr
@@ -39,12 +38,13 @@ class ProcessConfig(BaseModel):
   "configs_path",
   required=True,
   type=str,
-  callback=validate_configs_path,
+  callback=check_path(dir_okay=False),
 )
 @click.argument(
   "input_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True),
+  type=str,
+  callback=check_path(),
 )
 @click.argument(
   "output_path",
@@ -74,7 +74,7 @@ class ProcessConfig(BaseModel):
 )
 def process(
   configs_path: str,
-  input_path: pathlib.Path,
+  input_path: str,
   output_path: str,
   overwrite: bool = False,
   scheduler_type: SchedulerOptionType = "mpi",

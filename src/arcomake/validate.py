@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-import pathlib
 
 import click
 import xarray as xr
@@ -9,9 +8,9 @@ from pydantic import BaseModel, ConfigDict
 
 from arcomake.checks import ChecksConfig, ValidationError
 from arcomake.cli_utils import (
+  check_path,
   read_configs,
   set_default_logger,
-  validate_configs_path,
 )
 from arcomake.dataset_utils import ReadConfig
 
@@ -26,11 +25,12 @@ class ValidateConfig(BaseModel):
 
 
 @click.command()
-@click.argument("configs_path", required=True, type=str, callback=validate_configs_path)
+@click.argument("configs_path", required=True, type=str, callback=check_path())
 @click.argument(
   "input_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True),
+  type=str,
+  callback=check_path(),
 )
 @click.option("--fail/--no-fail", default=False)
 @click.option(
@@ -40,7 +40,7 @@ class ValidateConfig(BaseModel):
 )
 def validate(
   configs_path: str,
-  input_path: pathlib.Path,
+  input_path: str,
   fail: bool = False,
   log_level: str = "info",
 ):

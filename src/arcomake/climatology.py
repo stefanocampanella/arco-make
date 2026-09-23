@@ -37,7 +37,6 @@
 # which would further distort the results. However, the quantities computed here are aimed at standardizing the input
 # features in a deep-learning model, and therefore such approximations are reasonably acceptable.
 import logging
-import pathlib
 from contextlib import ExitStack
 from itertools import cycle
 from typing import Literal, get_args
@@ -50,9 +49,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from arcomake.cli_utils import (
   check_if_overwriting,
+  check_path,
   read_configs,
   set_default_logger,
-  validate_configs_path,
 )
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client, maybe_wait
 from arcomake.dataset_utils import ReadConfig, SaveConfig, safe_to_zarr
@@ -94,12 +93,13 @@ class ClimatologyConfig(BaseModel):
   "configs_path",
   required=True,
   type=str,
-  callback=validate_configs_path,
+  callback=check_path(dir_okay=False),
 )
 @click.argument(
   "input_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True),
+  type=str,
+  callback=check_path(),
 )
 @click.argument(
   "climatology_output_path",
@@ -141,7 +141,7 @@ class ClimatologyConfig(BaseModel):
 )
 def compute_climatology(
   configs_path: str,
-  input_path: pathlib.Path,
+  input_path: str,
   climatology_output_path: str,
   anomaly_std_output_path: str,
   overwrite: bool = False,

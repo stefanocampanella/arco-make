@@ -15,13 +15,19 @@ logger = logging.getLogger(__name__)
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
-def validate_configs_path(ctx: click.Context, param: click.Parameter, value: str) -> str:
-  fs, path = fsspec.url_to_fs(value)
-  if not fs.exists(path):
-    raise click.ClickException(f"Config path {path} does not exist")
-  if not fs.isfile(path):
-    raise click.ClickException(f"Config path {path} is not a file")
-  return str(path)
+def check_path(exists=True, file_okay=True, dir_okay=True):
+
+  def _check_path(ctx: click.Context, param: click.Parameter, value: str) -> str:
+    fs, path = fsspec.url_to_fs(value)
+    if exists and not fs.exists(path):
+      raise click.ClickException(f"{path} does not exist")
+    if not file_okay and fs.isfile(path):
+      raise click.ClickException(f"{path} is a file")
+    if not dir_okay and fs.isdir(path):
+      raise click.ClickException(f"{path} is a directory")
+    return value
+
+  return _check_path
 
 
 @overload
