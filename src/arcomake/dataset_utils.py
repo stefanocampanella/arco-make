@@ -251,7 +251,7 @@ def maybe_checkpointing_download_and_process(
 
 
 def open_archive(
-  path: str | pathlib.Path, time_dim: str = "time", attrs_to_drop: list[str] | None = None, **kwargs
+  path: str, time_dim: str = "time", attrs_to_drop: list[str] | None = None, **kwargs
 ) -> xr.Dataset:
   """
   Open multiple zipped Zarr datasets and combine them as xarray.open_mfdataset would, with a
@@ -275,8 +275,8 @@ def open_archive(
       Dataset obtained by combining the time-varying variables by coordinates and adding the static
       variables (validated to be equal across inputs) unchanged.
   """
-  path = pathlib.Path(path)
-  zip_file_paths = [str(file_path) for file_path in sorted(path.glob("*.zip"))]
+  fs, fs_path = fsspec.url_to_fs(path)
+  zip_file_paths = [str(file_path) for file_path in sorted(fs.glob(fs_path + "/*.zip"))]
   if len(zip_file_paths) == 0:
     raise ValueError("Provided path does not contain any .zip files.")
   logger.info(f"Reading {len(zip_file_paths)} .zip datasets from {path}")
@@ -288,7 +288,7 @@ def open_archive(
   # Open each dataset quickly to inspect static variables. Keep inline_array=False to avoid huge graphs.
   static_vars: dict[str, xr.DataArray] = {}
   for file_path in zip_file_paths:
-    with xr.open_dataset(file_path, engine="zarr", inline_array=False, **kwargs) as ds:
+    with xr.open_dataset(file_path, **kwargs) as ds:
       for name, var in ds.data_vars.items():
         for key in attrs_to_drop:
           var.attrs.pop(key, None)
@@ -317,11 +317,9 @@ def open_archive(
 
   ds_dynamic = xr.open_mfdataset(
     zip_file_paths,
-    engine="zarr",
     combine="by_coords",
     combine_attrs="no_conflicts",
     preprocess=_drop_static,
-    inline_array=False,
     **kwargs,
   )
 

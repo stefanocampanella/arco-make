@@ -46,7 +46,7 @@ class UnpackConfig(BaseModel):
   "configs_path",
   required=True,
   type=str,
-  callback=check_path,
+  callback=check_path(),
 )
 @click.argument(
   "input_path",
