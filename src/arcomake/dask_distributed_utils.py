@@ -4,8 +4,9 @@ import functools
 import inspect
 import logging
 import socket
+from collections.abc import Callable
 from contextlib import nullcontext
-from typing import Literal
+from typing import Any, Literal, TypeVar, cast
 
 import dask
 import dask.distributed as distributed
@@ -15,8 +16,10 @@ logger = logging.getLogger(__name__)
 
 SchedulerOptionType = Literal["synchronous", "threads", "processes", "mpi", "localcluster"]
 
+F = TypeVar("F", bound=Callable[..., Any])
 
-class DummyClient(nullcontext):
+
+class DummyClient(nullcontext[None]):
   def close(self):
     pass
 
@@ -24,14 +27,17 @@ class DummyClient(nullcontext):
 MaybeClient = distributed.Client | DummyClient
 
 
-def get_dask_env_options(suffix=None, inherit_params_from=None):
+def get_dask_env_options(
+  suffix: str | None = None, inherit_params_from: list[Any] | None = None
+) -> Callable[[F], F]:
 
-  def decorator(func):
+  def decorator(func: F) -> F:
 
     @functools.wraps(func)
-    def wrapped(*args, **kwargs):
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
       dask_config = dask.config.collect_env()
-      func_config = dask_config.get(suffix or func.__name__.lower(), {})
+      func_name = getattr(func, "__name__", "")
+      func_config = dask_config.get(suffix or func_name.lower(), {})
       parameters = []
       if inherit_params_from is not None:
         for f in inherit_params_from:
@@ -43,7 +49,7 @@ def get_dask_env_options(suffix=None, inherit_params_from=None):
           kwargs[p.name] = func_config[p.name]
       return func(*args, **kwargs)
 
-    return wrapped
+    return cast(F, wrapped)
 
   return decorator
 

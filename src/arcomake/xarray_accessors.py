@@ -29,9 +29,12 @@ class ArcoMakeSelector:
     time_coordinate = time_coordinate.to_index()
     if not time_coordinate.is_monotonic_increasing:
       raise ValueError(f"Time coordinate is not sorted: {self._dataset[time_dim]}")
-    time_coordinate_last_value: datetime = time_coordinate[-1].to_pydatetime()
+    time_coordinate_last_value = time_coordinate[-1].to_pydatetime()
+    assert isinstance(time_coordinate_last_value, datetime)
     if time_coordinate_last_value == end_datetime:
-      end_datetime = time_coordinate[-2].to_pydatetime()
+      end_val = time_coordinate[-2].to_pydatetime()
+      assert isinstance(end_val, datetime)
+      end_datetime = end_val
     return self._dataset.sel(time=slice(start_datetime, end_datetime))
 
   def process(
@@ -66,6 +69,7 @@ class ArcoMakeSelector:
         dataset = step_fn(**config)
       else:
         warnings.warn(f"Unrecognized processing step {name} with configuration {config}")
+    assert isinstance(dataset, xr.Dataset)
     return dataset
 
   def validate(

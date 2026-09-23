@@ -55,7 +55,7 @@ def astype(
 ) -> xr.Dataset:
   if dtype is not None and casting is not None:
     ds = ds.astype(dtype=dtype, casting=casting)
-  elif kwargs is not None:
+  elif kwargs:
     data_vars = {}
     for variable, astype_kwargs in kwargs.items():
       if variable in ds.data_vars:
@@ -93,6 +93,7 @@ def diff_std(dataset: xr.Dataset, time_dim: str = "time", **kwargs) -> xr.Datase
   dataset_diff = dataset.diff(dim=time_dim)
   dataset_diff_var = (dataset_diff * dataset_diff).mean(dim=time_dim, **kwargs)
   dataset_diff_std = xr.ufuncs.sqrt(dataset_diff_var)
+  assert isinstance(dataset_diff_std, xr.Dataset)
   return dataset_diff_std
 
 
@@ -127,8 +128,9 @@ def gaussian_blur_extrapolate(
     valid_frac = xr.where(data.isnull(), 0.0, 1.0)
     valid_frac = xr.apply_ufunc(gaussian_filter, valid_frac, kwargs=gaussian_filter_kwargs)
     data_u = data_u / valid_frac
-    data = xr.where(data.isnull(), data_u, data)
-    return data
+    data_filled = xr.where(data.isnull(), data_u, data)
+    assert isinstance(data_filled, xr.DataArray)
+    return data_filled
 
   data_vars = {}
   for var, da in ds.data_vars.items():
@@ -258,8 +260,9 @@ def regrid(
   regrid_conf = kwargs.get("kwargs", {})
   if method == "conservative":
     regrid_conf |= dict(latitude_coord=latitude_dim)
-  ds = getattr(ds.regrid, method)(target_dataset, **regrid_conf)
-  return ds
+  regridded = getattr(ds.regrid, method)(target_dataset, **regrid_conf)
+  assert isinstance(regridded, xr.Dataset)
+  return regridded
 
 
 def rename_coordinates(
@@ -304,8 +307,9 @@ def resample(ds: xr.Dataset, reduce: str, **kwargs) -> xr.Dataset:
     ValueError: If 'reduce' method is not specified.
   """
   ds_resample = ds.resample(**kwargs)
-  ds = getattr(ds_resample, reduce)()
-  return ds
+  ds_reduced = getattr(ds_resample, reduce)()
+  assert isinstance(ds_reduced, xr.Dataset)
+  return ds_reduced
 
 
 def rescale(ds: xr.Dataset, **kwargs) -> xr.Dataset:
@@ -324,7 +328,7 @@ def sel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
 
 
 def select_variables(ds: xr.Dataset, variables: Iterable[str]) -> xr.Dataset:
-  return ds[variables]  # type: ignore
+  return ds[list(variables)]
 
 
 def transpose(ds: xr.Dataset, dims: Sequence[str], **kwargs) -> xr.Dataset:
@@ -379,7 +383,7 @@ def _get_bottom_values(da: xr.DataArray, depth_dim: str = "depth") -> xr.DataArr
     dask="parallelized",
     output_dtypes=[da.dtype],
   )
-
+  assert isinstance(bottom, xr.DataArray)
   return bottom
 
 

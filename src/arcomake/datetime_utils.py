@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-from collections.abc import Generator, Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Literal, SupportsIndex, override
+from typing import Literal, SupportsIndex, override
 
 import numpy as np
 import pandas as pd
@@ -85,9 +85,9 @@ class IterableDateInterval(Iterable[DateInterval]):
   step: timedelta
 
   @override
-  def __iter__(self) -> Generator["DateInterval", Any]:
+  def __iter__(self) -> Iterator[DateInterval]:
 
-    def _date_iterator():
+    def _date_iterator() -> Iterator[DateInterval]:
       left = self.start
       while left < self.end:
         right = min(left + self.step, self.end)
@@ -96,8 +96,8 @@ class IterableDateInterval(Iterable[DateInterval]):
 
     return _date_iterator()
 
-  def __getitem__(self, item: SupportsIndex) -> "DateInterval":
-    return list(self)[item]
+  def __getitem__(self, item: SupportsIndex) -> DateInterval:
+    return [interval for interval in self][item]
 
   def __len__(self) -> int:
     return sum(1 for _ in self)

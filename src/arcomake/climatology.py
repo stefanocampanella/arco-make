@@ -223,7 +223,8 @@ def compute_climatology(
         # Postprocess climatology and anomaly standard deviation.
         if configs.postprocess_climatology:
           climatology = climatology.arcomake.process(steps=configs.postprocess_climatology)
-        anomaly_std: xr.Dataset = np.sqrt(anomaly_var.clip(min=0.0))
+        anomaly_std = np.sqrt(anomaly_var.clip(min=0.0))
+        assert isinstance(anomaly_std, xr.Dataset)
         if configs.postprocess_anomaly_std:
           anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
         # Compute and save the climatology and anomaly std in parallel.

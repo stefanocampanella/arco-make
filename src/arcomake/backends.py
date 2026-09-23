@@ -55,16 +55,16 @@ class CopernicusMarine(BackendEntrypoint):
       raise ValueError("Missing dataset ID.")
 
     if variables is None:
-      variables = []
+      variables_list: list[str] = []
     elif isinstance(variables, str):
-      variables = [variables]
+      variables_list = [variables]
     else:
-      variables = list(variables)
+      variables_list = list(variables)
 
     with cm.open_dataset(
       dataset_id=dataset_id,
       dataset_version=dataset_version,
-      variables=variables,
+      variables=variables_list,
       dataset_part=dataset_part,
       service=service,
       start_datetime=start_datetime,
@@ -74,6 +74,7 @@ class CopernicusMarine(BackendEntrypoint):
       # `chunk_size_limit` is an experimental feature and might break in the future. Crossing fingers...
       chunk_size_limit=False,
     ) as dataset:
+      assert isinstance(dataset, xr.Dataset)
       return dataset
 
   @override
@@ -238,10 +239,10 @@ class EarlyWarningDataStore(BackendEntrypoint):
     date_interval = DateInterval(start=start_datetime, end=end_datetime)
     days = date_interval.to_list(freq=datetime.timedelta(days=1))
 
-    def partition[T](f: Callable[[T, T], bool], sequence: Iterable[T]):
-      part = []
-      subseq = []
-      last = None
+    def partition[T](f: Callable[[T, T], bool], sequence: Iterable[T]) -> list[list[T]]:
+      part: list[list[T]] = []
+      subseq: list[T] = []
+      last: T | None = None
       for current in sequence:
         if (last is None) or (not subseq) or f(last, current):
           subseq.append(current)

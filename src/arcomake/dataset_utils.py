@@ -5,13 +5,14 @@ import logging
 import pathlib
 import tempfile
 from collections.abc import Hashable, Iterable, Mapping
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from typing import Any, Literal
 
 import fsspec
 import xarray as xr
 import zarr.storage
 from dask.delayed import Delayed
+from dask.diagnostics import ProgressBar
 from numcodecs import Blosc
 from pydantic import BaseModel, ConfigDict, Field
 from xarray.backends.common import BackendEntrypoint
@@ -201,9 +202,11 @@ def download_and_process(
     parts.append(part)
   if not parts:
     raise ValueError("No parts found in the dataset configuration")
-  dataset: xr.Dataset = xr.merge(parts, join="exact")
+  dataset = xr.merge(parts, join="exact")
+  assert isinstance(dataset, xr.Dataset)
   if configs.postprocess:
     dataset = dataset.arcomake.process(steps=configs.postprocess)
+    assert isinstance(dataset, xr.Dataset)
   return dataset
 
 
@@ -212,6 +215,7 @@ def maybe_checkpointing_download_and_process(
   start_datetime: datetime.datetime,
   end_datetime: datetime.datetime,
   time_dim: str = "time",
+  progress: bool = True,
 ) -> xr.Dataset:
   checkpointing_conf = configs.checkpointing
   checkpointing_step = checkpointing_conf.step if checkpointing_conf else None
@@ -236,16 +240,19 @@ def maybe_checkpointing_download_and_process(
       for var in dataset.data_vars:
         dataset[var].encoding["compressor"] = compressor
       logger.info(f"Saving checkpoint {date_interval}")
-      if is_first_checkpoint:
-        dataset.to_zarr(store=checkpoint_store, mode="w", compute=True)
-        is_first_checkpoint = False
-      else:
-        dataset.to_zarr(store=checkpoint_store, mode="a-", append_dim=time_dim, compute=True)
+      progress_bar = nullcontext if not progress else ProgressBar
+      with progress_bar():
+        if is_first_checkpoint:
+          dataset.to_zarr(store=checkpoint_store, mode="w", compute=True)
+          is_first_checkpoint = False
+        else:
+          dataset.to_zarr(store=checkpoint_store, mode="a-", append_dim=time_dim, compute=True)
     del dataset
 
   # Open the checkpointed dataset, set the close function to remove the temporary directory when done
   logger.info(f"Opening checkpointed dataset from {checkpoint.name}")
   dataset = xr.open_zarr(store=checkpoint_store, overwrite_encoded_chunks=True)
+  assert isinstance(dataset, xr.Dataset)
   dataset.set_close(checkpoint.cleanup)
   return dataset
 
@@ -410,8 +417,9 @@ def safe_to_zarr(
 
   close_fn = getattr(store, "close", None)
   if not compute:
+    assert store_stack is not None
     if close_fn is not None:
-      store_stack.callback(close_fn)  # ty: ignore
+      store_stack.callback(close_fn)
     return dataset.to_zarr(store=store, compute=False, mode="w", **to_zarr_kwargs)
   try:
     return dataset.to_zarr(store=store, compute=True, mode="w", **to_zarr_kwargs)

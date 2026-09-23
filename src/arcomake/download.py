@@ -46,13 +46,6 @@ class DownloadConfig(BaseModel):
     return self
 
 
-def bar(progress):
-  if progress:
-    return ProgressBar()
-  else:
-    return nullcontext()
-
-
 @click.command()
 @click.argument(
   "configs_path",
@@ -162,6 +155,7 @@ def download(
                 configs.start,
                 configs.end,
                 time_dim=configs.time_dim,
+                progress=progress,
               )
             )
           )
@@ -187,7 +181,8 @@ def download(
               steps=configs.postprocess,
             )
           # Save the dataset in a Zarr using sensible chunking and compression
-          with bar(progress):
+          progress_bar = nullcontext if not progress else ProgressBar
+          with progress_bar():
             safe_to_zarr(
               dataset=dataset,
               destination=output_path,
