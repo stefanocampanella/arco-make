@@ -8,16 +8,17 @@ import click
 from pydantic import BaseModel, ConfigDict, Field
 
 from arcomake.cli_utils import (
-  check_output_path,
+  check_if_overwriting,
   read_configs,
   set_default_logger,
+  validate_configs_path,
 )
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import (
   ReadConfig,
   SaveConfig,
   open_archive,
-  save_to_zarr,
+  safe_to_zarr,
 )
 from arcomake.processing_utils import ProcessingStepConfig
 
@@ -43,9 +44,10 @@ class UnpackConfig(BaseModel):
 
 @click.command()
 @click.argument(
-  "config_path",
+  "configs_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True, dir_okay=False),
+  type=str,
+  callback=validate_configs_path,
 )
 @click.argument(
   "input_path",
@@ -55,7 +57,7 @@ class UnpackConfig(BaseModel):
 @click.argument(
   "output_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, writable=True),
+  type=str,
 )
 @click.option(
   "--overwrite/--no-overwrite",
@@ -78,9 +80,9 @@ class UnpackConfig(BaseModel):
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
 )
 def unpack(
-  config_path: pathlib.Path,
+  configs_path: str,
   input_path: pathlib.Path,
-  output_path: pathlib.Path,
+  output_path: str,
   overwrite: bool = False,
   scheduler_type: SchedulerOptionType = "mpi",
   log_level: str = "info",
@@ -97,10 +99,10 @@ def unpack(
   set_default_logger(log_level)
 
   # Check output path
-  check_output_path(output_path, overwrite=overwrite)
+  check_if_overwriting(output_path, overwrite=overwrite)
 
   # Read configs
-  configs = read_configs(config_path, schema=UnpackConfig)
+  configs = read_configs(configs_path, schema=UnpackConfig)
 
   # Set up Dask client.
   with get_client(scheduler_type=scheduler_type):
@@ -116,9 +118,9 @@ def unpack(
         if configs.postprocess:
           dataset = dataset.arcomake.process(steps=configs.postprocess)
         # Save unpacked dataset
-        save_to_zarr(
+        safe_to_zarr(
           dataset=dataset,
-          path=output_path,
+          destination=output_path,
           configs=configs.save,
           compute=True,
         )

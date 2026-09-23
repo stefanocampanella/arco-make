@@ -11,6 +11,7 @@ from arcomake.checks import ChecksConfig, ValidationError
 from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
+  validate_configs_path,
 )
 from arcomake.dataset_utils import ReadConfig
 
@@ -25,11 +26,7 @@ class ValidateConfig(BaseModel):
 
 
 @click.command()
-@click.argument(
-  "config_path",
-  required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True, dir_okay=False),
-)
+@click.argument("configs_path", required=True, type=str, callback=validate_configs_path)
 @click.argument(
   "input_path",
   required=True,
@@ -42,7 +39,7 @@ class ValidateConfig(BaseModel):
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
 )
 def validate(
-  config_path: pathlib.Path,
+  configs_path: str,
   input_path: pathlib.Path,
   fail: bool = False,
   log_level: str = "info",
@@ -57,7 +54,7 @@ def validate(
   set_default_logger(log_level)
 
   # Read configs
-  configs = read_configs(config_path, schema=ValidateConfig)
+  configs = read_configs(configs_path, schema=ValidateConfig)
 
   # Validate the dataset
   if configs.checks:

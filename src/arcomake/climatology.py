@@ -49,12 +49,13 @@ import xarray as xr
 from pydantic import BaseModel, ConfigDict, Field
 
 from arcomake.cli_utils import (
-  check_output_path,
+  check_if_overwriting,
   read_configs,
   set_default_logger,
+  validate_configs_path,
 )
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client, maybe_wait
-from arcomake.dataset_utils import ReadConfig, SaveConfig, save_to_zarr
+from arcomake.dataset_utils import ReadConfig, SaveConfig, safe_to_zarr
 from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
@@ -90,9 +91,10 @@ class ClimatologyConfig(BaseModel):
 
 @click.command()
 @click.argument(
-  "config_path",
+  "configs_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True, dir_okay=False),
+  type=str,
+  callback=validate_configs_path,
 )
 @click.argument(
   "input_path",
@@ -102,12 +104,12 @@ class ClimatologyConfig(BaseModel):
 @click.argument(
   "climatology_output_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, writable=True),
+  type=str,
 )
 @click.argument(
   "anomaly_std_output_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, writable=True),
+  type=str,
 )
 @click.option(
   "--overwrite/--no-overwrite",
@@ -138,10 +140,10 @@ class ClimatologyConfig(BaseModel):
   show_default=True,
 )
 def compute_climatology(
-  config_path: pathlib.Path,
+  configs_path: str,
   input_path: pathlib.Path,
-  climatology_output_path: pathlib.Path,
-  anomaly_std_output_path: pathlib.Path,
+  climatology_output_path: str,
+  anomaly_std_output_path: str,
   overwrite: bool = False,
   scheduler_type: SchedulerOptionType = "mpi",
   sync_step: bool = False,
@@ -160,7 +162,7 @@ def compute_climatology(
 
   Parameters
   ----------
-  config_path : pathlib.Path
+  configs_path : pathlib.Path
       Path to TOML configuration file containing configuration options.
   input_path : pathlib.Path
       Path to the input Zarr dataset.
@@ -182,11 +184,11 @@ def compute_climatology(
   set_default_logger(log_level)
 
   # Check output paths.
-  check_output_path(climatology_output_path, overwrite=overwrite)
-  check_output_path(anomaly_std_output_path, overwrite=overwrite)
+  check_if_overwriting(climatology_output_path, overwrite=overwrite)
+  check_if_overwriting(anomaly_std_output_path, overwrite=overwrite)
 
   # Read configs
-  configs = read_configs(config_path, schema=ClimatologyConfig)
+  configs = read_configs(configs_path, schema=ClimatologyConfig)
 
   # Set up Dask client.
   with get_client(scheduler_type=scheduler_type):
@@ -227,14 +229,14 @@ def compute_climatology(
         # Compute and save the climatology and anomaly std in parallel.
         logger.info("Processing climatology and anomaly standard deviation.")
         with ExitStack() as store_stack:
-          _climatology_delayed_save = save_to_zarr(
+          _climatology_delayed_save = safe_to_zarr(
             climatology,
             climatology_output_path,
             configs=configs.save,
             compute=False,
             store_stack=store_stack,
           )
-          _anomaly_std_delayed_save = save_to_zarr(
+          _anomaly_std_delayed_save = safe_to_zarr(
             anomaly_std,
             anomaly_std_output_path,
             configs=configs.save,

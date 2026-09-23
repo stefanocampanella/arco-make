@@ -8,7 +8,9 @@ from collections.abc import Hashable, Iterable, Mapping
 from contextlib import ExitStack
 from typing import Any, Literal
 
+import fsspec
 import xarray as xr
+import zarr.storage
 from dask.delayed import Delayed
 from numcodecs import Blosc
 from pydantic import BaseModel, ConfigDict, Field
@@ -54,16 +56,6 @@ class ReadConfig(BaseModel):
   chunked_array_type: str | None = None
   from_array_kwargs: dict[str, Any] | None = None
   backend_kwargs: dict[str, Any] | None = None
-
-  # @model_validator(mode="after")
-  # def validate_chunks(self) -> Self:
-  #   if (
-  #     self.chunks is not None
-  #     and isinstance(self.chunks, dict)
-  #     and not all(isinstance(value, int) or value == "auto" for value in self.chunks.values())
-  #   ):
-  #     raise ValueError("Chunk option value must be a dictionary with integer or 'auto' values")
-  #   return self
 
 
 class CompressorConfig(BaseModel):
@@ -183,6 +175,7 @@ class SaveConfig(BaseModel):
   chunks: ChunksConfig | None = None
   compressor: CompressorConfig | None = None
   encoding: dict[str, VariableEncodingConfig] | None = None
+  storage_options: dict[str, Any] | None = None
 
 
 def download_and_process(
@@ -255,46 +248,6 @@ def maybe_checkpointing_download_and_process(
   dataset = xr.open_zarr(store=checkpoint_store, overwrite_encoded_chunks=True)
   dataset.set_close(checkpoint.cleanup)
   return dataset
-
-
-# FIXME: the code should handle both Zarr (using a DirectoryStore or a ZipStore) and NetCDF files.
-def open_dataset_wo_static(
-  path: str | pathlib.Path, time_dim: str = "time", chunks=None
-) -> xr.Dataset:
-  """
-  Open a dataset from a single Zarr file/store or a directory containing multiple Zarr zip files.
-
-  - If `path` is a directory with one or more .zip files, open all of them via xarray.open_mfdataset(engine='zarr').
-  - In all other cases, open it via xarray.open_dataset(engine='zarr').
-
-  Returns a xarray.Dataset filtered to only data variables that include the provided time dimension.
-  """
-  path = pathlib.Path(path)
-
-  def _drop_static_vars(ds: xr.Dataset, time_dim: str) -> xr.Dataset:
-    ds = ds.drop_vars([name for (name, var) in ds.data_vars.items() if time_dim not in var.dims])
-    return ds
-
-  # As the Dask graph tends to be huge it's important to avoid inline_array=True,
-  # see: https://docs.dask.org/en/latest/generated/dask.array.from_array.html#dask.array.from_array
-  if path.is_dir():
-    zip_files = sorted(p for p in path.glob("*.zip"))
-    if zip_files:
-      # noinspection PyTypeChecker
-      ds = xr.open_mfdataset(
-        [str(p) for p in zip_files],
-        preprocess=lambda ds: _drop_static_vars(ds, time_dim),
-        engine="zarr",
-        combine="by_coords",
-        inline_array=False,
-        chunks=chunks,
-      )
-      return ds
-
-  ds = xr.open_dataset(str(path), engine="zarr", inline_array=False, chunks=chunks)
-  ds = _drop_static_vars(ds, time_dim)
-
-  return ds
 
 
 def open_archive(
@@ -383,9 +336,9 @@ def open_archive(
   return ds_dynamic
 
 
-def save_to_zarr(
+def safe_to_zarr(
   dataset: xr.Dataset,
-  path: pathlib.Path,
+  destination: str | pathlib.Path | zarr.storage.BaseStore | fsspec.mapping.FSMap,
   configs: SaveConfig | None = None,
   compute: bool = True,
   *,
@@ -408,16 +361,18 @@ def save_to_zarr(
   if configs is None:
     configs = SaveConfig()
 
-  logger.info(f"Saving dataset to {path} with {configs}")
-  rechunk_conf = configs.chunks
+  logger.info(f"Saving dataset to {destination} with {configs}")
+  chunk_conf = configs.chunks
   compressor = (
     Blosc(**configs.compressor.model_dump(exclude_none=True))
     if configs.compressor is not None
     else None
   )
-  to_zarr_kwargs = configs.model_dump(exclude_none=True, exclude={"chunks", "compressor"})
+  to_zarr_kwargs = configs.model_dump(
+    exclude_none=True, exclude={"chunks", "compressor", "storage_options"}
+  )
 
-  if rechunk_conf:
+  if chunk_conf:
     # Set the on-disk Zarr chunk layout via encoding, without altering the
     # underlying Dask chunking. This requires the existing Dask chunks to be
     # an integer multiple of (and evenly divide into) the requested chunks
@@ -425,14 +380,14 @@ def save_to_zarr(
     # see: https://github.com/pydata/xarray/issues/4380
     for var in dataset.data_vars:
       dims = dataset[var].dims
-      if isinstance(rechunk_conf, dict):
+      if isinstance(chunk_conf, dict):
         chunk_sizes = tuple(
-          rechunk_conf[dim] if dim in rechunk_conf else dataset[var].sizes[dim] for dim in dims
+          chunk_conf[dim] if dim in chunk_conf else dataset[var].sizes[dim] for dim in dims
         )
-      elif isinstance(rechunk_conf, tuple):
-        chunk_sizes = rechunk_conf
+      elif isinstance(chunk_conf, tuple):
+        chunk_sizes = chunk_conf
       else:
-        chunk_sizes = tuple(rechunk_conf for _ in dims)
+        chunk_sizes = tuple(chunk_conf for _ in dims)
       dataset[var].encoding["chunks"] = chunk_sizes
   for var in dataset.data_vars:
     dataset[var].encoding["compressor"] = compressor
@@ -442,15 +397,26 @@ def save_to_zarr(
       if isinstance(var_enc, dict) and isinstance(var_enc.get("compressor"), dict):
         var_enc["compressor"] = Blosc(**var_enc["compressor"])
 
-  if path.suffix == ".zip":
-    # Notice that parallel writes to Zarr using zip store are (apparently) not supported.
-    store = ZipStore(path=str(path), mode="w", compression=0, allowZip64=True)
+  if isinstance(destination, (zarr.storage.BaseStore, fsspec.mapping.FSMap)):
+    store = destination
+  elif isinstance(destination, str) and "://" in destination:
+    storage_options = getattr(configs, "storage_options", None) or {}
+    store = fsspec.get_mapper(destination, **storage_options)
   else:
-    store = DirectoryStore(path=str(path))
+    path_obj = pathlib.Path(destination)
+    if path_obj.suffix == ".zip":
+      # Notice that parallel writes to Zarr using zip store are (apparently) not supported.
+      store = ZipStore(path=str(path_obj), mode="w", compression=0, allowZip64=True)
+    else:
+      store = DirectoryStore(path=str(path_obj))
+
+  close_fn = getattr(store, "close", None)
   if not compute:
-    store_stack.callback(store.close)  # ty: ignore
+    if close_fn is not None:
+      store_stack.callback(close_fn)  # ty: ignore
     return dataset.to_zarr(store=store, compute=False, mode="w", **to_zarr_kwargs)
   try:
     return dataset.to_zarr(store=store, compute=True, mode="w", **to_zarr_kwargs)
   finally:
-    store.close()
+    if close_fn is not None:
+      close_fn()

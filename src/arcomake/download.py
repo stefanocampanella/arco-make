@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-import pathlib
 import warnings
 from contextlib import ExitStack, nullcontext
 from datetime import datetime
@@ -13,16 +12,17 @@ from dask.diagnostics import ProgressBar
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from arcomake.cli_utils import (
-  check_output_path,
+  check_if_overwriting,
   read_configs,
   set_default_logger,
+  validate_configs_path,
 )
 from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
   maybe_checkpointing_download_and_process,
-  save_to_zarr,
+  safe_to_zarr,
 )
 from arcomake.processing_utils import ProcessingStepConfig
 
@@ -55,14 +55,15 @@ def bar(progress):
 
 @click.command()
 @click.argument(
-  "config_path",
+  "configs_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, exists=True, dir_okay=False),
+  type=str,
+  callback=validate_configs_path,
 )
 @click.argument(
   "output_path",
   required=True,
-  type=click.Path(path_type=pathlib.Path, resolve_path=True, writable=True),
+  type=str,
 )
 @click.option(
   "--start",
@@ -106,8 +107,8 @@ def bar(progress):
   is_flag=True,
 )
 def download(
-  config_path: pathlib.Path,
-  output_path: pathlib.Path,
+  configs_path: str,
+  output_path: str,
   start_datetime: datetime | None = None,
   end_datetime: datetime | None = None,
   overwrite: bool = False,
@@ -119,7 +120,7 @@ def download(
   Download and process multiple datasets into a single ARCO dataset.
 
   The function reads dataset configurations, applies necessary postprocessing steps,
-  and saves the merged dataset to a Zarr store.
+  and saves the merged dataset to a local or remote path.
   """
 
   # Set up logging.
@@ -131,10 +132,10 @@ def download(
     update_time_interval["start"] = start_datetime
   if end_datetime is not None:
     update_time_interval["end"] = end_datetime
-  configs = read_configs(config_path, inject=update_time_interval, schema=DownloadConfig)
+  configs = read_configs(configs_path, inject=update_time_interval, schema=DownloadConfig)
 
-  # Check if the output path exists.
-  check_output_path(output_path, overwrite=overwrite)
+  # Check if the output destination exists.
+  check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
 
   # Set up the Dask client. Notice: distributed dask clusters are not available due to serialization issues.
   with get_client(scheduler_type=scheduler_type):
@@ -187,9 +188,9 @@ def download(
             )
           # Save the dataset in a Zarr using sensible chunking and compression
           with bar(progress):
-            save_to_zarr(
+            safe_to_zarr(
               dataset=dataset,
-              path=output_path,
+              destination=output_path,
               configs=configs.save,
               compute=True,
             )

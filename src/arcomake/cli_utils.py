@@ -1,38 +1,48 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-import pathlib
 import tomllib
 from typing import Any, TypeVar, overload
 
 import click
+import fsspec
 from pydantic import BaseModel, ValidationError
+
+from arcomake.dataset_utils import SaveConfig
 
 logger = logging.getLogger(__name__)
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
+def validate_configs_path(ctx: click.Context, param: click.Parameter, value: str) -> str:
+  fs, path = fsspec.url_to_fs(value)
+  if not fs.exists(path):
+    raise click.ClickException(f"Config path {path} does not exist")
+  if not fs.isfile(path):
+    raise click.ClickException(f"Config path {path} is not a file")
+  return str(path)
+
+
 @overload
 def read_configs(
-  path: str | pathlib.Path, schema: type[ModelT], inject: dict[str, Any] | None = None
+  path: str, schema: type[ModelT], inject: dict[str, Any] | None = None
 ) -> ModelT: ...
 
 
 @overload
 def read_configs(
-  path: str | pathlib.Path, schema: None = None, inject: dict[str, Any] | None = None
+  path: str, schema: None = None, inject: dict[str, Any] | None = None
 ) -> dict[str, Any]: ...
 
 
 def read_configs(
-  path: str | pathlib.Path,
+  path: str,
   schema: type[ModelT] | None = None,
   inject: dict[str, Any] | None = None,
 ) -> ModelT | dict[str, Any]:
-  path = path if isinstance(path, pathlib.Path) else pathlib.Path(path)
   logger.info(f"Reading configs from {path}")
-  with path.open("rb") as config_file:
+  with fsspec.open(urlpath=path, mode="rb") as config_file:
     configs = tomllib.load(config_file)
   if inject:
     logger.info(f"Updating configs with {inject}")
@@ -45,15 +55,22 @@ def read_configs(
   return configs
 
 
-def check_output_path(path: pathlib.Path, overwrite: bool = False) -> None:
-  # If destination exists and should not overwrite, raise and exit.
-  if path.exists():
+def check_if_overwriting(
+  path: str, overwrite: bool = False, save_configs: SaveConfig | None = None
+) -> None:
+  storage_options = getattr(save_configs, "storage_options", None) if save_configs else None
+  fs, fs_path = fsspec.url_to_fs(path, **(storage_options or {}))
+  try:
+    exists = fs.exists(fs_path)
+  except Exception as exc:
+    logger.warning(f"Could not check existence of {path}: {exc}")
+    exists = False
+
+  if exists:
     if overwrite:
       logger.info(f"Overwriting existing output destination {path}")
     else:
       raise click.ClickException(f"Output destination {path} already exists")
-  # Ensure parent directory exists
-  path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def set_default_logger(log_level: str = "info"):
