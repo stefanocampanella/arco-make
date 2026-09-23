@@ -21,7 +21,7 @@ from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
-  maybe_checkpointing_open_and_process,
+  maybe_checkpointing_download_and_process,
   save_to_zarr,
 )
 from arcomake.processing_utils import ProcessingStepConfig
@@ -156,7 +156,7 @@ def download(
           logger.info(f"Downloading {dataset_name}")
           datasets.append(
             stack.enter_context(
-              maybe_checkpointing_open_and_process(
+              maybe_checkpointing_download_and_process(
                 dataset_conf,
                 configs.start,
                 configs.end,

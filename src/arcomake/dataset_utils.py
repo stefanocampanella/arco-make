@@ -185,7 +185,7 @@ class SaveConfig(BaseModel):
   encoding: dict[str, VariableEncodingConfig] | None = None
 
 
-def open_and_process(
+def download_and_process(
   configs: DatasetConfig,
   start_datetime: datetime.datetime,
   end_datetime: datetime.datetime,
@@ -214,7 +214,7 @@ def open_and_process(
   return dataset
 
 
-def maybe_checkpointing_open_and_process(
+def maybe_checkpointing_download_and_process(
   configs: DatasetConfig,
   start_datetime: datetime.datetime,
   end_datetime: datetime.datetime,
@@ -228,10 +228,10 @@ def maybe_checkpointing_open_and_process(
   )
 
   if checkpointing_step is None:
-    return open_and_process(configs, start_datetime, end_datetime)
+    return download_and_process(configs, start_datetime, end_datetime)
   parsed_step = may_parse_timedelta(checkpointing_step)
   if parsed_step >= end_datetime - start_datetime:
-    return open_and_process(configs, start_datetime, end_datetime)
+    return download_and_process(configs, start_datetime, end_datetime)
 
   checkpoint = tempfile.TemporaryDirectory(suffix=".zarr", delete=False)
   logger.info(f"Checkpointing to {checkpoint.name} every {parsed_step}")
@@ -239,7 +239,7 @@ def maybe_checkpointing_open_and_process(
   date_intervals = IterableDateInterval(start_datetime, end_datetime, parsed_step)
   is_first_checkpoint = True
   for date_interval in date_intervals:
-    with open_and_process(configs, date_interval.start, date_interval.end) as dataset:
+    with download_and_process(configs, date_interval.start, date_interval.end) as dataset:
       for var in dataset.data_vars:
         dataset[var].encoding["compressor"] = compressor
       logger.info(f"Saving checkpoint {date_interval}")
