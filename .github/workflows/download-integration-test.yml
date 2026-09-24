@@ -63,7 +63,7 @@ jobs:
           --no-progress
           --overwrite
           --
-          "${PWD}/arco-ocean/configs/download/arco-ocean_tres-1d_res-0p25_levels-10.toml" /tmp/tempfile.zip
+          "${PWD}/arco-ocean/configs/download/arco-ocean_tres-1d_res-0p25_levels-50.toml" /tmp/tempfile.zip
 
       - name: Verify output
         run: |
