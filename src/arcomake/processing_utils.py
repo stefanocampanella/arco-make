@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-from collections.abc import Hashable, Iterable, Mapping, Sequence
-from typing import Any
+from collections.abc import Hashable, Iterable, Mapping
+from typing import Any, Literal
 
 import numpy as np
 import xarray as xr
@@ -23,12 +23,12 @@ class ProcessingStepConfig(BaseModel):
 
 def apply_mask(
   ds: xr.Dataset,
-  mask_name: str,
-  variables: Iterable[str] | None = None,
+  mask_name: Hashable,
+  variables: Iterable[Hashable] | None = None,
 ) -> xr.Dataset:
   mask = ds[mask_name]
   if variables is None:
-    variables: str = ds.data_vars.keys()  # type: ignore
+    variables = ds.data_vars.keys()
   data_vars = {}
   for var in ds.data_vars:
     if var in variables:
@@ -66,7 +66,7 @@ def astype(
   return ds
 
 
-def clip_negative(ds: xr.Dataset, variables: Sequence[str]):
+def clip_negative(ds: xr.Dataset, variables: Iterable[Hashable]):
   data_vars = {}
   for var, da in ds.data_vars.items():
     if var in variables:
@@ -102,7 +102,7 @@ def drop_static_vars(ds: xr.Dataset, time_dim: str = "time") -> xr.Dataset:
   return ds
 
 
-def drop_var_attrs(ds: xr.Dataset, variables: Sequence[str]) -> xr.Dataset:
+def drop_var_attrs(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
   ds = ds.copy(deep=False)
   for key in variables:
     ds[key] = ds[key].drop_attrs()
@@ -115,11 +115,11 @@ def flip(ds: xr.Dataset, dim: str) -> xr.Dataset:
 
 def gaussian_blur_extrapolate(
   ds: xr.Dataset,
-  variables: Iterable[str] | None = None,
+  variables: Iterable[Hashable] | None = None,
   **kwargs,
 ) -> xr.Dataset:
   if variables is None:
-    variables: str = ds.data_vars.keys()  # type: ignore
+    variables = ds.data_vars.keys()
   gaussian_filter_kwargs = kwargs.get("gaussian_filter_kwargs", {})
 
   def gauss_fill_nan(data: xr.DataArray) -> xr.DataArray:
@@ -145,12 +145,12 @@ def gaussian_blur_extrapolate(
 def get_bottom(
   ds: xr.Dataset,
   depth_dim: str,
-  variables: Sequence[Hashable] | Mapping[Hashable, Hashable] | None = None,
+  variables: Iterable[Hashable] | Mapping[Hashable, Hashable] | None = None,
   replace=True,
 ) -> xr.Dataset:
   ds = ds.copy()
   if variables is None:
-    variables: list[Hashable] = list(ds.data_vars.keys())
+    variables = ds.data_vars.keys()
   if replace and isinstance(variables, Mapping):
     logger.warning(
       "Replacing variables in place with bottom values; mapping target names are ignored because 'replace=True'."
@@ -172,8 +172,8 @@ def get_bottom(
 
 def get_notnull_mask(
   ds: xr.Dataset,
-  variable: str,
-  mask_name: str,
+  variable: Hashable,
+  mask_name: Hashable,
 ) -> xr.Dataset:
   ds[mask_name] = ds[variable].notnull()
   return ds
@@ -181,11 +181,11 @@ def get_notnull_mask(
 
 def get_sea_mask(
   ds: xr.Dataset,
-  bathymetry="deptho",
-  depth_coordinate="depth",
-  depth_dim="level",
+  bathymetry: Hashable = "deptho",
+  depth_coordinate: Hashable = "depth",
+  depth_dim: str = "level",
   threshold: float = 0.5,
-  mask_name="sea_land_mask",
+  mask_name: Hashable = "sea_land_mask",
 ) -> xr.Dataset:
   bathymetry_values = ds[bathymetry].values
   depth = ds[depth_coordinate].values
@@ -217,16 +217,16 @@ def isel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
   return ds.isel({dim: _get_selection(values) for dim, values in kwargs.items()})
 
 
-def is_positive_mask(ds: xr.Dataset, variable: str, mask_name: str) -> xr.Dataset:
+def is_positive_mask(ds: xr.Dataset, variable: Hashable, mask_name: Hashable) -> xr.Dataset:
   ds[mask_name] = ds[variable] > 0.0
   return ds
 
 
 def masked_fill(
   ds: xr.Dataset,
-  variables: Iterable[str],
-  fill_value: Number | str | dict[str, Number | str],
-  mask_name: str,
+  variables: Iterable[Hashable],
+  fill_value: Number | str | Mapping[Hashable, Number | Hashable],
+  mask_name: Hashable,
 ) -> xr.Dataset:
   if mask_name not in ds.data_vars:
     raise ValueError(f"Mask {mask_name} does not exist")
@@ -236,7 +236,7 @@ def masked_fill(
     _mask = mask.isel({dim: 0 for dim in mask.dims if dim not in da.dims}, drop=True)
     if var in variables:
       # Check if the fill value is per variable
-      _fill_name_or_value = fill_value[var] if isinstance(fill_value, dict) else fill_value  # type: ignore
+      _fill_name_or_value = fill_value[var] if isinstance(fill_value, dict) else fill_value
       #  Check if the fill value is constant or a dataset variable
       _fill_value = (
         ds[_fill_name_or_value] if isinstance(_fill_name_or_value, str) else _fill_name_or_value
@@ -250,7 +250,7 @@ def masked_fill(
 
 def regrid(
   ds: xr.Dataset,
-  grid: dict[str, Any],
+  grid: Mapping[str, Any],
   latitude_dim: str = "latitude",
   longitude_dim: str = "longitude",
   **kwargs,
@@ -288,8 +288,8 @@ def regrid(
 
 def rename_coordinates(
   ds: xr.Dataset,
-  name_dict: dict[str, str],
-  set_new_coordinate: dict[str, str | Iterable[Number]] | None = None,
+  name_dict: Mapping[Hashable, Hashable],
+  set_new_coordinate: Mapping[Hashable, Literal["auto"] | Iterable[Number]] | None = None,
 ) -> xr.Dataset:
   name_dict = {
     old_name: new_name for old_name, new_name in name_dict.items() if old_name in ds.coords
@@ -306,7 +306,7 @@ def rename_coordinates(
         else:
           raise ValueError(f"Invalid value for new coordinate: {new_coordinate}")
       ds = ds.drop_indexes(new_name)
-      ds = ds.drop_vars(new_name)
+      ds = ds.drop_vars([new_name])
       ds = ds.assign_coords({new_name: (new_name, new_coordinate)})
       ds = ds.assign_coords({old_name: (new_name, old_coordinate.data)})
   return ds
@@ -348,11 +348,11 @@ def sel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
   return ds.sel({dim: _get_selection(values) for dim, values in kwargs.items()})
 
 
-def select_variables(ds: xr.Dataset, variables: Iterable[str]) -> xr.Dataset:
+def select_variables(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
   return ds[list(variables)]
 
 
-def transpose(ds: xr.Dataset, dims: Sequence[str], **kwargs) -> xr.Dataset:
+def transpose(ds: xr.Dataset, dims: Iterable[Hashable], **kwargs) -> xr.Dataset:
   return ds.transpose(*dims, **kwargs)
 
 
@@ -408,8 +408,10 @@ def _get_bottom_values(da: xr.DataArray, depth_dim: str = "depth") -> xr.DataArr
   return bottom
 
 
-def _get_selection[T: int | float](values: dict[str, T] | list[T] | T) -> slice | list[T] | T:
-  if isinstance(values, dict):
+def _get_selection[T: int | float](values: Mapping[str, T] | list[T] | T) -> slice | list[T] | T:
+  if isinstance(values, Mapping):
+    if not set(values.keys()).issuperset({"start", "stop", "step"}):
+      raise ValueError(f"Invalid selection: {values}")
     return slice(values.get("start"), values.get("stop"), values.get("step"))
   else:
     return values
