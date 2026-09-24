@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Hashable, Iterable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -142,10 +142,31 @@ def gaussian_blur_extrapolate(
   return ds
 
 
-def get_bottom(ds: xr.Dataset, depth_dim: str) -> xr.Dataset:
-  for var, da in ds.data_vars.items():
-    ds[var] = _get_bottom_values(da, depth_dim)
-  ds = ds.drop_vars(depth_dim)
+def get_bottom(
+  ds: xr.Dataset,
+  depth_dim: str,
+  variables: Sequence[Hashable] | Mapping[Hashable, Hashable] | None = None,
+  replace=True,
+) -> xr.Dataset:
+  ds = ds.copy()
+  if variables is None:
+    variables: list[Hashable] = list(ds.data_vars.keys())
+  if replace and isinstance(variables, Mapping):
+    logger.warning(
+      "Replacing variables in place with bottom values; mapping target names are ignored because 'replace=True'."
+    )
+  if not (replace or isinstance(variables, Mapping)):
+    raise ValueError(
+      "When not replacing, variables needs to be a mapping from source variable names to bottom variable names."
+    )
+  for name in variables:
+    bottom_da = _get_bottom_values(ds[name], depth_dim)
+    if replace:
+      ds[name] = bottom_da
+    else:
+      assert isinstance(variables, Mapping)
+      bottom_name = variables[name]
+      ds[bottom_name] = bottom_da
   return ds
 
 
