@@ -410,7 +410,7 @@ def _get_bottom_values(da: xr.DataArray, depth_dim: str = "depth") -> xr.DataArr
 
 def _get_selection[T: int | float](values: Mapping[str, T] | list[T] | T) -> slice | list[T] | T:
   if isinstance(values, Mapping):
-    if not set(values.keys()).issuperset({"start", "stop", "step"}):
+    if not set(values.keys()).issubset({"start", "stop", "step"}):
       raise ValueError(f"Invalid selection: {values}")
     return slice(values.get("start"), values.get("stop"), values.get("step"))
   else:
