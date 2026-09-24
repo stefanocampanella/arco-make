@@ -73,6 +73,12 @@ class DownloadConfig(BaseModel):
   type=click.DateTime(),
 )
 @click.option(
+  "--checkpointing/--no-checkpointing",
+  default=True,
+  is_flag=True,
+  help="Whether to checkpoint intermediate results to disk.",
+)
+@click.option(
   "--overwrite/--no-overwrite",
   help="Whether to overwrite existing outputs",
   default=False,
@@ -104,6 +110,7 @@ def download(
   output_path: str,
   start_datetime: datetime | None = None,
   end_datetime: datetime | None = None,
+  checkpointing: bool = True,
   overwrite: bool = False,
   log_level: str = "info",
   scheduler_type: SchedulerOptionType = "threads",
@@ -141,13 +148,24 @@ def download(
     logger.info(f"Downloading data from {configs.start} to {configs.end}")
     try:
       # Download and postprocess each dataset, possibly using checkpointing to disk.
-      with ExitStack() as stack:
+      with ExitStack() as stack, warnings.catch_warnings():
+        # During postprocessing computation, which may even happen during `save_to_zarr`, if each operation does not
+        # trigger dask computations (e.g., no calls to persist or compute) some RuntimeWarnings may be issued.
+        # This happens frequently with certain algorithms when regridding masked data (containing NaNs).
+        # We filter them to avoid cluttering the log.
+        warnings.filterwarnings(
+          "ignore",
+          message="invalid value encountered in divide",
+          category=RuntimeWarning,
+        )
         datasets: list[xr.Dataset] = []
         for dataset_name, dataset_conf in configs.datasets.items():
           if dataset_conf.skip:
             logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
             continue
-          logger.info(f"Downloading {dataset_name}")
+          if not checkpointing:
+            logger.info("Disabling checkpointing due to '--no-checkpointing' CLI option")
+            dataset_conf.checkpointing = None
           datasets.append(
             stack.enter_context(
               maybe_checkpointing_download_and_process(
@@ -164,17 +182,7 @@ def download(
           xr.merge(
             datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
           ) as dataset,
-          warnings.catch_warnings(),
         ):
-          # During postprocessing computation, which may even happen during `save_to_zarr`, if each operation does not
-          # trigger dask computations (e.g., no calls to persist or compute) some RuntimeWarnings may be issued.
-          # This happens frequently with certain algorithms when regridding masked data (containing NaNs).
-          # We filter them to avoid cluttering the log.
-          warnings.filterwarnings(
-            "ignore",
-            message="invalid value encountered in divide",
-            category=RuntimeWarning,
-          )
           # Postprocess the merged dataset
           if configs.postprocess:
             dataset = dataset.arcomake.process(

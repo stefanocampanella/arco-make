@@ -836,7 +836,7 @@ wheels = [
 [[package]]
 name = "copernicusmarine"
 version = "2.4.1"
-source = { git = "https://github.com/stefanocampanella/copernicus-marine-toolbox.git?rev=arco-make#905e69a23d11903294b5b30ccd0d6691f51a2347" }
+source = { git = "https://github.com/stefanocampanella/copernicus-marine-toolbox.git?rev=arco-make#0e7b2f73d5ebba1fdacd81c37911b44d57a8aedc" }
 dependencies = [
     { name = "arcosparse" },
     { name = "boto3" },
