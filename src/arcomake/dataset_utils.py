@@ -1,15 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
-import contextlib
-import contextvars
 import datetime
 import logging
 import pathlib
 import tempfile
-import threading
 from collections.abc import Hashable, Iterable, Mapping
 from contextlib import ExitStack, nullcontext
-from typing import Any, Literal, Self
+from typing import Any, Literal
 
 import fsspec
 import xarray as xr
@@ -27,67 +24,9 @@ from arcomake.datetime_utils import (
   may_parse_timedelta,
 )
 from arcomake.processing_utils import ProcessingStepConfig
+from arcomake.temporary_utils import get_current_temp_registry
 
 logger = logging.getLogger(__name__)
-
-
-_CURRENT_TEMP_REGISTRY: contextvars.ContextVar["TempDirectoryRegistry | None"] = (
-  contextvars.ContextVar("current_temp_registry", default=None)
-)
-
-
-def get_current_temp_registry() -> "TempDirectoryRegistry | None":
-  """Get the active temporary directory registry in the current context, if any."""
-  return _CURRENT_TEMP_REGISTRY.get()
-
-
-class TempDirectoryRegistry:
-  """Thread-safe and context-scoped manager for temporary directories and resources.
-
-  Ensures temporary directories remain intact while lazy computations (like Dask)
-  stream data from disk, and are deterministically deleted upon exiting the context.
-  """
-
-  def __init__(self):
-    self._stack = contextlib.ExitStack()
-    self._lock = threading.Lock()
-    self._token: contextvars.Token[TempDirectoryRegistry | None] | None = None
-
-  def create_temp_dir(
-    self,
-    suffix: str | None = None,
-    prefix: str | None = None,
-    dir: str | pathlib.Path | None = None,
-    **kwargs,
-  ) -> pathlib.Path:
-    """Create a temporary directory tracked by this registry."""
-    with self._lock:
-      tmpdir = self._stack.enter_context(
-        tempfile.TemporaryDirectory(suffix=suffix, prefix=prefix, dir=dir, **kwargs)
-      )
-      return pathlib.Path(tmpdir)
-
-  def register[T: contextlib.AbstractContextManager[Any]](self, context_or_cleanup: T) -> T:
-    """Register an existing context manager (e.g. TemporaryDirectory) for cleanup."""
-    with self._lock:
-      return self._stack.enter_context(context_or_cleanup)
-
-  def close(self):
-    """Clean up all registered temporary directories."""
-    with self._lock:
-      self._stack.close()
-
-  def __enter__(self) -> Self:
-    self._token = _CURRENT_TEMP_REGISTRY.set(self)
-    return self
-
-  def __exit__(self, exc_type, exc_val, exc_tb):
-    try:
-      self.close()
-    finally:
-      if self._token is not None:
-        _CURRENT_TEMP_REGISTRY.reset(self._token)
-        self._token = None
 
 
 EngineType = (

@@ -1,7 +1,6 @@
 import datetime
 import logging
 import os
-import pathlib
 import tempfile
 import warnings
 from collections.abc import Callable, Iterable
@@ -17,8 +16,8 @@ import xarray as xr
 from xarray.backends import AbstractDataStore, BackendEntrypoint
 from xarray.core.types import ReadBuffer
 
-from arcomake.dataset_utils import TempDirectoryRegistry, get_current_temp_registry
 from arcomake.datetime_utils import DateInterval
+from arcomake.temporary_utils import get_current_temp_registry, set_current_temp_registry
 
 logger = logging.getLogger(__name__)
 
@@ -103,17 +102,13 @@ class NetCDFOverHTTP(BackendEntrypoint):
     filename_or_obj,
     *,
     drop_variables: str | Iterable[str] | None = None,
-    temp_registry: TempDirectoryRegistry | None = None,
   ) -> xr.Dataset:
     logger.info(f"Downloading NetCDF from: {filename_or_obj}")
 
-    registry = temp_registry or get_current_temp_registry()
-    if registry is not None:
-      temp_dir = registry.create_temp_dir()
-      tmpdir = None
-    else:
-      tmpdir = tempfile.TemporaryDirectory()
-      temp_dir = pathlib.Path(tmpdir.name)
+    registry = get_current_temp_registry()
+    if registry is None:
+      raise ValueError("No temporary directory registry available.")
+    temp_dir = registry.create_temp_dir()
 
     temp_path = temp_dir / "downloaded.nc"
     with requests.get(filename_or_obj, stream=True) as response:
@@ -125,8 +120,6 @@ class NetCDFOverHTTP(BackendEntrypoint):
 
     # Open the downloaded file as xarray Dataset
     dataset = xr.open_dataset(temp_path, engine="netcdf4", drop_variables=drop_variables)
-    if tmpdir is not None:
-      dataset.set_close(tmpdir.cleanup)
     return dataset
 
   @override
@@ -178,7 +171,6 @@ class EarlyWarningDataStore(BackendEntrypoint):
     time_dim: str = "time",
     latitude_dim: str = "latitude",
     longitude_dim: str = "longitude",
-    temp_registry: TempDirectoryRegistry | None = None,
   ) -> xr.Dataset:
     url = urlparse(filename_or_obj)
     if url.path or url.query or url.fragment:
@@ -192,7 +184,9 @@ class EarlyWarningDataStore(BackendEntrypoint):
       raise ValueError("Missing required argument.")
     if start_datetime is None or end_datetime is None:
       raise ValueError("Missing required argument.")
-    registry = temp_registry or get_current_temp_registry()
+    registry = get_current_temp_registry()
+    if registry is None:
+      raise ValueError("No temporary directory registry available.")
     consecutive_dates = self._consecutive_dates_with_same_month_or_year(
       start_datetime, end_datetime
     )
@@ -211,7 +205,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
         "download_format": "zip",
       }
 
-      dataset = self._process_request(dataset_name, request, temp_registry=registry)
+      dataset = self._process_request(dataset_name, request)
       # TODO:
       #  Unfortunately, it was impossible to get documentation on `valid_time` for historical GLOFAS data, hence
       #  the provider documentation should clarify the difference between the two, e.g., if renaming the time
@@ -227,7 +221,10 @@ class EarlyWarningDataStore(BackendEntrypoint):
         dataset = dataset.assign_coords(time=dates)
       return dataset
 
-    with ThreadPoolExecutor() as executor:
+    def initializer():
+      set_current_temp_registry(registry)
+
+    with ThreadPoolExecutor(initializer=initializer) as executor:
       logger.info(f"Downloading {dataset_name} from EWDS using {executor._max_workers} threads")
       datasets = list(executor.map(_get_dataset_from_dates, consecutive_dates))
       return xr.concat(datasets, dim=time_dim)
@@ -259,9 +256,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
 
     return partition(same_month_or_year, days)
 
-  def _process_request(
-    self, dataset_name, request, temp_registry: TempDirectoryRegistry | None = None, **kwargs
-  ) -> xr.Dataset:
+  def _process_request(self, dataset_name, request, **kwargs) -> xr.Dataset:
     """Submit a request to the Climate Data Store, download some temporary NetCDFs, and returns a dataset.
     Temporary files are deleted when the temporary directory registry context closes.
     """
@@ -271,13 +266,10 @@ class EarlyWarningDataStore(BackendEntrypoint):
       )
       client.retrieve(dataset_name, request, file.name)
 
-      registry = temp_registry or get_current_temp_registry()
-      if registry is not None:
-        path = registry.create_temp_dir()
-        tmpdir = None
-      else:
-        tmpdir = tempfile.TemporaryDirectory()
-        path = pathlib.Path(tmpdir.name)
+      registry = get_current_temp_registry()
+      if registry is None:
+        raise ValueError("No temporary directory registry available.")
+      path = registry.create_temp_dir()
 
       with ZipFile(file.name) as zipfile:
         zipfile.extractall(path=path)
@@ -286,8 +278,6 @@ class EarlyWarningDataStore(BackendEntrypoint):
       #  see: https://git.ecmwf.int/users/erds/repos/eccodes/browse/src/accessor/grib_accessor_class_g2date.cc?at=f10d3f3c1be3737a231d4a2c19f45535de4d4424#71-75
       #  Also, cdsapi download one NetCDF per variable, ugly. :(
       dataset = xr.open_mfdataset(list(path.glob("*.grib")), engine="cfgrib")
-      if tmpdir is not None:
-        dataset.set_close(tmpdir.cleanup)
       return dataset
 
   # Credits to the amazing Stefano Piani from OGS

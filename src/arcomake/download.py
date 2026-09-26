@@ -21,11 +21,11 @@ from arcomake.dask_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
-  TempDirectoryRegistry,
   maybe_checkpointing_download_and_process,
   safe_to_zarr,
 )
 from arcomake.processing_utils import ProcessingStepConfig
+from arcomake.temporary_utils import TempDirectoryRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -148,7 +148,6 @@ def download(
       )
 
     logger.info(f"Downloading data from {configs.start} to {configs.end}")
-    datasets: list[xr.Dataset] = []
     try:
       # Download and postprocess each dataset, possibly using checkpointing to disk.
       with ExitStack() as stack, warnings.catch_warnings():
@@ -161,6 +160,7 @@ def download(
           message="invalid value encountered in divide",
           category=RuntimeWarning,
         )
+        datasets: list[xr.Dataset] = []
         for dataset_name, dataset_conf in configs.datasets.items():
           if dataset_conf.skip:
             logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
@@ -202,7 +202,3 @@ def download(
     except Exception as exc:
       logger.exception("An error occurred during download")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
-    finally:
-      # Clean up temporary files
-      for source_dataset in datasets:
-        source_dataset.close()
