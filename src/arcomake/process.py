@@ -13,7 +13,7 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
+from arcomake.dask_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import ReadConfig, SaveConfig, safe_to_zarr
 from arcomake.processing_utils import ProcessingStepConfig
 

@@ -17,6 +17,7 @@ import xarray as xr
 from xarray.backends import AbstractDataStore, BackendEntrypoint
 from xarray.core.types import ReadBuffer
 
+from arcomake.dataset_utils import TempDirectoryRegistry, get_current_temp_registry
 from arcomake.datetime_utils import DateInterval
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ class CopernicusMarine(BackendEntrypoint):
     else:
       variables_list = list(variables)
 
-    with cm.open_dataset(
+    dataset = cm.open_dataset(
       dataset_id=dataset_id,
       dataset_version=dataset_version,
       variables=variables_list,
@@ -73,9 +74,9 @@ class CopernicusMarine(BackendEntrypoint):
       # unless `chunk_size_limit` is set to False (a bit of a hack).
       # `chunk_size_limit` is an experimental feature and might break in the future. Crossing fingers...
       chunk_size_limit=False,
-    ) as dataset:
-      assert isinstance(dataset, xr.Dataset)
-      return dataset
+    )
+    assert isinstance(dataset, xr.Dataset)
+    return dataset
 
   @override
   def guess_can_open(
@@ -101,31 +102,32 @@ class NetCDFOverHTTP(BackendEntrypoint):
     self,
     filename_or_obj,
     *,
-    drop_variables=None,
+    drop_variables: str | Iterable[str] | None = None,
+    temp_registry: TempDirectoryRegistry | None = None,
   ) -> xr.Dataset:
     logger.info(f"Downloading NetCDF from: {filename_or_obj}")
 
-    # Create a temporary file to download the NetCDF
-    with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as temp_file:
-      temp_path = temp_file.name
+    registry = temp_registry or get_current_temp_registry()
+    if registry is not None:
+      temp_dir = registry.create_temp_dir()
+      tmpdir = None
+    else:
+      tmpdir = tempfile.TemporaryDirectory()
+      temp_dir = pathlib.Path(tmpdir.name)
 
-    try:
-      # Use requests to download the file
-      response = requests.get(filename_or_obj, stream=True)
+    temp_path = temp_dir / "downloaded.nc"
+    with requests.get(filename_or_obj, stream=True) as response:
       response.raise_for_status()  # Raise an exception for HTTP errors
 
       with open(temp_path, "wb") as f:
         for chunk in response.iter_content(chunk_size=8192):
           f.write(chunk)
 
-      # Open the downloaded file as xarray Dataset
-      with xr.open_dataset(temp_path, engine="netcdf4", drop_variables=drop_variables) as dataset:
-        return dataset.compute()
-
-    finally:
-      # Clean up the temporary file
-      if pathlib.Path(temp_path).exists():
-        pathlib.Path(temp_path).unlink()
+    # Open the downloaded file as xarray Dataset
+    dataset = xr.open_dataset(temp_path, engine="netcdf4", drop_variables=drop_variables)
+    if tmpdir is not None:
+      dataset.set_close(tmpdir.cleanup)
+    return dataset
 
   @override
   def guess_can_open(
@@ -176,6 +178,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
     time_dim: str = "time",
     latitude_dim: str = "latitude",
     longitude_dim: str = "longitude",
+    temp_registry: TempDirectoryRegistry | None = None,
   ) -> xr.Dataset:
     url = urlparse(filename_or_obj)
     if url.path or url.query or url.fragment:
@@ -189,6 +192,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
       raise ValueError("Missing required argument.")
     if start_datetime is None or end_datetime is None:
       raise ValueError("Missing required argument.")
+    registry = temp_registry or get_current_temp_registry()
     consecutive_dates = self._consecutive_dates_with_same_month_or_year(
       start_datetime, end_datetime
     )
@@ -207,7 +211,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
         "download_format": "zip",
       }
 
-      dataset = self._process_request(dataset_name, request)
+      dataset = self._process_request(dataset_name, request, temp_registry=registry)
       # TODO:
       #  Unfortunately, it was impossible to get documentation on `valid_time` for historical GLOFAS data, hence
       #  the provider documentation should clarify the difference between the two, e.g., if renaming the time
@@ -225,11 +229,8 @@ class EarlyWarningDataStore(BackendEntrypoint):
 
     with ThreadPoolExecutor() as executor:
       logger.info(f"Downloading {dataset_name} from EWDS using {executor._max_workers} threads")
-      datasets = executor.map(_get_dataset_from_dates, consecutive_dates)
-      with xr.concat(datasets, dim=time_dim) as dataset:
-        # The dataset must be loaded in memory, since the temporary directory will be deleted with all the NetCDFs within it.
-        # However, ds should be rather small. Hence, there should be no need to lazily load the dataset.
-        return dataset.compute()
+      datasets = list(executor.map(_get_dataset_from_dates, consecutive_dates))
+      return xr.concat(datasets, dim=time_dim)
 
   @staticmethod
   def _consecutive_dates_with_same_month_or_year(
@@ -258,9 +259,11 @@ class EarlyWarningDataStore(BackendEntrypoint):
 
     return partition(same_month_or_year, days)
 
-  def _process_request(self, dataset_name, request, **kwargs) -> xr.Dataset:
+  def _process_request(
+    self, dataset_name, request, temp_registry: TempDirectoryRegistry | None = None, **kwargs
+  ) -> xr.Dataset:
     """Submit a request to the Climate Data Store, download some temporary NetCDFs, and returns a dataset.
-    Temporary files are deleted on exit.
+    Temporary files are deleted when the temporary directory registry context closes.
     """
     with tempfile.NamedTemporaryFile("w+", suffix=".zip") as file:
       client = self.get_cdsapi_client(
@@ -268,16 +271,24 @@ class EarlyWarningDataStore(BackendEntrypoint):
       )
       client.retrieve(dataset_name, request, file.name)
 
-      with tempfile.TemporaryDirectory() as tmpdir:
-        path = pathlib.Path(tmpdir)
-        with ZipFile(file.name) as zipfile:
-          zipfile.extractall(path=path)
-        # FIXME: when reading grib files eccodes emits the following warning:
-        #    ECCODES WARNING :  g2date:unpack_long: Date is not valid! year=0 month=0 day=0
-        #  see: https://git.ecmwf.int/users/erds/repos/eccodes/browse/src/accessor/grib_accessor_class_g2date.cc?at=f10d3f3c1be3737a231d4a2c19f45535de4d4424#71-75
-        #  Also, cdsapi download one NetCDF per variable, ugly. :(
-        with xr.open_mfdataset(list(path.glob("*.grib")), engine="cfgrib") as dataset:
-          return dataset.compute()
+      registry = temp_registry or get_current_temp_registry()
+      if registry is not None:
+        path = registry.create_temp_dir()
+        tmpdir = None
+      else:
+        tmpdir = tempfile.TemporaryDirectory()
+        path = pathlib.Path(tmpdir.name)
+
+      with ZipFile(file.name) as zipfile:
+        zipfile.extractall(path=path)
+      # FIXME: when reading grib files eccodes emits the following warning:
+      #    ECCODES WARNING :  g2date:unpack_long: Date is not valid! year=0 month=0 day=0
+      #  see: https://git.ecmwf.int/users/erds/repos/eccodes/browse/src/accessor/grib_accessor_class_g2date.cc?at=f10d3f3c1be3737a231d4a2c19f45535de4d4424#71-75
+      #  Also, cdsapi download one NetCDF per variable, ugly. :(
+      dataset = xr.open_mfdataset(list(path.glob("*.grib")), engine="cfgrib")
+      if tmpdir is not None:
+        dataset.set_close(tmpdir.cleanup)
+      return dataset
 
   # Credits to the amazing Stefano Piani from OGS
   @staticmethod

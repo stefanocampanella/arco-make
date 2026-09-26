@@ -17,10 +17,11 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.dask_distributed_utils import SchedulerOptionType, get_client
+from arcomake.dask_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
+  TempDirectoryRegistry,
   maybe_checkpointing_download_and_process,
   safe_to_zarr,
 )
@@ -137,8 +138,9 @@ def download(
   # Check if the output destination exists.
   check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
 
-  # Set up the Dask client. Notice: distributed dask clusters are not available due to serialization issues.
-  with get_client(scheduler_type=scheduler_type):
+  # Set up the Dask client and TempDirectoryRegistry.
+  # Notice: distributed dask clusters are not available due to serialization issues.
+  with get_client(scheduler_type=scheduler_type), TempDirectoryRegistry():
     if scheduler_type in ("processes", "mpi", "localcluster"):
       logger.warning(
         f"Using {scheduler_type} scheduler, which is not compatible with remote arco-make xarray backends. "
@@ -146,6 +148,7 @@ def download(
       )
 
     logger.info(f"Downloading data from {configs.start} to {configs.end}")
+    datasets: list[xr.Dataset] = []
     try:
       # Download and postprocess each dataset, possibly using checkpointing to disk.
       with ExitStack() as stack, warnings.catch_warnings():
@@ -158,7 +161,6 @@ def download(
           message="invalid value encountered in divide",
           category=RuntimeWarning,
         )
-        datasets: list[xr.Dataset] = []
         for dataset_name, dataset_conf in configs.datasets.items():
           if dataset_conf.skip:
             logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
