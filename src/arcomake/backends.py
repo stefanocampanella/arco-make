@@ -171,6 +171,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
     time_dim: str = "time",
     latitude_dim: str = "latitude",
     longitude_dim: str = "longitude",
+    max_workers: int | None = None,
   ) -> xr.Dataset:
     url = urlparse(filename_or_obj)
     if url.path or url.query or url.fragment:
@@ -191,8 +192,8 @@ class EarlyWarningDataStore(BackendEntrypoint):
       start_datetime, end_datetime
     )
 
-    def _get_dataset_from_dates(dates: list[datetime.datetime]) -> xr.Dataset:
-      request = {
+    requests = [
+      {
         "system_version": [system_version],
         "hydrological_model": [hydrological_model],
         "product_type": [product_type],
@@ -204,8 +205,13 @@ class EarlyWarningDataStore(BackendEntrypoint):
         "data_format": "grib2",
         "download_format": "zip",
       }
+      for dates in consecutive_dates
+    ]
 
-      dataset = self._process_request(dataset_name, request)
+    raw_datasets = self._process_requests(dataset_name, requests, max_workers=max_workers)
+
+    datasets: list[xr.Dataset] = []
+    for dates, dataset in zip(consecutive_dates, raw_datasets, strict=True):
       # TODO:
       #  Unfortunately, it was impossible to get documentation on `valid_time` for historical GLOFAS data, hence
       #  the provider documentation should clarify the difference between the two, e.g., if renaming the time
@@ -219,15 +225,9 @@ class EarlyWarningDataStore(BackendEntrypoint):
       if len(dates) == 1:
         dataset = dataset.expand_dims(dim=time_dim, axis=0)
         dataset = dataset.assign_coords(time=dates)
-      return dataset
+      datasets.append(dataset)
 
-    def initializer():
-      set_current_temp_registry(registry)
-
-    with ThreadPoolExecutor(initializer=initializer) as executor:
-      logger.info(f"Downloading {dataset_name} from EWDS using {executor._max_workers} threads")
-      datasets = list(executor.map(_get_dataset_from_dates, consecutive_dates))
-      return xr.concat(datasets, dim=time_dim)
+    return xr.concat(datasets, dim=time_dim)
 
   @staticmethod
   def _consecutive_dates_with_same_month_or_year(
@@ -256,7 +256,31 @@ class EarlyWarningDataStore(BackendEntrypoint):
 
     return partition(same_month_or_year, days)
 
-  def _process_request(self, dataset_name, request, **kwargs) -> xr.Dataset:
+  def _process_requests(
+    self,
+    dataset_name: str,
+    requests: Iterable[dict[str, Any]],
+    max_workers: int | None = None,
+    **kwargs,
+  ) -> list[xr.Dataset]:
+    """Submit requests to the Climate Data Store, download temporary files, and return datasets.
+    Requests are processed asynchronously on a thread pool.
+    """
+    registry = get_current_temp_registry()
+    if registry is None:
+      raise ValueError("No temporary directory registry available.")
+
+    def _worker(request: dict[str, Any]) -> xr.Dataset:
+      return self._process_request(dataset_name, request, **kwargs)
+
+    def initializer():
+      set_current_temp_registry(registry)
+
+    with ThreadPoolExecutor(initializer=initializer, max_workers=max_workers) as executor:
+      logger.info(f"Downloading {dataset_name} from EWDS using {executor._max_workers} threads")
+      return list(executor.map(_worker, requests))
+
+  def _process_request(self, dataset_name: str, request: dict[str, Any], **kwargs) -> xr.Dataset:
     """Submit a request to the Climate Data Store, download some temporary NetCDFs, and returns a dataset.
     Temporary files are deleted when the temporary directory registry context closes.
     """
