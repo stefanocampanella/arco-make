@@ -42,9 +42,15 @@ def _cleanup_all_active_registries() -> None:
   """Clean up all currently active registries on process exit or termination."""
   with _ACTIVE_REGISTRIES_LOCK:
     registries = list(_ACTIVE_REGISTRIES)
+  if registries:
+    logger.info(
+      f"Cleaning up {len(registries)} active temporary director{'ies' if len(registries) > 1 else 'y'} on process exit."
+    )
   for reg in registries:
-    with contextlib.suppress(Exception):
+    try:
       reg.close()
+    except Exception as exc:
+      logger.warning(f"Error during registry cleanup on process termination: {exc}")
 
 
 atexit.register(_cleanup_all_active_registries)
@@ -68,6 +74,7 @@ def _install_signal_handlers() -> None:
       if prev_handler in (signal.SIG_DFL, None):
 
         def _handler(signum: int, frame: Any, prev: Any = prev_handler) -> None:
+          logger.info(f"Received signal {signum}, cleaning up active temporary registries.")
           _cleanup_all_active_registries()
           if callable(prev):
             prev(signum, frame)
@@ -128,6 +135,7 @@ class TempDirectoryRegistry:
         if len(parts) >= 2:
           pid = int(parts[1])
           if pid != current_pid and not _pid_exists(pid):
+            logger.info(f"Cleaning up stale temporary directory from dead process {pid}: {item}")
             shutil.rmtree(item, ignore_errors=True)
       except (ValueError, IndexError):
         continue
@@ -148,6 +156,7 @@ class TempDirectoryRegistry:
       prefix=f"pid_{self._pid}_{uuid.uuid4().hex[:6]}_", dir=parent_base
     )
     self._job_dir = pathlib.Path(job_dir_path)
+    logger.info(f"Created temporary job directory: {self._job_dir}")
 
     with _ACTIVE_REGISTRIES_LOCK:
       _ACTIVE_REGISTRIES.add(self)
@@ -170,11 +179,14 @@ class TempDirectoryRegistry:
       tmpdir = self._stack.enter_context(
         tempfile.TemporaryDirectory(suffix=suffix, prefix=prefix, dir=target_dir, **kwargs)
       )
-      return pathlib.Path(tmpdir)
+      path = pathlib.Path(tmpdir)
+      logger.info(f"Created temporary directory: {path}")
+      return path
 
   def register[T: contextlib.AbstractContextManager[Any]](self, context_or_cleanup: T) -> T:
     """Register an existing context manager (e.g. TemporaryDirectory) for cleanup."""
     with self._lock:
+      logger.info(f"Registered resource for cleanup: {context_or_cleanup}")
       return self._stack.enter_context(context_or_cleanup)
 
   def close(self) -> None:
@@ -187,6 +199,7 @@ class TempDirectoryRegistry:
       with _ACTIVE_REGISTRIES_LOCK:
         _ACTIVE_REGISTRIES.discard(self)
 
+      logger.info(f"Cleaning up temporary directory registry: {self._job_dir}")
       try:
         self._stack.close()
       finally:
