@@ -3,13 +3,13 @@
 import logging
 import warnings
 from contextlib import ExitStack, nullcontext
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Self, get_args
 
 import click
 import xarray as xr
 from dask.diagnostics import ProgressBar
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from arcomake.cli_utils import (
   check_if_overwriting,
@@ -24,6 +24,7 @@ from arcomake.dataset_utils import (
   maybe_checkpointing_download_and_process,
   safe_to_zarr,
 )
+from arcomake.datetime_utils import IterableDateInterval, may_parse_timedelta
 from arcomake.processing_utils import ProcessingStepConfig
 from arcomake.temporary_utils import TempDirectoryRegistry
 
@@ -34,11 +35,17 @@ class DownloadConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   time_dim: str = "time"
+  step: timedelta
   start: datetime
   end: datetime
   datasets: dict[str, DatasetConfig]
   postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
   save: SaveConfig
+
+  @field_validator("step", mode="before")
+  @classmethod
+  def parse_step(cls, value: str | timedelta) -> timedelta:
+    return may_parse_timedelta(value)
 
   @model_validator(mode="after")
   def validate_date_range(self) -> Self:
@@ -74,12 +81,6 @@ class DownloadConfig(BaseModel):
   type=click.DateTime(),
 )
 @click.option(
-  "--checkpointing/--no-checkpointing",
-  default=True,
-  is_flag=True,
-  help="Whether to checkpoint intermediate results to disk.",
-)
-@click.option(
   "--overwrite/--no-overwrite",
   help="Whether to overwrite existing outputs",
   default=False,
@@ -111,7 +112,6 @@ def download(
   output_path: str,
   start_datetime: datetime | None = None,
   end_datetime: datetime | None = None,
-  checkpointing: bool = True,
   overwrite: bool = False,
   log_level: str = "info",
   scheduler_type: SchedulerOptionType = "threads",
@@ -146,59 +146,69 @@ def download(
         f"Using {scheduler_type} scheduler, which is not compatible with remote arco-make xarray backends. "
         "Please use 'threads' or 'synchronous' instead."
       )
-
-    logger.info(f"Downloading data from {configs.start} to {configs.end}")
-    try:
-      # Download and postprocess each dataset, possibly using checkpointing to disk.
-      with ExitStack() as stack, warnings.catch_warnings():
-        # During postprocessing computation, which may even happen during `save_to_zarr`, if each operation does not
-        # trigger dask computations (e.g., no calls to persist or compute) some RuntimeWarnings may be issued.
-        # This happens frequently with certain algorithms when regridding masked data (containing NaNs).
-        # We filter them to avoid cluttering the log.
-        warnings.filterwarnings(
-          "ignore",
-          message="invalid value encountered in divide",
-          category=RuntimeWarning,
-        )
-        datasets: list[xr.Dataset] = []
-        for dataset_name, dataset_conf in configs.datasets.items():
-          if dataset_conf.skip:
-            logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
-            continue
-          if not checkpointing:
-            logger.info("Disabling checkpointing due to '--no-checkpointing' CLI option")
-            dataset_conf.checkpointing = None
-          datasets.append(
-            stack.enter_context(
-              maybe_checkpointing_download_and_process(
-                dataset_conf,
-                configs.start,
-                configs.end,
-                time_dim=configs.time_dim,
-                progress=progress,
+    is_first_date_interval = True
+    for date_interval in IterableDateInterval(configs.start, configs.end, configs.step):
+      logger.info(f"Downloading data from {date_interval.start} to {date_interval.end}")
+      try:
+        # Download and postprocess each dataset, possibly using checkpointing to disk.
+        with ExitStack() as stack, warnings.catch_warnings():
+          # During postprocessing computation, which may even happen during `save_to_zarr`, if each operation does not
+          # trigger dask computations (e.g., no calls to persist or compute) some RuntimeWarnings may be issued.
+          # This happens frequently with certain algorithms when regridding masked data (containing NaNs).
+          # We filter them to avoid cluttering the log.
+          warnings.filterwarnings(
+            "ignore",
+            message="invalid value encountered in divide",
+            category=RuntimeWarning,
+          )
+          datasets: list[xr.Dataset] = []
+          for dataset_name, dataset_conf in configs.datasets.items():
+            if dataset_conf.skip:
+              logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
+              continue
+            datasets.append(
+              stack.enter_context(
+                maybe_checkpointing_download_and_process(
+                  dataset_conf,
+                  date_interval.start,
+                  date_interval.end,
+                  time_dim=configs.time_dim,
+                  progress=progress,
+                )
               )
             )
-          )
-        # Merge the datasets
-        with (
-          xr.merge(
-            datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
-          ) as dataset,
-        ):
-          # Postprocess the merged dataset
-          if configs.postprocess:
-            dataset = dataset.arcomake.process(
-              steps=configs.postprocess,
-            )
-          # Save the dataset in a Zarr using sensible chunking and compression
-          progress_bar = nullcontext if not progress else ProgressBar
-          with progress_bar():
-            safe_to_zarr(
-              dataset=dataset,
-              destination=output_path,
-              configs=configs.save,
-              compute=True,
-            )
-    except Exception as exc:
-      logger.exception("An error occurred during download")
-      raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
+          # Merge the datasets
+          with (
+            xr.merge(
+              datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
+            ) as dataset,
+          ):
+            # Postprocess the merged dataset
+            if configs.postprocess:
+              dataset = dataset.arcomake.process(
+                steps=configs.postprocess,
+              )
+            # Save the dataset in a Zarr using sensible chunking and compression
+            progress_bar = nullcontext if not progress else ProgressBar
+            with progress_bar():
+              if is_first_date_interval:
+                safe_to_zarr(
+                  dataset=dataset,
+                  destination=output_path,
+                  configs=configs.save,
+                  mode="w",
+                  compute=True,
+                )
+                is_first_date_interval = False
+              else:
+                safe_to_zarr(
+                  dataset=dataset,
+                  destination=output_path,
+                  configs=configs.save,
+                  mode="a-",
+                  append_dim=configs.time_dim,
+                  compute=True,
+                )
+      except Exception as exc:
+        logger.exception("An error occurred during download")
+        raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

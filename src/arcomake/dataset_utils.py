@@ -14,7 +14,7 @@ import zarr.storage
 from dask.delayed import Delayed
 from dask.diagnostics import ProgressBar
 from numcodecs import Blosc
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from xarray.backends.common import BackendEntrypoint
 from xarray.coders import CFDatetimeCoder, CFTimedeltaCoder
 from zarr.storage import DirectoryStore, ZipStore
@@ -143,22 +143,6 @@ DatasetPartConfig = (
 )
 
 
-class CheckpointingConfig(BaseModel):
-  model_config = ConfigDict(extra="forbid")
-
-  step: str | None = None
-  compressor: CompressorConfig | None = None
-
-
-class DatasetConfig(BaseModel):
-  model_config = ConfigDict(extra="forbid")
-
-  skip: bool = False
-  checkpointing: CheckpointingConfig | None = None
-  parts: list[DatasetPartConfig] = Field(default_factory=list)
-  postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
-
-
 class VariableEncodingConfig(BaseModel):
   model_config = ConfigDict(extra="allow")
 
@@ -178,6 +162,27 @@ class SaveConfig(BaseModel):
   compressor: CompressorConfig | None = None
   encoding: dict[str, VariableEncodingConfig] | None = None
   storage_options: dict[str, Any] | None = None
+
+
+class CheckpointingConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  step: datetime.timedelta
+  compressor: CompressorConfig | None = None
+
+  @field_validator("step", mode="before")
+  @classmethod
+  def parse_step(cls, value: str | datetime.timedelta) -> datetime.timedelta:
+    return may_parse_timedelta(value)
+
+
+class DatasetConfig(BaseModel):
+  model_config = ConfigDict(extra="forbid")
+
+  skip: bool = False
+  checkpointing: CheckpointingConfig | None = None
+  parts: list[DatasetPartConfig] = Field(default_factory=list)
+  postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
 
 
 def download_and_process(
@@ -356,6 +361,8 @@ def safe_to_zarr(
   configs: SaveConfig | None = None,
   compute: bool = True,
   *,
+  mode: Literal["w", "w-", "a", "a-", "r+", "r"] | None = None,
+  append_dim: str | None = None,
   store_stack: ExitStack | None = None,
 ) -> xr.backends.ZarrStore | Delayed:
   """Write a dataset, explicitly managing the underlying store's lifetime.
@@ -420,18 +427,41 @@ def safe_to_zarr(
     path_obj = pathlib.Path(destination)
     if path_obj.suffix == ".zip":
       # Notice that parallel writes to Zarr using zip store are (apparently) not supported.
-      store = ZipStore(path=str(path_obj), mode="w", compression=0, allowZip64=True)
+      zip_mode = "a" if mode and "a" in mode else "w"
+      store = ZipStore(path=str(path_obj), mode=zip_mode, compression=0, allowZip64=True)
     else:
       store = DirectoryStore(path=str(path_obj))
+
+  if mode in ("a", "a-", "r+") and "encoding" in to_zarr_kwargs and to_zarr_kwargs["encoding"]:
+    try:
+      group = to_zarr_kwargs.get("group")
+      open_mode = mode if isinstance(store, ZipStore) else "r"
+      zg = (
+        zarr.open_group(store, mode=open_mode, path=group)
+        if group
+        else zarr.open_group(store, mode=open_mode)
+      )
+      existing_keys = set(zg.keys())
+      to_zarr_kwargs["encoding"] = {
+        k: v for k, v in to_zarr_kwargs["encoding"].items() if k not in existing_keys
+      }
+      if not to_zarr_kwargs["encoding"]:
+        to_zarr_kwargs.pop("encoding", None)
+    except Exception:
+      pass
 
   close_fn = getattr(store, "close", None)
   if not compute:
     assert store_stack is not None
     if close_fn is not None:
       store_stack.callback(close_fn)
-    return dataset.to_zarr(store=store, compute=False, mode="w", **to_zarr_kwargs)
+    return dataset.to_zarr(
+      store=store, compute=False, mode=mode, append_dim=append_dim, **to_zarr_kwargs
+    )
   try:
-    return dataset.to_zarr(store=store, compute=True, mode="w", **to_zarr_kwargs)
+    return dataset.to_zarr(
+      store=store, compute=True, mode=mode, append_dim=append_dim, **to_zarr_kwargs
+    )
   finally:
     if close_fn is not None:
       close_fn()
