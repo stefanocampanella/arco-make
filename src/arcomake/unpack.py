@@ -34,6 +34,7 @@ class ArchiveConfig(BaseModel):
 class UnpackConfig(BaseModel):
   model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
+  glob: str
   time_dim: str = "time"
   attrs_to_drop: list[str] | None = None
   read: ReadConfig
@@ -110,6 +111,7 @@ def unpack(
     try:
       with open_archive(
         input_path,
+        glob=configs.glob,
         time_dim=configs.time_dim,
         attrs_to_drop=configs.attrs_to_drop,
         **configs.read.model_dump(exclude_unset=True),

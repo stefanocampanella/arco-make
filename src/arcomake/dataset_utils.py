@@ -272,10 +272,10 @@ def maybe_checkpointing_download_and_process(
 
 
 def open_archive(
-  path: str, time_dim: str = "time", attrs_to_drop: list[str] | None = None, **kwargs
+  path: str, glob: str, time_dim: str = "time", attrs_to_drop: list[str] | None = None, **kwargs
 ) -> xr.Dataset:
   """
-  Open multiple zipped Zarr datasets and combine them as xarray.open_mfdataset would, with a
+  Open multiple Zarr datasets matching `glob` and combine them as xarray.open_mfdataset would, with a
   specific behavior for static variables (those without the provided time dimension):
 
   - Time-varying variables (containing `time_dim` among their dimensions) are merged along
@@ -286,7 +286,9 @@ def open_archive(
   Parameters
   ---------
   path: str | pathlib.Path
-      Directory of .zip Zarr datasets.
+      Directory of the Zarr datasets.
+  glob: str
+      Glob pattern to match the Zarr datasets.
   time_dim: str
       Name of the time dimension. Variables that do not include this dimension are considered static.
 
@@ -296,11 +298,11 @@ def open_archive(
       Dataset obtained by combining the time-varying variables by coordinates and adding the static
       variables (validated to be equal across inputs) unchanged.
   """
-  fs, fs_path = fsspec.url_to_fs(path)
-  zip_file_paths = [str(file_path) for file_path in sorted(fs.glob(fs_path + "/*.zip"))]
-  if len(zip_file_paths) == 0:
-    raise ValueError("Provided path does not contain any .zip files.")
-  logger.info(f"Reading {len(zip_file_paths)} .zip datasets from {path}")
+  fs, fs_root_path = fsspec.url_to_fs(path)
+  file_paths = [str(file_path) for file_path in sorted(fs.glob(fs_root_path + glob))]
+  if len(file_paths) == 0:
+    raise ValueError(f"Provided path does not contain any files matching '{glob}'.")
+  logger.info(f"Reading {len(file_paths)} datasets from {path}")
 
   # Drop the possibly conflicting attributes so that combining with
   # combine_attrs="no_conflicts" does not fail when it differs across inputs.
@@ -308,7 +310,7 @@ def open_archive(
 
   # Open each dataset quickly to inspect static variables. Keep inline_array=False to avoid huge graphs.
   static_vars: dict[str, xr.DataArray] = {}
-  for file_path in zip_file_paths:
+  for file_path in file_paths:
     with xr.open_dataset(file_path, **kwargs) as ds:
       for name, var in ds.data_vars.items():
         for key in attrs_to_drop:
@@ -337,7 +339,7 @@ def open_archive(
     return ds
 
   ds_dynamic = xr.open_mfdataset(
-    zip_file_paths,
+    file_paths,
     combine="by_coords",
     combine_attrs="no_conflicts",
     preprocess=_drop_static,
