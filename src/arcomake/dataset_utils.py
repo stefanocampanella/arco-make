@@ -3,6 +3,7 @@
 import datetime
 import logging
 import pathlib
+import posixpath
 import tempfile
 from collections.abc import Hashable, Iterable, Mapping
 from contextlib import ExitStack, nullcontext
@@ -298,22 +299,25 @@ def open_archive(
       Dataset obtained by combining the time-varying variables by coordinates and adding the static
       variables (validated to be equal across inputs) unchanged.
   """
-  fs, fs_root_path = fsspec.url_to_fs(path)
-  file_paths = [str(file_path) for file_path in sorted(fs.glob(fs_root_path + glob))]
+  storage_options = kwargs.pop("storage_options", {})
+  fs, fs_root_path = fsspec.url_to_fs(str(path), **storage_options)
+  glob_pattern = posixpath.join(fs_root_path, glob.lstrip("/"))
+  file_paths: list[str] = sorted(fs.glob(glob_pattern))
   if len(file_paths) == 0:
-    raise ValueError(f"Provided path does not contain any files matching '{glob}'.")
-  logger.info(f"Reading {len(file_paths)} datasets from {path}")
+    raise ValueError(f"Provided path '{path}' does not contain any files matching '{glob}'.")
+  file_mappers = [fs.get_mapper(file_path) for file_path in file_paths]
+  logger.info(f"Reading {len(file_mappers)} datasets from {path}")
 
   # Drop the possibly conflicting attributes so that combining with
   # combine_attrs="no_conflicts" does not fail when it differs across inputs.
-  attrs_to_drop: list[str] = [] if attrs_to_drop is None else attrs_to_drop
+  attrs_to_drop_list: list[str] = [] if attrs_to_drop is None else attrs_to_drop
 
   # Open each dataset quickly to inspect static variables. Keep inline_array=False to avoid huge graphs.
   static_vars: dict[str, xr.DataArray] = {}
-  for file_path in file_paths:
-    with xr.open_dataset(file_path, **kwargs) as ds:
+  for file_mapper in file_mappers:
+    with xr.open_dataset(file_mapper, **kwargs) as ds:
       for name, var in ds.data_vars.items():
-        for key in attrs_to_drop:
+        for key in attrs_to_drop_list:
           var.attrs.pop(key, None)
         if time_dim not in var.dims:
           if name in static_vars:
@@ -332,14 +336,16 @@ def open_archive(
     if to_drop:
       # Drop only those present to avoid errors if some files lack certain static vars
       ds = ds.drop_vars(to_drop)
-    # Drop the possibly conflicting 'last_updated' attribute so that combining with
+    # Drop the possibly conflicting attributes so that combining with
     # combine_attrs="no_conflicts" does not fail when it differs across inputs.
-    for key in attrs_to_drop:
+    for key in attrs_to_drop_list:
       ds.attrs.pop(key, None)
+      for var in ds.variables.values():
+        var.attrs.pop(key, None)
     return ds
 
   ds_dynamic = xr.open_mfdataset(
-    file_paths,
+    file_mappers,
     combine="by_coords",
     combine_attrs="no_conflicts",
     preprocess=_drop_static,
