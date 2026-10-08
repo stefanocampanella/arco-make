@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
+from contextlib import nullcontext
 from typing import get_args
 
 import click
+from dask.diagnostics import ProgressBar
 from pydantic import BaseModel, ConfigDict, Field
 
 from arcomake.cli_utils import (
@@ -80,6 +82,13 @@ class UnpackConfig(BaseModel):
   default="info",
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
 )
+@click.option(
+  "--progress/--no-progress",
+  "progress",
+  help="Whether to display a progress bar",
+  default=False,
+  is_flag=True,
+)
 def unpack(
   configs_path: str,
   input_path: str,
@@ -87,6 +96,7 @@ def unpack(
   overwrite: bool = False,
   scheduler_type: SchedulerOptionType = "mpi",
   log_level: str = "info",
+  progress: bool = False,
 ):
   """
   Unpack a collection of zip files containing Zarr datasets into a single Zarr dataset.
@@ -116,16 +126,18 @@ def unpack(
         attrs_to_drop=configs.attrs_to_drop,
         **configs.read.model_dump(exclude_unset=True),
       ) as dataset:
-        # Postproces unpacked dataset
-        if configs.postprocess:
-          dataset = dataset.arcomake.process(steps=configs.postprocess)
-        # Save unpacked dataset
-        safe_to_zarr(
-          dataset=dataset,
-          destination=output_path,
-          configs=configs.save,
-          compute=True,
-        )
+        progress_bar = nullcontext if not progress else ProgressBar
+        with progress_bar():
+          # Postproces unpacked dataset
+          if configs.postprocess:
+            dataset = dataset.arcomake.process(steps=configs.postprocess)
+          # Save unpacked dataset
+          safe_to_zarr(
+            dataset=dataset,
+            destination=output_path,
+            configs=configs.save,
+            compute=True,
+          )
     except Exception as exc:
       logger.exception("An error occurred while unpacking the archive")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
