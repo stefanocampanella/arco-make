@@ -136,6 +136,7 @@ def unpack(
             dataset=dataset,
             destination=output_path,
             configs=configs.save,
+            mode="w",
             compute=True,
           )
     except Exception as exc:
