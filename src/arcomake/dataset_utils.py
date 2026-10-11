@@ -389,6 +389,7 @@ def safe_to_zarr(
     raise ValueError("Delayed writes require a store_stack kept open through computation")
   if configs is None:
     configs = SaveConfig()
+  mode = mode or "w"
 
   logger.info(f"Saving dataset to {destination} with {configs}")
   chunk_conf = configs.chunks
@@ -435,7 +436,7 @@ def safe_to_zarr(
     path_obj = pathlib.Path(destination)
     if path_obj.suffix == ".zip":
       # Notice that parallel writes to Zarr using zip store are (apparently) not supported.
-      zip_mode = "a" if mode and "a" in mode else "w"
+      zip_mode = "a" if "a" in mode else "w"
       store = ZipStore(path=str(path_obj), mode=zip_mode, compression=0, allowZip64=True)
     else:
       store = DirectoryStore(path=str(path_obj))
