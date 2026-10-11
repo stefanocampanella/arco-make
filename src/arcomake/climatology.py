@@ -134,6 +134,13 @@ class ClimatologyConfig(BaseModel):
   show_default=True,
 )
 @click.option(
+  "--frisky",
+  "use_frisky",
+  default=False,
+  is_flag=True,
+  help="Hijack Dask client with frisky, this is an experimental feature.",
+)
+@click.option(
   "--log-level",
   default="info",
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
@@ -146,6 +153,7 @@ def compute_climatology(
   anomaly_std_output_path: str,
   overwrite: bool = False,
   scheduler_type: SchedulerOptionType = "mpi",
+  use_frisky: bool = False,
   sync_step: bool = False,
   log_level: str = "info",
 ):
@@ -191,7 +199,7 @@ def compute_climatology(
   configs = read_configs(configs_path, schema=ClimatologyConfig)
 
   # Set up Dask client.
-  with get_client(scheduler_type=scheduler_type):
+  with get_client(scheduler_type=scheduler_type, use_frisky=use_frisky):
     try:
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
       with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:

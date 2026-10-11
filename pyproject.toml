@@ -48,6 +48,9 @@ dev = [
     "ty",
     "memray",
 ]
+experimental = [
+    "frisky",
+]
 
 [project.entry-points."xarray.backends"]
 copernicusmarine = "arcomake.backends:CopernicusMarine"

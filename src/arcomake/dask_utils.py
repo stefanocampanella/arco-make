@@ -64,7 +64,7 @@ def LocalCluster(*args, **kwargs):
   return distributed.LocalCluster(*args, **kwargs)
 
 
-def get_client(scheduler_type: SchedulerOptionType = "threads") -> MaybeClient:
+def get_client(scheduler_type: SchedulerOptionType = "threads", use_frisky: bool = False) -> MaybeClient:
   if scheduler_type in ("synchronous", "threads", "processes"):
     dask.config.set(scheduler=scheduler_type)
     client = DummyClient()
@@ -81,8 +81,16 @@ def get_client(scheduler_type: SchedulerOptionType = "threads") -> MaybeClient:
     logger.info(f"Using local Dask cluster, dashboard available at: {cluster.dashboard_link}")
   else:
     raise ValueError(f"Invalid scheduler type: {scheduler_type}")
+  if not isinstance(client, DummyClient) and use_frisky:
+    try:
+      import frisky
 
-  return client
+      logger.warning("Hijacking Dask client with frisky, this is an experimental feature.")
+      client = frisky.hijack(client)
+    except ImportError:
+      logger.warning("frisky not found, falling back to default Dask client.")
+
+  return client #type: ignore
 
 
 def maybe_wait(futures, rebalance=False, **kwargs):

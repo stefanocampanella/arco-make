@@ -401,7 +401,7 @@ def safe_to_zarr(
     exclude_none=True, exclude={"chunks", "compressor", "storage_options"}
   )
 
-  if chunk_conf:
+  if chunk_conf is not None:
     # Set the on-disk Zarr chunk layout via encoding, without altering the
     # underlying Dask chunking. This requires the existing Dask chunks to be
     # an integer multiple of (and evenly divide into) the requested chunks

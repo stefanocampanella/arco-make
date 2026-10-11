@@ -50,7 +50,7 @@ def read_configs(
   logger.info(f"Reading configs from {path}")
   with fsspec.open(urlpath=path, mode="rb") as config_file:
     configs = tomllib.load(config_file)
-  if inject:
+  if inject is not None:
     logger.info(f"Updating configs with {inject}")
     configs.update(inject)
   if schema is not None:

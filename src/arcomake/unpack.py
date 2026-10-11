@@ -78,6 +78,13 @@ class UnpackConfig(BaseModel):
   help="Type of Dask scheduler to use.",
 )
 @click.option(
+  "--frisky",
+  "use_frisky",
+  default=False,
+  is_flag=True,
+  help="Hijack Dask client with frisky, this is an experimental feature.",
+)
+@click.option(
   "--log-level",
   default="info",
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
@@ -97,6 +104,7 @@ def unpack(
   scheduler_type: SchedulerOptionType = "mpi",
   log_level: str = "info",
   progress: bool = False,
+  use_frisky: bool = False,
 ):
   """
   Unpack a collection of zip files containing Zarr datasets into a single Zarr dataset.
@@ -116,7 +124,7 @@ def unpack(
   configs = read_configs(configs_path, schema=UnpackConfig)
 
   # Set up Dask client.
-  with get_client(scheduler_type=scheduler_type):
+  with get_client(scheduler_type=scheduler_type, use_frisky=use_frisky):
     # Unpack archive
     try:
       with open_archive(
