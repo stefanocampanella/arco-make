@@ -189,7 +189,7 @@ def download(
                 steps=configs.postprocess,
               )
             # Save the dataset in a Zarr using sensible chunking and compression
-            progress_bar = nullcontext if not progress else ProgressBar
+            progress_bar = ProgressBar if (progress and scheduler_type in ["processes", "threads"]) else nullcontext
             with progress_bar():
               if is_first_date_interval:
                 safe_to_zarr(

@@ -134,7 +134,7 @@ def unpack(
         attrs_to_drop=configs.attrs_to_drop,
         **configs.read.model_dump(exclude_unset=True),
       ) as dataset:
-        progress_bar = nullcontext if not progress else ProgressBar
+        progress_bar = ProgressBar if (progress and scheduler_type in ["processes", "threads"]) else nullcontext
         with progress_bar():
           # Postproces unpacked dataset
           if configs.postprocess:
@@ -144,7 +144,6 @@ def unpack(
             dataset=dataset,
             destination=output_path,
             configs=configs.save,
-            mode="w",
             compute=True,
           )
     except Exception as exc:
