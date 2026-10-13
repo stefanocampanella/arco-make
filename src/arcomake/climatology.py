@@ -36,13 +36,15 @@
 # Finally, the dataset might not start on the 1st of January or end before the 31 of December,
 # which would further distort the results. However, the quantities computed here are aimed at standardizing the input
 # features in a deep-learning model, and therefore such approximations are reasonably acceptable.
+import functools
 import logging
+import operator
 from contextlib import ExitStack
-from itertools import cycle
 from typing import Literal, get_args
 
 import click
 import dask
+import flox.xarray
 import numpy as np
 import xarray as xr
 from pydantic import BaseModel, ConfigDict, Field
@@ -53,7 +55,7 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.dask_utils import SchedulerOptionType, get_client, maybe_wait
+from arcomake.dask_utils import SchedulerOptionType, get_client
 from arcomake.dataset_utils import ReadConfig, SaveConfig, safe_to_zarr
 from arcomake.processing_utils import ProcessingStepConfig
 
@@ -127,13 +129,6 @@ class ClimatologyConfig(BaseModel):
   help="Type of Dask scheduler to use.",
 )
 @click.option(
-  "--sync-step/--no-sync-step",
-  "sync_step",
-  default=False,
-  help="Whether to persist the result in memory during climatology computation.",
-  show_default=True,
-)
-@click.option(
   "--frisky",
   "use_frisky",
   default=False,
@@ -154,7 +149,6 @@ def compute_climatology(
   overwrite: bool = False,
   scheduler_type: SchedulerOptionType = "mpi",
   use_frisky: bool = False,
-  sync_step: bool = False,
   log_level: str = "info",
 ):
   """
@@ -182,8 +176,6 @@ def compute_climatology(
       Whether to overwrite the outputs if they already exist.
   scheduler_type : SchedulerOptionType, default "mpi"
       Type of Dask scheduler to use.
-  sync_step : bool, default False
-      Whether to persist the result in memory during climatology computation.
   log_level : {"debug", "info", "warning", "error", "critical"}, default "info"
       Logging verbosity.
   """
@@ -217,16 +209,17 @@ def compute_climatology(
         assert dataset[configs.time_dim].size % configs.period == 0, (
           "Dataset must contain an integer number of full periods."
         )
-        # Welford's online algorithm yields both the climatological mean and the
-        # unbiased sample variance of the anomalies in a single pass over the data.
-        climatology, anomaly_var = _online_climatology(
+        # Compute the climatological mean and the unbiased sample variance
+        # of the anomalies using vectorized reductions across periods and window smoothing.
+        if not dataset.data_vars:
+          raise ValueError("Input dataset contains no data variables.")
+        climatology, anomaly_var = _compute_climatology(
           dataset,
           time_dim=configs.time_dim,
           period=configs.period,
           window=configs.window,
           weighting=configs.weighting,
           weighting_scale=configs.weighting_scale,
-          sync_step=sync_step,
         )
         # Postprocess climatology and anomaly standard deviation.
         if configs.postprocess_climatology:
@@ -309,46 +302,24 @@ def _window_weights(
   raise ValueError(f"Unsupported weighting scheme: {weighting}")
 
 
-def _online_climatology(
+def _compute_climatology(
   dataset: xr.Dataset,
   period: int,
   window: int = 1,
   weighting: WeightingType = "constant",
   weighting_scale: float | None = None,
   time_dim: str = "time",
-  sync_step=False,
 ) -> tuple[xr.Dataset, xr.Dataset]:
   """
-  Average a dataset over consecutive windows of ``step_size`` steps along time.
-
-  The dataset is split along the time dimension into consecutive windows of
-  ``period`` steps, and the windows are combined elementwise using a weighted
-  Welford online algorithm, so that only one window is combined at a time.
-  This yields both the running (streaming) weighted mean and the unbiased weighted
-  sample variance across windows.
-
-  Optionally, statistics can be computed over a ``window`` of steps centered on
-  each bin, rather than over a single bin. In that case, for each yearly window
-  and each bin, the ``window`` neighbouring steps (wrapped around the calendar
-  year) are folded into the running statistics, so that each bin aggregates the
-  values of a ``window``-step window centered on it, across all years. For
-  example, with a centered window of 15 days on daily data, the statistics of
-  the 8th of January are computed from the 1st to the 15th of January of every
-  year.
-
-  Each step of the window is weighted according to ``weighting`` by a factor
-  that depends only on its distance from the center of the window (see
-  ``_window_weights``). Since these weights are the same for every yearly
-  window, they are constant from one year to the next. With ``"constant"``
-  weighting the algorithm reduces to the plain (unweighted) Welford algorithm.
+  Compute the climatological mean and unbiased sample variance for a single DataArray.
 
   Parameters
   ----------
   dataset : xr.Dataset
-      Input dataset, assumed to be sorted and uniformly spaced along the time
+      Input Dataset, assumed to be sorted and uniformly spaced along the time
       dimension.
   period : int
-      Number of time steps in each window (i.e., per calendar year).
+      Number of time steps in each period (i.e., per calendar year).
   window : int, default 1
       Number of steps of the (centered) window over which statistics are
       computed for each bin. ``window=1`` reduces to the plain per-bin
@@ -365,68 +336,106 @@ def _online_climatology(
 
   Returns
   -------
-  tuple[xr.Dataset, xr.Dataset]
-      A pair ``(mean, variance)``, each of size ``step_size`` along
+  tuple[xr.DataArray, xr.DataArray]
+      A pair ``(mean, variance)``, each of size ``period`` along
       ``time_dim``. ``mean`` is the weighted climatological average
-      across windows and ``variance`` is the unbiased weighted sample variance
-      across windows (with reliability weights, i.e. normalised by
-      ``W - (sum of squared weights) / W``, which reduces to ``n - 1`` for
-      constant weights).
+      and ``variance`` is the unbiased weighted sample variance of the anomalies.
   """
   size = dataset.sizes[time_dim]
+  n_periods = size // period
   bins = np.arange(period, dtype=int)
-  dataset = dataset.assign_coords({time_dim: np.fromiter(cycle(bins), dtype=int, count=size)})
-  # Offsets of a `window`-step window centered on each bin.
+
+  # Construct the periodic grouping array aligned with dataset time coordinates
+  group = xr.DataArray(
+    np.tile(bins, n_periods),
+    dims=[time_dim],
+    coords={time_dim: dataset[time_dim]},
+    name=time_dim,
+  )
+  # TODO: Another implementation of climatological averages could be:
+  #    folded = (
+  #      dataset
+  #      .assign_coords({time_dim: np.arange(size)})
+  #      .chunk({time_dim: period})
+  #      .coarsen({time_dim: period}, boundary="exact")
+  #      .construct({time_dim: ("_period", time_dim)})
+  #      .assign_coords({time_dim: bins})
+  #    ) # Reshape time dimension into (_period, time_dim)
+  #    raw_mean = folded.mean(dim="_period") # Parallel reduction across years
+  #    raw_var = ((bind(folded, raw_mean) - raw_mean) ** 2).mean(dim="_period")
+  #  Performance, wrt peak memory usage and time to solution, should be profiled.
+  #  Apparently, `flox` produce larger graphs, but the only experiments using
+  #  the previous implementation hadn't enough compute resources and blowed up.
+
+  # Choose the optimal reduction strategy based on chunk alignment:
+  # 'blockwise' provides maximal speed and zero inter-worker communication
+  # when time chunks align with period boundaries; 'cohorts' prevents memory
+  # spikes when chunks span arbitrary periodic boundaries.
+  time_chunks = dataset.chunksizes.get(time_dim, (size,))
+  is_aligned = all(c % period == 0 for c in time_chunks)
+  reduction_method = "blockwise" if is_aligned else "cohorts"
+
+  # Parallel computation of periodic mean in a single pass
+  # TODO: Investigate if `persist` is really necessary, or even detrimental.
+  raw_mean = flox.xarray.xarray_reduce(
+    dataset,
+    group,
+    func="mean",
+    expected_groups=bins,
+    method=reduction_method,
+  )
+  # raw_mean = raw_mean.persist()
+
+  # Direct variance calculation without intermediate array materialization
+  raw_var = flox.xarray.xarray_reduce(
+    dataset,
+    group,
+    func="var",
+    ddof=0,
+    expected_groups=bins,
+    method=reduction_method,
+  )
+  # raw_var = raw_var.persist()
+
+  # Centered window smoothing
   half = window // 2
   offsets = list(range(-half, window - half))
-  # Per-step weights, constant from one year to the next.
   weights = _window_weights(offsets, weighting, scale=weighting_scale)
 
-  avg = xr.Dataset()
-  m2 = xr.Dataset()
-  # Running sums of the weights and of the squared weights (West's algorithm).
-  weight_total = 0.0
-  weight_sq_total = 0.0
-  start = 0
-  first_iteration = True
+  w_total = float(np.sum(weights))
+  w_sq_total = float(np.sum(weights**2))
 
-  while start < size:
-    end = min(start + period, size)
-    value = dataset.isel({time_dim: slice(start, end)})
-    # Inner loop over the steps of the window centered on each bin. Each offset
-    # contributes the value `offset` steps away (wrapped around the year),
-    # weighted by `weight`, so that every bin aggregates a weighted
-    # `window`-step window centered on it.
-    for offset, weight in zip(offsets, weights, strict=True):
-      weight = float(weight)
-      weight_total += weight
-      weight_sq_total += weight * weight
-      shifted = value.roll({time_dim: -offset}, roll_coords=False)
-      if first_iteration:
-        avg: xr.Dataset = shifted
-        # Welford's aggregated squared distance from the running mean (M2 accumulator).
-        m2 = xr.zeros_like(avg)
-        first_iteration = False
-        continue
-      # Notice: it is assumed that the dataset contains an integer number of periods.
-      # However, in the case of missing values, it would be enough to set them to avg
-      # shifted = shifted.where(shifted.notnull(), avg)
-      # We don't do that to not hurt the performance.
-      # Weighted Welford (West) online update for mean and squared-distance accumulator.
-      delta = shifted - avg
-      avg = avg + (weight / weight_total) * delta
-      delta2 = shifted - avg
-      m2 = m2 + delta * delta2 * weight
-    if sync_step:
-      avg = avg.persist()
-      m2 = m2.persist()
-      maybe_wait([avg, m2], rebalance=True)
-    start = end
+  if window == 1:
+    weighted_mean = raw_mean
+    m2_per_period = raw_var
+  else:
+    weighted_mean = (
+      functools.reduce(
+        operator.add,
+        (
+          float(w) * raw_mean.roll({time_dim: -offset}, roll_coords=False)
+          for offset, w in zip(offsets, weights, strict=True)
+        ),
+      )
+      / w_total
+    )
 
-  # Unbiased weighted sample variance with reliability weights (normalised by
-  # W - (sum of squared weights) / W, which reduces to n - 1 for constant weights).
-  # noinspection PyTypeChecker
-  denom = weight_total - (weight_sq_total / weight_total)
-  variance = m2 / denom if denom > 0.0 else xr.zeros_like(m2)
+    m2_per_period = functools.reduce(
+      operator.add,
+      (
+        float(w)
+        * (
+          raw_var.roll({time_dim: -offset}, roll_coords=False)
+          + (raw_mean.roll({time_dim: -offset}, roll_coords=False) - weighted_mean) ** 2
+        )
+        for offset, w in zip(offsets, weights, strict=True)
+      ),
+    )
 
-  return avg, variance
+  total_m2 = n_periods * m2_per_period
+  total_w = n_periods * w_total
+  total_w_sq = n_periods * w_sq_total
+  denom = total_w - (total_w_sq / total_w)
+  variance = total_m2 / denom if denom > 0.0 else xr.zeros_like(total_m2)
+  assert isinstance(weighted_mean, xr.Dataset) and isinstance(variance, xr.Dataset)
+  return weighted_mean, variance
