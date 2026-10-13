@@ -134,7 +134,9 @@ def unpack(
         attrs_to_drop=configs.attrs_to_drop,
         **configs.read.model_dump(exclude_unset=True),
       ) as dataset:
-        progress_bar = ProgressBar if (progress and scheduler_type in ["processes", "threads"]) else nullcontext
+        progress_bar = (
+          ProgressBar if (progress and scheduler_type in ["processes", "threads"]) else nullcontext
+        )
         with progress_bar():
           # Postproces unpacked dataset
           if configs.postprocess:

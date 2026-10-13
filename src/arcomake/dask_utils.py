@@ -64,7 +64,9 @@ def LocalCluster(*args, **kwargs):
   return distributed.LocalCluster(*args, **kwargs)
 
 
-def get_client(scheduler_type: SchedulerOptionType = "threads", use_frisky: bool = False) -> MaybeClient:
+def get_client(
+  scheduler_type: SchedulerOptionType = "threads", use_frisky: bool = False
+) -> MaybeClient:
   if scheduler_type in ("synchronous", "threads", "processes"):
     dask.config.set(scheduler=scheduler_type)
     client = DummyClient()
@@ -85,12 +87,12 @@ def get_client(scheduler_type: SchedulerOptionType = "threads", use_frisky: bool
     try:
       import frisky
 
-      logger.warning("Hijacking Dask client with frisky, this is an experimental feature.")
+      logger.info("Hijacking Dask client with frisky, this is an experimental feature.")
       client = frisky.hijack(client)
     except ImportError:
       logger.warning("frisky not found, falling back to default Dask client.")
 
-  return client #type: ignore
+  return client  # type: ignore
 
 
 def maybe_wait(futures, rebalance=False, **kwargs):
