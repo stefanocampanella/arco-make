@@ -36,17 +36,17 @@
 # Finally, the dataset might not start on the 1st of January or end before the 31 of December,
 # which would further distort the results. However, the quantities computed here are aimed at standardizing the input
 # features in a deep-learning model, and therefore such approximations are reasonably acceptable.
-import functools
 import logging
 import operator
+from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from typing import Literal, get_args
 
 import click
 import dask
-import flox.xarray
 import numpy as np
 import xarray as xr
+from dask.graph_manipulation import bind
 from pydantic import BaseModel, ConfigDict, Field
 
 from arcomake.cli_utils import (
@@ -82,6 +82,9 @@ class ClimatologyConfig(BaseModel):
   weighting: WeightingType
   weighting_scale: float | None = Field(
     default=None, ge=0.0, description="Scale of the weighting function in bins"
+  )
+  use_flox: bool = Field(
+    default=False, description="Whether to use flox for grouped periodic reductions"
   )
   read: ReadConfig
   preprocess: list[ProcessingStepConfig] = Field(default_factory=list)
@@ -149,6 +152,7 @@ def compute_climatology(
   overwrite: bool = False,
   scheduler_type: SchedulerOptionType = "mpi",
   use_frisky: bool = False,
+  use_flox: bool = False,
   log_level: str = "info",
 ):
   """
@@ -220,6 +224,7 @@ def compute_climatology(
           window=configs.window,
           weighting=configs.weighting,
           weighting_scale=configs.weighting_scale,
+          use_flox=use_flox,
         )
         # Postprocess climatology and anomaly standard deviation.
         if configs.postprocess_climatology:
@@ -252,6 +257,28 @@ def compute_climatology(
       logger.exception("An error occurred while processing the climatology and anomaly std.")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
   logger.info("Climatology complete; Dask client closed.")
+
+
+def balanced_tree_reduce[T](
+  func: Callable[[T, T], T],
+  seq: Sequence[T],
+  start: int = 0,
+  end: int | None = None,
+) -> T:
+  """Divide-and-conquer reduction using index bounds to avoid intermediate slices."""
+  if end is None:
+    end = len(seq)
+  count = end - start
+  if count == 0:
+    raise ValueError("Cannot reduce empty range")
+  if count == 1:
+    return seq[start]
+
+  mid = start + count // 2
+  return func(
+    balanced_tree_reduce(func, seq, start, mid),
+    balanced_tree_reduce(func, seq, mid, end),
+  )
 
 
 def _window_weights(
@@ -309,6 +336,7 @@ def _compute_climatology(
   weighting: WeightingType = "constant",
   weighting_scale: float | None = None,
   time_dim: str = "time",
+  use_flox: bool = False,
 ) -> tuple[xr.Dataset, xr.Dataset]:
   """
   Compute the climatological mean and unbiased sample variance for a single DataArray.
@@ -333,6 +361,10 @@ def _compute_climatology(
       size is used. See ``_window_weights`` for details.
   time_dim : str, default "time"
       Name of the time dimension to average over.
+  use_flox : bool, default False
+      Whether to use ``flox`` for grouped periodic reductions. If ``True``
+      and ``flox`` is not installed, falls back to the native xarray
+      implementation.
 
   Returns
   -------
@@ -345,57 +377,56 @@ def _compute_climatology(
   n_periods = size // period
   bins = np.arange(period, dtype=int)
 
-  # Construct the periodic grouping array aligned with dataset time coordinates
-  group = xr.DataArray(
-    np.tile(bins, n_periods),
-    dims=[time_dim],
-    coords={time_dim: dataset[time_dim]},
-    name=time_dim,
-  )
-  # TODO: Another implementation of climatological averages could be:
-  #    folded = (
-  #      dataset
-  #      .assign_coords({time_dim: np.arange(size)})
-  #      .chunk({time_dim: period})
-  #      .coarsen({time_dim: period}, boundary="exact")
-  #      .construct({time_dim: ("_period", time_dim)})
-  #      .assign_coords({time_dim: bins})
-  #    ) # Reshape time dimension into (_period, time_dim)
-  #    raw_mean = folded.mean(dim="_period") # Parallel reduction across years
-  #    raw_var = ((bind(folded, raw_mean) - raw_mean) ** 2).mean(dim="_period")
-  #  Performance, wrt peak memory usage and time to solution, should be profiled.
-  #  Apparently, `flox` produce larger graphs, but the only experiments using
-  #  the previous implementation hadn't enough compute resources and blowed up.
+  flox_xarray = None
+  if use_flox:
+    try:
+      import flox.xarray as flox_xarray
+    except ImportError:
+      logger.warning("flox is not installed; falling back to native xarray implementation.")
 
-  # Choose the optimal reduction strategy based on chunk alignment:
-  # 'blockwise' provides maximal speed and zero inter-worker communication
-  # when time chunks align with period boundaries; 'cohorts' prevents memory
-  # spikes when chunks span arbitrary periodic boundaries.
-  time_chunks = dataset.chunksizes.get(time_dim, (size,))
-  is_aligned = all(c % period == 0 for c in time_chunks)
-  reduction_method = "blockwise" if is_aligned else "cohorts"
-
-  # Parallel computation of periodic mean in a single pass
-  # TODO: Investigate if `persist` is really necessary, or even detrimental.
-  raw_mean = flox.xarray.xarray_reduce(
-    dataset,
-    group,
-    func="mean",
-    expected_groups=bins,
-    method=reduction_method,
-  )
-  # raw_mean = raw_mean.persist()
-
-  # Direct variance calculation without intermediate array materialization
-  raw_var = flox.xarray.xarray_reduce(
-    dataset,
-    group,
-    func="var",
-    ddof=0,
-    expected_groups=bins,
-    method=reduction_method,
-  )
-  # raw_var = raw_var.persist()
+  if flox_xarray is not None:
+    # Choose the optimal reduction strategy based on chunk alignment:
+    # 'blockwise' provides maximal speed and zero inter-worker communication
+    # when time chunks align with period boundaries; 'cohorts' prevents memory
+    # spikes when chunks span arbitrary periodic boundaries.
+    time_chunks = dataset.chunksizes.get(time_dim, (size,))
+    is_aligned = all(c % period == 0 for c in time_chunks)
+    reduction_method = "blockwise" if is_aligned else "cohorts"
+    group = xr.DataArray(
+      np.tile(bins, n_periods),
+      dims=[time_dim],
+      coords={time_dim: dataset[time_dim]},
+      name=time_dim,
+    )
+    # Parallel computation of periodic mean in a single pass
+    raw_mean = flox_xarray.xarray_reduce(
+      dataset,
+      group,
+      func="mean",
+      expected_groups=bins,
+      method=reduction_method,
+    )
+    # Direct variance calculation without intermediate array materialization
+    raw_var = flox_xarray.xarray_reduce(
+      dataset,
+      group,
+      func="var",
+      ddof=0,
+      expected_groups=bins,
+      method=reduction_method,
+    )
+    assert isinstance(raw_mean, xr.Dataset) and isinstance(raw_var, xr.Dataset)
+  else:
+    # Reshape time dimension into (_period, time_dim)
+    folded = (
+      dataset.assign_coords({time_dim: np.arange(size)})
+      .chunk({time_dim: period})
+      .coarsen({time_dim: period}, boundary="exact")
+      .construct({time_dim: ("_period", time_dim)})
+      .assign_coords({time_dim: bins})
+    )
+    raw_mean = folded.mean(dim="_period")
+    raw_var = ((bind(folded, raw_mean) - raw_mean) ** 2).mean(dim="_period")
 
   # Centered window smoothing
   half = window // 2
@@ -409,33 +440,29 @@ def _compute_climatology(
     weighted_mean = raw_mean
     m2_per_period = raw_var
   else:
-    weighted_mean = (
-      functools.reduce(
-        operator.add,
-        (
-          float(w) * raw_mean.roll({time_dim: -offset}, roll_coords=False)
-          for offset, w in zip(offsets, weights, strict=True)
-        ),
-      )
-      / w_total
-    )
+    mean_terms = [
+      float(w) * raw_mean.roll({time_dim: -offset}, roll_coords=False)
+      for offset, w in zip(offsets, weights, strict=True)
+    ]
+    weighted_mean = balanced_tree_reduce(operator.add, mean_terms) / w_total
 
-    m2_per_period = functools.reduce(
-      operator.add,
-      (
-        float(w)
-        * (
-          raw_var.roll({time_dim: -offset}, roll_coords=False)
-          + (raw_mean.roll({time_dim: -offset}, roll_coords=False) - weighted_mean) ** 2
-        )
-        for offset, w in zip(offsets, weights, strict=True)
-      ),
-    )
+    var_smooth_terms = [
+      float(w) * raw_var.roll({time_dim: -offset}, roll_coords=False)
+      for offset, w in zip(offsets, weights, strict=True)
+    ]
+    smoothed_raw_var = balanced_tree_reduce(operator.add, var_smooth_terms)
+
+    mean_dispersion_terms = [
+      float(w) * (raw_mean.roll({time_dim: -offset}, roll_coords=False) - weighted_mean) ** 2
+      for offset, w in zip(offsets, weights, strict=True)
+    ]
+    between_bin_var = balanced_tree_reduce(operator.add, mean_dispersion_terms)
+
+    m2_per_period = smoothed_raw_var + between_bin_var
 
   total_m2 = n_periods * m2_per_period
   total_w = n_periods * w_total
   total_w_sq = n_periods * w_sq_total
   denom = total_w - (total_w_sq / total_w)
   variance = total_m2 / denom if denom > 0.0 else xr.zeros_like(total_m2)
-  assert isinstance(weighted_mean, xr.Dataset) and isinstance(variance, xr.Dataset)
   return weighted_mean, variance
