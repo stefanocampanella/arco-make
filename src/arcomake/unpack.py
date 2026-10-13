@@ -116,17 +116,14 @@ def unpack(
 
   # Set up logging.
   set_default_logger(log_level)
-
-  # Check output path
-  check_if_overwriting(output_path, overwrite=overwrite)
-
-  # Read configs
-  configs = read_configs(configs_path, schema=UnpackConfig)
-
   # Set up Dask client.
   with get_client(scheduler_type=scheduler_type, use_frisky=use_frisky):
-    # Unpack archive
     try:
+      # Check output path
+      check_if_overwriting(output_path, overwrite=overwrite)
+      # Read configs
+      configs = read_configs(configs_path, schema=UnpackConfig)
+      # Unpack archive
       with open_archive(
         input_path,
         glob=configs.glob,

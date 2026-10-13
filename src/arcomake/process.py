@@ -110,15 +110,14 @@ def process(
   # Set up logging.
   set_default_logger(log_level)
 
-  # Check output path.
-  check_if_overwriting(output_path, overwrite=overwrite)
-
-  # Read configs
-  configs = read_configs(configs_path, schema=ProcessConfig)
-
   # Set up Dask client.
   with get_client(scheduler_type=scheduler_type, use_frisky=use_frisky):
     try:
+      # Check output path.
+      check_if_overwriting(output_path, overwrite=overwrite)
+      # Read configs
+      configs = read_configs(configs_path, schema=ProcessConfig)
+      # Read input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
       with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
         # Process dataset

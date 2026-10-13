@@ -187,16 +187,15 @@ def compute_climatology(
   # Set up logging.
   set_default_logger(log_level)
 
-  # Check output paths.
-  check_if_overwriting(climatology_output_path, overwrite=overwrite)
-  check_if_overwriting(anomaly_std_output_path, overwrite=overwrite)
-
-  # Read configs
-  configs = read_configs(configs_path, schema=ClimatologyConfig)
-
   # Set up Dask client.
   with get_client(scheduler_type=scheduler_type, use_frisky=use_frisky):
     try:
+      # Check output paths.
+      check_if_overwriting(climatology_output_path, overwrite=overwrite)
+      check_if_overwriting(anomaly_std_output_path, overwrite=overwrite)
+      # Read configs
+      configs = read_configs(configs_path, schema=ClimatologyConfig)
+      # Open input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
       with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
         # Preprocess input dataset

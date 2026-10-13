@@ -127,25 +127,24 @@ def download(
   # Set up logging.
   set_default_logger(log_level)
 
-  # Read configs and inject start and end time.
-  update_time_interval = {}
-  if start_datetime is not None:
-    update_time_interval["start"] = start_datetime
-  if end_datetime is not None:
-    update_time_interval["end"] = end_datetime
-  configs = read_configs(configs_path, inject=update_time_interval, schema=DownloadConfig)
-
-  # Check if the output destination exists.
-  check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
-
   # Set up the Dask client and TempDirectoryRegistry.
   # Notice: distributed dask clusters are not available due to serialization issues.
+  if scheduler_type in ("processes", "mpi", "localcluster"):
+    logger.warning(
+      f"Using {scheduler_type} scheduler, which is not compatible with remote arco-make xarray backends. "
+      "Please use 'threads' or 'synchronous' instead."
+    )
   with get_client(scheduler_type=scheduler_type), TempDirectoryRegistry():
-    if scheduler_type in ("processes", "mpi", "localcluster"):
-      logger.warning(
-        f"Using {scheduler_type} scheduler, which is not compatible with remote arco-make xarray backends. "
-        "Please use 'threads' or 'synchronous' instead."
-      )
+    # Read configs and inject start and end time.
+    update_time_interval = {}
+    if start_datetime is not None:
+      update_time_interval["start"] = start_datetime
+    if end_datetime is not None:
+      update_time_interval["end"] = end_datetime
+    configs = read_configs(configs_path, inject=update_time_interval, schema=DownloadConfig)
+    # Check if the output destination exists.
+    check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
+    # Iterate over date intervals.
     is_first_date_interval = True
     for date_interval in IterableDateInterval(configs.start, configs.end, configs.step):
       logger.info(f"Downloading data from {date_interval.start} to {date_interval.end}")
