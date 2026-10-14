@@ -4,8 +4,8 @@ import functools
 import inspect
 import logging
 import socket
-from collections.abc import Callable
-from contextlib import nullcontext
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, nullcontext
 from typing import Any, Literal, TypeVar, cast
 
 import dask
@@ -64,9 +64,10 @@ def LocalCluster(*args, **kwargs):
   return distributed.LocalCluster(*args, **kwargs)
 
 
+@contextmanager
 def get_client(
   scheduler_type: SchedulerOptionType = "threads", use_frisky: bool = False
-) -> MaybeClient:
+) -> Generator[MaybeClient]:
   if scheduler_type in ("synchronous", "threads", "processes"):
     dask.config.set(scheduler=scheduler_type)
     client = DummyClient()
@@ -92,7 +93,17 @@ def get_client(
     except ImportError:
       logger.warning("frisky not found, falling back to default Dask client.")
 
-  return client  # type: ignore
+  try:
+    yield client  # type: ignore
+  finally:
+    if not isinstance(client, DummyClient):
+      if scheduler_type == "mpi":
+        try:
+          client.shutdown()
+        except Exception:
+          client.close()
+      else:
+        client.close()
 
 
 def maybe_wait(futures, rebalance=False, **kwargs):
