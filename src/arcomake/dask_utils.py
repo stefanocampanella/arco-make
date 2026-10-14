@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
+import atexit
 import functools
 import inspect
 import logging
@@ -98,6 +99,12 @@ def get_client(
   finally:
     if not isinstance(client, DummyClient):
       if dask_setup == "mpi":
+        for target in (
+          getattr(dask_mpi, "send_close_signal", None),
+          getattr(getattr(dask_mpi, "execute", None), "send_close_signal", None),
+        ):
+          if target is not None:
+            atexit.unregister(target)
         try:
           client.shutdown()
         except Exception:
