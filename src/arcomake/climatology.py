@@ -419,7 +419,6 @@ def _compute_climatology(
     # Reshape time dimension into (_period, time_dim)
     folded = (
       dataset.assign_coords({time_dim: np.arange(size)})
-      .chunk({time_dim: period})
       .coarsen({time_dim: period}, boundary="exact")
       .construct({time_dim: ("_period", time_dim)})
       .assign_coords({time_dim: bins})
