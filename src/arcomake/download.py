@@ -17,7 +17,7 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.dask_utils import SchedulerOptionType, get_client
+from arcomake.dask_utils import DaskSetupType, get_client
 from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
@@ -92,10 +92,10 @@ class DownloadConfig(BaseModel):
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
 )
 @click.option(
-  "--scheduler-type",
+  "--dask-setup",
   default="threads",
   type=click.Choice(
-    get_args(SchedulerOptionType),
+    get_args(DaskSetupType),
     case_sensitive=False,
   ),
   help="Type of Dask scheduler to use, for remote downloads the choice is between 'synchronous' or 'threads'.",
@@ -114,7 +114,7 @@ def download(
   end_datetime: datetime | None = None,
   overwrite: bool = False,
   log_level: str = "info",
-  scheduler_type: SchedulerOptionType = "threads",
+  dask_setup: DaskSetupType = "threads",
   progress: bool = False,
 ):
   """
@@ -129,12 +129,12 @@ def download(
 
   # Set up the Dask client and TempDirectoryRegistry.
   # Notice: distributed dask clusters are not available due to serialization issues.
-  if scheduler_type in ("processes", "mpi", "localcluster"):
+  if dask_setup in ("processes", "mpi", "localcluster"):
     logger.warning(
-      f"Using {scheduler_type} scheduler, which is not compatible with remote arco-make xarray backends. "
+      f"Using {dask_setup} scheduler, which is not compatible with remote arco-make xarray backends. "
       "Please use 'threads' or 'synchronous' instead."
     )
-  with get_client(scheduler_type=scheduler_type), TempDirectoryRegistry():
+  with get_client(dask_setup=dask_setup), TempDirectoryRegistry():
     # Read configs and inject start and end time.
     update_time_interval = {}
     if start_datetime is not None:
@@ -189,9 +189,7 @@ def download(
               )
             # Save the dataset in a Zarr using sensible chunking and compression
             progress_bar = (
-              ProgressBar
-              if (progress and scheduler_type in ["processes", "threads"])
-              else nullcontext
+              ProgressBar if (progress and dask_setup in ["processes", "threads"]) else nullcontext
             )
             with progress_bar():
               if is_first_date_interval:

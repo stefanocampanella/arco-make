@@ -55,7 +55,7 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.dask_utils import SchedulerOptionType, get_client
+from arcomake.dask_utils import DaskSetupType, get_client
 from arcomake.dataset_utils import ReadConfig, SaveConfig, safe_to_zarr
 from arcomake.processing_utils import ProcessingStepConfig
 
@@ -123,10 +123,10 @@ class ClimatologyConfig(BaseModel):
   is_flag=True,
 )
 @click.option(
-  "--scheduler-type",
+  "--dask-setup",
   default="mpi",
   type=click.Choice(
-    get_args(SchedulerOptionType),
+    get_args(DaskSetupType),
     case_sensitive=False,
   ),
   help="Type of Dask scheduler to use.",
@@ -150,7 +150,7 @@ def compute_climatology(
   climatology_output_path: str,
   anomaly_std_output_path: str,
   overwrite: bool = False,
-  scheduler_type: SchedulerOptionType = "mpi",
+  dask_setup: DaskSetupType = "mpi",
   use_frisky: bool = False,
   use_flox: bool = False,
   log_level: str = "info",
@@ -178,7 +178,7 @@ def compute_climatology(
       Path to the anomaly std output.
   overwrite : bool, default False
       Whether to overwrite the outputs if they already exist.
-  scheduler_type : SchedulerOptionType, default "mpi"
+  dask_setup : DaskSetupType, default "mpi"
       Type of Dask scheduler to use.
   log_level : {"debug", "info", "warning", "error", "critical"}, default "info"
       Logging verbosity.
@@ -188,7 +188,7 @@ def compute_climatology(
   set_default_logger(log_level)
 
   # Set up Dask client.
-  with get_client(scheduler_type=scheduler_type, use_frisky=use_frisky):
+  with get_client(dask_setup=dask_setup, use_frisky=use_frisky):
     try:
       # Check output paths.
       check_if_overwriting(climatology_output_path, overwrite=overwrite)

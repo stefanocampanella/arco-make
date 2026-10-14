@@ -14,7 +14,7 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.dask_utils import SchedulerOptionType, get_client
+from arcomake.dask_utils import DaskSetupType, get_client
 from arcomake.dataset_utils import (
   ReadConfig,
   SaveConfig,
@@ -69,10 +69,10 @@ class UnpackConfig(BaseModel):
   is_flag=True,
 )
 @click.option(
-  "--scheduler-type",
+  "--dask-setup",
   default="mpi",
   type=click.Choice(
-    get_args(SchedulerOptionType),
+    get_args(DaskSetupType),
     case_sensitive=False,
   ),
   help="Type of Dask scheduler to use.",
@@ -101,7 +101,7 @@ def unpack(
   input_path: str,
   output_path: str,
   overwrite: bool = False,
-  scheduler_type: SchedulerOptionType = "mpi",
+  dask_setup: DaskSetupType = "mpi",
   log_level: str = "info",
   progress: bool = False,
   use_frisky: bool = False,
@@ -117,7 +117,7 @@ def unpack(
   # Set up logging.
   set_default_logger(log_level)
   # Set up Dask client.
-  with get_client(scheduler_type=scheduler_type, use_frisky=use_frisky):
+  with get_client(dask_setup=dask_setup, use_frisky=use_frisky):
     try:
       # Check output path
       check_if_overwriting(output_path, overwrite=overwrite)
@@ -132,7 +132,7 @@ def unpack(
         **configs.read.model_dump(exclude_unset=True),
       ) as dataset:
         progress_bar = (
-          ProgressBar if (progress and scheduler_type in ["processes", "threads"]) else nullcontext
+          ProgressBar if (progress and dask_setup in ["processes", "threads"]) else nullcontext
         )
         with progress_bar():
           # Postproces unpacked dataset

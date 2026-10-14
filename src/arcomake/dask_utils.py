@@ -14,7 +14,7 @@ import dask_mpi
 
 logger = logging.getLogger(__name__)
 
-SchedulerOptionType = Literal["synchronous", "threads", "processes", "mpi", "localcluster"]
+DaskSetupType = Literal["synchronous", "threads", "processes", "mpi", "localcluster"]
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -66,24 +66,24 @@ def LocalCluster(*args, **kwargs):
 
 @contextmanager
 def get_client(
-  scheduler_type: SchedulerOptionType = "threads", use_frisky: bool = False
+  dask_setup: DaskSetupType = "threads", use_frisky: bool = False
 ) -> Generator[MaybeClient]:
-  if scheduler_type in ("synchronous", "threads", "processes"):
-    dask.config.set(scheduler=scheduler_type)
+  if dask_setup in ("synchronous", "threads", "processes"):
+    dask.config.set(scheduler=dask_setup)
     client = DummyClient()
-    logger.info(f"Using Dask scheduler: {scheduler_type}.")
-  elif scheduler_type == "mpi":
+    logger.info(f"Using Dask scheduler: {dask_setup}.")
+  elif dask_setup == "mpi":
     dask_mpi_initialize()
     client = distributed.Client()
     host = client.run_on_scheduler(socket.gethostname)
     port = client.scheduler_info()["services"]["dashboard"]
     logger.info(f"Using dask_mpi, Dask dashboard available at {host}:{port}")
-  elif scheduler_type == "localcluster":
+  elif dask_setup == "localcluster":
     cluster = LocalCluster()
     client = distributed.Client(cluster)
     logger.info(f"Using local Dask cluster, dashboard available at: {cluster.dashboard_link}")
   else:
-    raise ValueError(f"Invalid scheduler type: {scheduler_type}")
+    raise ValueError(f"Invalid scheduler type: {dask_setup}")
   if not isinstance(client, DummyClient) and use_frisky:
     try:
       import frisky
@@ -97,7 +97,7 @@ def get_client(
     yield client  # type: ignore
   finally:
     if not isinstance(client, DummyClient):
-      if scheduler_type == "mpi":
+      if dask_setup == "mpi":
         try:
           client.shutdown()
         except Exception:
