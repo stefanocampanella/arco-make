@@ -41,6 +41,7 @@ license = "MIT"
 [project.optional-dependencies]
 dev = [
     "pandas-stubs~=3.0.3",
+    "scipy-stubs~=1.18.1",
     "pre-commit",
     "ruff",
     "ty",
