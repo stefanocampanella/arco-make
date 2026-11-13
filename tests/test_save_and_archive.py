@@ -61,9 +61,6 @@ def test_safe_to_zarr_does_not_modify_input_encoding(ocean_ds: xr.Dataset, tmp_p
   assert zarr.open_group(str(tmp_path / "other.zarr"), mode="r")["thetao"].chunks == (2, 3, 8, 8)
 
 
-@pytest.mark.xfail(
-  reason="N1: without [save] compressor the output is written uncompressed", strict=True
-)
 def test_safe_to_zarr_default_compression(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
   """Without a compressor in the recipe, zarr's default compressor is used, not none."""
   safe_to_zarr(ocean_ds, tmp_path / "out.zarr", configs=SaveConfig())

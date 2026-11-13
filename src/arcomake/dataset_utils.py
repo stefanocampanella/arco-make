@@ -253,8 +253,9 @@ def maybe_checkpointing_download_and_process(
     with download_and_process(configs, date_interval.start, date_interval.end) as downloaded:
       # A shallow copy has its own encodings: the downloaded dataset is left unchanged.
       dataset = downloaded.copy(deep=False)
-      for var in dataset.data_vars:
-        dataset[var].encoding["compressor"] = compressor
+      if compressor is not None:
+        for var in dataset.data_vars:
+          dataset[var].encoding["compressor"] = compressor
       logger.info(f"Saving checkpoint {date_interval}")
       progress_bar = nullcontext if not progress else ProgressBar
       with progress_bar():
@@ -424,8 +425,10 @@ def safe_to_zarr(
       else:
         chunk_sizes = tuple(chunk_conf for _ in dims)
       dataset[var].encoding["chunks"] = chunk_sizes
-  for var in dataset.data_vars:
-    dataset[var].encoding["compressor"] = compressor
+  if compressor is not None:
+    # Without `[save] compressor`, the variables keep their own (or zarr's default) compressor.
+    for var in dataset.data_vars:
+      dataset[var].encoding["compressor"] = compressor
 
   if "encoding" in to_zarr_kwargs and isinstance(to_zarr_kwargs["encoding"], dict):
     for var_enc in to_zarr_kwargs["encoding"].values():
