@@ -3,8 +3,9 @@
 import logging
 import warnings
 from collections.abc import Sequence
-from datetime import datetime
+from typing import Any
 
+import numpy as np
 import xarray as xr
 
 from arcomake import steps as step_registry
@@ -19,22 +20,23 @@ class ArcoMakeSelector:
   def __init__(self, dataset: xr.Dataset):
     self._dataset = dataset
 
-  def time_sel(self, start_datetime: datetime, end_datetime: datetime, time_dim: str = "time"):
-    """XArray DataArray and Dataset sel method is right inclusive, this accessor provides right exclusive selection."""
+  def time_sel(self, start_datetime: Any, end_datetime: Any, time_dim: str = "time") -> xr.Dataset:
+    """Select the right-open interval `[start, end)` along `time_dim`.
+
+    `Dataset.sel` with a slice includes its end; this selection excludes it, so that consecutive
+    intervals do not overlap. Works for numpy datetimes and cftime calendars, and for empty or
+    one-step selections. A dataset without `time_dim` (e.g. static fields) is returned unchanged.
+
+    Raises:
+      ValueError: if the time coordinate is not sorted.
+    """
     if time_dim not in self._dataset.coords:
       return self._dataset
-    time_coordinate = self._dataset[time_dim]
-    time_coordinate = time_coordinate.sel(time=slice(start_datetime, end_datetime))
-    time_coordinate = time_coordinate.to_index()
-    if not time_coordinate.is_monotonic_increasing:
+    if not self._dataset.indexes[time_dim].is_monotonic_increasing:
       raise ValueError(f"Time coordinate is not sorted: {self._dataset[time_dim]}")
-    time_coordinate_last_value = time_coordinate[-1].to_pydatetime()
-    assert isinstance(time_coordinate_last_value, datetime)
-    if time_coordinate_last_value == end_datetime:
-      end_val = time_coordinate[-2].to_pydatetime()
-      assert isinstance(end_val, datetime)
-      end_datetime = end_val
-    return self._dataset.sel(time=slice(start_datetime, end_datetime))
+    selected = self._dataset.sel({time_dim: slice(start_datetime, end_datetime)})
+    before_end = np.asarray(selected.indexes[time_dim] < end_datetime)
+    return selected.isel({time_dim: np.flatnonzero(before_end)})
 
   def process(
     self,

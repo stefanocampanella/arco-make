@@ -117,7 +117,6 @@ def test_time_sel_without_time_returns_dataset(static_ds: xr.Dataset):
   assert static_ds.arcomake.time_sel(datetime(2020, 1, 1), datetime(2020, 1, 2)) is static_ds
 
 
-@pytest.mark.xfail(reason="B5: time_sel uses the literal keyword `time=`", strict=True)
 def test_time_sel_other_time_dim(ocean_ds: xr.Dataset):
   """The time dimension may have another name."""
   ds = ocean_ds.rename(time="valid_time")
@@ -125,7 +124,6 @@ def test_time_sel_other_time_dim(ocean_ds: xr.Dataset):
   assert out.sizes["valid_time"] == 3
 
 
-@pytest.mark.xfail(reason="B5: time_sel indexes [-1] and [-2] of the selection", strict=True)
 @pytest.mark.parametrize(
   ("start", "end", "size"),
   [
@@ -138,7 +136,6 @@ def test_time_sel_short_intervals(ocean_ds: xr.Dataset, start, end, size):
   assert ocean_ds.arcomake.time_sel(start, end).sizes["time"] == size
 
 
-@pytest.mark.xfail(reason="B5: time_sel calls to_pydatetime, which cftime lacks", strict=True)
 def test_time_sel_cftime():
   """Non-standard calendars (cftime) are selected the same way."""
   times = xr.date_range("2001-01-01", periods=5, freq="1D", calendar="noleap", use_cftime=True)

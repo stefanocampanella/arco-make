@@ -219,6 +219,7 @@ def download_and_process(
   configs: DatasetConfig,
   start_datetime: datetime.datetime,
   end_datetime: datetime.datetime,
+  time_dim: str = "time",
 ) -> xr.Dataset:
   """
   Downloads and pre-processes a dataset based on provided configurations.
@@ -234,7 +235,7 @@ def download_and_process(
     if engine == "earlywarningdatastore" or engine == "copernicusmarine":
       part_conf.update(start_datetime=start_datetime, end_datetime=end_datetime)
     part = xr.open_dataset(**part_conf)
-    part = part.arcomake.time_sel(start_datetime, end_datetime)
+    part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
     parts.append(part)
   if not parts:
     raise ValueError("No parts found in the dataset configuration")
@@ -261,10 +262,10 @@ def maybe_checkpointing_download_and_process(
   )
 
   if checkpointing_step is None:
-    return download_and_process(configs, start_datetime, end_datetime)
+    return download_and_process(configs, start_datetime, end_datetime, time_dim=time_dim)
   parsed_step = may_parse_timedelta(checkpointing_step)
   if parsed_step >= end_datetime - start_datetime:
-    return download_and_process(configs, start_datetime, end_datetime)
+    return download_and_process(configs, start_datetime, end_datetime, time_dim=time_dim)
 
   registry = get_current_temp_registry()
   if registry is not None:
@@ -279,7 +280,9 @@ def maybe_checkpointing_download_and_process(
   date_intervals = IterableDateInterval(start_datetime, end_datetime, parsed_step)
   is_first_checkpoint = True
   for date_interval in date_intervals:
-    with download_and_process(configs, date_interval.start, date_interval.end) as downloaded:
+    with download_and_process(
+      configs, date_interval.start, date_interval.end, time_dim=time_dim
+    ) as downloaded:
       # A shallow copy has its own encodings: the downloaded dataset is left unchanged.
       dataset = downloaded.copy(deep=False)
       if compressor is not None:
