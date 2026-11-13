@@ -36,7 +36,7 @@ on the project VM with the image's eccodes 2.48, threads scheduler):
 | Window | Result | Wall time | Peak RSS | Output |
 |---|---|---|---|---|
 | 1993-01-01 → 01-03 | ok | 22 min | 36 GB | 832 MB |
-| 2012-12-30 → 2013-01-02 | attempt 1: `ConnectTimeout` on `confluence.ecmwf.int` (GloFAS `uparea`, NetCDF over HTTP: no retry) after 25 min; attempt 2: **segmentation fault** after 22 s | | | |
+| 2012-12-30 → 2013-01-02 | attempt 1: `ConnectTimeout` on `confluence.ecmwf.int` (GloFAS `uparea`, NetCDF over HTTP: no retry) after 25 min; attempt 2: **segmentation fault** after 22 s; attempts 3 and 4: **hung** (no progress for 2 h 11 min and for 15 min, stopped by hand) | | | |
 | 2020-02-26 → 03-02 | ok | 3 min | 53 GB | 2.1 GB |
 
 - Wall time is dominated by the remote services' queues (EWDS above all) and varies by an order of
@@ -54,6 +54,26 @@ on the project VM with the image's eccodes 2.48, threads scheduler):
   piece and writes nothing wrong, so the published data are not affected.
 - The ConnectTimeout is the failure class seen in production: a transient error aborts the whole
   block (group 7).
+- **Hang, a third failure class (N7):** attempts 3 and 4 both stopped about two minutes in, while
+  writing, with 1.3 GB on disk: every array was complete except ERA5 `10v`, which had no chunk.
+  The process then sat at 0 % CPU with no I/O (stopped by hand after 2 h 11 min and 15 min).
+  - A py-spy dump of attempt 4: the main thread waits in `Dataset.to_zarr` for Dask; two Dask
+    workers wait in `fsspec.asyn.sync` (`Event.wait`, no timeout) on `FSMap.getitems` of the ERA5
+    store on Google Cloud Storage; the fsspec event loop is idle in `epoll`. Nothing deadlocked: a
+    read never got an answer and nothing gave up on it. (The 30 CLOSE-WAIT connections to Copernicus
+    Marine are idle leftovers.)
+  - Cause: gcsfs (2026.10.0) passes `requests_timeout=None` to every aiohttp request by default,
+    and aiohttp (3.14.5) turns an explicit `None` into `ClientTimeout(total=None)`, which removes
+    its own 5-minute default. Any GCS read can wait forever, at any arco-make commit.
+  - A recipe can set it today: `storage_options = {token = "anon", requests_timeout = 120}` on
+    the ERA5 part. From reading the code (not tested): a total timeout raises `TimeoutError`,
+    which is not in gcsfs's retriable exceptions, so the piece fails instead of hanging, but is
+    not retried. Group 7: default read timeouts on every remote source, with retries.
+  - The PR's code finished this window once (2 min 20 s); it has the same dependencies, so it is
+    exposed the same way.
+- **[Moby-Dick]** A production piece could hang the same way rather than fail. A killed piece leaves
+  a partial store that must be rewritten with `--overwrite`, as the failed pieces were; the cost is
+  lost time, not wrong data, provided every killed piece was rerun.
 - **Comparison, `29a9edd` vs `847b6f2` on window 1:** the array metadata were identical (dtype,
   chunks, compressor, fill value, attributes), but ERA5 values (`2t`, `msl`, `ssrd`...) and a few
   wave points differed by a few float32 ULP, e.g. 1.2e-4 K on `2t`.
