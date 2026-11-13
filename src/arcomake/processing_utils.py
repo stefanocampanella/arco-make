@@ -60,25 +60,42 @@ def assign_var_attrs(ds: xr.Dataset, **kwargs) -> xr.Dataset:
   return ds
 
 
-# TODO: document astype behaviour
+CastingType = Literal["no", "equiv", "safe", "same_kind", "unsafe"]
+
+
 @step
 def astype(
   ds: xr.Dataset,
   dtype: str | None = None,
-  casting: str | None = None,
-  **kwargs,
+  casting: CastingType | None = None,
+  **kwargs: Mapping[str, Any],
 ) -> xr.Dataset:
-  if dtype is not None and casting is not None:
-    ds = ds.astype(dtype=dtype, casting=casting)
-  elif kwargs:
-    data_vars = {}
-    for variable, astype_kwargs in kwargs.items():
-      if variable in ds.data_vars:
-        data_vars[variable] = ds[variable].astype(**astype_kwargs)
-      else:
-        data_vars[variable] = ds[variable]
-    ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
-  return ds
+  """Convert the data type of the data variables, all at once or per variable.
+
+  Either `dtype` (and optionally `casting`, as in NumPy) for every data variable::
+
+    name = "astype"
+    dtype = "float32"
+    casting = "same_kind"
+
+  or one table per variable, with the arguments of `DataArray.astype`; the variables not listed
+  are kept unchanged::
+
+    name = "astype"
+    uparea = {dtype = "float32", casting = "same_kind"}
+  """
+  if dtype is not None:
+    if kwargs:
+      raise ValueError("astype takes either `dtype` for all variables or one table per variable")
+    return ds.astype(dtype=dtype, **({"casting": casting} if casting is not None else {}))
+  if casting is not None:
+    raise ValueError("astype: `casting` without `dtype`")
+  converted = {}
+  for variable, astype_kwargs in kwargs.items():
+    if variable not in ds.data_vars:
+      raise ValueError(f"astype: {variable!r} is not a data variable")
+    converted[variable] = ds[variable].astype(**astype_kwargs)
+  return ds.assign(converted)
 
 
 @step

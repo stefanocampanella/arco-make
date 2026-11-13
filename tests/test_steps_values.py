@@ -15,7 +15,6 @@ def test_astype_whole_dataset(ocean_ds: xr.Dataset):
   assert all(da.dtype == np.float32 for da in out.data_vars.values())
 
 
-@pytest.mark.xfail(reason="N2: astype ignores `dtype` unless `casting` is also given", strict=True)
 def test_astype_dtype_alone(ocean_ds: xr.Dataset):
   """`dtype` alone converts too; it must not be a silent no-op."""
   out = pu.astype(ocean_ds, dtype="float32")
@@ -28,13 +27,25 @@ def test_astype_per_variable(ocean_ds: xr.Dataset):
   assert out.zos.dtype == np.float32
 
 
-@pytest.mark.xfail(
-  reason="N2: the per-variable form of astype drops unlisted variables", strict=True
-)
 def test_astype_per_variable_keeps_other_variables(ocean_ds: xr.Dataset):
   """Variables not listed are kept unchanged."""
   out = pu.astype(ocean_ds, zos={"dtype": "float32", "casting": "same_kind"})
   assert set(out.data_vars) == {"thetao", "zos"}
+  xr.testing.assert_identical(out.thetao, ocean_ds.thetao)
+
+
+@pytest.mark.parametrize(
+  "kwargs",
+  [
+    {"dtype": "float32", "zos": {"dtype": "float32"}},  # both forms at once
+    {"casting": "same_kind"},  # casting alone
+    {"absent": {"dtype": "float32"}},  # not a data variable
+  ],
+)
+def test_astype_rejects_ambiguous_arguments(ocean_ds: xr.Dataset, kwargs: dict):
+  """Arguments that would be ignored or misread are errors."""
+  with pytest.raises(ValueError):
+    pu.astype(ocean_ds, **kwargs)
 
 
 def test_clip_negative(atmosphere_ds: xr.Dataset):
