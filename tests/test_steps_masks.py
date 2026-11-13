@@ -73,6 +73,14 @@ def test_apply_mask(ocean_ds: xr.Dataset, static_ds: xr.Dataset):
   xr.testing.assert_identical(out.thetao, ds.thetao)
 
 
+def test_apply_mask_default_leaves_the_mask_boolean(ocean_ds: xr.Dataset, static_ds: xr.Dataset):
+  """Without `variables` every data variable is masked, except the mask itself."""
+  ds = pu.get_notnull_mask(xr.merge([ocean_ds, static_ds]), variable="deptho", mask_name="m")
+  out = pu.apply_mask(ds, mask_name="m")
+  xr.testing.assert_identical(out.m, ds.m)
+  assert out.zos.isel(longitude=0).isnull().all()
+
+
 def test_masked_fill_constant_inside_mask_only(ocean_ds: xr.Dataset, static_ds: xr.Dataset):
   """NaN inside the mask are filled; NaN outside the mask stay NaN; valid values are unchanged."""
   ds = pu.get_notnull_mask(xr.merge([ocean_ds, static_ds]), variable="deptho", mask_name="m")

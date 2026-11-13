@@ -40,7 +40,7 @@ def apply_mask(
 ) -> xr.Dataset:
   mask = ds[mask_name]
   if variables is None:
-    variables = ds.data_vars.keys()
+    variables = [name for name in ds.data_vars if name != mask_name]
   data_vars = {}
   for var in ds.data_vars:
     if var in variables:
