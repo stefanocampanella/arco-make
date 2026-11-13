@@ -69,8 +69,8 @@ def check_if_overwriting(
   try:
     exists = fs.exists(fs_path)
   except Exception as exc:
-    logger.warning(f"Could not check existence of {path}: {exc}")
-    exists = False
+    # Fail before any work: an unreachable destination would fail late, or be overwritten.
+    raise click.ClickException(f"Could not check whether {path} exists: {exc}") from exc
 
   if exists:
     if overwrite:

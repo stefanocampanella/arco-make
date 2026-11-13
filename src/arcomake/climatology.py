@@ -183,11 +183,10 @@ def compute_climatology(
   # Set up Dask client.
   with get_client(dask_setup=dask_setup, use_frisky=use_frisky):
     try:
-      # Check output paths.
-      check_if_overwriting(climatology_output_path, overwrite=overwrite)
-      check_if_overwriting(anomaly_std_output_path, overwrite=overwrite)
-      # Read configs
+      # Read configs, then check the output paths (with the recipe's storage options).
       configs = read_configs(configs_path, schema=ClimatologyConfig)
+      for path in (climatology_output_path, anomaly_std_output_path):
+        check_if_overwriting(path, overwrite=overwrite, save_configs=configs.save)
       # Open input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
       with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:

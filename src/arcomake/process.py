@@ -108,10 +108,9 @@ def process(
   # Set up Dask client.
   with get_client(dask_setup=dask_setup, use_frisky=use_frisky):
     try:
-      # Check output path.
-      check_if_overwriting(output_path, overwrite=overwrite)
-      # Read configs
+      # Read configs, then check the output path (with the recipe's storage options).
       configs = read_configs(configs_path, schema=ProcessConfig)
+      check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
       # Read input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
       with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:

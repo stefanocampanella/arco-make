@@ -112,10 +112,9 @@ def unpack(
   # Set up Dask client.
   with get_client(dask_setup=dask_setup, use_frisky=use_frisky):
     try:
-      # Check output path
-      check_if_overwriting(output_path, overwrite=overwrite)
-      # Read configs
+      # Read configs, then check the output path (with the recipe's storage options).
       configs = read_configs(configs_path, schema=UnpackConfig)
+      check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
       # Unpack archive
       with open_archive(
         input_path,

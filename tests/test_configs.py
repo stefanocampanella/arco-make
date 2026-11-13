@@ -125,9 +125,6 @@ def test_check_if_overwriting(tmp_path: pathlib.Path):
   check_if_overwriting(str(tmp_path), overwrite=True)
 
 
-@pytest.mark.xfail(
-  reason="B14: a failed existence check is treated as 'does not exist'", strict=True
-)
 def test_check_if_overwriting_fails_when_destination_is_unreachable(
   monkeypatch: pytest.MonkeyPatch,
 ):
