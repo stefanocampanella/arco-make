@@ -87,7 +87,7 @@ def get_client(
     raise ValueError(f"Invalid scheduler type: {dask_setup}")
   if not isinstance(client, DummyClient) and use_frisky:
     try:
-      import frisky
+      import frisky  # ty: ignore[unresolved-import]  # optional "experimental" extra
 
       logger.info("Hijacking Dask client with frisky, this is an experimental feature.")
       client = frisky.hijack(client)

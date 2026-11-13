@@ -1,2 +1,20 @@
+# Python and tooling
 .venv
 .idea
+__pycache__/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Secrets and environment files: never commit them.
+.env
+*.env
+.*_env
+*.key
+*.pem
+
+# Run artefacts
+logs/
+*.log
+*.sif

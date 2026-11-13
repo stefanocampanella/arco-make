@@ -1,0 +1,18 @@
+version = 1
+
+# Files that cannot carry an SPDX header (data, lock files, configuration, documentation).
+# Python sources carry their own header and are checked individually.
+[[annotations]]
+path = [
+  "**.md",
+  "**.toml",
+  "**.lock",
+  "**.ipynb",
+  "**.yml",
+  "**.yaml",
+  ".gitignore",
+  "Apptainer",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Stefano Campanella"
+SPDX-License-Identifier = "MIT"

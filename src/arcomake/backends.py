@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Stefano Campanella
+# SPDX-License-Identifier: MIT
 import datetime
 import logging
 import os

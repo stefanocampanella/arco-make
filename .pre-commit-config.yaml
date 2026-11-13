@@ -1,14 +1,30 @@
 repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.13.0
-    hooks:
-      - id: ruff-check
-
+  # Linters run from the project environment, so their versions follow uv.lock.
   - repo: local
     hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --frozen ruff check --force-exclude
+        language: system
+        types: [python]
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --frozen ruff format --check --force-exclude
+        language: system
+        types: [python]
       - id: ty-check
         name: ty check
-        entry: ty check
+        entry: uv run --frozen ty check
         language: system
         types: [python]
         pass_filenames: false
+
+  - repo: https://github.com/fsfe/reuse-tool
+    rev: v6.3.0
+    hooks:
+      - id: reuse-lint-file
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
