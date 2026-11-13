@@ -14,15 +14,15 @@ after the correctness PRs are merged.
 - Feb 29, for group 6: keep 365 bins with a documented Feb 28 mapping.
 
 **Provenance of the published 0.25° dataset [Moby-Dick]:**
-- The 0.25° levels-50 download (30 Sep – 8 Oct 2026, on the project VM) ran in the cached image
-  (built 30 Sep). Its `src/arcomake` is identical to commit **`6f0e2f1`**
+- The 0.25° levels-50 download (30 Sep – 8 Oct 2026, on the project VM) ran in the cached
+  Apptainer image of 30 Sep. Its `src/arcomake` is identical to commit **`6f0e2f1`**
   (2026-09-30), not to `847b6f2`. `6f0e2f1..847b6f2` changes `download.py`, `dataset_utils.py`,
   `climatology.py` and the Dask setup.
 - It ran as 45 pieces of 256 days, about 3.3 h each and 165 h in total. Pieces 1, 16, 19, 20, 34 and
   41 failed on the first attempt and were rerun with `--overwrite` (7–8 Oct); 41 needed a third try.
   The errors in the logs are transient network ones: EWDS retries, DNS failures, connect timeouts.
-- The arco-ocean log folder named for the 0.5° recipe holds that 0.25° run,
-  despite its name.
+- In the arco-ocean checkout, the logs of that 0.25° run sit in a folder named for the 0.5° recipe
+  (machine details: `CLAUDE.local.md`, not committed).
 
 **Environment:**
 - The host's apt eccodes 2.45 cannot decode the GloFAS GRIB served by EWDS (`Unable to find
@@ -30,8 +30,9 @@ after the correctness PRs are merged.
   builds eccodes 2.48 from source, which works. Local runs use the image's library and
   definitions via `ECCODES_DIR`, `ECCODES_DEFINITION_PATH` and `ECCODES_SAMPLES_PATH`.
 
-**Real-data baseline at `847b6f2`** (0.25° levels-50 recipe, copied outside the repo,
-on the project VM with the image's eccodes 2.48, threads scheduler):
+**Real-data baseline at `847b6f2`** (a pinned copy of the 0.25° levels-50 recipe, on the project VM
+with 32 cores and 110 GB, the image's eccodes 2.48, threads scheduler; locations in
+`CLAUDE.local.md`, not committed):
 
 | Window | Result | Wall time | Peak RSS | Output |
 |---|---|---|---|---|

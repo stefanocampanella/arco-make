@@ -48,9 +48,10 @@ Registered in `src/arcomake/__init__.py`: `download`, `unpack`, `process`, `comp
 
 ## Working rules (from the maintainer)
 
-- **Secrets:** a credentials file on the project machine holds credentials. Never read, print or copy it. Source it only in the shell of the command that needs it (`set -a; . FILE; set +a`), without `set -x`, `env` or `printenv`. Commit files by name (never `git add -A`) and read `git diff --cached --stat` first. Logs may contain tokens: keep them out of the repo and read them through redacting filters.
+- **Local notes:** machine-specific paths, host names and file names live in `CLAUDE.local.md` (gitignored, not committed). Keep them out of committed files, this one and `docs/logbook.md` included.
+- **Secrets:** a credentials file on the project machine (named in `CLAUDE.local.md`) holds credentials. Never read, print or copy it. Source it only in the shell of the command that needs it (`set -a; . FILE; set +a`), without `set -x`, `env` or `printenv`. Commit files by name (never `git add -A`) and read `git diff --cached --stat` first. Logs may contain tokens: keep them out of the repo and read them through redacting filters.
 - **Commits:** one purpose each; tests pass after each; a fix comes with its test; a commit that changes output for an unchanged recipe starts with `output:`. Nothing specific to ARCO-OCEAN or to a cluster goes into arco-make.
-- **Real-data baseline:** a directory outside the repo. It holds the frozen code per commit (`code-<sha>`, from `git archive`, with its own venv), outputs per window, logs with `/usr/bin/time -v`, and the pinned recipe copy. Runs use the image's eccodes 2.48 (via `ECCODES_DIR` and `ECCODES_DEFINITION_PATH`): the host's eccodes 2.45 cannot read GloFAS GRIB.
+- **Real-data baseline:** a directory outside the repo (location and scripts in `CLAUDE.local.md`) holds the frozen code per commit (from `git archive`, each with its own venv), outputs per window, logs with `/usr/bin/time -v`, and a pinned copy of the 0.25° levels-50 recipe. "Same output" is checked bit for bit, metadata and encodings included. Runs use the image's eccodes 2.48 (via `ECCODES_DIR` and `ECCODES_DEFINITION_PATH`): older host eccodes cannot read GloFAS GRIB. Run a watchdog next to long runs: a hang (N7) sends no notification.
 - **Experiments:** for distributed runs (`localcluster`/`mpi`), `--frisky` (the `experimental` extra) gives readable diagnostics. It is experimental and closed-source, so treat what it shows as a lead to confirm.
 
 ## Findings for Moby-Dick
