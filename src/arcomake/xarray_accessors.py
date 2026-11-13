@@ -8,9 +8,9 @@ from typing import Any
 import numpy as np
 import xarray as xr
 
-from arcomake import steps as step_registry
 from arcomake.checks import CHECKS, ChecksConfig, ValidationError
 from arcomake.processing_utils import ProcessingStepConfig
+from arcomake.steps import resolve as resolve_step
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class ArcoMakeSelector:
     for raw_step in steps:
       config = raw_step.model_dump(exclude_unset=True)
       name = config.pop("name")
-      step_fn = step_registry.resolve(name)
+      step_fn = resolve_step(name)
       logger.info(f"Applying {name} with configuration {config}")
       dataset = step_fn(dataset, **config)
     assert isinstance(dataset, xr.Dataset)

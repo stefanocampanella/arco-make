@@ -1,5 +1,20 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
+"""The processing steps a recipe can name (`[[...postprocess]]` tables and similar).
+
+Every step takes a dataset and returns a new one; it never modifies its input (values,
+attributes or encodings) nor its arguments. Steps are lazy: they build Dask graphs and leave
+the computation to the final write, except `get_sea_mask`, which reads the (static) bathymetry.
+
+In a recipe, `name` selects the step and every other key is an argument:
+
+    [[datasets.ocean.postprocess]]
+    name = "select_variables"
+    variables = ["thetao", "so"]
+
+`docs/steps.md` (or `arco-make steps`) lists every step with its arguments.
+"""
+
 import logging
 from collections.abc import Hashable, Iterable, Mapping
 from typing import Any, Literal
@@ -38,6 +53,12 @@ def apply_mask(
   mask_name: Hashable,
   variables: Iterable[Hashable] | None = None,
 ) -> xr.Dataset:
+  """Set variables to NaN outside a mask.
+
+  Args:
+    mask_name: Boolean variable, True where values are kept.
+    variables: Variables to mask; by default every data variable except the mask.
+  """
   mask = ds[mask_name]
   if variables is None:
     variables = [name for name in ds.data_vars if name != mask_name]
@@ -52,7 +73,12 @@ def apply_mask(
 
 
 @step
-def assign_var_attrs(ds: xr.Dataset, **kwargs) -> xr.Dataset:
+def assign_var_attrs(ds: xr.Dataset, **kwargs: Mapping[str, Any]) -> xr.Dataset:
+  """Replace the attributes of variables or coordinates, one table per name::
+
+  name = "assign_var_attrs"
+  lat = {standard_name = "latitude", units = "degrees_north"}
+  """
   ds = ds.copy(deep=False)
   for key, attrs in kwargs.items():
     ds[key].attrs = attrs
@@ -98,7 +124,8 @@ def astype(
 
 
 @step
-def clip_negative(ds: xr.Dataset, variables: Iterable[Hashable]):
+def clip_negative(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
+  """Set negative values of the listed variables to 0 (e.g. accumulated precipitation); NaN stay."""
   data_vars = {}
   for var, da in ds.data_vars.items():
     if var in variables:
@@ -111,12 +138,14 @@ def clip_negative(ds: xr.Dataset, variables: Iterable[Hashable]):
 
 @step
 def drop_static_vars(ds: xr.Dataset, time_dim: str = "time") -> xr.Dataset:
+  """Drop the data variables without the time dimension (masks, bathymetry...)."""
   ds = ds.drop_vars([name for name, var in ds.data_vars.items() if time_dim not in var.dims])
   return ds
 
 
 @step
 def drop_var_attrs(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
+  """Remove all attributes of the listed variables or coordinates."""
   ds = ds.copy(deep=False)
   for key in variables:
     ds[key] = ds[key].drop_attrs()
@@ -125,6 +154,7 @@ def drop_var_attrs(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
 
 @step
 def flip(ds: xr.Dataset, dim: str) -> xr.Dataset:
+  """Reverse the order along a dimension (e.g. make ERA5 latitudes increase)."""
   return ds.isel({dim: slice(None, None, -1)})
 
 
@@ -133,8 +163,18 @@ def get_bottom(
   ds: xr.Dataset,
   depth_dim: str,
   variables: Iterable[Hashable] | Mapping[Hashable, Hashable] | None = None,
-  replace=True,
+  replace: bool = True,
 ) -> xr.Dataset:
+  """The deepest valid (non-NaN) value of each column along `depth_dim`.
+
+  The depth dimension is rechunked to a single chunk. Columns without valid values stay NaN.
+
+  Args:
+    depth_dim: Vertical dimension; its coordinate must increase downwards.
+    variables: Variables to reduce (default: all). With `replace = false`, a table from each
+      variable to the name of its new bottom variable, e.g. `{thetao = "thetao_bottom"}`.
+    replace: Replace the variables by their bottom values instead of adding new ones.
+  """
   ds = ds.copy()
   if variables is None:
     variables = ds.data_vars.keys()
@@ -163,6 +203,7 @@ def get_notnull_mask(
   variable: Hashable,
   mask_name: Hashable,
 ) -> xr.Dataset:
+  """Add a boolean mask, True where `variable` is not null."""
   return ds.assign({mask_name: ds[variable].notnull()})
 
 
@@ -175,6 +216,21 @@ def get_sea_mask(
   threshold: float = 0.5,
   mask_name: Hashable = "sea_land_mask",
 ) -> xr.Dataset:
+  """Add a 3D sea mask from a bathymetry: a cell is sea where the sea floor is below it.
+
+  Cell faces are rebuilt from the level centres, assuming each centre is mid-cell and the top
+  face of the first level is at 0 m. A cell is sea where the bathymetry is deeper than
+  `threshold * top + (1 - threshold) * bottom` of the cell; with `threshold = 0.5` this is the
+  level centre. Land (NaN bathymetry) is never sea. Eager: the bathymetry and the depth
+  coordinate are loaded.
+
+  Args:
+    bathymetry: Sea-floor depth, positive downwards.
+    depth_coordinate: Level centres, positive downwards.
+    depth_dim: Vertical dimension of the mask (default: the depth coordinate's dimension).
+    threshold: Fraction of the cell, between 0 (bottom face) and 1 (top face).
+    mask_name: Name of the new mask.
+  """
   if depth_dim is None:
     # The mask's vertical dimension is the one of the depth coordinate.
     (depth_dim,) = ds[depth_coordinate].dims
@@ -204,12 +260,18 @@ def get_sea_mask(
 
 
 @step
-def isel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
+def isel(ds: xr.Dataset, **kwargs: Any) -> xr.Dataset:
+  """Select by position along dimensions: an index, a list, or `{start, stop, step}`::
+
+  name = "isel"
+  time = {start = 0, stop = 365}
+  """
   return ds.isel({dim: _get_selection(values) for dim, values in kwargs.items()})
 
 
 @step
 def is_positive_mask(ds: xr.Dataset, variable: Hashable, mask_name: Hashable) -> xr.Dataset:
+  """Add a boolean mask, True where `variable` is strictly positive (NaN gives False)."""
   return ds.assign({mask_name: ds[variable] > 0.0})
 
 
@@ -220,6 +282,19 @@ def masked_fill(
   fill_value: Number | str | Mapping[Hashable, Number | Hashable],
   mask_name: Hashable,
 ) -> xr.Dataset:
+  """Fill missing values inside a mask; values outside the mask are left as they are.
+
+  The fill value is a number, the name of another variable (e.g. the bottom value of the
+  column), or a table with one of those per variable::
+
+    name = "masked_fill"
+    mask_name = "glorys_mask"
+    variables = ["thetao", "so"]
+    fill_value = {thetao = "thetao_bottom", so = "so_bottom"}
+
+  For variables without one of the mask's dimensions (e.g. 2D fields and a 3D mask), the
+  first index of that dimension is used (e.g. the surface level).
+  """
   if mask_name not in ds.data_vars:
     raise ValueError(f"Mask {mask_name} does not exist")
   mask = ds[mask_name]
@@ -251,17 +326,25 @@ def regrid(
   ] = "nearest",
   kwargs: Mapping[str, Any] | None = None,
 ) -> xr.Dataset:
-  """
-  Regrids the dataset to a new grid using xarray-regrid (default using nearest neighbor algorithm).
+  """Regrid to a regular latitude-longitude grid with xarray-regrid.
+
+  The target coordinates are float32. Example::
+
+    name = "regrid"
+    method = "conservative"
+    grid = {south = -90.0, north = 90.0, west = 0.0, east = 359.75, resolution_lat = 0.25, resolution_lon = 0.25}
+    kwargs = {skipna = true, nan_threshold = 1.0}
+
+  With `method = "conservative"`, `skipna = false` counts missing source cells as 0 (e.g. land
+  as depth 0), while `skipna = true` averages the valid part of each target cell, and leaves NaN
+  where its valid fraction is below `1 - nan_threshold`.
 
   Args:
-    ds (xr.Dataset): The input dataset.
-    grid (dict): Grid specification for the target grid (`xarray_regrid.Grid` arguments).
-    method: The xarray-regrid method.
-    kwargs: Additional arguments for the regridding method.
-
-  Returns:
-    xr.Dataset: The regridded dataset.
+    grid: Arguments of `xarray_regrid.Grid` (`north`, `east`, `south`, `west`,
+      `resolution_lat`, `resolution_lon`).
+    latitude_dim, longitude_dim: Names of the horizontal dimensions.
+    method: The xarray-regrid method (default "nearest").
+    kwargs: Further arguments of that method (e.g. `skipna`, `nan_threshold`, `output_chunks`).
   """
   new_grid = xarray_regrid.Grid(**grid)
   target_dataset = new_grid.create_regridding_dataset(lat_name=latitude_dim, lon_name=longitude_dim)
@@ -285,6 +368,12 @@ def rename_coordinates(
   name_dict: Mapping[Hashable, Hashable],
   set_new_coordinate: Mapping[Hashable, Literal["auto"] | Iterable[Number]] | None = None,
 ) -> xr.Dataset:
+  """Rename coordinates (and their dimensions); names that are not coordinates are skipped.
+
+  Skipping lets one table serve several sources. With `set_new_coordinate = {NEW = "auto"}`
+  (or a list of values), the renamed dimension gets a new index 0..n-1 (or those values) and
+  the old values are kept as a non-index coordinate under the old name.
+  """
   name_dict = {
     old_name: new_name for old_name, new_name in name_dict.items() if old_name in ds.coords
   }
@@ -307,20 +396,21 @@ def rename_coordinates(
 
 
 @step
-def resample(ds: xr.Dataset, reduce: str, **kwargs) -> xr.Dataset:
-  """
-  Resamples the dataset along a specified dimension and reduces it using a given method.
-  The implementation checks that the 'reduce' method is specified.
+def resample(
+  ds: xr.Dataset,
+  reduce: Literal["mean", "sum", "min", "max", "median", "std", "var", "first", "last", "count"],
+  **kwargs: Any,
+) -> xr.Dataset:
+  """Resample along time and reduce each bin; the other arguments go to `Dataset.resample`::
 
-  Args:
-    ds (xr.Dataset): The input dataset.
-    **kwargs: Arguments for resampling, it must include 'reduce' specifying the reduction method.
+    name = "resample"
+    time = "1D"
+    label = "left"
+    closed = "left"
+    reduce = "mean"
 
-  Returns:
-    xr.Dataset: The resampled dataset.
-
-  Raises:
-    ValueError: If 'reduce' method is not specified.
+  With `label` and `closed` "left", day D is the reduction of the stamps of D (00:00 to 23:00
+  for hourly data). Each Dask chunk should hold whole bins, or the reduction rechunks.
   """
   ds_resample = ds.resample(**kwargs)
   ds_reduced = getattr(ds_resample, reduce)()
@@ -329,7 +419,8 @@ def resample(ds: xr.Dataset, reduce: str, **kwargs) -> xr.Dataset:
 
 
 @step
-def rescale(ds: xr.Dataset, **kwargs) -> xr.Dataset:
+def rescale(ds: xr.Dataset, **kwargs: Number) -> xr.Dataset:
+  """Multiply variables by constant factors, one per variable (e.g. `tp = 1000.0`)."""
   data_vars = {}
   for var, da in ds.data_vars.items():
     if var in kwargs:
@@ -341,17 +432,24 @@ def rescale(ds: xr.Dataset, **kwargs) -> xr.Dataset:
 
 
 @step
-def sel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
+def sel(ds: xr.Dataset, **kwargs: Any) -> xr.Dataset:
+  """Select by label along dimensions: a label, a list, or `{start, stop, step}` (inclusive)::
+
+  name = "sel"
+  latitude = {start = -76.9167, stop = 89.9167}
+  """
   return ds.sel({dim: _get_selection(values) for dim, values in kwargs.items()})
 
 
 @step
 def select_variables(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
+  """Keep only the listed data variables (and the coordinates of their dimensions)."""
   return ds[list(variables)]
 
 
 @step
-def transpose(ds: xr.Dataset, dims: Iterable[Hashable], **kwargs) -> xr.Dataset:
+def transpose(ds: xr.Dataset, dims: Iterable[Hashable], **kwargs: Any) -> xr.Dataset:
+  """Reorder dimensions; other arguments go to `Dataset.transpose` (e.g. `missing_dims`)."""
   return ds.transpose(*dims, **kwargs)
 
 
