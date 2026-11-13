@@ -106,6 +106,17 @@ def test_time_sel_is_right_open(ocean_ds: xr.Dataset):
   assert list(pd.DatetimeIndex(out.time.values).day) == [27, 28, 29]
 
 
+def test_time_sel_keeps_dask_chunks(atmosphere_ds: xr.Dataset):
+  """Selecting whole days keeps day-long chunks, as `Dataset.sel` does.
+
+  Rechunking here changed the summation order of the daily resample downstream: the outputs of
+  a real download differed from the previous version by a few float32 units in the last place.
+  """
+  ds = atmosphere_ds.chunk(time=24)
+  out = ds.arcomake.time_sel(datetime(2020, 2, 26), datetime(2020, 2, 28))
+  assert out.chunks["time"] == (24, 24)
+
+
 def test_time_sel_end_after_data(ocean_ds: xr.Dataset):
   """An end past the last time step keeps the last step."""
   out = ocean_ds.arcomake.time_sel(datetime(2020, 3, 1), datetime(2020, 4, 1))

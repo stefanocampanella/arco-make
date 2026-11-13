@@ -35,8 +35,10 @@ class ArcoMakeSelector:
     if not self._dataset.indexes[time_dim].is_monotonic_increasing:
       raise ValueError(f"Time coordinate is not sorted: {self._dataset[time_dim]}")
     selected = self._dataset.sel({time_dim: slice(start_datetime, end_datetime)})
-    before_end = np.asarray(selected.indexes[time_dim] < end_datetime)
-    return selected.isel({time_dim: np.flatnonzero(before_end)})
+    # The index is sorted, so the stamps before `end` are a prefix. Select them with a slice:
+    # an index array would rechunk Dask arrays (and change the order of later reductions).
+    n_before_end = int(np.count_nonzero(np.asarray(selected.indexes[time_dim] < end_datetime)))
+    return selected.isel({time_dim: slice(0, n_before_end)})
 
   def process(
     self,
