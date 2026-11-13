@@ -7,7 +7,7 @@ import posixpath
 import tempfile
 from collections.abc import Hashable, Iterable, Mapping
 from contextlib import ExitStack, nullcontext
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import fsspec
 import xarray as xr
@@ -41,7 +41,9 @@ ChunksConfig = (
 
 
 class ReadConfig(BaseModel):
-  model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+  """Arguments of `xarray.open_dataset` (the `[read]` table of a recipe)."""
+
+  model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
   engine: EngineType | None = None
   chunks: ChunksConfig | None = None
@@ -105,7 +107,6 @@ class EarlyWarningDataStorePartConfig(BaseModel):
   product_type: str | None = None
   timespan: str | None = None
   variable: str | list[str] | None = None
-  variables: str | list[str] | None = None
   drop_variables: str | list[str] | None = None
   start_datetime: datetime.datetime | str | None = None
   end_datetime: datetime.datetime | str | None = None
@@ -126,13 +127,23 @@ class ZarrPartConfig(BaseModel):
   drop_variables: str | list[str] | None = None
 
 
-class GenericPartConfig(BaseModel):
-  model_config = ConfigDict(extra="allow")
+class GenericPartConfig(ReadConfig):
+  """A part read by any other xarray engine, with the arguments of `xarray.open_dataset`."""
 
   filename_or_obj: str
-  engine: str | None = None
-  chunks: ChunksConfig | None = None
-  drop_variables: str | list[str] | None = None
+
+  @field_validator("engine")
+  @classmethod
+  def _not_a_dedicated_engine(cls, value: EngineType | None) -> EngineType | None:
+    # Engines with a dedicated model must match it: a typo there is not a generic part.
+    if value in DEDICATED_ENGINES:
+      raise ValueError(f"invalid options for engine {value!r}")
+    return value
+
+
+DEDICATED_ENGINES = frozenset(
+  {"copernicusmarine", "netcdfoverhttp", "earlywarningdatastore", "zarr"}
+)
 
 
 DatasetPartConfig = (
@@ -145,7 +156,7 @@ DatasetPartConfig = (
 
 
 class VariableEncodingConfig(BaseModel):
-  model_config = ConfigDict(extra="allow")
+  model_config = ConfigDict(extra="forbid")
 
   units: str | None = None
   calendar: str | None = None
@@ -155,14 +166,32 @@ class VariableEncodingConfig(BaseModel):
   fill_value: float | int | str | bool | None = None
 
 
+StoredChunk = Annotated[int, Field(ge=-1)]
+# The layout on disk: one size per dimension (-1: the whole dimension), or one size for all.
+StoredChunksConfig = StoredChunk | dict[str, StoredChunk] | tuple[StoredChunk, ...]
+
+
 class SaveConfig(BaseModel):
-  model_config = ConfigDict(extra="allow")
+  """The `[save]` table: layout, compression and encodings of the stored arrays."""
+
+  model_config = ConfigDict(extra="forbid")
 
   consolidated: bool | None = None
-  chunks: ChunksConfig | None = None
+  chunks: StoredChunksConfig | None = None
   compressor: CompressorConfig | None = None
   encoding: dict[str, VariableEncodingConfig] | None = None
   storage_options: dict[str, Any] | None = None
+  group: str | None = None
+
+  @field_validator("chunks")
+  @classmethod
+  def _no_zero_chunks(cls, value: StoredChunksConfig | None) -> StoredChunksConfig | None:
+    sizes = (
+      value.values() if isinstance(value, dict) else value if isinstance(value, tuple) else [value]
+    )
+    if any(size == 0 for size in sizes or []):
+      raise ValueError("chunk sizes are positive, or -1 for a whole dimension")
+    return value
 
 
 class CheckpointingConfig(BaseModel):
@@ -417,9 +446,7 @@ def safe_to_zarr(
     for var in dataset.data_vars:
       dims = dataset[var].dims
       if isinstance(chunk_conf, dict):
-        chunk_sizes = tuple(
-          chunk_conf[dim] if dim in chunk_conf else dataset[var].sizes[dim] for dim in dims
-        )
+        chunk_sizes = tuple(chunk_conf.get(str(dim), dataset[var].sizes[dim]) for dim in dims)
       elif isinstance(chunk_conf, tuple):
         chunk_sizes = chunk_conf
       else:

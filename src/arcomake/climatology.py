@@ -67,12 +67,6 @@ logger = logging.getLogger(__name__)
 WeightingType = Literal["constant", "gaussian", "geometric"]
 
 
-class PostprocessConfig(BaseModel):
-  model_config = ConfigDict(extra="allow")
-
-  postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
-
-
 class ClimatologyConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
@@ -152,7 +146,6 @@ def compute_climatology(
   overwrite: bool = False,
   dask_setup: DaskSetupType = "mpi",
   use_frisky: bool = False,
-  use_flox: bool = False,
   log_level: str = "info",
 ):
   """
@@ -223,7 +216,7 @@ def compute_climatology(
           window=configs.window,
           weighting=configs.weighting,
           weighting_scale=configs.weighting_scale,
-          use_flox=use_flox,
+          use_flox=configs.use_flox,
         )
         # Postprocess climatology and anomaly standard deviation.
         if configs.postprocess_climatology:

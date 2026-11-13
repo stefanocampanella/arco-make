@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-import sys
 import warnings
+from collections.abc import Callable
 from datetime import datetime
 from typing import Literal, Self
 
@@ -11,7 +11,6 @@ import xarray as xr
 from pydantic import BaseModel, ConfigDict, model_validator
 
 logger = logging.getLogger(__name__)
-checks_module = sys.modules[__name__]
 
 
 class ValidationError(Exception):
@@ -40,22 +39,27 @@ class ValidTimeCoordinateCheck(BaseModel):
 
 
 class EnsureNoNansCheck(BaseModel):
+  """`time_dim`, and one key per mask: `MASK = ["variable", ...]` checks those variables inside it."""
+
   model_config = ConfigDict(extra="allow")
 
   time_dim: str | None = None
 
+  @model_validator(mode="after")
+  def _masks_map_to_variable_lists(self) -> Self:
+    # The extra keys are mask names, each with the list of variables it applies to.
+    for mask_name, variables in (self.model_extra or {}).items():
+      if not (isinstance(variables, list) and all(isinstance(v, str) for v in variables)):
+        raise ValueError(f"mask {mask_name!r} must map to a list of variable names")
+    return self
+
 
 class ChecksConfig(BaseModel):
-  model_config = ConfigDict(extra="allow")
+  model_config = ConfigDict(extra="forbid")
 
   valid_global_ecmwf_coordinates: ValidGlobalECMWFCoordinatesCheck | None = None
   valid_time_coordinate: ValidTimeCoordinateCheck | None = None
   ensure_no_nans: EnsureNoNansCheck | None = None
-
-
-ValidGlobalECMWFCoordinates = ValidGlobalECMWFCoordinatesCheck
-ValidTimeCoordinate = ValidTimeCoordinateCheck
-EnsureNoNans = EnsureNoNansCheck
 
 
 def ensure_no_nans(
@@ -225,3 +229,12 @@ def valid_cftime_index(
     preview = ", ".join(str(ts) for ts in missing[:5])
     more = "" if len(missing) <= 5 else f" and {len(missing) - 5} more"
     raise ValidationError(f"Missing or irregular dates detected: {preview}{more}")
+
+
+# The checks a recipe may name: each field of `ChecksConfig` maps to its function.
+CHECKS: dict[str, Callable[..., None]] = {
+  "valid_global_ecmwf_coordinates": valid_global_ecmwf_coordinates,
+  "valid_time_coordinate": valid_time_coordinate,
+  "ensure_no_nans": ensure_no_nans,
+}
+assert set(CHECKS) == set(ChecksConfig.model_fields)

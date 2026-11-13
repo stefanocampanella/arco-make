@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: MIT
 """The `Dataset.arcomake` accessor: running recipe steps and selecting time intervals."""
 
-import warnings
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import pydantic
 import pytest
 import xarray as xr
 
@@ -42,21 +42,59 @@ def test_process_prefers_arcomake_steps_to_dataset_methods(ocean_ds: xr.Dataset)
   np.testing.assert_array_equal(out.latitude.values, [0.25, 0.75])
 
 
-@pytest.mark.xfail(reason="B3: an unknown step name only warns", strict=True)
 def test_process_rejects_unknown_steps(ocean_ds: xr.Dataset):
-  """A misspelled step fails instead of being skipped (intent 4)."""
-  with warnings.catch_warnings():
-    warnings.simplefilter("ignore")
-    with pytest.raises((ValueError, KeyError)):
-      ocean_ds.arcomake.process(steps({"name": "selct_variables", "variables": ["zos"]}))
+  """A misspelled step fails instead of being skipped (intent 4), even without a recipe model."""
+  step = ProcessingStepConfig.model_construct(name="selct_variables", variables=["zos"])
+  with pytest.raises(ValueError, match="Unknown processing step 'selct_variables'"):
+    ocean_ds.arcomake.process([step])
 
 
-@pytest.mark.xfail(reason="B3: any name in the processing_utils namespace is callable", strict=True)
-@pytest.mark.parametrize("name", ["np", "logger", "gaussian_filter", "xarray_regrid"])
-def test_process_rejects_names_that_are_not_steps(ocean_ds: xr.Dataset, name: str):
-  """Imports and private helpers of the steps module are not steps."""
-  with pytest.raises((ValueError, KeyError)):
-    ocean_ds.arcomake.process(steps({"name": name}))
+@pytest.mark.parametrize(
+  "name",
+  ["np", "logger", "gaussian_filter", "xarray_regrid", "_get_selection", "thetao", "to_zarr"],
+)
+def test_names_that_are_not_steps_are_rejected_at_load_time(name: str):
+  """Imports, private helpers, variable names and unlisted Dataset methods are not steps."""
+  with pytest.raises(pydantic.ValidationError, match="Unknown processing step"):
+    ProcessingStepConfig.model_validate({"name": name})
+
+
+@pytest.mark.parametrize(
+  ("table", "message"),
+  [
+    (
+      {"name": "select_variables", "variable": ["zos"]},
+      "Unknown argument 'variable' of step 'select_variables' \(did you mean 'variables'\?\)",
+    ),
+    ({"name": "select_variables"}, "missing a required argument: 'variables'"),
+    ({"name": "flip", "dim": 3}, "Invalid argument 'dim' of step 'flip'"),
+    ({"name": "regrid", "grid": {}, "method": "bilinear"}, "Invalid argument 'method'"),
+    (
+      {"name": "regrid", "grid": {}, "kwarg": {"skipna": True}},
+      "Unknown argument 'kwarg' of step 'regrid'",
+    ),
+    ({"name": "drop_attrs", "deeep": False}, "Unknown argument 'deeep' of step 'drop_attrs'"),
+  ],
+)
+def test_step_arguments_are_checked_at_load_time(table: dict, message: str):
+  """Misspelled, missing or mistyped arguments fail when the recipe is read, before any download."""
+  with pytest.raises(pydantic.ValidationError, match=message):
+    ProcessingStepConfig.model_validate(table)
+
+
+def test_recipe_errors_name_the_step_location(tmp_path):
+  """The error message points at the faulty table of the recipe."""
+  from arcomake.download import DownloadConfig
+
+  recipe = {
+    "start": "2020-01-01",
+    "end": "2020-01-02",
+    "step": "1D",
+    "save": {},
+    "datasets": {"ocean": {"postprocess": [{"name": "flip", "dim": "x"}, {"name": "flipp"}]}},
+  }
+  with pytest.raises(pydantic.ValidationError, match=r"datasets\.ocean\.postprocess\.1"):
+    DownloadConfig.model_validate(recipe)
 
 
 # time_sel: right-open selection [start, end)

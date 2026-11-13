@@ -12,6 +12,7 @@ import pytest
 import xarray as xr
 
 from arcomake import processing_utils as pu
+from arcomake.steps import registered_steps
 from tests.conftest import make_ocean_dataset, make_static_dataset
 
 GRID = {
@@ -66,15 +67,8 @@ def snapshot(ds: xr.Dataset) -> dict:
 
 def test_every_step_is_covered():
   """Each public step of processing_utils has an entry here (new steps must be added)."""
-  public = {
-    name
-    for name in dir(pu)
-    if not name.startswith("_")
-    and callable(getattr(pu, name))
-    and getattr(getattr(pu, name), "__module__", None) == pu.__name__
-    and name not in {"ProcessingStepConfig", "diff_std", "gaussian_blur_extrapolate"}
-  }
-  assert public == set(STEPS)
+  registered = set(registered_steps()) - {"diff_std", "gaussian_blur_extrapolate"}
+  assert registered == set(STEPS)
 
 
 @pytest.mark.parametrize("name", sorted(STEPS))

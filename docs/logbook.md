@@ -30,6 +30,19 @@ after the correctness PRs are merged.
   builds eccodes 2.48 from source, which works. Local runs use the image's library and
   definitions via `ECCODES_DIR`, `ECCODES_DEFINITION_PATH` and `ECCODES_SAMPLES_PATH`.
 
+**Strict recipes (group 3):**
+- All arco-ocean recipes at the local checkout (`c67b8ab` plus uncommitted and untracked files) were
+  loaded with the strict models; nothing was downloaded.
+- These load: the download recipes for levels-50 at 0.25°, 0.5° and 1.0°, every unpack and
+  climatology recipe, and both validate recipes.
+- These are rejected, for arco-ocean A13/A17:
+  - levels-10 (0.25°, 0.5°, 1.0°) and arco-med: `step` is missing (already rejected before), and
+    `[save] chunk` is a typo for `chunks`;
+  - anfc: `step` is missing;
+  - both stats recipes: `[save] chunk`, plus `time_dim` and `skipna`, which never had an effect
+    (B15, C2).
+- The step names and arguments of every recipe pass the new load-time checks.
+
 **Code findings beyond the guide (confirmed by tests in `tests/`):**
 - N1: `safe_to_zarr` writes uncompressed arrays when `[save]` has no compressor. **[Moby-Dick]**
   Not affected: the arco-ocean download, unpack and climatology recipes all set lz4.

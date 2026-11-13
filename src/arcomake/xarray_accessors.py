@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-import sys
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from datetime import datetime
 
 import xarray as xr
 
-from arcomake.checks import ChecksConfig, ValidationError
+from arcomake import steps as step_registry
+from arcomake.checks import CHECKS, ChecksConfig, ValidationError
 from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
@@ -16,9 +16,6 @@ logger = logging.getLogger(__name__)
 
 @xr.register_dataset_accessor("arcomake")
 class ArcoMakeSelector:
-  _processing_module = sys.modules["arcomake.processing_utils"]
-  _checks_module = sys.modules["arcomake.checks"]
-
   def __init__(self, dataset: xr.Dataset):
     self._dataset = dataset
 
@@ -44,16 +41,18 @@ class ArcoMakeSelector:
     steps: Sequence[ProcessingStepConfig],
   ) -> xr.Dataset:
     """
-    Applies a sequence of postprocessing steps to a xarray.Dataset.
+    Apply recipe steps, in order, and return the resulting dataset.
 
-    The steps are provided as a list of ProcessingStepConfig configurations.
-    All methods defined on a xarray.Dataset can be used as processing steps, in addition to the
-    methods defined in this module (which have precedence).
+    A step name is either a registered arco-make step or one of the allowed `xarray.Dataset`
+    methods (see `arcomake.steps`); arco-make steps take precedence. Steps never modify the
+    dataset they receive.
 
     Args:
       steps (Sequence[ProcessingStepConfig]): Configuration for each processing step.
     Returns:
       xr.Dataset: The processed dataset.
+    Raises:
+      ValueError: if a step name is unknown.
     """
     dataset = self._dataset
     step_names = [step.name for step in steps]
@@ -61,16 +60,9 @@ class ArcoMakeSelector:
     for raw_step in steps:
       config = raw_step.model_dump(exclude_unset=True)
       name = config.pop("name")
+      step_fn = step_registry.resolve(name)
       logger.info(f"Applying {name} with configuration {config}")
-      step_fn: Callable[..., xr.Dataset]
-      if name in dir(self._processing_module):
-        step_fn = getattr(self._processing_module, name)
-        dataset = step_fn(dataset, **config)
-      elif name in dir(dataset):
-        step_fn = getattr(dataset, name)
-        dataset = step_fn(**config)
-      else:
-        warnings.warn(f"Unrecognized processing step {name} with configuration {config}")
+      dataset = step_fn(dataset, **config)
     assert isinstance(dataset, xr.Dataset)
     return dataset
 
@@ -82,12 +74,12 @@ class ArcoMakeSelector:
     """
     Performs checks on a xarray.Dataset and raise an exception if any check fails.
 
-    The checks are provided as a ChecksConfig model containing step configurations.
-    All methods defined in this module can be used as checks.
+    The checks are the tables of a `ChecksConfig`; each table name is a function of
+    `arcomake.checks` (see `checks.CHECKS`).
 
     Args:
       checks (ChecksConfig): Configuration for each validation step.
-      should_raise (bool): Whether to raise an exception if validation fails.
+      fail (bool): Raise on the first failed check instead of warning.
     Returns:
       None
     """
@@ -97,12 +89,7 @@ class ArcoMakeSelector:
       "Validating dataset with the following checks: " + ", ".join(checks_dict.keys()) + ". "
     )
     for name, config in checks_dict.items():
-      if not hasattr(self._checks_module, name):
-        warnings.warn(f"Unrecognized validation check {name} with configuration {config}")
-        continue
-      check_fn: Callable[..., None] = getattr(self._checks_module, name)
-      if not isinstance(config, dict):
-        config = {}
+      check_fn = CHECKS[name]
       try:
         check_fn(dataset, **config)
       except ValidationError as exc:

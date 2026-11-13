@@ -26,13 +26,6 @@ from arcomake.processing_utils import ProcessingStepConfig
 logger = logging.getLogger(__name__)
 
 
-class ArchiveConfig(BaseModel):
-  model_config = ConfigDict(extra="allow")
-
-  attrs_to_drop: list[str] | None = None
-  read: ReadConfig
-
-
 class UnpackConfig(BaseModel):
   model_config = ConfigDict(extra="forbid", populate_by_name=True)
 

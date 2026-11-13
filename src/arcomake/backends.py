@@ -24,6 +24,13 @@ from arcomake.temporary_utils import get_current_temp_registry, set_current_temp
 logger = logging.getLogger(__name__)
 
 
+def _drop_variables(dataset: xr.Dataset, names: str | Iterable[str] | None) -> xr.Dataset:
+  """Apply `drop_variables` as xarray's own backends do: listed variables absent are ignored."""
+  if names is None:
+    return dataset
+  return dataset.drop_vars([names] if isinstance(names, str) else list(names), errors="ignore")
+
+
 class CopernicusMarine(BackendEntrypoint):
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
@@ -77,7 +84,7 @@ class CopernicusMarine(BackendEntrypoint):
       chunk_size_limit=False,
     )
     assert isinstance(dataset, xr.Dataset)
-    return dataset
+    return _drop_variables(dataset, drop_variables)
 
   @override
   def guess_can_open(
@@ -229,7 +236,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
         dataset = dataset.assign_coords(time=dates)
       datasets.append(dataset)
 
-    return xr.concat(datasets, dim=time_dim)
+    return _drop_variables(xr.concat(datasets, dim=time_dim), drop_variables)
 
   @staticmethod
   def _consecutive_dates_with_same_month_or_year(

@@ -9,7 +9,9 @@ import pydantic
 import pytest
 
 from arcomake import cli_utils, climatology
+from arcomake.checks import ChecksConfig
 from arcomake.cli_utils import check_if_overwriting, read_configs
+from arcomake.dataset_utils import DatasetConfig, ReadConfig, SaveConfig, VariableEncodingConfig
 from arcomake.download import DownloadConfig
 from arcomake.process import ProcessConfig
 from tests.conftest import make_ocean_dataset, render_recipe
@@ -45,16 +47,50 @@ def test_download_config_rejects_unknown_top_level_keys():
     )
 
 
-@pytest.mark.xfail(
-  reason="B15: ProcessConfig accepts `time_dim` and `skipna` and ignores them", strict=True
-)
 def test_process_config_has_no_ignored_options():
   """Options that have no effect are not accepted."""
   with pytest.raises(pydantic.ValidationError):
     ProcessConfig.model_validate({"skipna": True})
 
 
-@pytest.mark.xfail(reason="B4: the recipe's `use_flox` never reaches the computation", strict=True)
+@pytest.mark.parametrize(
+  ("model", "table"),
+  [
+    (SaveConfig, {"chunk": {"time": 1}}),  # typo for `chunks` (arco-ocean stats recipes)
+    (SaveConfig, {"chunks": {"time": "auto"}}),  # N4: not a stored layout
+    (SaveConfig, {"chunks": {"time": 0}}),
+    (ReadConfig, {"engin": "zarr"}),
+    (VariableEncodingConfig, {"unit": "days since 2000-01-01"}),
+    (ChecksConfig, {"valid_time_coordinates": {}}),
+    (ChecksConfig, {"ensure_no_nans": {"sea_mask": "thetao"}}),  # a list of variables is required
+  ],
+)
+def test_nested_tables_reject_unknown_or_invalid_keys(model, table):
+  """Typos one level down in a recipe are errors too (intent 3)."""
+  with pytest.raises(pydantic.ValidationError):
+    model.model_validate(table)
+
+
+@pytest.mark.parametrize(
+  "part",
+  [
+    {"filename_or_obj": "gs://bucket/store.zarr", "engine": "zarr", "consolidate": True},
+    {"filename_or_obj": "cm://dataset", "engine": "copernicusmarine", "variable": ["uo"]},
+    {"filename_or_obj": "ewds://cems", "engine": "earlywarningdatastore", "variables": ["dis"]},
+  ],
+)
+def test_parts_with_typos_do_not_fall_back_to_generic_parts(part: dict):
+  """A typo in a part of a dedicated engine is an error, not a generic `open_dataset` call."""
+  with pytest.raises(pydantic.ValidationError):
+    DatasetConfig.model_validate({"parts": [part]})
+
+
+def test_generic_parts_take_open_dataset_arguments():
+  """Other engines accept the arguments of `xarray.open_dataset`."""
+  part = {"filename_or_obj": "data.nc", "engine": "h5netcdf", "decode_times": False}
+  assert DatasetConfig.model_validate({"parts": [part]}).parts[0].decode_times is False
+
+
 def test_climatology_honours_use_flox(tmp_path: pathlib.Path, sources: pathlib.Path, monkeypatch):
   """`use_flox = true` in the recipe selects the flox implementation."""
   seen = {}

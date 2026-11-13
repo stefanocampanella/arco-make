@@ -37,9 +37,6 @@ def test_cdsapi_client_receives_explicit_url(monkeypatch: pytest.MonkeyPatch):
   assert received.get("url") == "https://example.invalid/api"
 
 
-@pytest.mark.xfail(
-  reason="B8: drop_variables is accepted and ignored by the Copernicus backend", strict=True
-)
 def test_copernicus_marine_drop_variables(monkeypatch: pytest.MonkeyPatch):
   """`drop_variables` removes variables, as for xarray's own backends."""
   fake = xr.Dataset({"a": ("x", np.zeros(2)), "b": ("x", np.ones(2))})

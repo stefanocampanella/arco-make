@@ -23,11 +23,6 @@ logger = logging.getLogger(__name__)
 class ProcessConfig(BaseModel):
   model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-  time_dim: str = "time"
-  skipna: bool = Field(
-    default=False,
-    description="Whether to skip NaNs when computing the statistic.",
-  )
   read: ReadConfig = Field(default_factory=ReadConfig)
   process: list[ProcessingStepConfig] = Field(default_factory=list)
   save: SaveConfig = Field(default_factory=SaveConfig)

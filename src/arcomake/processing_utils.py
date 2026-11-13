@@ -7,8 +7,10 @@ from typing import Any, Literal
 import numpy as np
 import xarray as xr
 import xarray_regrid
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 from scipy.ndimage import gaussian_filter
+
+from arcomake.steps import check_arguments, step
 
 logger = logging.getLogger(__name__)
 
@@ -16,11 +18,22 @@ Number = int | float
 
 
 class ProcessingStepConfig(BaseModel):
+  """One step of a recipe: `name` selects the step, every other key is one of its arguments.
+
+  The step and its arguments are checked when the recipe is loaded (see `arcomake.steps`).
+  """
+
   model_config = ConfigDict(extra="allow")
 
   name: str
 
+  @model_validator(mode="after")
+  def _check_step(self):
+    check_arguments(self.name, self.model_extra or {})
+    return self
 
+
+@step
 def apply_mask(
   ds: xr.Dataset,
   mask_name: Hashable,
@@ -39,6 +52,7 @@ def apply_mask(
   return ds
 
 
+@step
 def assign_var_attrs(ds: xr.Dataset, **kwargs) -> xr.Dataset:
   ds = ds.copy(deep=False)
   for key, attrs in kwargs.items():
@@ -47,6 +61,7 @@ def assign_var_attrs(ds: xr.Dataset, **kwargs) -> xr.Dataset:
 
 
 # TODO: document astype behaviour
+@step
 def astype(
   ds: xr.Dataset,
   dtype: str | None = None,
@@ -66,6 +81,7 @@ def astype(
   return ds
 
 
+@step
 def clip_negative(ds: xr.Dataset, variables: Iterable[Hashable]):
   data_vars = {}
   for var, da in ds.data_vars.items():
@@ -77,6 +93,7 @@ def clip_negative(ds: xr.Dataset, variables: Iterable[Hashable]):
   return ds
 
 
+@step
 def diff_std(dataset: xr.Dataset, time_dim: str = "time", **kwargs) -> xr.Dataset:
   """
   Compute the standard deviation of one-step differences along the time dimension.
@@ -97,11 +114,13 @@ def diff_std(dataset: xr.Dataset, time_dim: str = "time", **kwargs) -> xr.Datase
   return dataset_diff_std
 
 
+@step
 def drop_static_vars(ds: xr.Dataset, time_dim: str = "time") -> xr.Dataset:
   ds = ds.drop_vars([name for name, var in ds.data_vars.items() if time_dim not in var.dims])
   return ds
 
 
+@step
 def drop_var_attrs(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
   ds = ds.copy(deep=False)
   for key in variables:
@@ -109,10 +128,12 @@ def drop_var_attrs(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
   return ds
 
 
+@step
 def flip(ds: xr.Dataset, dim: str) -> xr.Dataset:
   return ds.isel({dim: slice(None, None, -1)})
 
 
+@step
 def gaussian_blur_extrapolate(
   ds: xr.Dataset,
   variables: Iterable[Hashable] | None = None,
@@ -142,6 +163,7 @@ def gaussian_blur_extrapolate(
   return ds
 
 
+@step
 def get_bottom(
   ds: xr.Dataset,
   depth_dim: str,
@@ -170,6 +192,7 @@ def get_bottom(
   return ds
 
 
+@step
 def get_notnull_mask(
   ds: xr.Dataset,
   variable: Hashable,
@@ -178,6 +201,7 @@ def get_notnull_mask(
   return ds.assign({mask_name: ds[variable].notnull()})
 
 
+@step
 def get_sea_mask(
   ds: xr.Dataset,
   bathymetry: Hashable = "deptho",
@@ -214,14 +238,17 @@ def get_sea_mask(
   return ds.assign({mask_name: (dims, mask)})
 
 
+@step
 def isel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
   return ds.isel({dim: _get_selection(values) for dim, values in kwargs.items()})
 
 
+@step
 def is_positive_mask(ds: xr.Dataset, variable: Hashable, mask_name: Hashable) -> xr.Dataset:
   return ds.assign({mask_name: ds[variable] > 0.0})
 
 
+@step
 def masked_fill(
   ds: xr.Dataset,
   variables: Iterable[Hashable],
@@ -248,37 +275,38 @@ def masked_fill(
   return ds
 
 
+@step
 def regrid(
   ds: xr.Dataset,
   grid: Mapping[str, Any],
   latitude_dim: str = "latitude",
   longitude_dim: str = "longitude",
-  **kwargs,
+  method: Literal[
+    "nearest", "linear", "cubic", "conservative", "most_common", "least_common", "stat"
+  ] = "nearest",
+  kwargs: Mapping[str, Any] | None = None,
 ) -> xr.Dataset:
   """
   Regrids the dataset to a new grid using xarray-regrid (default using nearest neighbor algorithm).
 
   Args:
     ds (xr.Dataset): The input dataset.
-    grid (dict, optional): Grid specification for the target grid.
-    **kwargs: Additional arguments for the regridding method.
+    grid (dict): Grid specification for the target grid (`xarray_regrid.Grid` arguments).
+    method: The xarray-regrid method.
+    kwargs: Additional arguments for the regridding method.
 
   Returns:
     xr.Dataset: The regridded dataset.
-
-  Raises:
-    ValueError: If grid is not specified.
   """
   new_grid = xarray_regrid.Grid(**grid)
   target_dataset = new_grid.create_regridding_dataset(lat_name=latitude_dim, lon_name=longitude_dim)
-  method = kwargs.get("method", "nearest")
   target_dataset = target_dataset.assign_coords(
     {
       latitude_dim: target_dataset[latitude_dim].astype(np.float32),
       longitude_dim: target_dataset[longitude_dim].astype(np.float32),
     }
   )
-  regrid_conf = dict(kwargs.get("kwargs", {}))
+  regrid_conf = dict(kwargs or {})
   if method == "conservative":
     regrid_conf["latitude_coord"] = latitude_dim
   regridded = getattr(ds.regrid, method)(target_dataset, **regrid_conf)
@@ -286,6 +314,7 @@ def regrid(
   return regridded
 
 
+@step
 def rename_coordinates(
   ds: xr.Dataset,
   name_dict: Mapping[Hashable, Hashable],
@@ -312,6 +341,7 @@ def rename_coordinates(
   return ds
 
 
+@step
 def resample(ds: xr.Dataset, reduce: str, **kwargs) -> xr.Dataset:
   """
   Resamples the dataset along a specified dimension and reduces it using a given method.
@@ -333,6 +363,7 @@ def resample(ds: xr.Dataset, reduce: str, **kwargs) -> xr.Dataset:
   return ds_reduced
 
 
+@step
 def rescale(ds: xr.Dataset, **kwargs) -> xr.Dataset:
   data_vars = {}
   for var, da in ds.data_vars.items():
@@ -344,14 +375,17 @@ def rescale(ds: xr.Dataset, **kwargs) -> xr.Dataset:
   return ds
 
 
+@step
 def sel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
   return ds.sel({dim: _get_selection(values) for dim, values in kwargs.items()})
 
 
+@step
 def select_variables(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
   return ds[list(variables)]
 
 
+@step
 def transpose(ds: xr.Dataset, dims: Iterable[Hashable], **kwargs) -> xr.Dataset:
   return ds.transpose(*dims, **kwargs)
 
