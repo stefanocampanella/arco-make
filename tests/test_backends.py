@@ -17,7 +17,7 @@ from arcomake.temporary_utils import TempDirectoryRegistry
 
 def test_ewds_requests_split_by_month():
   """EWDS requests group consecutive days of the same month and year (one request each)."""
-  groups = EarlyWarningDataStore._consecutive_dates_with_same_month_or_year(
+  groups = EarlyWarningDataStore._consecutive_dates_by_month(
     datetime(2020, 2, 27), datetime(2020, 3, 2)
   )
   assert [[d.day for d in g] for g in groups] == [[27, 28, 29], [1]]

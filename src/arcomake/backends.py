@@ -159,7 +159,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
 
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
-    # Avoid annoying copernicusmarine log handling
+    # No progress bars; cdsapi messages go to this module's logger.
     self.progress = False
     self.client_logger = logger
 
@@ -196,9 +196,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
     registry = get_current_temp_registry()
     if registry is None:
       raise ValueError("No temporary directory registry available.")
-    consecutive_dates = self._consecutive_dates_with_same_month_or_year(
-      start_datetime, end_datetime
-    )
+    consecutive_dates = self._consecutive_dates_by_month(start_datetime, end_datetime)
 
     requests = [
       {
@@ -238,7 +236,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
     return _drop_variables(xr.concat(datasets, dim=time_dim), drop_variables)
 
   @staticmethod
-  def _consecutive_dates_with_same_month_or_year(
+  def _consecutive_dates_by_month(
     start_datetime: datetime.datetime,
     end_datetime: datetime.datetime,
   ) -> list[list[datetime.datetime]]:
@@ -259,10 +257,10 @@ class EarlyWarningDataStore(BackendEntrypoint):
       part.append(subseq)
       return part
 
-    def same_month_or_year(x: datetime.datetime, y: datetime.datetime) -> bool:
+    def same_month_and_year(x: datetime.datetime, y: datetime.datetime) -> bool:
       return x.month == y.month and x.year == y.year
 
-    return partition(same_month_or_year, days)
+    return partition(same_month_and_year, days)
 
   def _process_requests(
     self,
