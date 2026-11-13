@@ -58,4 +58,6 @@ Registered in `src/arcomake/__init__.py`: `download`, `unpack`, `process`, `comp
 A report for Moby-Dick (the consumer of ARCO-OCEAN) is due after the PRs are merged. Record every finding that affects consumers of the data here, and with details in `docs/logbook.md` (entries tagged **[Moby-Dick]**). So far:
 - The published 0.25° dataset was downloaded with arco-make `6f0e2f1` (image of 30 Sep 2026), not `847b6f2`. Six pieces were rerun after network failures.
 - N1 (uncompressed output without `[save] compressor`) and N2 (`astype` pitfalls) do not affect the published data: the arco-ocean recipes set lz4 and both `astype` arguments.
+- N6 (EWDS requests of different months opened GRIB concurrently, which crashed ecCodes) can abort a download piece; it cannot write wrong data. Hypothesis, not checkable: some of the six rerun pieces of the 0.25° download failed this way.
+- Peak memory of the 0.25° levels-50 download: 36–53 GB for 2–5 days on 32 threads.
 - B6, measured on synthetic data: a missing year biases the anomaly variance of its bin low (6 % with 1 of 5 years missing). An all-NaN bin spreads NaN to its window neighbours.

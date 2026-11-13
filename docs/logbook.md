@@ -54,6 +54,15 @@ on the project VM with the image's eccodes 2.48, threads scheduler):
   piece and writes nothing wrong, so the published data are not affected.
 - The ConnectTimeout is the failure class seen in production: a transient error aborts the whole
   block (group 7).
+- **Comparison, `29a9edd` vs `847b6f2` on window 1:** the array metadata were identical (dtype,
+  chunks, compressor, fill value, attributes), but ERA5 values (`2t`, `msl`, `ssrd`...) and a few
+  wave points differed by a few float32 ULP, e.g. 1.2e-4 K on `2t`.
+  - Cause: the B5 fix selected the time range with an index array. That rechunked the hourly
+    source (24 → 16 steps per chunk), so the daily resample summed in another order.
+  - Fixed in `d7b49dc` (slice selection), with a test on the chunks.
+  - Note: any rechunking before a reduction changes float32 results at this level. "Same output"
+    has to be checked bit for bit, not with a tolerance.
+  - Peak memory was 27 GB instead of 36 GB; to be re-measured with the fix.
 
 **Strict recipes (group 3):**
 - All arco-ocean recipes at the local checkout (`c67b8ab` plus uncommitted and untracked files) were
