@@ -250,7 +250,9 @@ def maybe_checkpointing_download_and_process(
   date_intervals = IterableDateInterval(start_datetime, end_datetime, parsed_step)
   is_first_checkpoint = True
   for date_interval in date_intervals:
-    with download_and_process(configs, date_interval.start, date_interval.end) as dataset:
+    with download_and_process(configs, date_interval.start, date_interval.end) as downloaded:
+      # A shallow copy has its own encodings: the downloaded dataset is left unchanged.
+      dataset = downloaded.copy(deep=False)
       for var in dataset.data_vars:
         dataset[var].encoding["compressor"] = compressor
       logger.info(f"Saving checkpoint {date_interval}")
@@ -390,6 +392,9 @@ def safe_to_zarr(
   if configs is None:
     configs = SaveConfig()
   mode = mode or "w"
+  # The stored layout is set through the variables' encodings. A shallow copy has its own
+  # encodings (data are shared), so the caller's dataset is left unchanged.
+  dataset = dataset.copy(deep=False)
 
   logger.info(f"Saving dataset to {destination} with {configs}")
   chunk_conf = configs.chunks

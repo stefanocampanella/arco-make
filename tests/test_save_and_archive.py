@@ -50,14 +50,15 @@ def test_safe_to_zarr_delayed_requires_stack(ocean_ds: xr.Dataset, tmp_path: pat
   xr.testing.assert_allclose(xr.open_zarr(tmp_path / "out.zarr").load(), ocean_ds)
 
 
-@pytest.mark.xfail(
-  reason="B2: safe_to_zarr writes chunks and compressor into the input's encoding", strict=True
-)
 def test_safe_to_zarr_does_not_modify_input_encoding(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
   """Saving a dataset leaves its encoding unchanged (intent 1), so saving twice is consistent."""
   before = {name: dict(da.encoding) for name, da in ocean_ds.data_vars.items()}
   safe_to_zarr(ocean_ds, tmp_path / "out.zarr", configs=SAVE)
   assert {name: dict(da.encoding) for name, da in ocean_ds.data_vars.items()} == before
+  # A second save with another layout is not affected by the first one.
+  other = SaveConfig(chunks={"time": 2})
+  safe_to_zarr(ocean_ds, tmp_path / "other.zarr", configs=other)
+  assert zarr.open_group(str(tmp_path / "other.zarr"), mode="r")["thetao"].chunks == (2, 3, 8, 8)
 
 
 @pytest.mark.xfail(
