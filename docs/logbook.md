@@ -30,6 +30,31 @@ after the correctness PRs are merged.
   builds eccodes 2.48 from source, which works. Local runs use the image's library and
   definitions via `ECCODES_DIR`, `ECCODES_DEFINITION_PATH` and `ECCODES_SAMPLES_PATH`.
 
+**Real-data baseline at `847b6f2`** (0.25° levels-50 recipe, copied outside the repo,
+on the project VM with the image's eccodes 2.48, threads scheduler):
+
+| Window | Result | Wall time | Peak RSS | Output |
+|---|---|---|---|---|
+| 1993-01-01 → 01-03 | ok | 22 min | 36 GB | 832 MB |
+| 2012-12-30 → 2013-01-02 | attempt 1: `ConnectTimeout` on `confluence.ecmwf.int` (GloFAS `uparea`, NetCDF over HTTP: no retry) after 25 min; attempt 2: **segmentation fault** after 22 s | | | |
+| 2020-02-26 → 03-02 | ok | 3 min | 53 GB | 2.1 GB |
+
+- Wall time is dominated by the remote services' queues (EWDS above all) and varies by an order of
+  magnitude between runs. Peak memory is the meaningful number: 36–53 GB for 2–5 days. The
+  recipe header's "32 CPUs and about 110 GB" is consistent with this; `download.slurm`'s 8 CPUs and
+  30 GB is not.
+- **N6, new bug:** the segfault (`fatal flex scanner internal error--end of buffer missed`) came from
+  ecCodes. The EWDS backend sends one request per month on a thread pool, and each thread opens its
+  GRIB files with cfgrib. cfgrib locks reads but not opens, and ecCodes' definition parser is not
+  thread-safe. So any interval spanning two or more months can crash; the 2020 window, also
+  spanning two months, happened not to.
+- **[Moby-Dick]** The production pieces of 256 days always span several months. *Hypothesis:* some of
+  the pieces that failed and were rerun in the 0.25° download (1, 16, 19, 20, 34, 41) crashed this
+  way. Their logs were overwritten by the reruns, so this cannot be checked. A crash aborts the
+  piece and writes nothing wrong, so the published data are not affected.
+- The ConnectTimeout is the failure class seen in production: a transient error aborts the whole
+  block (group 7).
+
 **Strict recipes (group 3):**
 - All arco-ocean recipes at the local checkout (`c67b8ab` plus uncommitted and untracked files) were
   loaded with the strict models; nothing was downloaded.

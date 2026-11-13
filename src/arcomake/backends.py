@@ -3,6 +3,7 @@
 import datetime
 import logging
 import os
+import threading
 import warnings
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +22,9 @@ from arcomake.datetime_utils import DateInterval
 from arcomake.temporary_utils import get_current_temp_registry, set_current_temp_registry
 
 logger = logging.getLogger(__name__)
+
+# Serializes the opening of GRIB files by concurrent EWDS requests (see `_process_request`).
+_GRIB_OPEN_LOCK = threading.Lock()
 
 
 def _drop_variables(dataset: xr.Dataset, names: str | Iterable[str] | None) -> xr.Dataset:
@@ -309,7 +313,10 @@ class EarlyWarningDataStore(BackendEntrypoint):
     #    ECCODES WARNING :  g2date:unpack_long: Date is not valid! year=0 month=0 day=0
     #  see: https://git.ecmwf.int/users/erds/repos/eccodes/browse/src/accessor/grib_accessor_class_g2date.cc?at=f10d3f3c1be3737a231d4a2c19f45535de4d4424#71-75
     #  Also, cdsapi download one NetCDF per variable, ugly. :(
-    return xr.open_mfdataset(list(path.glob("*.grib")), engine="cfgrib")
+    # Requests run on a thread pool, but ecCodes' definition parser is not thread-safe, and
+    # cfgrib only locks reads, not opens: concurrent opens crashed the process (segfault).
+    with _GRIB_OPEN_LOCK:
+      return xr.open_mfdataset(list(path.glob("*.grib")), engine="cfgrib")
 
   # Credits to the amazing Stefano Piani from OGS
   @staticmethod

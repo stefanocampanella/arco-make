@@ -3,6 +3,8 @@
 """Remote backends, with the network replaced by fakes (no credentials needed)."""
 
 import pathlib
+import threading
+import time
 import zipfile
 from datetime import datetime
 
@@ -97,3 +99,38 @@ def test_ewds_one_day_requests_use_time_dim(
     )
   assert out.dis.dims == (time_dim, "latitude", "longitude")
   assert [str(t)[:10] for t in out[time_dim].values] == ["2020-02-29", "2020-03-01"]
+
+
+def test_ewds_requests_open_grib_files_one_at_a_time(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+  """Requests download in parallel, but their GRIB files are opened one at a time.
+
+  ecCodes' definition parser is not thread-safe: concurrent opens crashed a download
+  ("fatal flex scanner internal error", segmentation fault) for an interval spanning two months.
+  """
+  active, peak = 0, 0
+  guard = threading.Lock()
+
+  class FakeClient:
+    def retrieve(self, name, request, target):
+      with zipfile.ZipFile(target, "w") as archive:
+        archive.writestr("data.grib", b"")
+
+  def fake_open(paths, **kwargs):
+    nonlocal active, peak
+    with guard:
+      active += 1
+      peak = max(peak, active)
+    time.sleep(0.05)
+    with guard:
+      active -= 1
+    return xr.Dataset()
+
+  monkeypatch.setattr(
+    EarlyWarningDataStore, "get_cdsapi_client", staticmethod(lambda **kwargs: FakeClient())
+  )
+  monkeypatch.setattr(backends.xr, "open_mfdataset", fake_open)
+  with TempDirectoryRegistry(base_dir=tmp_path):
+    EarlyWarningDataStore()._process_requests("cems-glofas-historical", [{}] * 4, max_workers=4)
+  assert peak == 1
