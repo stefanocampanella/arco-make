@@ -60,20 +60,27 @@ def test_valid_global_ecmwf_coordinates_accepts_increasing_latitudes():
   checks.valid_global_ecmwf_coordinates(global_grid(), latitude_dim="lat", longitude_dim="lon")
 
 
-@pytest.mark.xfail(
-  reason="B11: coordinate failures raise ValueError, not ValidationError", strict=True
+@pytest.mark.parametrize(
+  ("grid", "message"),
+  [
+    (global_grid(decreasing=True), "decreasing"),
+    (global_grid().assign_coords(lat=np.linspace(-95, 90, 5)), r"outside the \[-90, 90\]"),
+    (global_grid().assign_coords(lon=np.arange(-180.0, 180.0, 90.0)), r"\[0, 360\)"),
+  ],
 )
-def test_valid_global_ecmwf_coordinates_failure_is_a_validation_error():
+def test_valid_global_ecmwf_coordinates_failure_is_a_validation_error(grid, message):
   """Rejected coordinates are validation failures, so `--no-fail` reports them instead of aborting."""
-  with pytest.raises(ValidationError):
-    checks.valid_global_ecmwf_coordinates(
-      global_grid(decreasing=True), latitude_dim="lat", longitude_dim="lon"
-    )
+  with pytest.raises(ValidationError, match=message):
+    checks.valid_global_ecmwf_coordinates(grid, latitude_dim="lat", longitude_dim="lon")
 
 
-@pytest.mark.xfail(
-  reason="N3: the check's model and function disagree on lat/lon defaults", strict=True
-)
+def test_validate_without_fail_warns_on_bad_coordinates():
+  """With `fail=False` the accessor turns the failure into a warning (B11 aborted here)."""
+  config = ChecksConfig.model_validate({"valid_global_ecmwf_coordinates": {}})
+  with pytest.warns(UserWarning, match="decreasing"):
+    global_grid(decreasing=True).arcomake.validate(config)
+
+
 def test_ecmwf_check_defaults_agree():
   """The defaults of the recipe table and of the function are the same."""
   model_defaults = checks.ValidGlobalECMWFCoordinatesCheck().model_dump()

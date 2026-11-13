@@ -109,23 +109,26 @@ def ensure_no_nans(
 
 
 def valid_global_ecmwf_coordinates(
-  ds: xr.Dataset, latitude_dim: str = "latitude", longitude_dim: str = "longitude"
+  ds: xr.Dataset, latitude_dim: str = "lat", longitude_dim: str = "lon"
 ) -> None:
+  """Check a global grid: latitudes within [-90, 90] and increasing, longitudes within [0, 360).
+
+  Raises:
+    ValidationError: describing the first violation.
+  """
   logger.info("Checking that coordinates use ECMWF global convention.")
 
-  # Check that each dataset contains all latitudes in [-90, 90], and use the [-90, 90] convention
   if latitude_dim not in ds.dims:
     raise ValidationError(f"Latitude dimension {latitude_dim} not found in dataset")
   if ds[latitude_dim].min().item() < -90 or ds[latitude_dim].max().item() > 90:
-    raise ValueError("Dataset has latitudes outside the [-90, 90] range")
+    raise ValidationError("Dataset has latitudes outside the [-90, 90] range")
   if ds[latitude_dim][0].item() > ds[latitude_dim][-1].item():
-    raise ValueError("Dataset does not use the [90, -90] convention for latitude")
+    raise ValidationError("Latitudes are decreasing; they must increase from south to north")
 
-  # Check that each dataset uses the [0, 360) convention for longitude
   if longitude_dim not in ds.dims:
     raise ValidationError(f"Longitude dimension {longitude_dim} not found in dataset")
   if ds[longitude_dim].min().item() < 0 or ds[longitude_dim].max().item() >= 360:
-    raise ValueError("Dataset does not use the [0, 360) convention for longitude")
+    raise ValidationError("Dataset does not use the [0, 360) convention for longitude")
 
 
 def valid_time_coordinate(
