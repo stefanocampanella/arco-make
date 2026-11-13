@@ -28,6 +28,13 @@ def test_get_sea_mask_threshold_moves_the_cut(static_ds: xr.Dataset):
   np.testing.assert_array_equal(bottom.values, deptho[None] > np.array([1, 3, 7])[:, None, None])
 
 
+def test_get_sea_mask_default_dimension_is_the_depth_coordinate_one(static_ds: xr.Dataset):
+  """Without `depth_dim`, the mask's vertical dimension is that of the depth coordinate."""
+  ds = static_ds.rename(depth="level")
+  out = pu.get_sea_mask(ds, depth_coordinate="level", mask_name="m")
+  assert out["m"].dims == ("level", "latitude", "longitude")
+
+
 def test_get_sea_mask_rejects_threshold_outside_unit_interval(static_ds: xr.Dataset):
   """The threshold is a fraction of the cell height."""
   with pytest.raises(ValueError):
@@ -42,7 +49,6 @@ def test_get_notnull_and_is_positive_masks(static_ds: xr.Dataset):
   np.testing.assert_array_equal(positive.isel(latitude=0).values, BATHYMETRY_PROFILE > 0)
 
 
-@pytest.mark.xfail(reason="B1: mask steps assign into the input dataset", strict=True)
 @pytest.mark.parametrize(
   ("step", "kwargs"),
   [

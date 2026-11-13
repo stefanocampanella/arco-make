@@ -3,7 +3,6 @@
 """Regridding and resampling steps (processing_utils)."""
 
 import numpy as np
-import pytest
 import xarray as xr
 
 from arcomake import processing_utils as pu
@@ -58,7 +57,6 @@ def test_conservative_regrid_nan_rules(static_ds: xr.Dataset):
   np.testing.assert_allclose(skip.deptho.isel(longitude=1).values, 3.0)
 
 
-@pytest.mark.xfail(reason="regrid updates the `kwargs` table it is given in place", strict=True)
 def test_regrid_does_not_modify_its_arguments(atmosphere_ds: xr.Dataset):
   """The arguments of a step are not changed by the step (intent 1 extended to arguments)."""
   kwargs = {"skipna": True}

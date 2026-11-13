@@ -175,18 +175,20 @@ def get_notnull_mask(
   variable: Hashable,
   mask_name: Hashable,
 ) -> xr.Dataset:
-  ds[mask_name] = ds[variable].notnull()
-  return ds
+  return ds.assign({mask_name: ds[variable].notnull()})
 
 
 def get_sea_mask(
   ds: xr.Dataset,
   bathymetry: Hashable = "deptho",
   depth_coordinate: Hashable = "depth",
-  depth_dim: str = "level",
+  depth_dim: Hashable | None = None,
   threshold: float = 0.5,
   mask_name: Hashable = "sea_land_mask",
 ) -> xr.Dataset:
+  if depth_dim is None:
+    # The mask's vertical dimension is the one of the depth coordinate.
+    (depth_dim,) = ds[depth_coordinate].dims
   bathymetry_values = ds[bathymetry].values
   depth = ds[depth_coordinate].values
   if threshold < 0.0 or threshold > 1.0:
@@ -209,8 +211,7 @@ def get_sea_mask(
 
   mask = get_mask(bathymetry_values, depth)
   dims = (depth_dim,) + ds[bathymetry].dims
-  ds[mask_name] = (dims, mask)
-  return ds
+  return ds.assign({mask_name: (dims, mask)})
 
 
 def isel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
@@ -218,8 +219,7 @@ def isel(ds: xr.Dataset, **kwargs) -> xr.Dataset:
 
 
 def is_positive_mask(ds: xr.Dataset, variable: Hashable, mask_name: Hashable) -> xr.Dataset:
-  ds[mask_name] = ds[variable] > 0.0
-  return ds
+  return ds.assign({mask_name: ds[variable] > 0.0})
 
 
 def masked_fill(
@@ -278,9 +278,9 @@ def regrid(
       longitude_dim: target_dataset[longitude_dim].astype(np.float32),
     }
   )
-  regrid_conf = kwargs.get("kwargs", {})
+  regrid_conf = dict(kwargs.get("kwargs", {}))
   if method == "conservative":
-    regrid_conf |= dict(latitude_coord=latitude_dim)
+    regrid_conf["latitude_coord"] = latitude_dim
   regridded = getattr(ds.regrid, method)(target_dataset, **regrid_conf)
   assert isinstance(regridded, xr.Dataset)
   return regridded
