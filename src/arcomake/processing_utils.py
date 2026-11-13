@@ -8,7 +8,6 @@ import numpy as np
 import xarray as xr
 import xarray_regrid
 from pydantic import BaseModel, ConfigDict, model_validator
-from scipy.ndimage import gaussian_filter
 
 from arcomake.steps import check_arguments, step
 
@@ -111,27 +110,6 @@ def clip_negative(ds: xr.Dataset, variables: Iterable[Hashable]):
 
 
 @step
-def diff_std(dataset: xr.Dataset, time_dim: str = "time", **kwargs) -> xr.Dataset:
-  """
-  Compute the standard deviation of one-step differences along the time dimension.
-
-  Notes
-  -----
-  Given a sequence ``{x_i}_{i = 1, ..., N}``, the mean of the diffs
-  ``{x_i - x_{i-1}}`` is the sum of a telescopic series divided by the number of
-  terms, i.e. ``(x_N - x_1) / (N - 1)``, which becomes negligible for large N.
-  Also, GraphCast-like models compute the increment between the present and next
-  system state rescaled by diff_std, which amounts to standardizing the targets.
-  Whatever the rationale, one can reasonably approximate the mean with zero here.
-  """
-  dataset_diff = dataset.diff(dim=time_dim)
-  dataset_diff_var = (dataset_diff * dataset_diff).mean(dim=time_dim, **kwargs)
-  dataset_diff_std = xr.ufuncs.sqrt(dataset_diff_var)
-  assert isinstance(dataset_diff_std, xr.Dataset)
-  return dataset_diff_std
-
-
-@step
 def drop_static_vars(ds: xr.Dataset, time_dim: str = "time") -> xr.Dataset:
   ds = ds.drop_vars([name for name, var in ds.data_vars.items() if time_dim not in var.dims])
   return ds
@@ -148,36 +126,6 @@ def drop_var_attrs(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
 @step
 def flip(ds: xr.Dataset, dim: str) -> xr.Dataset:
   return ds.isel({dim: slice(None, None, -1)})
-
-
-@step
-def gaussian_blur_extrapolate(
-  ds: xr.Dataset,
-  variables: Iterable[Hashable] | None = None,
-  **kwargs,
-) -> xr.Dataset:
-  if variables is None:
-    variables = ds.data_vars.keys()
-  gaussian_filter_kwargs = kwargs.get("gaussian_filter_kwargs", {})
-
-  def gauss_fill_nan(data: xr.DataArray) -> xr.DataArray:
-    data_u = xr.where(data.isnull(), 0.0, data)
-    data_u = xr.apply_ufunc(gaussian_filter, data_u, kwargs=gaussian_filter_kwargs)
-    valid_frac = xr.where(data.isnull(), 0.0, 1.0)
-    valid_frac = xr.apply_ufunc(gaussian_filter, valid_frac, kwargs=gaussian_filter_kwargs)
-    data_u = data_u / valid_frac
-    data_filled = xr.where(data.isnull(), data_u, data)
-    assert isinstance(data_filled, xr.DataArray)
-    return data_filled
-
-  data_vars = {}
-  for var, da in ds.data_vars.items():
-    if var in variables:
-      data_vars[var] = da.map_blocks(gauss_fill_nan, template=da).assign_attrs(da.attrs)
-    else:
-      data_vars[var] = da
-    ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
-  return ds
 
 
 @step

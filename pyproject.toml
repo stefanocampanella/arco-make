@@ -26,7 +26,6 @@ dependencies = [
     "pydantic",
     "requests",
     "s3fs>2026",
-    "scipy",
     "tqdm",
     "xarray[complete]",
     "xarray-regrid[accel]",
@@ -41,7 +40,6 @@ license = "MIT"
 [project.optional-dependencies]
 dev = [
     "pandas-stubs~=3.0.3",
-    "scipy-stubs~=1.18.1",
     "pre-commit",
     "pytest",
     "pytest-cov",

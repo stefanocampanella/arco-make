@@ -67,7 +67,7 @@ def snapshot(ds: xr.Dataset) -> dict:
 
 def test_every_step_is_covered():
   """Each public step of processing_utils has an entry here (new steps must be added)."""
-  registered = set(registered_steps()) - {"diff_std", "gaussian_blur_extrapolate"}
+  registered = set(registered_steps())
   assert registered == set(STEPS)
 
 

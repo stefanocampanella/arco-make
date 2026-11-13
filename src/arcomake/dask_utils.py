@@ -111,37 +111,3 @@ def get_client(
           client.close()
       else:
         client.close()
-
-
-def maybe_wait(futures, rebalance=False, **kwargs):
-  """
-  Call ``dask.distributed.wait`` only if a distributed client is currently active.
-
-  This is a no-op (returns ``None`` immediately) when no
-  ``distributed.Client`` is running, e.g. when using the default
-  synchronous/threaded/multiprocessing Dask schedulers without a cluster.
-  In that case, computations are already fully materialized by the time
-  ``.persist()``/``.compute()`` return, so there is nothing to wait for.
-
-  Parameters
-  ----------
-  *args
-      Positional arguments forwarded to ``dask.distributed.wait``.
-  **kwargs
-      Keyword arguments forwarded to ``dask.distributed.wait``.
-
-  Returns
-  -------
-  Any or None
-      The result of ``dask.distributed.wait(*args, **kwargs)`` if a client
-      is active, otherwise ``None``.
-  """
-  try:
-    client = distributed.get_client()
-  except ValueError:
-    # No distributed client is running; nothing to wait for.
-    return None
-  result = distributed.wait(futures, **kwargs)
-  if rebalance:
-    client.rebalance(futures)
-  return result
