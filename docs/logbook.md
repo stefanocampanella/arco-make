@@ -1,0 +1,42 @@
+# Logbook
+
+Dated records of what was run, measured or decided while working on arco-make. Newest last.
+Entries marked **[Moby-Dick]** are relevant to consumers of ARCO-OCEAN and feed the report due
+after the correctness PRs are merged.
+
+## 2026-11-13: correctness PR (groups 0–5 and 10 of the findings guide)
+
+**Decisions (maintainer):**
+- Scope: groups 0–5 and 10 now; climatology (6), blocks (7), chunk planner (8) and recipe
+  capabilities (9) in follow-up PRs.
+- `gaussian_blur_extrapolate` is removed, not fixed. `diff_std` is removed (tendency std moves to
+  Moby-Dick).
+- Feb 29, for group 6: keep 365 bins with a documented Feb 28 mapping.
+
+**Provenance of the published 0.25° dataset [Moby-Dick]:**
+- The 0.25° levels-50 download (30 Sep – 8 Oct 2026, on the project VM) ran in the cached image
+  (built 30 Sep). Its `src/arcomake` is identical to commit **`6f0e2f1`**
+  (2026-09-30), not to `847b6f2`. `6f0e2f1..847b6f2` changes `download.py`, `dataset_utils.py`,
+  `climatology.py` and the Dask setup.
+- It ran as 45 pieces of 256 days, about 3.3 h each and 165 h in total. Pieces 1, 16, 19, 20, 34 and
+  41 failed on the first attempt and were rerun with `--overwrite` (7–8 Oct); 41 needed a third try.
+  The errors in the logs are transient network ones: EWDS retries, DNS failures, connect timeouts.
+- The arco-ocean log folder named for the 0.5° recipe holds that 0.25° run,
+  despite its name.
+
+**Environment:**
+- The host's apt eccodes 2.45 cannot decode the GloFAS GRIB served by EWDS (`Unable to find
+  template localSection from grib2/local.98.65535.def`, then `KeyError: 'gridType'`). The image
+  builds eccodes 2.48 from source, which works. Local runs use the image's library and
+  definitions via `ECCODES_DIR`, `ECCODES_DEFINITION_PATH` and `ECCODES_SAMPLES_PATH`.
+
+**Code findings beyond the guide (confirmed by tests in `tests/`):**
+- N1: `safe_to_zarr` writes uncompressed arrays when `[save]` has no compressor. **[Moby-Dick]**
+  Not affected: the arco-ocean download, unpack and climatology recipes all set lz4.
+- N2: `astype` with `dtype` and no `casting` is a no-op, and its per-variable form drops the
+  unlisted variables. **[Moby-Dick]** Not affected: every recipe call sets both.
+- N3: the ECMWF-coordinates check has different lat/lon defaults in its model and its function.
+- B6, measured on synthetic data **[Moby-Dick]:**
+  - with one of five years missing in one bin, the anomaly variance of that bin is 6 % too low
+    (window 1);
+  - a bin missing in every year makes its neighbours NaN through the window.
