@@ -49,6 +49,10 @@ after the correctness PRs are merged.
 - N2: `astype` with `dtype` and no `casting` is a no-op, and its per-variable form drops the
   unlisted variables. **[Moby-Dick]** Not affected: every recipe call sets both.
 - N3: the ECMWF-coordinates check has different lat/lon defaults in its model and its function.
+- B12 went further than a deprecation: `valid_time_coordinate` built the expected cftime axis
+  with `datetime` bounds, which makes xarray ignore both `calendar` and `inclusive`. The check
+  therefore failed on every cftime dataset. Published data were not affected: the dataset uses
+  numpy datetimes and the climatology integer bins.
 - B6, measured on synthetic data **[Moby-Dick]:**
   - with one of five years missing in one bin, the anomaly variance of that bin is 6 % too low
     (window 1);

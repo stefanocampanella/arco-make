@@ -44,7 +44,6 @@ def test_valid_time_coordinate_reports_problems(ocean_ds: xr.Dataset, selection,
     )
 
 
-@pytest.mark.xfail(reason="B12: xr.cftime_range is deprecated (warns)", strict=True)
 def test_valid_time_coordinate_cftime_without_deprecation():
   """cftime axes are checked with the non-deprecated API."""
   times = xr.date_range("2001-01-01", periods=3, freq="1D", calendar="noleap", use_cftime=True)
@@ -53,6 +52,17 @@ def test_valid_time_coordinate_cftime_without_deprecation():
     warnings.simplefilter("error", FutureWarning)
     warnings.simplefilter("error", DeprecationWarning)
     checks.valid_time_coordinate(ds, datetime(2001, 1, 1), datetime(2001, 1, 4))
+
+
+def test_valid_time_coordinate_cftime_calendar():
+  """A complete `noleap` axis passes: Feb 29 is not expected in that calendar."""
+  times = xr.date_range(
+    "2020-02-27", periods=3, freq="1D", calendar="noleap", use_cftime=True
+  )  # Feb 27, Feb 28, Mar 1
+  ds = xr.Dataset(coords={"time": times})
+  checks.valid_time_coordinate(ds, datetime(2020, 2, 27), datetime(2020, 3, 2))
+  with pytest.raises(ValidationError, match="Missing"):
+    checks.valid_time_coordinate(ds.isel(time=[0, 2]), datetime(2020, 2, 27), datetime(2020, 3, 2))
 
 
 def test_valid_global_ecmwf_coordinates_accepts_increasing_latitudes():

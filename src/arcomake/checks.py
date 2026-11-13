@@ -28,7 +28,7 @@ class ValidTimeCoordinateCheck(BaseModel):
   model_config = ConfigDict(extra="forbid")
   start: datetime
   end: datetime
-  freq: str | None = None
+  freq: str = "1D"
   time_dim: str = "time"
 
   @model_validator(mode="after")
@@ -221,10 +221,16 @@ def valid_cftime_index(
     raise ValidationError(f"Duplicate timestamps found in time coordinate: {preview}{more}")
 
   # Regularity check (daily frequency across CF calendars)
-  calendar = getattr(idx, "calendar", None)
+  calendar = getattr(idx, "calendar", None) or "standard"
   # Build expected daily sequence with same calendar
-  expected = xr.cftime_range(
-    start=start_date, end=end_date, freq=freq, inclusive=inclusive, calendar=calendar
+  # Bounds as ISO strings: given as `datetime` objects, the calendar and `inclusive` are ignored.
+  expected = xr.date_range(
+    start=start_date.isoformat(),
+    end=end_date.isoformat(),
+    freq=freq,
+    inclusive=inclusive,
+    calendar=calendar,
+    use_cftime=True,
   )
   if not idx.equals(expected):
     # Compute missing days between min and max dates for helpful diagnostics
