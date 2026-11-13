@@ -70,3 +70,33 @@ def test_ewds_download_stays_in_registry(tmp_path: pathlib.Path, monkeypatch: py
   with TempDirectoryRegistry(base_dir=tmp_path / "registry") as registry:
     EarlyWarningDataStore()._process_request("cems-glofas-historical", {})
     assert seen and all(path.is_relative_to(registry.job_dir) for path in seen)
+
+
+@pytest.mark.parametrize("time_dim", ["time", "valid_time"])
+def test_ewds_one_day_requests_use_time_dim(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, time_dim: str
+):
+  """A one-day request (no time dimension in the GRIB) is stamped along the recipe's time_dim."""
+  day = xr.Dataset(
+    {"dis": (("latitude", "longitude"), np.ones((2, 2)))},
+    coords={"latitude": [0.0, 1.0], "longitude": [0.0, 1.0]},
+  )
+  monkeypatch.setattr(
+    EarlyWarningDataStore,
+    "_process_requests",
+    lambda self, name, requests, **kwargs: [day for _ in requests],
+  )
+  with TempDirectoryRegistry(base_dir=tmp_path):
+    out = EarlyWarningDataStore().open_dataset(
+      "ewds://cems-glofas-historical",
+      start_datetime=datetime(2020, 2, 29),
+      end_datetime=datetime(2020, 3, 2),
+      system_version="v",
+      hydrological_model="m",
+      product_type="p",
+      timespan="t",
+      variable="dis",
+      time_dim=time_dim,
+    )
+  assert out.dis.dims == (time_dim, "latitude", "longitude")
+  assert [str(t)[:10] for t in out[time_dim].values] == ["2020-02-29", "2020-03-01"]

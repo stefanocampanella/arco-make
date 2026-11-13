@@ -233,7 +233,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
       # _process_request drops the time dimension if of length one
       if len(dates) == 1:
         dataset = dataset.expand_dims(dim=time_dim, axis=0)
-        dataset = dataset.assign_coords(time=dates)
+        dataset = dataset.assign_coords({time_dim: dates})
       datasets.append(dataset)
 
     return _drop_variables(xr.concat(datasets, dim=time_dim), drop_variables)
