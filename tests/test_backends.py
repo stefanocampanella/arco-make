@@ -23,7 +23,6 @@ def test_ewds_requests_split_by_month():
   assert [[d.day for d in g] for g in groups] == [[27, 28, 29], [1]]
 
 
-@pytest.mark.xfail(reason="B7: an explicit cdsapi URL is never passed to the client", strict=True)
 def test_cdsapi_client_receives_explicit_url(monkeypatch: pytest.MonkeyPatch):
   """`url` given to `get_cdsapi_client` reaches `cdsapi.Client`."""
   received = {}

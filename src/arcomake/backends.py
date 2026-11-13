@@ -359,7 +359,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
       **kwargs,
     }
 
-    if url is None:
+    if url is not None:
       client_kwargs["url"] = url
 
     cdsapi_client = cdsapi.Client(**client_kwargs)
