@@ -36,7 +36,7 @@ on the project VM with the image's eccodes 2.48, threads scheduler):
 | Window | Result | Wall time | Peak RSS | Output |
 |---|---|---|---|---|
 | 1993-01-01 → 01-03 | ok | 22 min | 36 GB | 832 MB |
-| 2012-12-30 → 2013-01-02 | attempt 1: `ConnectTimeout` on `confluence.ecmwf.int` (GloFAS `uparea`, NetCDF over HTTP: no retry) after 25 min; attempt 2: **segmentation fault** after 22 s; attempts 3 and 4: **hung** (no progress for 2 h 11 min and for 15 min, stopped by hand) | | | |
+| 2012-12-30 → 2013-01-02 | attempt 1: `ConnectTimeout` on `confluence.ecmwf.int` (GloFAS `uparea`, NetCDF over HTTP: no retry) after 25 min; attempt 2: **segmentation fault** after 22 s; attempts 3 and 4: **hung** (no progress for 2 h 11 min and for 15 min, stopped by hand); attempt 5, with a GCS timeout: ok, but **two ERA5 hours silently lost** (N8) | 5 min | 31 GB | 1.3 GB |
 | 2020-02-26 → 03-02 | ok | 3 min | 53 GB | 2.1 GB |
 
 - Wall time is dominated by the remote services' queues (EWDS above all) and varies by an order of
@@ -65,12 +65,31 @@ on the project VM with the image's eccodes 2.48, threads scheduler):
   - Cause: gcsfs (2026.10.0) passes `requests_timeout=None` to every aiohttp request by default,
     and aiohttp (3.14.5) turns an explicit `None` into `ClientTimeout(total=None)`, which removes
     its own 5-minute default. Any GCS read can wait forever, at any arco-make commit.
-  - A recipe can set it today: `storage_options = {token = "anon", requests_timeout = 120}` on
-    the ERA5 part. From reading the code (not tested): a total timeout raises `TimeoutError`,
-    which is not in gcsfs's retriable exceptions, so the piece fails instead of hanging, but is
-    not retried. Group 7: default read timeouts on every remote source, with retries.
+  - Setting `requests_timeout` in the recipe is **not** a fix: see N8. A timeout must come with
+    N8 fixed, or it turns the hang into silent data loss.
   - The PR's code finished this window once (2 min 20 s); it has the same dependencies, so it is
     exposed the same way.
+- **N8, silent loss of source chunks (all commits) [Moby-Dick]:** attempt 5 ran the old code with
+  `requests_timeout = 120` on the ERA5 parts (a copy of the pinned recipe, nothing else changed).
+  It finished in 5 min 20 s, 31 GB, exit 0, with no error or warning in the log. Its output differs
+  from the PR's in two fields only: `2t` on 2012-12-30 (max 0.70 K, mean 0.043 K) and `msl` on
+  2013-01-01 (max 74 Pa, mean 7.2 Pa).
+  - Recomputed from the public ERA5 store: the PR's two fields equal the 24-hour means bit for bit;
+    the old run's are, bit for bit, the means without 09:00 (`2t`) and without 05:00 (`msl`).
+  - Mechanism: zarr 2.18's `FSStore.getitems` treats `KeyError`, `PermissionError` and `IOError` as
+    "chunk missing" and returns the fill value (NaN). `TimeoutError`, aiohttp's `ClientOSError` and
+    `ServerTimeoutError` are all `OSError`. So a chunk read that times out, or fails with a
+    connection error once gcsfs's retries are spent, becomes NaN with no message. The daily
+    `resample` mean skips NaN, so the output is a mean over 23 hours and has no NaN to detect.
+  - Reproduced offline with the PR's environment: a `TimeoutError` on one hourly chunk of a
+    memory-filesystem Zarr store gives NaN at that hour and a wrong mean, silently.
+  - Exposure: every source opened with `engine = "zarr"` over fsspec (ERA5 in ARCO-OCEAN). The
+    published download ran with no timeout, so the trigger there is a connection error that
+    outlasts gcsfs's 6 retries. Days without such an error are exact.
+  - Fix (follow-up, with N7): open Zarr sources with `FSStore(..., exceptions=(KeyError,))` so that
+    I/O errors raise, then add timeouts and retries per block (group 7).
+- **Window 2, result:** apart from those two fields, explained by the old run's lost chunks, the
+  37 arrays are identical. The PR's output matches the source where the old one does not.
 - **[Moby-Dick]** A production piece could hang the same way rather than fail. A killed piece leaves
   a partial store that must be rewritten with `--overwrite`, as the failed pieces were; the cost is
   lost time, not wrong data, provided every killed piece was rerun.
@@ -82,7 +101,10 @@ on the project VM with the image's eccodes 2.48, threads scheduler):
   - Fixed in `d7b49dc` (slice selection), with a test on the chunks.
   - Note: any rechunking before a reduction changes float32 results at this level. "Same output"
     has to be checked bit for bit, not with a tolerance.
-  - Peak memory was 27 GB instead of 36 GB; to be re-measured with the fix.
+- **PR head `d7b49dc`, same recipe and host:** window 1: 3 min 27 s, 35.5 GB, identical; window 2:
+  2 min 20 s, 44 GB, identical apart from the old run's lost chunks (N8); window 3: 5 min 12 s,
+  50 GB, identical (37 arrays each, compared bit for bit with metadata and encodings). Peak memory
+  is unchanged by the PR.
 
 **Strict recipes (group 3):**
 - All arco-ocean recipes at the local checkout (`c67b8ab` plus uncommitted and untracked files) were
