@@ -3,7 +3,6 @@
 import datetime
 import logging
 import os
-import tempfile
 import warnings
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -290,28 +289,29 @@ class EarlyWarningDataStore(BackendEntrypoint):
       return list(executor.map(_worker, requests))
 
   def _process_request(self, dataset_name: str, request: dict[str, Any], **kwargs) -> xr.Dataset:
-    """Submit a request to the Climate Data Store, download some temporary NetCDFs, and returns a dataset.
-    Temporary files are deleted when the temporary directory registry context closes.
+    """Submit a request to the Climate Data Store, download its GRIB files, and return a dataset.
+
+    Every file (the zip and its content) lives in a directory of the current temporary registry,
+    so it is removed when the registry closes, including on SIGTERM (intent 9).
     """
-    with tempfile.NamedTemporaryFile("w+", suffix=".zip") as file:
-      client = self.get_cdsapi_client(
-        progress=self.progress, client_logger=self.client_logger, **kwargs
-      )
-      client.retrieve(dataset_name, request, file.name)
+    registry = get_current_temp_registry()
+    if registry is None:
+      raise ValueError("No temporary directory registry available.")
+    path = registry.create_temp_dir()
+    archive = path / "request.zip"
 
-      registry = get_current_temp_registry()
-      if registry is None:
-        raise ValueError("No temporary directory registry available.")
-      path = registry.create_temp_dir()
-
-      with ZipFile(file.name) as zipfile:
-        zipfile.extractall(path=path)
-      # FIXME: when reading grib files eccodes emits the following warning:
-      #    ECCODES WARNING :  g2date:unpack_long: Date is not valid! year=0 month=0 day=0
-      #  see: https://git.ecmwf.int/users/erds/repos/eccodes/browse/src/accessor/grib_accessor_class_g2date.cc?at=f10d3f3c1be3737a231d4a2c19f45535de4d4424#71-75
-      #  Also, cdsapi download one NetCDF per variable, ugly. :(
-      dataset = xr.open_mfdataset(list(path.glob("*.grib")), engine="cfgrib")
-      return dataset
+    client = self.get_cdsapi_client(
+      progress=self.progress, client_logger=self.client_logger, **kwargs
+    )
+    client.retrieve(dataset_name, request, str(archive))
+    with ZipFile(archive) as zipfile:
+      zipfile.extractall(path=path)
+    archive.unlink()  # The extracted files are all that is needed.
+    # FIXME: when reading grib files eccodes emits the following warning:
+    #    ECCODES WARNING :  g2date:unpack_long: Date is not valid! year=0 month=0 day=0
+    #  see: https://git.ecmwf.int/users/erds/repos/eccodes/browse/src/accessor/grib_accessor_class_g2date.cc?at=f10d3f3c1be3737a231d4a2c19f45535de4d4424#71-75
+    #  Also, cdsapi download one NetCDF per variable, ugly. :(
+    return xr.open_mfdataset(list(path.glob("*.grib")), engine="cfgrib")
 
   # Credits to the amazing Stefano Piani from OGS
   @staticmethod

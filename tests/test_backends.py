@@ -50,9 +50,6 @@ def test_copernicus_marine_requires_dataset_id():
     CopernicusMarine().open_dataset("cm://")
 
 
-@pytest.mark.xfail(
-  reason="B16: the EWDS zip is downloaded to the system temporary directory", strict=True
-)
 def test_ewds_download_stays_in_registry(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
   """Every file of a request, the zip included, is inside the registry's directory (intent 9)."""
   seen: list[pathlib.Path] = []
