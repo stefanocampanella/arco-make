@@ -4,7 +4,6 @@ import logging
 from typing import get_args
 
 import click
-import xarray as xr
 from pydantic import BaseModel, ConfigDict, Field
 
 from arcomake.cli_utils import (
@@ -14,7 +13,7 @@ from arcomake.cli_utils import (
   set_default_logger,
 )
 from arcomake.dask_utils import DaskSetupType, get_client
-from arcomake.dataset_utils import ReadConfig, SaveConfig, safe_to_zarr
+from arcomake.dataset_utils import ReadConfig, SaveConfig, open_input, safe_to_zarr
 from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
@@ -101,7 +100,7 @@ def process(
       check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
       # Read input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
-      with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
+      with open_input(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
         # Process dataset
         if configs.process:
           dataset = dataset.arcomake.process(steps=configs.process)

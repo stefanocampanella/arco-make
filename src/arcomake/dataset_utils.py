@@ -207,6 +207,46 @@ class CheckpointingConfig(BaseModel):
     return may_parse_timedelta(value)
 
 
+def strict_zarr_store(
+  path: str,
+  *,
+  fs: fsspec.AbstractFileSystem | None = None,
+  storage_options: Mapping[str, Any] | None = None,
+) -> zarr.storage.FSStore:
+  """A read-only fsspec Zarr store on which only a missing object is a missing chunk.
+
+  zarr 2 reads a chunk whose object does not exist as the fill value (that is how sparse stores
+  work). Its `FSStore` does the same, by default, for `PermissionError` and any `OSError`, which
+  include timeouts and connection errors: a failed read would become NaN with no message, and a
+  later mean would skip it. This store raises those errors instead.
+
+  Args:
+    path: URL of the store, or its path on `fs`.
+    fs: The filesystem of `path`; by default, the one its URL names.
+    storage_options: Options of that filesystem (when `fs` is not given).
+  """
+  return zarr.storage.FSStore(
+    path, mode="r", fs=fs, exceptions=(KeyError,), **dict(storage_options or {})
+  )
+
+
+def open_input(filename_or_obj: Any, **kwargs: Any) -> xr.Dataset:
+  """`xarray.open_dataset`, raising read errors of Zarr stores given as fsspec URLs.
+
+  With `engine="zarr"`, a URL (`gs://`, `s3://`, `https://`, chained `::` URLs...) is opened as a
+  `strict_zarr_store`, with the `storage_options` given. Local paths keep zarr's directory and zip
+  stores, which already raise read errors. Other engines are not affected.
+  """
+  is_url = isinstance(filename_or_obj, str) and (
+    "://" in filename_or_obj or "::" in filename_or_obj
+  )
+  if kwargs.get("engine") == "zarr" and is_url:
+    storage_options = kwargs.pop("storage_options", None)
+    filename_or_obj = strict_zarr_store(filename_or_obj, storage_options=storage_options)
+  # xarray accepts zarr stores, but its type hints do not list them.
+  return xr.open_dataset(filename_or_obj, **kwargs)  # ty: ignore[invalid-argument-type]
+
+
 class DatasetConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
@@ -233,9 +273,11 @@ def download_and_process(
   for raw_part in configs.parts:
     part_conf = raw_part.model_dump(exclude_unset=True)
     engine = getattr(raw_part, "engine", None) or part_conf.get("engine")
+    if engine is not None:
+      part_conf["engine"] = engine
     if engine == "earlywarningdatastore" or engine == "copernicusmarine":
       part_conf.update(start_datetime=start_datetime, end_datetime=end_datetime)
-    part = xr.open_dataset(**part_conf)
+    part = open_input(**part_conf)
     part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
     parts.append(part)
   if not parts:
@@ -341,7 +383,14 @@ def open_archive(
   file_paths: list[str] = sorted(fs.glob(glob_pattern))
   if len(file_paths) == 0:
     raise ValueError(f"Provided path '{path}' does not contain any files matching '{glob}'.")
-  file_mappers = [fs.get_mapper(file_path) for file_path in file_paths]
+  # Zarr pieces are read through strict stores, so that a failed read raises (see
+  # `strict_zarr_store`); other engines get plain fsspec mappers.
+  file_mappers: list[Any] = [
+    strict_zarr_store(file_path, fs=fs)
+    if kwargs.get("engine") == "zarr"
+    else fs.get_mapper(file_path)
+    for file_path in file_paths
+  ]
   logger.info(f"Reading {len(file_mappers)} datasets from {path}")
 
   # Drop the possibly conflicting attributes so that combining with

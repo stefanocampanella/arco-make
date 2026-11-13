@@ -81,7 +81,6 @@ def test_missing_chunks_are_fill_values(source: str):
   assert np.isnan(values[3]).all() and not np.isnan(np.delete(values, 3, axis=0)).any()
 
 
-@pytest.mark.xfail(strict=True, reason="N8: read errors become fill values")
 def test_download_part_read_error_fails(source: str):
   """A chunk whose read times out fails the download instead of becoming NaN."""
   fail_reads_of(source, "t/3.0")
@@ -89,7 +88,6 @@ def test_download_part_read_error_fails(source: str):
     read_part(source)
 
 
-@pytest.mark.xfail(strict=True, reason="N8: read errors become fill values")
 def test_open_archive_read_error_fails(source: str):
   """`unpack` reads its pieces through fsspec mappers: the same rule applies."""
   fail_reads_of(source, "t/3.0")
@@ -98,7 +96,6 @@ def test_open_archive_read_error_fails(source: str):
     open_archive(archive, glob="*.zarr", engine="zarr").load()
 
 
-@pytest.mark.xfail(strict=True, reason="N8: read errors become fill values")
 def test_read_table_read_error_fails(source: str, tmp_path: pathlib.Path):
   """The `[read]` table of `process` (and `validate`, `compute-climatology`) follows the rule."""
   recipe = tmp_path / "process.toml"
@@ -106,4 +103,4 @@ def test_read_table_read_error_fails(source: str, tmp_path: pathlib.Path):
   fail_reads_of(source, "t/3.0")
   args = ["process", "--dask-setup", "threads", str(recipe), source, str(tmp_path / "out.zarr")]
   result = CliRunner().invoke(cli, args)
-  assert isinstance(result.exception, TimeoutError)
+  assert result.exit_code != 0 and "(TimeoutError)" in result.output

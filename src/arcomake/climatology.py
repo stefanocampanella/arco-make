@@ -57,7 +57,7 @@ from arcomake.cli_utils import (
   set_default_logger,
 )
 from arcomake.dask_utils import DaskSetupType, get_client
-from arcomake.dataset_utils import ReadConfig, SaveConfig, safe_to_zarr
+from arcomake.dataset_utils import ReadConfig, SaveConfig, open_input, safe_to_zarr
 from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
@@ -176,7 +176,7 @@ def compute_climatology(
         check_if_overwriting(path, overwrite=overwrite, save_configs=configs.save)
       # Open input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
-      with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
+      with open_input(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
         # Preprocess input dataset
         if configs.preprocess:
           dataset = dataset.arcomake.process(steps=configs.preprocess)
