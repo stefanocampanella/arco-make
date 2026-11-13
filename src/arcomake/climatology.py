@@ -18,8 +18,9 @@
 #    2. https://flox.readthedocs.io/en/latest/user-stories/climatology.html
 #    3. https://xarray.dev/blog/flox
 #
-#  With these and other optimizations, now we're able to get the job to the end without errors and compute the all the
-#  stats, including the climatology. Optionally, the climatology can now be computed using Welford's algorithm.
+#  With these and other optimizations, now we're able to get the job to the end without errors and compute all the
+#  stats, including the climatology. The climatology uses vectorized reductions over periods (a streaming Welford
+#  implementation was removed in 9dcb661); flox can be used for the grouped reductions (`use_flox`).
 #
 #  Even without rechunking, the communication is still a bottleneck. Hence, further optimization might be:
 #   1. Try to set up a Dask cluster using UCX (which appears to be experimental) to reduce communication time.
@@ -148,33 +149,19 @@ def compute_climatology(
   use_frisky: bool = False,
   log_level: str = "info",
 ):
-  """
-  Compute the climatology and anomaly std of a Zarr dataset and save them to Zarr.
+  """Compute a periodic climatology and the standard deviation of the anomalies.
 
-  The time coordinate is validated (sorted, no missing dates or duplicates,
-  uniformly spaced with a daily-multiple frequency dividing the calendar year)
-  and the dataset is converted to the given fixed-day calendar to handle leap
-  years. Data variables without the time dimension (e.g., static masks) are
-  dropped. Two outputs are written: the climatological average over
-  calendar-year bins, and the standard deviation of the anomalies with
-  respect to that climatology.
+  After the [[preprocess]] steps, the time axis is cut into consecutive periods of `period`
+  steps (e.g. 365 daily steps); step k of every period falls in bin k. For each bin, the
+  climatology is the weighted mean over all periods and over a centred `window` of bins
+  (wrapping around the period), and the anomaly standard deviation is the unbiased weighted
+  standard deviation over the same samples.
 
-  Parameters
-  ----------
-  configs_path : pathlib.Path
-      Path to TOML configuration file containing configuration options.
-  input_path : pathlib.Path
-      Path to the input Zarr dataset.
-  climatology_output_path : pathlib.Path
-      Path to the climatology output.
-  anomaly_std_output_path : pathlib.Path
-      Path to the anomaly std output.
-  overwrite : bool, default False
-      Whether to overwrite the outputs if they already exist.
-  dask_setup : DaskSetupType, default "mpi"
-      Type of Dask scheduler to use.
-  log_level : {"debug", "info", "warning", "error", "critical"}, default "info"
-      Logging verbosity.
+  Assumed, not checked: the time axis is sorted, complete and uniformly spaced, every data
+  variable has the time dimension, and one period is one calendar cycle. Only the number of
+  steps is checked to be a multiple of `period`. Leap days must be handled by the
+  [[preprocess]] steps (e.g. `convert_calendar` to a 365-day calendar). The two outputs have
+  `period` steps along time, the bin index.
   """
 
   # Set up logging.
@@ -330,7 +317,7 @@ def _compute_climatology(
   use_flox: bool = False,
 ) -> tuple[xr.Dataset, xr.Dataset]:
   """
-  Compute the climatological mean and unbiased sample variance for a single DataArray.
+  Compute the climatological mean and unbiased sample variance of every data variable.
 
   Parameters
   ----------
@@ -359,10 +346,16 @@ def _compute_climatology(
 
   Returns
   -------
-  tuple[xr.DataArray, xr.DataArray]
+  tuple[xr.Dataset, xr.Dataset]
       A pair ``(mean, variance)``, each of size ``period`` along
       ``time_dim``. ``mean`` is the weighted climatological average
       and ``variance`` is the unbiased weighted sample variance of the anomalies.
+
+  Notes
+  -----
+  Known limitation (findings B6): the variance assumes every period has a value in every bin.
+  Where a value is missing in some periods, the per-bin mean skips it but the count does not,
+  which biases the variance low; a bin missing in every period makes its window neighbours NaN.
   """
   size = dataset.sizes[time_dim]
   n_periods = size // period

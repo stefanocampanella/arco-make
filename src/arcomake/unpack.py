@@ -99,12 +99,13 @@ def unpack(
   progress: bool = False,
   use_frisky: bool = False,
 ):
-  """
-  Unpack a collection of zip files containing Zarr datasets into a single Zarr dataset.
+  """Join the pieces written by separate `download` runs into one Zarr dataset.
 
-  The command reads zipped Zarr fragments with xarray.open_mfdataset(engine='zarr'),
-  optionally slices the time range, rechunks, and saves to a DirectoryStore at the
-  given output path.
+  INPUT_PATH is a directory (local or fsspec URL) holding the pieces; the recipe's `glob` selects
+  them (e.g. "*.zarr" or "*.zip") and [read] gives the arguments to open each. Variables with the
+  time dimension are concatenated in time order; static variables must be identical in every
+  piece and are written once. Attributes listed in `attrs_to_drop` are removed before joining.
+  The optional [[postprocess]] steps run on the joined dataset, which is saved per [save].
   """
 
   # Set up logging.

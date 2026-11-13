@@ -320,12 +320,12 @@ class EarlyWarningDataStore(BackendEntrypoint):
     submitted)
 
     Args:
-      url (str): the url of the endpoint of the cdsapi. If it is None, it will be
-        read from the ~/.cdsapi file (if exists)
-      key (str): the key of the cdsapi user account. If it is None, it will be
-        read from the ~/.cdsapi file (if exists)
+      url (str): the url of the endpoint of the cdsapi. If it is None, the client reads it
+        from its configuration (the CDSAPI_URL environment variable or ~/.cdsapirc).
       client_logger (logging.Logger): Logger that the returned client
         will use to print its messages
+      **kwargs: Other arguments of `cdsapi.Client` (e.g. `key`, read from CDSAPI_KEY or
+        ~/.cdsapirc when not given).
 
     Returns:
       cdsapi.Client instance

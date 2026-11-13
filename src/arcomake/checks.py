@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 import logging
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from datetime import datetime
 from typing import Literal, Self
 
@@ -65,9 +65,18 @@ class ChecksConfig(BaseModel):
 def ensure_no_nans(
   dataset: xr.Dataset,
   time_dim: str = "time",
-  **kwargs,
+  **kwargs: list[str],
 ) -> None:
-  variable_mask_mapping = {}
+  """Check that variables have no missing value, inside their mask if one is given.
+
+  Each extra argument maps a mask to the variables it applies to, e.g.
+  `glorys_mask = ["thetao", "so"]`: those are checked only where the mask is True (the first
+  level of a 3D mask for 2D variables). Other variables are checked everywhere.
+
+  Raises:
+    ValidationError: listing, per time step, the variables with missing values.
+  """
+  variable_mask_mapping: dict[Hashable, str] = {}
   for mask_name, variable_names in kwargs.items():
     for variable_name in variable_names:
       if variable_name in dataset.data_vars:
@@ -139,15 +148,20 @@ def valid_time_coordinate(
   inclusive: Literal["left", "right", "both", "neither"] = "left",
   time_dim="time",
 ) -> None:
-  """
-  Check that time coordinate is sorted, that all dates are within the specified range, and that there are no duplicates
-  or missing dates.
+  """Check that the time coordinate is exactly the regular axis from `start` to `end`.
+
+  The axis must be sorted, without duplicates, and equal to the stamps every `freq` from `start`
+  to `end` (`end` excluded by default), in the dataset's calendar (numpy or cftime).
 
   Args:
-    dataset: The dataset to check
-    start_datetime: Start date (required)
-    end_datetime: End date (required)
-    dataset_name: Optional name of the dataset for the warning message
+    dataset: The dataset to check.
+    start, end: Bounds of the expected axis.
+    freq: Spacing of the expected axis (a pandas frequency, e.g. "1D").
+    inclusive: Which bounds are part of the axis (default: `start` only).
+    time_dim: Name of the time coordinate.
+
+  Raises:
+    ValidationError: on disorder, duplicates, or missing or irregular stamps.
   """
   logger.info(
     f"Checking that time coordinate contains all dates between {start} and {end}, with frequency {freq}."

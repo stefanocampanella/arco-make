@@ -117,11 +117,14 @@ def download(
   dask_setup: DaskSetupType = "threads",
   progress: bool = False,
 ):
-  """
-  Download and process multiple datasets into a single ARCO dataset.
+  """Download, process and merge the datasets of a recipe into one Zarr dataset.
 
-  The function reads dataset configurations, applies necessary postprocessing steps,
-  and saves the merged dataset to a local or remote path.
+  The interval [start, end) of the recipe (or of --start/--end) is processed in blocks of
+  `step`: for each block, every dataset is read from its parts, time-sliced and processed by
+  its [[postprocess]] steps (optionally in sub-blocks checkpointed to temporary Zarr, per
+  `checkpointing.step`); the datasets are merged, the global [[postprocess]] steps run, and the
+  block is written (first block) or appended along time. OUTPUT_PATH may be a directory, a
+  `.zip` archive or an fsspec URL; it is never overwritten without --overwrite.
   """
 
   # Set up logging.

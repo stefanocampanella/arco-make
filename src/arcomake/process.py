@@ -83,23 +83,11 @@ def process(
   use_frisky: bool = False,
   log_level: str = "info",
 ):
-  """
-  Compute a statistic of a Zarr dataset over time and save it to Zarr.
+  """Apply recipe steps to a dataset and save the result to Zarr.
 
-  Parameters
-  ----------
-  configs_path : pathlib.Path
-      Path to TOML configuration file containing configuration options.
-  input_path : pathlib.Path
-      Path to the input Zarr dataset.
-  output_path : pathlib.Path
-      Path to the output Zarr dataset.
-  overwrite : bool, default False
-      Whether to overwrite existing output.
-  dask_setup : DaskSetupType, default "mpi"
-      Type of Dask scheduler to use.
-  log_level : {"debug", "info", "warning", "error", "critical"}, default "info"
-      Logging verbosity.
+  CONFIGS_PATH is a TOML recipe with a [read] table (arguments of xarray.open_dataset), a list of
+  [[process]] steps (see `arco-make steps`; e.g. a time mean) and a [save] table. INPUT_PATH and
+  OUTPUT_PATH may be local paths or fsspec URLs.
   """
 
   # Set up logging.

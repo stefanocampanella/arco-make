@@ -44,11 +44,12 @@ def validate(
   fail: bool = False,
   log_level: str = "info",
 ):
-  """
-  Validate a dataset against checks defined in a configuration file.
+  """Check a dataset against the [checks] of a recipe.
 
-  The function reads the configuration file, opens the input dataset,
-  and applies the validation procedure.
+  Checks: `valid_time_coordinate` (complete, sorted, without duplicates, between `start` and
+  `end` excluded), `valid_global_ecmwf_coordinates` (latitudes increasing within [-90, 90],
+  longitudes within [0, 360)) and `ensure_no_nans` (no missing value inside each mask).
+  Failed checks are warnings, or an error with --fail.
   """
   # Set up logging.
   set_default_logger(log_level)

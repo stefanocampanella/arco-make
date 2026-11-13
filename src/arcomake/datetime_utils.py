@@ -72,12 +72,15 @@ class DateInterval:
 
 @dataclass
 class IterableDateInterval(Iterable[DateInterval]):
-  """Represents a right open date interval, which can be iterated over with arbitrary step size.
+  """A right-open interval [start, end), iterated as consecutive blocks of length `step`.
+
+  Blocks share their boundaries and the last one is cut at `end`, so the blocks cover the
+  interval exactly once.
 
   Attributes:
     start (datetime.datetime): The start date of the interval.
-    end (datetime.datetime): The stop date of the interval.
-    step (datetime.timedelta): Datetime resolution. Defaults to 1 day.
+    end (datetime.datetime): The (excluded) end date of the interval.
+    step (datetime.timedelta): Length of each block (no default).
   """
 
   start: datetime
