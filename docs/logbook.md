@@ -65,8 +65,8 @@ on the project VM with the image's eccodes 2.48, threads scheduler):
   - Cause: gcsfs (2026.10.0) passes `requests_timeout=None` to every aiohttp request by default,
     and aiohttp (3.14.5) turns an explicit `None` into `ClientTimeout(total=None)`, which removes
     its own 5-minute default. Any GCS read can wait forever, at any arco-make commit.
-  - Setting `requests_timeout` in the recipe is **not** a fix: see N8. A timeout must come with
-    N8 fixed, or it turns the hang into silent data loss.
+  - Setting `requests_timeout` in the recipe is **not** a fix with code older than `efd3d60`: see
+    N8. Without the N8 fix, a timeout turns the hang into silent data loss.
   - The PR's code finished this window once (2 min 20 s); it has the same dependencies, so it is
     exposed the same way.
 - **N8, silent loss of source chunks (all commits) [Moby-Dick]:** attempt 5 ran the old code with
@@ -86,8 +86,23 @@ on the project VM with the image's eccodes 2.48, threads scheduler):
   - Exposure: every source opened with `engine = "zarr"` over fsspec (ERA5 in ARCO-OCEAN). The
     published download ran with no timeout, so the trigger there is a connection error that
     outlasts gcsfs's 6 retries. Days without such an error are exact.
-  - Fix (follow-up, with N7): open Zarr sources with `FSStore(..., exceptions=(KeyError,))` so that
-    I/O errors raise, then add timeouts and retries per block (group 7).
+  - Fixed in this PR (`efd3d60`, maintainer's decision): remote Zarr inputs (download parts,
+    `unpack` pieces, `[read]` tables) are opened as `FSStore(..., exceptions=(KeyError,))`, so a
+    failed read raises; a missing object is still a fill value. Tests in
+    `tests/test_read_errors.py`. Timeouts and retries per block stay in group 7: with this fix, a
+    timeout aborts the piece instead of losing data. Window 1 with `efd3d60` and the pinned recipe:
+    identical to `847b6f2` (37 arrays, bit for bit), 3 min 7 s, 37 GB.
+  - Side effect: on S3 buckets that answer 403 for a missing object (no list permission), a
+    sparse store now fails instead of reading fill values. No ARCO-OCEAN source is affected (ERA5
+    on GCS answers 404).
+- **N9, the Copernicus Marine toolbox has the same flaw [Moby-Dick]:** the fork used by arco-make
+  (`copernicusmarine` 2.4.1, branch `arco-make`, `3009add`) reads Zarr through its own
+  `CustomS3StoreZarrV2`. Its `__getitem__` turns every S3 error response (`ClientError`: 403,
+  500, 503 SlowDown...) into `KeyError`, which zarr reads as a missing chunk. Its retry wrapper
+  tries 9 times over about 8.5 minutes first, so only a long outage or expired credentials during
+  a read would lose data. Connection errors (no response) are raised. Seen in the code, not in a
+  run. Fix belongs in the fork: raise unless the error is 404/`NoSuchKey`. Exposed: every
+  Copernicus Marine variable (GLORYS12, WAVERYS, ...).
 - **Window 2, result:** apart from those two fields, explained by the old run's lost chunks, the
   37 arrays are identical. The PR's output matches the source where the old one does not.
 - **[Moby-Dick]** A production piece could hang the same way rather than fail. A killed piece leaves
