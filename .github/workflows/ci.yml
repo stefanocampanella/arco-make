@@ -49,4 +49,4 @@ jobs:
       - name: Install system libraries
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenmpi-dev
       - run: uv sync --frozen --extra dev
-      - run: uv run --frozen pytest --cov=arcomake --cov-report=term-missing
+      - run: uv run --frozen pytest --cov=arcomake --cov-report=term-missing --cov-fail-under=80

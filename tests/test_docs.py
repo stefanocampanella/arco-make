@@ -8,6 +8,7 @@ import tomllib
 
 import pytest
 
+from arcomake.download import DownloadConfig
 from arcomake.processing_utils import ProcessingStepConfig
 from arcomake.steps import registered_steps, render_reference
 
@@ -26,6 +27,13 @@ def toml_examples() -> list[tuple[str, str]]:
     section = reference.split(f"## `{name}`")[1].split("\n## ")[0]
     examples += [(name, block) for block in re.findall(r"```toml\n(.*?)```", section, re.S)]
   return examples
+
+
+def test_readme_recipe_is_valid():
+  """The recipe shown in the README loads as a download recipe."""
+  readme = (ROOT / "README.md").read_text()
+  (example,) = re.findall(r"```toml\n(.*?)```", readme, re.S)
+  DownloadConfig.model_validate(tomllib.loads(example))
 
 
 @pytest.mark.parametrize(("name", "example"), toml_examples())

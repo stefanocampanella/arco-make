@@ -4,7 +4,7 @@ From: ubuntu:26.04
 %labels
     Maintainer Stefano Campanella
     Version 0.1
-    Description Apptainer image for arco-make compatible with CINECA Leonardo OpenMPI.
+    Description Apptainer image for arco-make, with Open MPI 4.1 (UCX, Slurm, PMIx v3) for running dask-mpi under Slurm.
 
 %files
     pyproject.toml /app/pyproject.toml

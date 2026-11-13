@@ -20,15 +20,15 @@ uv run arco-make --help                         # CLI entry point (arcomake:cli)
 
 Tests live in `tests/`: synthetic fixtures in `conftest.py` (grid with a coastline and slope, Feb 29 crossed), sample recipes in `tests/data/` (rendered with `@SOURCES@` replaced), and CLI end-to-end runs via click's `CliRunner`. Known bugs are pinned as `xfail(strict=True)`; the commit fixing a bug removes its marker. `unpack`, `process` and `compute-climatology` default to `--dask-setup mpi`: pass `threads` in tests.
 
-CI (`.github/workflows/ci.yml`): lint, reuse, gitleaks secret scan, tests. The Apptainer image build is separate.
+CI (`.github/workflows/ci.yml`): lint, reuse, gitleaks secret scan, tests with a coverage gate of 80 %. The Apptainer image build is separate.
 
 Code style: **2-space indentation**, line length 100 (ruff config in `pyproject.toml`). Files start with an SPDX MIT header.
 
 ## CLI subcommands
 
-Registered in `src/arcomake/__init__.py`: `download`, `unpack`, `process`, `compute-climatology` (from `climatology.py`), `validate`. Each has a Pydantic config model (`DownloadConfig`, `UnpackConfig`, `ProcessConfig`, `ClimatologyConfig`, `ValidateConfig`) loaded via `cli_utils.read_configs(path, schema=..., inject=...)`; CLI options like `--start/--end` are injected into the parsed TOML before validation. Most models use `extra="forbid"`, so unknown TOML keys fail validation.
+Registered in `src/arcomake/__init__.py`: `download`, `unpack`, `process`, `compute-climatology` (from `climatology.py`), `validate`, and `steps` (prints the step reference). Each data command has a Pydantic config model (`DownloadConfig`, `UnpackConfig`, `ProcessConfig`, `ClimatologyConfig`, `ValidateConfig`) loaded via `cli_utils.read_configs(path, schema=..., inject=...)`; CLI options like `--start/--end` are injected into the parsed TOML before validation, and the output check runs after (it uses `[save] storage_options`). Checkpointing is configured as `[datasets.<name>.checkpointing]` with `step` and optional `compressor`.
 
-Note: the README is partly stale — it mentions a `stats` command, a `sample_configs/` directory and a `checkpointing_step` key, none of which exist. Checkpointing is configured as `[datasets.<name>.checkpointing]` with `step` and optional `compressor`.
+**Documentation is tested:** `docs/steps.md` must equal `arco-make steps` (regenerate with `uv run arco-make steps > docs/steps.md` after changing a step or its docstring), every TOML example in a step docstring must validate, and the README recipe must load as a `DownloadConfig`.
 
 ## Architecture
 
