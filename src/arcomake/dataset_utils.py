@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal
 
 import fsspec
 import xarray as xr
+import zarr.errors
 import zarr.storage
 from dask.delayed import Delayed
 from dask.diagnostics import ProgressBar
@@ -494,7 +495,8 @@ def safe_to_zarr(
       }
       if not to_zarr_kwargs["encoding"]:
         to_zarr_kwargs.pop("encoding", None)
-    except Exception:
+    except zarr.errors.GroupNotFoundError:
+      # Nothing written yet (e.g. mode "a" on a new store): every encoding applies.
       pass
 
   close_fn = getattr(store, "close", None)

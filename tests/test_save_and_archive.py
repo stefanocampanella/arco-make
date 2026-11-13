@@ -67,9 +67,14 @@ def test_safe_to_zarr_default_compression(ocean_ds: xr.Dataset, tmp_path: pathli
   assert zarr.open_group(str(tmp_path / "out.zarr"), mode="r")["thetao"].compressor is not None
 
 
-@pytest.mark.xfail(
-  reason="B13: errors while pruning encodings on append are swallowed", strict=True
-)
+def test_safe_to_zarr_append_mode_on_a_new_store(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
+  """Mode "a" on a store that does not exist yet writes it, with the configured encodings."""
+  path = tmp_path / "out.zarr"
+  configs = SaveConfig(encoding={"time": {"units": "days since 2020-01-01"}})
+  safe_to_zarr(ocean_ds, path, configs=configs, mode="a")
+  assert zarr.open_group(str(path), mode="r")["time"].attrs["units"] == "days since 2020-01-01"
+
+
 def test_safe_to_zarr_append_does_not_hide_store_errors(
   ocean_ds: xr.Dataset, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ):
