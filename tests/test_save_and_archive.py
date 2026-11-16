@@ -49,6 +49,29 @@ def test_safe_to_zarr_whole_dimension_with_split_dask_chunks(tmp_path: pathlib.P
   np.testing.assert_array_equal(out.values, data)
 
 
+@pytest.mark.parametrize("key", ["_FillValue", "fill_value"])
+def test_safe_to_zarr_sets_the_fill_value(key: str, tmp_path: pathlib.Path):
+  """`[save.encoding.<var>] _FillValue` (or `fill_value`) becomes the stored fill value.
+
+  The model forbade `_FillValue` and passed `fill_value`, which xarray rejects: the write failed
+  after the first interval was downloaded.
+  """
+  ds = xr.Dataset({"v": ("x", np.array([1.0, np.nan, 3.0]))})
+  conf = SaveConfig.model_validate({"encoding": {"v": {key: -9.0}}})
+  safe_to_zarr(ds, tmp_path / "out.zarr", configs=conf)
+  assert zarr.open_array(str(tmp_path / "out.zarr" / "v"), mode="r").fill_value == -9.0
+  xr.testing.assert_identical(xr.open_zarr(tmp_path / "out.zarr").load(), ds)
+
+
+def test_safe_to_zarr_packs_with_scale_factor(tmp_path: pathlib.Path):
+  """`scale_factor`, `add_offset` and an integer `dtype` pack floats; they decode on reading."""
+  ds = xr.Dataset({"v": ("x", np.array([10.0, 10.5, 11.0]))})
+  encoding = {"v": {"dtype": "int16", "scale_factor": 0.5, "add_offset": 10.0}}
+  safe_to_zarr(ds, tmp_path / "out.zarr", configs=SaveConfig.model_validate({"encoding": encoding}))
+  assert zarr.open_array(str(tmp_path / "out.zarr" / "v"), mode="r")[:].tolist() == [0, 1, 2]
+  np.testing.assert_array_equal(xr.open_zarr(tmp_path / "out.zarr")["v"].values, ds["v"].values)
+
+
 def test_safe_to_zarr_zip_and_append(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
   """A `.zip` destination is a ZipStore; appending along time gives the same data as one write."""
   path = tmp_path / "out.zip"

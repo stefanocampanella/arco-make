@@ -16,7 +16,7 @@ import zarr.storage
 from dask.delayed import Delayed
 from dask.diagnostics import ProgressBar
 from numcodecs import Blosc
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from xarray.backends.common import BackendEntrypoint
 from xarray.coders import CFDatetimeCoder, CFTimedeltaCoder
 from zarr.storage import DirectoryStore, ZipStore
@@ -157,14 +157,26 @@ DatasetPartConfig = (
 
 
 class VariableEncodingConfig(BaseModel):
-  model_config = ConfigDict(extra="forbid")
+  """One variable's encoding in `[save.encoding]`, as `xarray.Dataset.to_zarr` takes it.
+
+  The fill value is `_FillValue` (`fill_value` is accepted too); `scale_factor` and `add_offset`
+  pack floats into integers. `chunks` are explicit sizes, one per dimension.
+  """
+
+  model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
   units: str | None = None
   calendar: str | None = None
   dtype: str | None = None
-  chunks: list[int] | None = None
+  chunks: list[Annotated[int, Field(ge=1)]] | None = None
   compressor: CompressorConfig | None = None
-  fill_value: float | int | str | bool | None = None
+  fill_value: float | int | str | bool | None = Field(
+    default=None,
+    validation_alias=AliasChoices("_FillValue", "fill_value"),
+    serialization_alias="_FillValue",
+  )
+  scale_factor: float | None = None
+  add_offset: float | None = None
 
 
 StoredChunk = Annotated[int, Field(ge=-1)]
@@ -486,8 +498,9 @@ def safe_to_zarr(
     if configs.compressor is not None
     else None
   )
+  # by_alias: encodings use xarray's names (`_FillValue`).
   to_zarr_kwargs = configs.model_dump(
-    exclude_none=True, exclude={"chunks", "compressor", "storage_options"}
+    exclude_none=True, by_alias=True, exclude={"chunks", "compressor", "storage_options"}
   )
 
   if chunk_conf is not None:
