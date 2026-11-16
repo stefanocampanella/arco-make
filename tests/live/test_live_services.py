@@ -131,3 +131,27 @@ def test_download_from_live_service(name: str, tmp_path: pathlib.Path):
   assert expected.low <= finite.min() and finite.max() <= expected.high, (
     f"values outside [{expected.low}, {expected.high}]: {finite.min()}..{finite.max()}"
   )
+
+
+def test_copernicusmarine_keeps_native_chunks():
+  """The backend opens Copernicus Marine data with the store's own chunks.
+
+  It passes `chunk_size_limit=False`, which the toolbox does not document (it accepts -1 or a
+  positive limit): today a falsy limit skips the toolbox's rechunking (which would double the
+  time chunk of this dataset). If a toolbox release changes that, this check fails.
+  """
+  expected = CASES["copernicusmarine"]
+  settings.load()
+  if not credentials_available(expected):
+    pytest.fail(f"no credentials: set {', '.join(expected.credentials)}")
+  ds = xr.open_dataset(
+    "cm://cmems_mod_glo_phy_my_0.083deg_P1D-m",
+    engine="copernicusmarine",
+    chunks={},
+    variables=["zos"],
+    start_datetime="2012-01-01",
+    end_datetime="2012-01-04",
+  )
+  da = ds["zos"]
+  native = da.encoding["preferred_chunks"]
+  assert da.data.chunksize == tuple(native[dim] for dim in da.dims), (da.data.chunksize, native)

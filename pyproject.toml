@@ -8,7 +8,10 @@ dependencies = [
     "cfgrib",
     "cftime",
     "click",
-    "copernicusmarine@git+https://github.com/stefanocampanella/copernicus-marine-toolbox.git@arco-make",
+    # Upstream main after the merge of COPERNICUSMARINE_MAX_POOL_CONNECTIONS (#532), not yet in a
+    # release; move to the first release that has it. The backend relies on chunk_size_limit=False
+    # keeping the native chunks (undocumented): tests/live checks it.
+    "copernicusmarine @ git+https://github.com/mercator-ocean/copernicus-marine-toolbox.git@f66a8b8",
     "dask",
     "dask_mpi",
     "eccodes",
