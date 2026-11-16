@@ -1,0 +1,54 @@
+name: Live services
+
+# One tiny download per remote backend from the real services (tests/live), to catch changes in the
+# services, in their client libraries or in arco-make's use of them. Not a merge gate.
+#
+# Never runs on pull requests: their code would run with the secrets, and the logs are public.
+# The secrets belong to the `live-services` environment; restrict its deployment branches to
+# master in the repository settings, so that no other branch can read them.
+on:
+  schedule:
+    - cron: "17 5 * * 1"  # Mondays, 05:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-services
+  cancel-in-progress: false
+
+jobs:
+  live:
+    name: ${{ matrix.backend }}
+    runs-on: ubuntu-latest
+    environment: live-services
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [zarr_gcs, copernicusmarine, earlywarningdatastore, netcdfoverhttp]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.13"
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenmpi-dev
+      - run: uv sync --frozen --extra dev
+      - name: Download from the live service
+        # Each backend gets only its own credentials. The distribution's ecCodes is too old for
+        # GloFAS GRIB: eccodeslib bundles the library (keep it at the version of eccodes in uv.lock).
+        # --show-capture=no keeps the services' own log lines (which may carry temporary tokens)
+        # out of the public log.
+        env:
+          COPERNICUSMARINE_SERVICE_USERNAME: ${{ matrix.backend == 'copernicusmarine' && secrets.COPERNICUSMARINE_SERVICE_USERNAME || '' }}
+          COPERNICUSMARINE_SERVICE_PASSWORD: ${{ matrix.backend == 'copernicusmarine' && secrets.COPERNICUSMARINE_SERVICE_PASSWORD || '' }}
+          CDSAPI_URL: ${{ matrix.backend == 'earlywarningdatastore' && secrets.CDSAPI_URL || '' }}
+          CDSAPI_KEY: ${{ matrix.backend == 'earlywarningdatastore' && secrets.CDSAPI_KEY || '' }}
+        run: >
+          uv run --frozen --with 'eccodeslib==2.49.*'
+          pytest -m network tests/live -k ${{ matrix.backend }}
+          -p no:cacheprovider --show-capture=no -q

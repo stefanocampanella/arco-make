@@ -104,8 +104,9 @@ all = "error"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["-ra", "--strict-markers"]
+# Live checks are deselected by default; `pytest -m network tests/live` runs them.
+addopts = ["-ra", "--strict-markers", "-m", "not network"]
 xfail_strict = true
 markers = [
-    "network: needs network access and credentials; never run in CI",
+    "network: needs the live services and their credentials; never run on pull requests",
 ]
