@@ -22,6 +22,25 @@ import arcomake  # noqa: F401  (registers the `arcomake` accessor)
 
 DATA_DIR = pathlib.Path(__file__).parent / "data"
 
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+  parser.addoption(
+    "--live",
+    action="store_true",
+    help="run the live checks (marker `network`): needs the network and service credentials",
+  )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+  """Skip the live checks unless `--live` is given, even when they are named explicitly."""
+  if config.getoption("--live"):
+    return
+  skip = pytest.mark.skip(reason="live check: run with --live (network and credentials)")
+  for item in items:
+    if "network" in item.keywords:
+      item.add_marker(skip)
+
+
 LATITUDES = np.arange(-1.75, 2.0, 0.5)
 LONGITUDES = np.arange(0.25, 4.0, 0.5)
 DEPTHS = np.array([0.5, 2.0, 5.0])
