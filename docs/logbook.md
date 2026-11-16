@@ -66,7 +66,7 @@ with 32 cores and 110 GB, the image's eccodes 2.48, threads scheduler; locations
   - Cause: gcsfs (2026.10.0) passes `requests_timeout=None` to every aiohttp request by default,
     and aiohttp (3.14.5) turns an explicit `None` into `ClientTimeout(total=None)`, which removes
     its own 5-minute default. Any GCS read can wait forever, at any arco-make commit.
-  - Setting `requests_timeout` in the recipe is **not** a fix with code older than `efd3d60`: see
+  - Setting `requests_timeout` in the recipe is **not** a fix with code older than `f9fcd45`: see
     N8. Without the N8 fix, a timeout turns the hang into silent data loss.
   - The PR's code finished this window once (2 min 20 s); it has the same dependencies, so it is
     exposed the same way.
@@ -87,11 +87,11 @@ with 32 cores and 110 GB, the image's eccodes 2.48, threads scheduler; locations
   - Exposure: every source opened with `engine = "zarr"` over fsspec (ERA5 in ARCO-OCEAN). The
     published download ran with no timeout, so the trigger there is a connection error that
     outlasts gcsfs's 6 retries. Days without such an error are exact.
-  - Fixed in this PR (`efd3d60`, maintainer's decision): remote Zarr inputs (download parts,
+  - Fixed in this PR (`f9fcd45`, maintainer's decision): remote Zarr inputs (download parts,
     `unpack` pieces, `[read]` tables) are opened as `FSStore(..., exceptions=(KeyError,))`, so a
     failed read raises; a missing object is still a fill value. Tests in
     `tests/test_read_errors.py`. Timeouts and retries per block stay in group 7: with this fix, a
-    timeout aborts the piece instead of losing data. Window 1 with `efd3d60` and the pinned recipe:
+    timeout aborts the piece instead of losing data. Window 1 with `f9fcd45` and the pinned recipe:
     identical to `847b6f2` (37 arrays, bit for bit), 3 min 7 s, 37 GB.
   - Side effect: on S3 buckets that answer 403 for a missing object (no list permission), a
     sparse store now fails instead of reading fill values. No ARCO-OCEAN source is affected (ERA5
@@ -109,15 +109,15 @@ with 32 cores and 110 GB, the image's eccodes 2.48, threads scheduler; locations
 - **[Moby-Dick]** A production piece could hang the same way rather than fail. A killed piece leaves
   a partial store that must be rewritten with `--overwrite`, as the failed pieces were; the cost is
   lost time, not wrong data, provided every killed piece was rerun.
-- **Comparison, `29a9edd` vs `847b6f2` on window 1:** the array metadata were identical (dtype,
+- **Comparison, `b6b2cd7` vs `847b6f2` on window 1:** the array metadata were identical (dtype,
   chunks, compressor, fill value, attributes), but ERA5 values (`2t`, `msl`, `ssrd`...) and a few
   wave points differed by a few float32 ULP, e.g. 1.2e-4 K on `2t`.
   - Cause: the B5 fix selected the time range with an index array. That rechunked the hourly
     source (24 → 16 steps per chunk), so the daily resample summed in another order.
-  - Fixed in `d7b49dc` (slice selection), with a test on the chunks.
+  - Fixed in `210bdbd` (slice selection), with a test on the chunks.
   - Note: any rechunking before a reduction changes float32 results at this level. "Same output"
     has to be checked bit for bit, not with a tolerance.
-- **PR head `d7b49dc`, same recipe and host:** window 1: 3 min 27 s, 35.5 GB, identical; window 2:
+- **PR head `210bdbd`, same recipe and host:** window 1: 3 min 27 s, 35.5 GB, identical; window 2:
   2 min 20 s, 44 GB, identical apart from the old run's lost chunks (N8); window 3: 5 min 12 s,
   50 GB, identical (37 arrays each, compared bit for bit with metadata and encodings). Peak memory
   is unchanged by the PR.
