@@ -71,11 +71,20 @@ def resolve(name: str) -> Callable[..., xr.Dataset]:
   Raises:
     ValueError: if `name` is not a step.
   """
+  return _lookup(name)[0]
+
+
+def _lookup(name: str) -> tuple[StepFunction, bool]:
+  """The function of step `name`, taking the dataset first, and whether it is a registered step.
+
+  The one place that decides what a name means, for loading (`check_arguments`) and running
+  (`resolve`) alike.
+  """
   if name in _REGISTRY:
-    return _REGISTRY[name]
+    return _REGISTRY[name], True
   if name in DATASET_METHODS:
-    method = getattr(xr.Dataset, name)
-    return lambda dataset, **arguments: method(dataset, **arguments)
+    # The method as a plain function of the class: `method(dataset, **arguments)`.
+    return getattr(xr.Dataset, name), False
   raise ValueError(f"Unknown processing step {name!r}. Available steps: {', '.join(step_names())}")
 
 
@@ -88,11 +97,7 @@ def check_arguments(name: str, arguments: Mapping[str, Any]) -> None:
   Raises:
     ValueError: describing the first problem found.
   """
-  function = _REGISTRY.get(name) or (getattr(xr.Dataset, name) if name in DATASET_METHODS else None)
-  if function is None:
-    raise ValueError(
-      f"Unknown processing step {name!r}. Available steps: {', '.join(step_names())}"
-    )
+  function, registered = _lookup(name)
   signature = inspect.signature(function)
   parameters = list(signature.parameters.values())[1:]  # the first one is the dataset
   if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters):
@@ -106,7 +111,7 @@ def check_arguments(name: str, arguments: Mapping[str, Any]) -> None:
     bound = signature.bind(None, **arguments)
   except TypeError as exc:
     raise ValueError(f"Invalid arguments for step {name!r}: {exc}") from None
-  if name not in _REGISTRY:
+  if not registered:
     return  # Dataset methods: binding is the check (their annotations are not pydantic-friendly).
   dataset_parameter = next(iter(signature.parameters))
   for parameter_name, value in bound.arguments.items():
