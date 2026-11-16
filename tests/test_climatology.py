@@ -10,7 +10,13 @@ import pydantic
 import pytest
 import xarray as xr
 
-from arcomake.climatology import ClimatologyConfig, _compute_climatology, _window_weights
+from arcomake.climatology import (
+  ClimatologyConfig,
+  _compute_climatology,
+  _compute_series,
+  _read_block,
+  _window_weights,
+)
 
 PERIOD = 6
 N_PERIODS = 5
@@ -154,6 +160,31 @@ def test_flox_gives_the_same_statistics():
   mean_f, var_f = _compute_climatology(ds, period=365, window=7, bins="day_of_year", use_flox=True)
   np.testing.assert_allclose(mean_f.x.values, mean.x.values, rtol=1e-10)
   np.testing.assert_allclose(var_f.x.values, var.x.values, rtol=1e-10)
+
+
+def test_in_memory_series_equal_the_lazy_statistics():
+  """One series at a time (S1): one read pass, then the window in NumPy, by latitude bands."""
+  rng = np.random.default_rng(1)
+  time = pd.date_range("2019-03-01", "2021-07-01", freq="1D", inclusive="left")
+  values = rng.standard_normal((time.size, 70, 3)).astype("float32")
+  values[10:40, :5] = np.nan  # gaps
+  values[:, 7] = np.nan  # a row without data
+  ds = xr.Dataset({"x": (("time", "lat", "lon"), values)}, coords={"time": time}).chunk(time=50)
+  args = {"period": 365, "window": 7, "weighting": "gaussian", "weighting_scale": 2.0}
+  mean, var = _compute_climatology(ds, bins="day_of_year", **args)
+  mean_s, var_s = _compute_series(ds, time_dim="time", bins="day_of_year", **args)
+  # Welford in float64 against float32 reductions: equal to float32 precision.
+  np.testing.assert_allclose(mean_s.x.values, mean.x.values, rtol=1e-5, atol=1e-6, equal_nan=True)
+  np.testing.assert_allclose(var_s.x.values, var.x.values, rtol=1e-5, atol=1e-6, equal_nan=True)
+  assert mean_s.x.dtype == np.float32 and mean_s.x.dims == ("time", "lat", "lon")
+
+
+def test_read_blocks_follow_the_input_chunks():
+  """Blocks of about 1 GB, a whole number of the input's time chunks (or shards), at least one."""
+  da = xr.DataArray(np.zeros((1000, 721, 1440), dtype="float32"), dims=("time", "lat", "lon"))
+  assert _read_block(da, "time") == 240  # 4.15 MB per step
+  assert _read_block(da.chunk(time=50), "time") == 200
+  assert _read_block(da.chunk(time=500), "time") == 500  # never less than one chunk
 
 
 def test_window_weights():

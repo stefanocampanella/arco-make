@@ -38,16 +38,24 @@
 # which would further distort the results. However, the quantities computed here are aimed at standardizing the input
 # features in a deep-learning model, and therefore such approximations are reasonably acceptable.
 import datetime
+import itertools
 import logging
 import operator
-from collections.abc import Callable, Sequence
+import os
+import time
+from collections.abc import Callable, Hashable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 
 import click
 import dask
+import dask.array
+import fsspec
+import numba
 import numpy as np
 import xarray as xr
+import zarr
 from dask.graph_manipulation import bind
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -111,6 +119,14 @@ class ClimatologyConfig(BaseModel):
   )
   use_flox: bool = Field(
     default=False, description="Whether to use flox for grouped periodic reductions"
+  )
+  split_dims: list[str] | None = Field(
+    default=None,
+    description=(
+      "Compute one series at a time (in memory, written region by region): each data variable,"
+      ' and each index along these dimensions (e.g. ["depth"]; [] for one series per variable).'
+      " Default: all variables in one Dask graph."
+    ),
   )
   read: ReadConfig
   preprocess: list[ProcessingStepConfig] = Field(default_factory=list)
@@ -238,6 +254,10 @@ def compute_climatology(
         # of the anomalies using vectorized reductions across periods and window smoothing.
         if not dataset.data_vars:
           raise ValueError("Input dataset contains no data variables.")
+        if configs.split_dims is not None:
+          _compute_by_series(dataset, configs, climatology_output_path, anomaly_std_output_path)
+          logger.info("Climatology writes completed, one series at a time.")
+          return
         climatology, anomaly_var = _compute_climatology(
           dataset,
           time_dim=configs.time_dim,
@@ -571,3 +591,296 @@ def _compute_climatology(
     )
 
   return as_input_types(climatology), as_input_types(variance)
+
+
+def _rolled_into(out: np.ndarray, src: np.ndarray, shift: int) -> np.ndarray:
+  """`out[i] = src[(i + shift) % n]` along axis 0, into a preallocated array (no rolled copy)."""
+  n = src.shape[0]
+  k = shift % n
+  out[: n - k] = src[k:]
+  out[n - k :] = src[:k]
+  return out
+
+
+def _window_statistics_in_memory(
+  count: np.ndarray,
+  mean: np.ndarray,
+  m2: np.ndarray,
+  offsets: list[int],
+  weights: np.ndarray,
+  band: int = 1 << 15,
+) -> tuple[np.ndarray, np.ndarray]:
+  """The window step of `_compute_climatology` on in-memory per-bin statistics (bins on axis 0).
+
+  Same formulas as the lazy path, accumulated in place in float64 over bands of `band` points
+  (all axes after the bins, flattened), in parallel, so that memory stays a few times the size of
+  one band per thread whatever the dimensions.
+  """
+  shape = mean.shape
+  count, mean, m2 = (a.reshape(shape[0], -1) for a in (count, mean, m2))
+  climatology = np.empty(mean.shape, dtype=np.float64)
+  variance = np.empty(mean.shape, dtype=np.float64)
+  rows = mean.shape[1]
+
+  def window_band(start: int) -> None:
+    part = (slice(None), slice(start, start + band))
+    n = count[part].astype(np.float64)
+    mean0 = np.nan_to_num(mean[part].astype(np.float64), nan=0.0)
+    m2_part = np.nan_to_num(m2[part].astype(np.float64), nan=0.0)
+    n_mean = n * mean0
+    v1, v2, total = np.zeros_like(n), np.zeros_like(n), np.zeros_like(n)
+    weighted_sum = np.zeros_like(n)
+    a, b = np.empty_like(n), np.empty_like(n)
+    for offset, w in zip(offsets, weights, strict=True):
+      _rolled_into(a, n, offset)
+      v1 += w * a
+      v2 += w * w * a
+      weighted_sum += w * _rolled_into(b, n_mean, offset)
+    with np.errstate(invalid="ignore", divide="ignore"):
+      clim = np.where(v1 > 0, weighted_sum / v1, np.nan)
+    clim0 = np.nan_to_num(clim, nan=0.0)
+    for offset, w in zip(offsets, weights, strict=True):
+      _rolled_into(b, mean0, offset)
+      b -= clim0
+      b *= b
+      b *= _rolled_into(a, n, offset)
+      b += _rolled_into(a, m2_part, offset)
+      total += w * b
+    with np.errstate(invalid="ignore", divide="ignore"):
+      denominator = v1 - np.where(v1 > 0, v2 / v1, np.nan)
+      var = np.where(denominator > 0, total / denominator, np.nan)
+    climatology[part] = clim
+    variance[part] = var
+
+  # Bands are independent, and NumPy releases the GIL: compute them in parallel.
+  with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1)) as pool:
+    list(pool.map(window_band, range(0, rows, band)))
+  return climatology.reshape(shape), variance.reshape(shape)
+
+
+def _series(dataset: xr.Dataset, split_dims: list[str]) -> list[tuple[str, dict[str, int]]]:
+  """(variable, {dim: index}) for every series: each variable, each index of its split dims."""
+  series = []
+  for name, var in dataset.data_vars.items():
+    dims = [d for d in split_dims if d in var.dims]
+    for index in itertools.product(*(range(var.sizes[d]) for d in dims)):
+      series.append((str(name), dict(zip(dims, index, strict=True))))
+  return series
+
+
+def _compute_series(
+  piece: xr.Dataset,
+  period: int,
+  window: int,
+  weighting: WeightingType,
+  weighting_scale: float | None,
+  time_dim: str,
+  bins: BinningType,
+) -> tuple[xr.Dataset, xr.Dataset]:
+  """Climatology and variance of one series, in memory: one read pass, then the window in NumPy."""
+  if bins == "day_of_year" and period != 365:
+    raise ValueError(f"day_of_year bins need period = 365, got {period}")
+  half = window // 2
+  offsets = list(range(-half, window - half))
+  weights = _window_weights(offsets, weighting, scale=weighting_scale)
+  results: tuple[dict[str, xr.DataArray], dict[str, xr.DataArray]] = ({}, {})
+  for name, var in piece.data_vars.items():
+    order = [time_dim, *(d for d in var.dims if d != time_dim)]
+    started = time.monotonic()
+    count, mean, m2 = _stream_bin_statistics(var, period, bins, time_dim)
+    read = time.monotonic()
+    statistics = _window_statistics_in_memory(count, mean, m2, offsets, weights)
+    logger.info(
+      f"{name}: read and binned in {read - started:.0f} s, window in {time.monotonic() - read:.0f} s"
+    )
+    dtype = var.dtype if np.issubdtype(var.dtype, np.floating) else np.float64
+    coords: dict[Hashable, Any] = {d: var[d] for d in order[1:] if d in var.coords}
+    coords[time_dim] = np.arange(period)
+    for out, values in zip(results, statistics, strict=True):
+      out[str(name)] = xr.DataArray(values.astype(dtype), dims=order, coords=coords).transpose(
+        *var.dims
+      )
+  climatology, variance = xr.Dataset(results[0]), xr.Dataset(results[1])
+  assert isinstance(climatology, xr.Dataset) and isinstance(variance, xr.Dataset)
+  return climatology, variance
+
+
+def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Dataset:
+  """The outputs' layout, lazily (never computed): `period` bins along time, other dims kept."""
+  data_vars = {}
+  for name, var in dataset.data_vars.items():
+    shape = tuple(period if d == time_dim else var.sizes[d] for d in var.dims)
+    dtype = var.dtype if np.issubdtype(var.dtype, np.floating) else np.float64
+    data_vars[name] = (var.dims, dask.array.zeros(shape, dtype=dtype, chunks=-1))
+  coords = {name: coord for name, coord in dataset.coords.items() if time_dim not in coord.dims}
+  coords[time_dim] = np.arange(period)
+  return xr.Dataset(data_vars, coords=coords)
+
+
+def _compute_by_series(
+  dataset: xr.Dataset,
+  configs: ClimatologyConfig,
+  climatology_output_path: str,
+  anomaly_std_output_path: str,
+) -> None:
+  """S1: one series (variable, index of `split_dims`) at a time, written into its region.
+
+  The outputs' metadata are written first, from a template with the postprocess steps applied;
+  then every series is computed in memory (`_compute_series`), postprocessed and written into its
+  region. Postprocess steps therefore have to work on one series (attributes, renames, chunking).
+  """
+  assert configs.split_dims is not None
+  outputs = (
+    (climatology_output_path, configs.postprocess_climatology),
+    (anomaly_std_output_path, configs.postprocess_anomaly_std),
+  )
+  for path, _ in outputs:
+    if str(path).endswith(".zip"):
+      raise ValueError("split_dims writes region by region: zip outputs are not supported")
+  template = _output_template(dataset, configs.period, configs.time_dim)
+  with ExitStack() as store_stack:
+    for path, steps in outputs:
+      safe_to_zarr(
+        template.arcomake.process(steps=steps) if steps else template,
+        path,
+        configs=configs.save,
+        compute=False,
+        store_stack=store_stack,
+      )
+  storage_options = configs.save.storage_options or {}
+  # Stored chunks of every output variable: results are chunked alike, so that Dask writes the
+  # chunks of a region in parallel.
+  stored_chunks = [
+    {
+      name: var.encoding["chunks"]
+      for name, var in xr.open_zarr(
+        path, storage_options=storage_options or None, consolidated=False
+      ).data_vars.items()
+    }
+    for path, _ in outputs
+  ]
+
+  def write(results: tuple[xr.Dataset, xr.Dataset], label: str) -> None:
+    writing = time.monotonic()
+    for (path, steps), result, chunks in zip(outputs, results, stored_chunks, strict=True):
+      if steps:
+        result = result.arcomake.process(steps=steps)
+      result = result.drop_attrs().chunk(
+        {
+          dim: size
+          for name in result.data_vars
+          for dim, size in zip(result[name].dims, chunks[str(name)], strict=True)
+        }
+      )
+      result.to_zarr(
+        path, region="auto", mode="r+", consolidated=False, storage_options=storage_options or None
+      )
+    logger.info(f"{label} written in {time.monotonic() - writing:.0f} s")
+
+  series = _series(dataset, configs.split_dims)
+  started = time.monotonic()
+  # Each series is written in the background while the next one is read.
+  with ThreadPoolExecutor(max_workers=1) as writer:
+    pending = None
+    for number, (name, index) in enumerate(series, start=1):
+      piece = dataset[[name]].isel({d: slice(i, i + 1) for d, i in index.items()})
+      climatology, variance = _compute_series(
+        piece,
+        period=configs.period,
+        window=configs.window,
+        weighting=configs.weighting,
+        weighting_scale=configs.weighting_scale,
+        time_dim=configs.time_dim,
+        bins=configs.bins,
+      )
+      anomaly_std = np.sqrt(variance.clip(min=0.0))
+      assert isinstance(anomaly_std, xr.Dataset)
+      if pending is not None:
+        pending.result()  # one write at a time; errors surface here
+      pending = writer.submit(write, (climatology, anomaly_std), f"{name} {index}")
+      elapsed = time.monotonic() - started
+      logger.info(
+        f"Series {number}/{len(series)} ({name} {index}) computed; {elapsed / number:.0f} s per"
+        f" series, {elapsed / number * (len(series) - number) / 60:.0f} min left"
+      )
+    if pending is not None:
+      pending.result()
+  if configs.save.consolidated is not False:
+    for path, _ in outputs:
+      zarr.consolidate_metadata(fsspec.get_mapper(str(path), **storage_options))
+
+
+def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:
+  """Steps to read at once: about `target_bytes`, a whole number of the input's time chunks.
+
+  Large reads keep many requests in flight (one 4 MB step at a time was latency-bound on S3);
+  following the input's chunks (or shards) means no chunk is fetched twice.
+  """
+  step_bytes = max(
+    1, da.dtype.itemsize * int(np.prod([da.sizes[d] for d in da.dims if d != time_dim]))
+  )
+  steps = max(1, int(target_bytes // step_bytes))
+  chunk = da.chunks[da.get_axis_num(time_dim)][0] if da.chunks is not None else 1
+  return max(chunk, steps // chunk * chunk)
+
+
+def _stream_bin_statistics(
+  da: xr.DataArray, period: int, bins: BinningType, time_dim: str, block: int | None = None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+  """Per-bin count, mean and sum of squared deviations of one series, streaming over time.
+
+  Reads `block` steps at a time (by default about 1 GB, in whole chunks along time: see
+  `_read_block`; the next block is read while this one is added) and updates
+  the bins with Welford's algorithm, in float64. Returns arrays with the bins on axis 0 and the
+  other dimensions of `da` (time removed) after it. Memory: about 20 bytes per bin and point.
+  """
+  da = da.transpose(time_dim, ...)
+  size = da.sizes[time_dim]
+  if bins == "day_of_year":
+    labels, _ = day_of_year_bins(da[time_dim])
+  else:
+    labels = np.arange(size) % period
+  shape = (period, *da.shape[1:])
+  count = np.zeros(shape, dtype=np.int32)
+  mean = np.zeros(shape, dtype=np.float64)
+  m2 = np.zeros(shape, dtype=np.float64)
+
+  def read(start: int) -> np.ndarray:
+    return np.asarray(da.isel({time_dim: slice(start, start + steps)}).values)
+
+  steps = _read_block(da, time_dim) if block is None else block
+  starts = list(range(0, size, steps))
+  with ThreadPoolExecutor(max_workers=1) as prefetch:
+    pending = prefetch.submit(read, starts[0]) if starts else None
+    for k, start in enumerate(starts):
+      assert pending is not None
+      values = pending.result()
+      if k + 1 < len(starts):
+        pending = prefetch.submit(read, starts[k + 1])
+      _welford_block(
+        count.reshape(period, -1),
+        mean.reshape(period, -1),
+        m2.reshape(period, -1),
+        values.reshape(len(values), -1),
+        labels[start : start + len(values)],
+      )
+  mean[count == 0] = np.nan
+  return count, mean, m2
+
+
+@numba.njit(parallel=True, nogil=True)
+def _welford_block(count, mean, m2, values, labels):  # pragma: no cover (compiled)
+  """Add row j of `values` (steps × points) to bin `labels[j]`, skipping NaN (Welford, float64).
+
+  One fused pass per step, parallel over points; `count`, `mean` and `m2` are (bins × points).
+  """
+  for j in range(values.shape[0]):
+    b = labels[j]
+    for i in numba.prange(values.shape[1]):
+      x = values[j, i]
+      if np.isfinite(x):
+        n = count[b, i] + 1
+        count[b, i] = n
+        delta = x - mean[b, i]
+        mean[b, i] += delta / n
+        m2[b, i] += delta * (x - mean[b, i])

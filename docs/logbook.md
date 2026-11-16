@@ -289,3 +289,44 @@ pydantic-settings (maintainer's choice) rather than by hand.
   leaks the exported values into later tests. Commands no longer reduce their own `ClickException`
   messages (e.g. the overwrite refusal) to "An error occurred (ClickException)".
 
+## 2026-11-16: statistics on the project VM (S1), zarr v3 and Icechunk
+
+**Decisions (maintainer):** move arco-make to zarr v3, then to Icechunk (in this order, after S1
+and before group 7). Shard sizes will come from Moby-Dick's access patterns and the best object
+size on S3: experiments that read less than a whole shard must still perform well.
+
+**Measured on the project VM, published 0.25° dataset on S3 (read only):**
+- 223 series (23 surface variables + 4 × 50 levels), 11,322 daily steps; 9,496 in 1993–2018.
+  Time-varying data: 10.5 TB raw, 3.86 TB stored (LZ4), 3.24 TB within the reference period.
+- S3 to the VM: 36 chunks/s (85 MB/s) with s3fs's default pool of 10 connections, whatever the
+  number of threads; 136 MB/s (about 1.1 Gbit/s, likely the VM's limit) with 64 connections;
+  29 MB/s with 256.
+- One full series (thetao, depth 0, 1993–2018) with the group 6 code: 234 s, peak 55 GB, limited
+  by reading. Projection: about 15 h for the 223 series one at a time, at least about 7 h if
+  reading is overlapped; the outputs are about 0.3 TB.
+- **S1:** `split_dims` computes one series at a time: per-bin count, mean and sum of squared
+  deviations in one read pass, then the window in NumPy over latitude bands, written into the
+  series' region of outputs whose metadata were written first. Same statistics as the Dask path
+  (tested). Postprocess steps must work on one series.
+- **S1 on real data** (one series per pass, input and outputs on S3 under `experiments/`):
+  - First version (Dask fold per series): 473 s per series and a 105 GB peak, with the recipe's
+    `time = "auto"` read chunks: worse than one graph.
+  - Streaming per-bin statistics (Welford, float64) and the window over point bands, in threads:
+    `2t` 207 s reading and binning, 22 s window, 85 s writing (one chunk at a time), 26 GB.
+  - memray on a `thetao` level: the window took 263 s and 55 GB because its bands were cut along
+    `depth` (size 1 in a series); bands are now cut over flattened points (24 s). Binning was
+    CPU-bound (same 200 s for `2t` and `thetao`, whose chunks are 40 % smaller): a numba kernel
+    (one fused pass per step, parallel over points) replaced eight NumPy passes.
+  - Reads were latency-bound with 64-step blocks (49 steps/s for `thetao`); about 1 GB per read
+    (a whole number of the input's time chunks) gives 71 steps/s. Writes are chunked like the
+    outputs (parallel) and run in the background while the next series is read.
+  - Result for `thetao` depth 0: 122 s reading and binning, 24 s window, 62 s writing (overlapped
+    in a full run), 32 GB peak: about 150–210 s per series, 9–13 h for the 223 series.
+  - One run hung (all threads waiting, no I/O, 14 min) right after writing the outputs' metadata,
+    with `numba.set_num_threads` called among Dask and pool threads; that call is gone, and the
+    rerun finished. Not reproduced, cause not confirmed; long runs keep faulthandler on (SIGABRT
+    dumps the stacks) and a watchdog.
+  - These figures are for today's layout (zarr v2, daily chunks, no shards). The statistics will
+    be recomputed on the new zarr v3, sharded dataset: the read block follows the input's chunks
+    (or shards), and grouping several levels per pass waits for the shard layout.
+
