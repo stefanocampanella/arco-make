@@ -7,6 +7,7 @@ import click
 from pydantic import BaseModel, ConfigDict, Field
 
 from arcomake.cli_utils import (
+  check_aws_profile,
   check_if_overwriting,
   check_path,
   read_configs,
@@ -97,6 +98,7 @@ def process(
     try:
       # Read configs, then check the output path (with the recipe's storage options).
       configs = read_configs(configs_path, schema=ProcessConfig)
+      check_aws_profile(input_path, output_path)
       check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
       # Read input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
@@ -111,6 +113,8 @@ def process(
           configs=configs.save,
           compute=True,
         )
+    except click.ClickException:
+      raise
     except Exception as exc:
       logger.exception("An error occurred while processing dataset")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

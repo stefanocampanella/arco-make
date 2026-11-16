@@ -43,6 +43,37 @@ Every command documents its options with `--help`. Paths may be local or fsspec 
 The usual workflow is `download` (in pieces, e.g. as a SLURM job array), then `unpack`, `validate`, and
 `compute-climatology`.
 
+## Settings and credentials
+
+Credentials and machine settings come from the environment, never from recipes: Copernicus
+Marine (`COPERNICUSMARINE_SERVICE_USERNAME`, `COPERNICUSMARINE_SERVICE_PASSWORD`), EWDS and CDS
+(`CDSAPI_URL`, `CDSAPI_KEY`), cloud storage (`AWS_PROFILE` or `AWS_DEFAULT_PROFILE`, the default
+profile of `s3://` paths;
+`AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `GOOGLE_APPLICATION_CREDENTIALS`), `TMPDIR` (use a
+disk, not RAM: checkpoints and downloads go there) and Dask (`DASK_*`).
+
+Every command first reads `~/.arcomakerc` (or the file named by `ARCOMAKE_RC`; an empty value
+disables it), a dotenv file, and sets the variables the environment lacks. `export KEY=VALUE` lines
+are allowed, so a shell can `source` the same file:
+
+```sh
+# ~/.arcomakerc: holds secrets, so `chmod 600 ~/.arcomakerc`
+export TMPDIR=/scratch/${USER}/tmp
+export AWS_PROFILE=my-bucket-profile
+export CDSAPI_URL=https://ewds.climate.copernicus.eu/api
+export CDSAPI_KEY='...'
+```
+
+Variables already set win, and empty values (`KEY=`) count as unset. Values are checked when a
+command starts, from the environment or the file (`CDSAPI_URL` must be an HTTP URL, `TMPDIR` an
+existing writable directory); errors name the variable, never its value. Keys that are not
+settings are ignored with a warning naming the key; a file other users can read, or a missing file
+named by `ARCOMAKE_RC`, is reported. Also accepted: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_ENDPOINT_URL` and the `ECCODES_*`
+paths. A recipe's `storage_options` (e.g. `profile`) override `AWS_PROFILE`. Runs with `s3://`
+paths or Copernicus Marine parts (both use botocore) fail at once if the AWS profile does not
+exist.
+
 ## Recipes
 
 A download recipe has a top table for the whole dataset, one table per source dataset, steps applied

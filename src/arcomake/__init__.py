@@ -5,6 +5,7 @@
 import click
 
 import arcomake.xarray_accessors  # noqa: F401  (registers the `Dataset.arcomake` accessor)
+from arcomake import settings
 from arcomake.climatology import compute_climatology
 from arcomake.download import download
 from arcomake.process import process
@@ -19,7 +20,14 @@ def cli():
 
   Every command takes a recipe (TOML) and input/output paths, which may be local or fsspec
   URLs. Outputs are never overwritten without --overwrite.
+
+  Settings missing from the environment (credentials, AWS_PROFILE, TMPDIR, DASK_*) are read
+  from ~/.arcomakerc, or the file named by ARCOMAKE_RC: a dotenv file (`export KEY=VALUE`).
   """
+  try:
+    settings.load()
+  except settings.SettingsError as error:
+    raise click.ClickException(str(error)) from None
 
 
 @click.command(name="steps")

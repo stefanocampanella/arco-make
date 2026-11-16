@@ -3,8 +3,8 @@
 """Live checks: one tiny download per remote backend, against the real services.
 
 Marked `network` and skipped unless pytest gets `--live`: they need the network and, for
-Copernicus Marine and EWDS, credentials (environment variables, or the services' own credential
-files). They never run on pull requests (see `.github/workflows/live-services.yml`); run them with
+Copernicus Marine and EWDS, credentials (environment variables, `~/.arcomakerc`, or the services'
+own credential files). They never run on pull requests (see `.github/workflows/live-services.yml`); run them with
 `pytest --live tests/live`.
 
 The services revise their data, so these tests check structure, completeness and plausible values,
@@ -20,7 +20,7 @@ import pytest
 import xarray as xr
 from click.testing import CliRunner, Result
 
-from arcomake import cli
+from arcomake import cli, settings
 
 RECIPES = pathlib.Path(__file__).parent / "recipes"
 
@@ -99,6 +99,7 @@ def failure_report(result: Result) -> str:
 def test_download_from_live_service(name: str, tmp_path: pathlib.Path):
   """One day from the service: the variable, on a non-empty grid, complete, with plausible values."""
   expected = CASES[name]
+  settings.load()  # credentials may come from ~/.arcomakerc, as for the CLI
   if expected.credentials and not credentials_available(expected):
     pytest.fail(f"no credentials: set {', '.join(expected.credentials)}")
   output = tmp_path / f"{name}.zarr"
