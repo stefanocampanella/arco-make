@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Remote backends, with the network replaced by fakes (no credentials needed)."""
 
+import functools
+import http.server
 import pathlib
 import threading
 import time
@@ -10,6 +12,7 @@ from datetime import datetime
 
 import numpy as np
 import pytest
+import requests
 import xarray as xr
 
 from arcomake import backends
@@ -134,3 +137,47 @@ def test_ewds_requests_open_grib_files_one_at_a_time(
   with TempDirectoryRegistry(base_dir=tmp_path):
     EarlyWarningDataStore()._process_requests("cems-glofas-historical", [{}] * 4, max_workers=4)
   assert peak == 1
+
+
+class QuietHandler(http.server.SimpleHTTPRequestHandler):
+  def log_message(self, format, *args):
+    pass
+
+
+@pytest.fixture
+def http_root(tmp_path: pathlib.Path):
+  """A local HTTP server for `tmp_path / "www"`; yields the directory and its base URL."""
+  root = tmp_path / "www"
+  root.mkdir()
+  handler = functools.partial(QuietHandler, directory=str(root))
+  with http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield root, f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+
+
+def test_netcdf_over_http_reads_the_file(tmp_path: pathlib.Path, http_root):
+  """The `netcdfoverhttp` engine downloads the file into the registry and opens it unchanged."""
+  root, url = http_root
+  expected = xr.Dataset(
+    {"a": (("y", "x"), np.arange(6.0).reshape(2, 3)), "b": ("x", np.ones(3))},
+    coords={"x": [0.0, 0.5, 1.0], "y": [10.0, 20.0]},
+  )
+  expected.to_netcdf(root / "static.nc", engine="netcdf4")
+  with TempDirectoryRegistry(base_dir=tmp_path / "registry") as registry:
+    out = xr.open_dataset(f"{url}/static.nc", engine="netcdfoverhttp", drop_variables=["b"])
+    xr.testing.assert_identical(out.load(), expected.drop_vars("b"))
+    out.close()
+    downloaded = list(registry.job_dir.rglob("*.nc"))
+  assert len(downloaded) == 1
+
+
+def test_netcdf_over_http_error_fails(tmp_path: pathlib.Path, http_root):
+  """An HTTP error response fails the read."""
+  _, url = http_root
+  with (
+    TempDirectoryRegistry(base_dir=tmp_path / "registry"),
+    pytest.raises(requests.HTTPError, match="404"),
+  ):
+    xr.open_dataset(f"{url}/missing.nc", engine="netcdfoverhttp")
