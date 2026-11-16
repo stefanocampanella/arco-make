@@ -219,3 +219,25 @@ test each.
   arco-ocean recipes: they set both `astype` arguments, pass `depth_dim` to `get_sea_mask` and do
   not use `apply_mask`. The PR description lists them under "Behaviour changes". Rewording would
   rename every later commit.
+
+## 2026-11-16: climatology statistics (group 6)
+
+**Decisions (maintainer):** Feb 29 counts in Feb 28's bin (365 bins; the lookup rule Moby-Dick
+already uses); the arco-ocean climatology uses the reference period 1993–2018; the single-node
+implementation (S1) is built and timed on the project VM, and the maintainer times it on Leonardo.
+
+- **B6, fixed:** each bin counts the values it has. Per bin, the count, mean and sum of squared
+  deviations are computed skipping NaN; the window combines bins with reliability weights
+  (weight of the offset × count). With complete data this is the previous formula. A bin missing
+  in every period no longer spreads NaN through the window; a value missing in some years no
+  longer biases the variance low. Where the window holds fewer than two values, the variance is
+  NaN (it was 0).
+- **Calendar:** `bins = "day_of_year"` puts daily steps in the bin of their date in a 365-day year
+  and Feb 29 in Feb 28's bin, so recipes no longer need `convert_calendar` (which dropped Feb 29).
+  Incomplete first or last years are allowed.
+- **Reference period:** `reference_period = {start, end}`, right-open; the default stays the whole
+  input.
+- Output: statistics are now accumulated in float64 and cast back to the input type, so the
+  published climatology would differ in the last bits even for complete data, besides the
+  changes above (commit marked `output:`).
+

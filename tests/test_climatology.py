@@ -3,6 +3,7 @@
 """Climatology and anomaly variance against a direct NumPy computation."""
 
 import numpy as np
+import pandas as pd
 import pytest
 import xarray as xr
 
@@ -58,7 +59,6 @@ def test_climatology_matches_numpy(window: int, weighting: str):
   np.testing.assert_array_equal(mean.time.values, np.arange(PERIOD))
 
 
-@pytest.mark.xfail(reason="B6: bins count every period even where a period is missing", strict=True)
 def test_climatology_variance_with_a_missing_year():
   """A value missing in one period does not bias the variance of its bin."""
   ds = series()
@@ -70,9 +70,6 @@ def test_climatology_variance_with_a_missing_year():
   np.testing.assert_allclose(var.x.values, ref_var, rtol=1e-12)
 
 
-@pytest.mark.xfail(
-  reason="B6: an all-NaN bin spreads NaN to its neighbours through the window", strict=True
-)
 def test_climatology_window_does_not_spread_nan():
   """A bin missing in every period leaves the smoothed neighbours finite."""
   ds = series()
@@ -82,6 +79,66 @@ def test_climatology_window_does_not_spread_nan():
   mean, _ = _compute_climatology(ds, period=PERIOD, window=3)
   ref_mean, _ = reference(values, 3, "constant")
   np.testing.assert_allclose(mean.x.values, ref_mean, rtol=1e-12)
+
+
+def test_climatology_with_an_incomplete_last_period():
+  """A partial last period counts in the bins it covers only (no integer number of periods)."""
+  ds = series()
+  values = ds.x.values.copy()
+  values[-2:] = np.nan  # as if the last two steps were missing
+  _, var = _compute_climatology(ds.isel(time=slice(0, -2)), period=PERIOD, window=3)
+  _, ref_var = reference(values, 3, "constant")
+  np.testing.assert_allclose(var.x.values, ref_var, rtol=1e-12)
+
+
+def daily(start: str, end: str, seed: int = 0) -> xr.Dataset:
+  rng = np.random.default_rng(seed)
+  time = pd.date_range(start, end, freq="1D", inclusive="left")
+  return xr.Dataset({"x": ("time", rng.standard_normal(time.size))}, coords={"time": time})
+
+
+def test_day_of_year_bins_put_feb_29_with_feb_28():
+  """Feb 29 counts in Feb 28's bin; later days of a leap year take the same date's bin."""
+  ds = daily("2019-01-01", "2021-01-01")  # 2020 is a leap year
+  mean, var = _compute_climatology(ds, period=365, bins="day_of_year")
+  x = ds.x.to_series()
+  feb_28 = x[(x.index.month == 2) & (x.index.day.isin([28, 29]))]
+  np.testing.assert_allclose(mean.x.values[58], feb_28.mean(), rtol=1e-12)
+  np.testing.assert_allclose(var.x.values[58], feb_28.var(ddof=1), rtol=1e-12)
+  mar_1 = x[(x.index.month == 3) & (x.index.day == 1)]
+  np.testing.assert_allclose(mean.x.values[59], mar_1.mean(), rtol=1e-12)
+  dec_31 = x[(x.index.month == 12) & (x.index.day == 31)]
+  np.testing.assert_allclose(mean.x.values[364], dec_31.mean(), rtol=1e-12)
+  assert mean.sizes["time"] == 365
+
+
+def test_day_of_year_bins_match_position_bins_without_leap_days():
+  """Without Feb 29 and with whole years, day-of-year bins are position bins."""
+  ds = daily("2021-01-01", "2024-01-01")
+  by_day, var_day = _compute_climatology(ds, period=365, window=5, bins="day_of_year")
+  by_position, var_position = _compute_climatology(ds, period=365, window=5)
+  np.testing.assert_allclose(by_day.x.values, by_position.x.values, rtol=1e-12)
+  np.testing.assert_allclose(var_day.x.values, var_position.x.values, rtol=1e-12)
+
+
+def test_climatology_keeps_the_input_dtype():
+  """float32 inputs give float32 statistics (counts are integers internally)."""
+  ds = series().astype("float32")
+  mean, var = _compute_climatology(ds, period=PERIOD, window=3)
+  assert mean.x.dtype == var.x.dtype == np.float32
+
+
+def test_flox_gives_the_same_statistics():
+  """The flox implementation agrees with the folded one, Feb 29 included."""
+  pytest.importorskip("flox")
+  ds = daily("2019-03-01", "2021-07-01").chunk(time=100)
+  values = ds.x.values.copy()
+  values[10:40] = np.nan
+  ds = ds.assign(x=("time", values))
+  mean, var = _compute_climatology(ds, period=365, window=7, bins="day_of_year")
+  mean_f, var_f = _compute_climatology(ds, period=365, window=7, bins="day_of_year", use_flox=True)
+  np.testing.assert_allclose(mean_f.x.values, mean.x.values, rtol=1e-10)
+  np.testing.assert_allclose(var_f.x.values, var.x.values, rtol=1e-10)
 
 
 def test_window_weights():

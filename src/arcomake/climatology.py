@@ -37,6 +37,7 @@
 # Finally, the dataset might not start on the 1st of January or end before the 31 of December,
 # which would further distort the results. However, the quantities computed here are aimed at standardizing the input
 # features in a deep-learning model, and therefore such approximations are reasonably acceptable.
+import datetime
 import logging
 import operator
 from collections.abc import Callable, Sequence
@@ -66,13 +67,34 @@ logger = logging.getLogger(__name__)
 # compute the climatology. The weights depend only on the distance from the
 # center of the window and are therefore constant from one year to the next.
 WeightingType = Literal["constant", "gaussian", "geometric"]
+# How time steps fall into bins: by position in each period, or by day of a 365-day year.
+BinningType = Literal["position", "day_of_year"]
+
+
+class ReferencePeriod(BaseModel):
+  """The right-open interval `[start, end)` of the input the statistics are computed over."""
+
+  model_config = ConfigDict(extra="forbid")
+
+  start: datetime.datetime
+  end: datetime.datetime
 
 
 class ClimatologyConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   time_dim: str = "time"
-  period: int = Field(description="Period of the climatology bins")
+  period: int = Field(ge=1, description="Number of climatology bins")
+  bins: BinningType = Field(
+    default="position",
+    description=(
+      'How steps fall into bins: "position" (step k of each period of `period` steps is in bin k)'
+      ' or "day_of_year" (daily data, 365 bins, Feb 29 in Feb 28\'s bin)'
+    ),
+  )
+  reference_period: ReferencePeriod | None = Field(
+    default=None, description="Compute the statistics over [start, end) only (default: all)"
+  )
   window: int = Field(ge=1, description="Number of bins to average over")
   weighting: WeightingType
   weighting_scale: float | None = Field(
@@ -151,17 +173,26 @@ def compute_climatology(
 ):
   """Compute a periodic climatology and the standard deviation of the anomalies.
 
-  After the [[preprocess]] steps, the time axis is cut into consecutive periods of `period`
-  steps (e.g. 365 daily steps); step k of every period falls in bin k. For each bin, the
-  climatology is the weighted mean over all periods and over a centred `window` of bins
-  (wrapping around the period), and the anomaly standard deviation is the unbiased weighted
-  standard deviation over the same samples.
+  After the [[preprocess]] steps, and within `reference_period` if set, each time step falls in
+  one of `period` bins: by position (`bins = "position"`: step k of every run of `period` steps
+  is in bin k) or by day of the year (`bins = "day_of_year"`: daily data, 365 bins, Feb 29 in
+  Feb 28's bin, later days of a leap year in the bin of their date). For each bin, the
+  climatology is the weighted mean of the values of a centred `window` of bins (wrapping around
+  the period), and the anomaly standard deviation is the unbiased weighted standard deviation of
+  the same values. Missing values are skipped: each bin counts the values it has.
 
-  Assumed, not checked: the time axis is sorted, complete and uniformly spaced, every data
-  variable has the time dimension, and one period is one calendar cycle. Only the number of
-  steps is checked to be a multiple of `period`. Leap days must be handled by the
-  [[preprocess]] steps (e.g. `convert_calendar` to a 365-day calendar). The two outputs have
-  `period` steps along time, the bin index.
+  Assumed, not checked: the time axis is sorted and every data variable has the time dimension.
+  The two outputs have `period` steps along time, the bin index (0 is Jan 1 for day-of-year
+  bins).
+
+  Example::
+
+    period = 365
+    bins = "day_of_year"
+    reference_period = {start = 1993-01-01, end = 2019-01-01}
+    window = 29
+    weighting = "gaussian"
+    weighting_scale = 7.0
   """
 
   # Set up logging.
@@ -180,17 +211,13 @@ def compute_climatology(
         # Preprocess input dataset
         if configs.preprocess:
           dataset = dataset.arcomake.process(steps=configs.preprocess)
-        # We assume that after preprocessing the time coordinate of the dataset is:
-        #   1. sorted,
-        #   2. without missing dates or duplicates,
-        #   3. uniformly spaced,
-        #   4. that all variables have a time dimension,
-        #   5. that period times the size of a climatology bin divides the calendar year,
-        #   6. that the dataset contains an integer number of periods.
-        # We just check for the latter.
-        assert dataset[configs.time_dim].size % configs.period == 0, (
-          "Dataset must contain an integer number of full periods."
-        )
+        # Statistics over the reference period only, if one is set.
+        if configs.reference_period is not None:
+          dataset = dataset.arcomake.time_sel(
+            configs.reference_period.start, configs.reference_period.end, configs.time_dim
+          )
+          if dataset.sizes[configs.time_dim] == 0:
+            raise ValueError(f"No data in the reference period {configs.reference_period}")
         # Compute the climatological mean and the unbiased sample variance
         # of the anomalies using vectorized reductions across periods and window smoothing.
         if not dataset.data_vars:
@@ -203,6 +230,7 @@ def compute_climatology(
           weighting=configs.weighting,
           weighting_scale=configs.weighting_scale,
           use_flox=configs.use_flox,
+          bins=configs.bins,
         )
         # Postprocess climatology and anomaly standard deviation.
         if configs.postprocess_climatology:
@@ -307,6 +335,126 @@ def _window_weights(
   raise ValueError(f"Unsupported weighting scheme: {weighting}")
 
 
+# Days before each month in a 365-day year: the day-of-year bins of `bins = "day_of_year"`.
+_DAYS_BEFORE_MONTH = np.cumsum([0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30])
+_DAYS_IN_MONTH = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
+# Feb 29 counts in Feb 28's bin (0-based day 58 of a 365-day year).
+FEB_29_BIN = 58
+
+BinStatistics = tuple[xr.Dataset, xr.Dataset, xr.Dataset]
+
+
+def day_of_year_bins(time: xr.DataArray) -> tuple[np.ndarray, np.ndarray]:
+  """The 0-based day of a 365-day year of each time stamp, and which stamps are Feb 29.
+
+  Days after Feb 29 in a leap year take the bin of the same date in other years; Feb 29 itself
+  takes Feb 28's bin (`FEB_29_BIN`). Works for numpy and cftime dates with standard months.
+  """
+  month = np.asarray(time.dt.month.values)
+  day = np.asarray(time.dt.day.values)
+  is_feb_29 = (month == 2) & (day == 29)
+  if np.any((day > _DAYS_IN_MONTH[month - 1]) & ~is_feb_29):
+    raise ValueError("day_of_year bins need a calendar with standard month lengths")
+  bins = _DAYS_BEFORE_MONTH[month - 1] + day - 1
+  bins[is_feb_29] = FEB_29_BIN
+  return bins, is_feb_29
+
+
+def _fold_statistics(folded: xr.Dataset) -> BinStatistics:
+  """Count, mean and sum of squared deviations over `_period`, skipping NaN."""
+  count = folded.count("_period")
+  mean = folded.mean("_period", skipna=True)
+  m2 = ((bind(folded, mean) - mean) ** 2).sum("_period", skipna=True)
+  return count, mean, m2
+
+
+def _combine(a: BinStatistics, b: BinStatistics) -> BinStatistics:
+  """Statistics of the union of two samples (Chan et al.); an empty sample has mean NaN."""
+  n_a, mean_a, m2_a = a
+  n_b, mean_b, m2_b = b
+  n = n_a + n_b
+  mean_a0, mean_b0 = mean_a.fillna(0.0), mean_b.fillna(0.0)
+  mean = ((n_a * mean_a0 + n_b * mean_b0) / n).where(n > 0)
+  m2 = m2_a + m2_b + ((mean_b0 - mean_a0) ** 2 * n_a * n_b / n).where(n > 0, 0.0)
+  return n, mean, m2
+
+
+def _bin_statistics(
+  dataset: xr.Dataset, period: int, bins: BinningType, time_dim: str, use_flox: bool
+) -> BinStatistics:
+  """Per bin: the number of values, their mean and their sum of squared deviations (NaN skipped).
+
+  The bins are along `time_dim`, numbered 0 to `period - 1`.
+  """
+  size = dataset.sizes[time_dim]
+  if bins == "day_of_year":
+    labels, is_feb_29 = day_of_year_bins(dataset[time_dim])
+  else:
+    labels, is_feb_29 = np.arange(size) % period, np.zeros(size, dtype=bool)
+  bin_coords = {time_dim: np.arange(period)}
+
+  flox_xarray = None
+  if use_flox:
+    try:
+      import flox.xarray as flox_xarray
+    except ImportError:
+      logger.warning("flox is not installed; falling back to native xarray implementation.")
+  if flox_xarray is not None:
+    group = xr.DataArray(labels, dims=[time_dim], coords={time_dim: dataset[time_dim]}, name="_bin")
+    expected = np.arange(period)
+    count = flox_xarray.xarray_reduce(
+      dataset, group, func="count", expected_groups=expected, method="cohorts"
+    )
+    mean = flox_xarray.xarray_reduce(
+      dataset, group, func="nanmean", expected_groups=expected, method="cohorts"
+    )
+    var = flox_xarray.xarray_reduce(
+      dataset, group, func="nanvar", ddof=0, expected_groups=expected, method="cohorts"
+    )
+    assert isinstance(count, xr.Dataset) and isinstance(mean, xr.Dataset)
+    assert isinstance(var, xr.Dataset)
+    as_bins = [s.rename({"_bin": time_dim}).assign_coords(bin_coords) for s in (count, mean, var)]
+    m2 = as_bins[2] * as_bins[0]
+    assert isinstance(m2, xr.Dataset)
+    return as_bins[0], as_bins[1], m2
+
+  # Fold the time axis into (_period, bin): step k of a folded period is bin k. Missing steps (an
+  # incomplete first or last year, gaps) become NaN, which the statistics skip.
+  if bins == "day_of_year":
+    years = np.asarray(dataset[time_dim].dt.year.values)
+    position = (years - years.min()) * period + labels
+  else:
+    position = np.arange(size)
+  regular = ~is_feb_29
+  if np.unique(position[regular]).size != np.count_nonzero(regular):
+    raise ValueError("day_of_year bins need at most one time step per day")
+  n_periods = -(-int(position.max(initial=0) + 1) // period)
+  folded = (
+    dataset.isel({time_dim: regular})
+    .assign_coords({time_dim: position[regular]})
+    .reindex({time_dim: np.arange(n_periods * period)})
+    .coarsen({time_dim: period}, boundary="exact")
+    .construct({time_dim: ("_period", time_dim)})
+    .assign_coords(bin_coords)
+  )
+  count, mean, m2 = _fold_statistics(folded)
+  if is_feb_29.any():
+    leap = dataset.isel({time_dim: is_feb_29}).rename({time_dim: "_period"})
+    feb_28 = (
+      count.isel({time_dim: FEB_29_BIN}),
+      mean.isel({time_dim: FEB_29_BIN}),
+      m2.isel({time_dim: FEB_29_BIN}),
+    )
+    merged = _combine(feb_28, _fold_statistics(leap))
+    is_feb_28 = xr.DataArray(np.arange(period) == FEB_29_BIN, dims=[time_dim], coords=bin_coords)
+    count, mean, m2 = (
+      xr.where(is_feb_28, new, old) for old, new in zip((count, mean, m2), merged, strict=True)
+    )
+  assert isinstance(count, xr.Dataset) and isinstance(mean, xr.Dataset)
+  assert isinstance(m2, xr.Dataset)
+  return count, mean, m2
+
+
 def _compute_climatology(
   dataset: xr.Dataset,
   period: int,
@@ -315,137 +463,82 @@ def _compute_climatology(
   weighting_scale: float | None = None,
   time_dim: str = "time",
   use_flox: bool = False,
+  bins: BinningType = "position",
 ) -> tuple[xr.Dataset, xr.Dataset]:
   """
   Compute the climatological mean and unbiased sample variance of every data variable.
 
+  Bin b pools the values of bins b + k for k in a centred `window` (wrapping around the
+  period), each weighted by the weight of its offset k. Missing values (NaN, missing steps,
+  incomplete periods) are skipped: each bin counts only the values it has (B6).
+
   Parameters
   ----------
   dataset : xr.Dataset
-      Input Dataset, assumed to be sorted and uniformly spaced along the time
-      dimension.
+      Input Dataset, sorted along the time dimension.
   period : int
-      Number of time steps in each period (i.e., per calendar year).
+      Number of bins (e.g. 365 daily bins).
   window : int, default 1
-      Number of steps of the (centered) window over which statistics are
-      computed for each bin. ``window=1`` reduces to the plain per-bin
-      climatology.
+      Number of bins of the (centred) window; 1 gives the plain per-bin statistics.
   weighting : {"constant", "gaussian", "geometric"}, default "constant"
-      Weighting scheme applied to the steps of the window. See
-      ``_window_weights`` for details.
+      Weighting of the window's bins (see ``_window_weights``).
   weighting_scale : float or None, default None
-      Scale of the weighting kernel, in step units (Gaussian standard deviation
-      or geometric decay ratio). If ``None``, a default derived from the window
-      size is used. See ``_window_weights`` for details.
+      Scale of the weighting kernel, in bins (see ``_window_weights``).
   time_dim : str, default "time"
-      Name of the time dimension to average over.
+      Name of the time dimension.
   use_flox : bool, default False
-      Whether to use ``flox`` for grouped periodic reductions. If ``True``
-      and ``flox`` is not installed, falls back to the native xarray
-      implementation.
+      Use ``flox`` for the grouped reductions (falls back to xarray without it).
+  bins : {"position", "day_of_year"}, default "position"
+      ``"position"``: step k of each run of `period` steps is in bin k. ``"day_of_year"``: daily
+      data; the bin is the day of a 365-day year, and Feb 29 is in Feb 28's bin.
 
   Returns
   -------
   tuple[xr.Dataset, xr.Dataset]
-      A pair ``(mean, variance)``, each of size ``period`` along
-      ``time_dim``. ``mean`` is the weighted climatological average
-      and ``variance`` is the unbiased weighted sample variance of the anomalies.
-
-  Notes
-  -----
-  Known limitation (findings B6): the variance assumes every period has a value in every bin.
-  Where a value is missing in some periods, the per-bin mean skips it but the count does not,
-  which biases the variance low; a bin missing in every period makes its window neighbours NaN.
+      ``(mean, variance)``, each with `period` bins along ``time_dim`` (numbered from 0) and the
+      input's data types. ``variance`` is the unbiased (reliability weights) variance, NaN where
+      the window holds fewer than two values.
   """
-  size = dataset.sizes[time_dim]
-  n_periods = size // period
-  bins = np.arange(period, dtype=int)
+  if bins == "day_of_year" and period != 365:
+    raise ValueError(f"day_of_year bins need period = 365, got {period}")
+  count, mean, m2 = _bin_statistics(dataset, period, bins, time_dim, use_flox)
 
-  flox_xarray = None
-  if use_flox:
-    try:
-      import flox.xarray as flox_xarray
-    except ImportError:
-      logger.warning("flox is not installed; falling back to native xarray implementation.")
-
-  if flox_xarray is not None:
-    # Choose the optimal reduction strategy based on chunk alignment:
-    # 'blockwise' provides maximal speed and zero inter-worker communication
-    # when time chunks align with period boundaries; 'cohorts' prevents memory
-    # spikes when chunks span arbitrary periodic boundaries.
-    time_chunks = dataset.chunksizes.get(time_dim, (size,))
-    is_aligned = all(c % period == 0 for c in time_chunks)
-    reduction_method = "blockwise" if is_aligned else "cohorts"
-    group = xr.DataArray(
-      np.tile(bins, n_periods),
-      dims=[time_dim],
-      coords={time_dim: dataset[time_dim]},
-      name=time_dim,
-    )
-    # Parallel computation of periodic mean in a single pass
-    raw_mean = flox_xarray.xarray_reduce(
-      dataset,
-      group,
-      func="mean",
-      expected_groups=bins,
-      method=reduction_method,
-    )
-    # Direct variance calculation without intermediate array materialization
-    raw_var = flox_xarray.xarray_reduce(
-      dataset,
-      group,
-      func="var",
-      ddof=0,
-      expected_groups=bins,
-      method=reduction_method,
-    )
-    assert isinstance(raw_mean, xr.Dataset) and isinstance(raw_var, xr.Dataset)
-  else:
-    # Reshape time dimension into (_period, time_dim)
-    folded = (
-      dataset.assign_coords({time_dim: np.arange(size)})
-      .coarsen({time_dim: period}, boundary="exact")
-      .construct({time_dim: ("_period", time_dim)})
-      .assign_coords({time_dim: bins})
-    )
-    raw_mean = folded.mean(dim="_period")
-    raw_var = ((bind(folded, raw_mean) - raw_mean) ** 2).mean(dim="_period")
-
-  # Centered window smoothing
   half = window // 2
   offsets = list(range(-half, window - half))
-  weights = _window_weights(offsets, weighting, scale=weighting_scale)
+  terms = list(
+    zip(offsets, _window_weights(offsets, weighting, scale=weighting_scale), strict=True)
+  )
 
-  w_total = float(np.sum(weights))
-  w_sq_total = float(np.sum(weights**2))
+  def shifted(stat: xr.Dataset, offset: int) -> xr.Dataset:
+    return stat.roll({time_dim: -offset}, roll_coords=False)
 
-  if window == 1:
-    weighted_mean = raw_mean
-    m2_per_period = raw_var
-  else:
-    mean_terms = [
-      float(w) * raw_mean.roll({time_dim: -offset}, roll_coords=False)
-      for offset, w in zip(offsets, weights, strict=True)
+  def window_sum(parts: list[xr.Dataset]) -> xr.Dataset:
+    return balanced_tree_reduce(operator.add, parts)
+
+  # Reliability weights: each value of bin b + k has the weight w_k of its offset.
+  mean0 = mean.fillna(0.0)
+  v1 = window_sum([float(w) * shifted(count, o) for o, w in terms])
+  v2 = window_sum([float(w) ** 2 * shifted(count, o) for o, w in terms])
+  climatology = (window_sum([float(w) * shifted(count * mean0, o) for o, w in terms]) / v1).where(
+    v1 > 0
+  )
+  clim0 = climatology.fillna(0.0)
+  total_m2 = window_sum(
+    [
+      float(w) * (shifted(m2, o) + shifted(count, o) * (shifted(mean0, o) - clim0) ** 2)
+      for o, w in terms
     ]
-    weighted_mean = balanced_tree_reduce(operator.add, mean_terms) / w_total
+  )
+  denominator = v1 - v2 / v1.where(v1 > 0)
+  variance = (total_m2 / denominator).where(denominator > 0)
 
-    var_smooth_terms = [
-      float(w) * raw_var.roll({time_dim: -offset}, roll_coords=False)
-      for offset, w in zip(offsets, weights, strict=True)
-    ]
-    smoothed_raw_var = balanced_tree_reduce(operator.add, var_smooth_terms)
+  def as_input_types(result: xr.Dataset) -> xr.Dataset:
+    return result.astype(
+      {
+        name: dataset[name].dtype
+        for name in result.data_vars
+        if np.issubdtype(dataset[name].dtype, np.floating)
+      }
+    )
 
-    mean_dispersion_terms = [
-      float(w) * (raw_mean.roll({time_dim: -offset}, roll_coords=False) - weighted_mean) ** 2
-      for offset, w in zip(offsets, weights, strict=True)
-    ]
-    between_bin_var = balanced_tree_reduce(operator.add, mean_dispersion_terms)
-
-    m2_per_period = smoothed_raw_var + between_bin_var
-
-  total_m2 = n_periods * m2_per_period
-  total_w = n_periods * w_total
-  total_w_sq = n_periods * w_sq_total
-  denom = total_w - (total_w_sq / total_w)
-  variance = total_m2 / denom if denom > 0.0 else xr.zeros_like(total_m2)
-  return weighted_mean, variance
+  return as_input_types(climatology), as_input_types(variance)
