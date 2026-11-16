@@ -49,7 +49,7 @@ import dask
 import numpy as np
 import xarray as xr
 from dask.graph_manipulation import bind
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from arcomake.cli_utils import (
   check_if_overwriting,
@@ -78,6 +78,14 @@ class ReferencePeriod(BaseModel):
 
   start: datetime.datetime
   end: datetime.datetime
+
+  @model_validator(mode="after")
+  def _ordered_and_naive(self) -> "ReferencePeriod":
+    if self.start.tzinfo is not None or self.end.tzinfo is not None:
+      raise ValueError("reference_period dates have no time zone (time axes are naive)")
+    if self.start >= self.end:
+      raise ValueError(f"reference_period start ({self.start}) must be before end ({self.end})")
+    return self
 
 
 class ClimatologyConfig(BaseModel):
@@ -108,6 +116,12 @@ class ClimatologyConfig(BaseModel):
   postprocess_climatology: list[ProcessingStepConfig] = Field(default_factory=list)
   postprocess_anomaly_std: list[ProcessingStepConfig] = Field(default_factory=list)
   save: SaveConfig
+
+  @model_validator(mode="after")
+  def _day_of_year_bins(self) -> "ClimatologyConfig":
+    if self.bins == "day_of_year" and self.period != 365:
+      raise ValueError(f'bins = "day_of_year" needs period = 365, got {self.period}')
+    return self
 
 
 @click.command()
@@ -189,10 +203,10 @@ def compute_climatology(
 
     period = 365
     bins = "day_of_year"
-    reference_period = {start = 1993-01-01, end = 2019-01-01}
-    window = 29
+    reference_period = {start = 1991-01-01, end = 2021-01-01}
+    window = 15
     weighting = "gaussian"
-    weighting_scale = 7.0
+    weighting_scale = 3.0
   """
 
   # Set up logging.
@@ -389,8 +403,19 @@ def _bin_statistics(
   size = dataset.sizes[time_dim]
   if bins == "day_of_year":
     labels, is_feb_29 = day_of_year_bins(dataset[time_dim])
+    years = np.asarray(dataset[time_dim].dt.year.values)
+    position = (years - years.min()) * period + labels
+    regular = ~is_feb_29
+    if np.unique(position[regular]).size != np.count_nonzero(regular):
+      raise ValueError("day_of_year bins need at most one time step per day")
   else:
+    if size % period != 0:
+      raise ValueError(
+        f"position bins need a whole number of periods ({size} steps, period {period}): leap"
+        ' days and partial years shift every later bin; use bins = "day_of_year" for daily data'
+      )
     labels, is_feb_29 = np.arange(size) % period, np.zeros(size, dtype=bool)
+    position = np.arange(size)
   bin_coords = {time_dim: np.arange(period)}
 
   flox_xarray = None
@@ -402,14 +427,19 @@ def _bin_statistics(
   if flox_xarray is not None:
     group = xr.DataArray(labels, dims=[time_dim], coords={time_dim: dataset[time_dim]}, name="_bin")
     expected = np.arange(period)
+    # "blockwise" needs no communication when time chunks hold whole periods of position bins;
+    # "cohorts" bounds memory otherwise.
+    time_chunks = dataset.chunksizes.get(time_dim, (size,))
+    aligned = bins == "position" and all(c % period == 0 for c in time_chunks)
+    method = "blockwise" if aligned else "cohorts"
     count = flox_xarray.xarray_reduce(
-      dataset, group, func="count", expected_groups=expected, method="cohorts"
+      dataset, group, func="count", expected_groups=expected, method=method
     )
     mean = flox_xarray.xarray_reduce(
-      dataset, group, func="nanmean", expected_groups=expected, method="cohorts"
+      dataset, group, func="nanmean", expected_groups=expected, method=method
     )
     var = flox_xarray.xarray_reduce(
-      dataset, group, func="nanvar", ddof=0, expected_groups=expected, method="cohorts"
+      dataset, group, func="nanvar", ddof=0, expected_groups=expected, method=method
     )
     assert isinstance(count, xr.Dataset) and isinstance(mean, xr.Dataset)
     assert isinstance(var, xr.Dataset)
@@ -420,14 +450,7 @@ def _bin_statistics(
 
   # Fold the time axis into (_period, bin): step k of a folded period is bin k. Missing steps (an
   # incomplete first or last year, gaps) become NaN, which the statistics skip.
-  if bins == "day_of_year":
-    years = np.asarray(dataset[time_dim].dt.year.values)
-    position = (years - years.min()) * period + labels
-  else:
-    position = np.arange(size)
   regular = ~is_feb_29
-  if np.unique(position[regular]).size != np.count_nonzero(regular):
-    raise ValueError("day_of_year bins need at most one time step per day")
   n_periods = -(-int(position.max(initial=0) + 1) // period)
   folded = (
     dataset.isel({time_dim: regular})
@@ -502,6 +525,8 @@ def _compute_climatology(
   if bins == "day_of_year" and period != 365:
     raise ValueError(f"day_of_year bins need period = 365, got {period}")
   count, mean, m2 = _bin_statistics(dataset, period, bins, time_dim, use_flox)
+  # Counts as the data's float type, so that float32 inputs are combined in float32 (memory).
+  count = count.astype({name: mean[name].dtype for name in count.data_vars})
 
   half = window // 2
   offsets = list(range(-half, window - half))

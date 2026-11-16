@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: MIT
 """Climatology and anomaly variance against a direct NumPy computation."""
 
+import datetime
+
 import numpy as np
 import pandas as pd
+import pydantic
 import pytest
 import xarray as xr
 
-from arcomake.climatology import _compute_climatology, _window_weights
+from arcomake.climatology import ClimatologyConfig, _compute_climatology, _window_weights
 
 PERIOD = 6
 N_PERIODS = 5
@@ -81,14 +84,20 @@ def test_climatology_window_does_not_spread_nan():
   np.testing.assert_allclose(mean.x.values, ref_mean, rtol=1e-12)
 
 
-def test_climatology_with_an_incomplete_last_period():
-  """A partial last period counts in the bins it covers only (no integer number of periods)."""
+def test_climatology_with_missing_last_steps():
+  """Steps missing at the end of the last period (NaN) count in no bin."""
   ds = series()
   values = ds.x.values.copy()
-  values[-2:] = np.nan  # as if the last two steps were missing
-  _, var = _compute_climatology(ds.isel(time=slice(0, -2)), period=PERIOD, window=3)
+  values[-2:] = np.nan
+  _, var = _compute_climatology(ds.assign(x=(ds.x.dims, values)), period=PERIOD, window=3)
   _, ref_var = reference(values, 3, "constant")
   np.testing.assert_allclose(var.x.values, ref_var, rtol=1e-12)
+
+
+def test_position_bins_need_whole_periods():
+  """Position bins refuse a partial period: leap days or partial years would shift later bins."""
+  with pytest.raises(ValueError, match="whole number of periods"):
+    _compute_climatology(series().isel(time=slice(0, -2)), period=PERIOD)
 
 
 def daily(start: str, end: str, seed: int = 0) -> xr.Dataset:
@@ -132,6 +141,12 @@ def test_flox_gives_the_same_statistics():
   """The flox implementation agrees with the folded one, Feb 29 included."""
   pytest.importorskip("flox")
   ds = daily("2019-03-01", "2021-07-01").chunk(time=100)
+  with pytest.raises(ValueError, match="one time step per day"):  # checked before either path
+    hourly = xr.Dataset(
+      {"x": ("time", np.zeros(48))},
+      coords={"time": pd.date_range("2020-01-01", periods=48, freq="1h")},
+    )
+    _compute_climatology(hourly, period=365, bins="day_of_year", use_flox=True)
   values = ds.x.values.copy()
   values[10:40] = np.nan
   ds = ds.assign(x=("time", values))
@@ -150,3 +165,26 @@ def test_window_weights():
   np.testing.assert_allclose(geometric[0], 0.1)
   with pytest.raises(ValueError):
     _window_weights([-1, 0, 1], "geometric", scale=2.0)
+
+
+@pytest.mark.parametrize(
+  ("table", "message"),
+  [
+    ({"reference_period": {"start": "2019-01-01", "end": "1993-01-01"}}, "before end"),
+    (
+      {
+        "reference_period": {
+          "start": datetime.datetime(1993, 1, 1, tzinfo=datetime.UTC),
+          "end": "2019-01-01",
+        }
+      },
+      "no time zone",
+    ),
+    ({"bins": "day_of_year", "period": 366}, "needs period = 365"),
+  ],
+)
+def test_climatology_recipes_are_checked_when_loaded(table: dict, message: str):
+  """Inconsistent settings fail when the recipe is read, not after the cluster has started."""
+  base = {"period": 365, "window": 1, "weighting": "constant", "read": {}, "save": {}}
+  with pytest.raises(pydantic.ValidationError, match=message):
+    ClimatologyConfig.model_validate(base | table)

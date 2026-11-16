@@ -224,7 +224,7 @@ test each.
 
 **Decisions (maintainer):** Feb 29 counts in Feb 28's bin (365 bins; the lookup rule Moby-Dick
 already uses); the arco-ocean climatology uses the reference period 1993–2018; the single-node
-implementation (S1) is built and timed on the project VM, and the maintainer times it on Leonardo.
+implementation (S1) is built and timed on the project VM, and the maintainer times it on the HPC cluster.
 
 - **B6, fixed:** each bin counts the values it has. Per bin, the count, mean and sum of squared
   deviations are computed skipping NaN; the window combines bins with reliability weights
@@ -237,7 +237,12 @@ implementation (S1) is built and timed on the project VM, and the maintainer tim
   Incomplete first or last years are allowed.
 - **Reference period:** `reference_period = {start, end}`, right-open; the default stays the whole
   input.
-- Output: statistics are now accumulated in float64 and cast back to the input type, so the
-  published climatology would differ in the last bits even for complete data, besides the
-  changes above (commit marked `output:`).
+- Output: per-bin statistics and the window are computed in the input's float type (float32 for
+  ARCO-OCEAN) and in another order than before, so the published climatology would differ in the
+  last bits even for complete data, besides the changes above (commit marked `output:`).
+- After the code review: position bins again require a whole number of periods (a missing
+  `convert_calendar` would otherwise shift every bin after a leap day, silently); the one-step-
+  per-day check of day-of-year bins also covers flox; `reference_period` (ordered, no time zone)
+  and `day_of_year` with `period = 365` are checked when the recipe is loaded; flox again uses the
+  communication-free "blockwise" method when time chunks hold whole periods.
 
