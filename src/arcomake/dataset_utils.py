@@ -18,6 +18,7 @@ from dask.diagnostics import ProgressBar
 from numcodecs import Blosc
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from xarray.backends.common import BackendEntrypoint
+from xarray.backends.plugins import guess_engine
 from xarray.coders import CFDatetimeCoder, CFTimedeltaCoder
 from zarr.storage import DirectoryStore, ZipStore
 
@@ -62,6 +63,10 @@ class ReadConfig(BaseModel):
   chunked_array_type: str | None = None
   from_array_kwargs: dict[str, Any] | None = None
   backend_kwargs: dict[str, Any] | None = None
+  # Options of the fsspec filesystem of a remote input (credentials, `requests_timeout`...).
+  storage_options: dict[str, Any] | None = None
+  # Zarr inputs: whether to read consolidated metadata.
+  consolidated: bool | None = None
 
 
 class CompressorConfig(BaseModel):
@@ -242,17 +247,32 @@ def strict_zarr_store(
   )
 
 
+def reads_as_zarr(filename_or_obj: str, engine: str | None) -> bool:
+  """Whether `xarray.open_dataset(filename_or_obj, engine=engine)` uses the zarr engine.
+
+  Without an engine, xarray guesses one from the name (e.g. a `.zarr` suffix).
+  """
+  if engine is not None:
+    return engine == "zarr"
+  try:
+    return guess_engine(filename_or_obj) == "zarr"
+  except ValueError:
+    return False
+
+
 def open_input(filename_or_obj: Any, **kwargs: Any) -> xr.Dataset:
   """`xarray.open_dataset`, raising read errors of Zarr stores given as fsspec URLs.
 
-  With `engine="zarr"`, a URL (`gs://`, `s3://`, `https://`, chained `::` URLs...) is opened as a
-  `strict_zarr_store`, with the `storage_options` given. Local paths keep zarr's directory and zip
-  stores, which already raise read errors. Other engines are not affected.
+  A URL (`gs://`, `s3://`, `https://`, chained `::` URLs...) read with the zarr engine, given or
+  guessed by xarray, is opened as a `strict_zarr_store`, with the `storage_options` given. Local
+  paths keep zarr's directory and zip stores, which already raise read errors. Other engines are
+  not affected.
   """
   is_url = isinstance(filename_or_obj, str) and (
     "://" in filename_or_obj or "::" in filename_or_obj
   )
-  if kwargs.get("engine") == "zarr" and is_url:
+  if is_url and reads_as_zarr(filename_or_obj, kwargs.get("engine")):
+    kwargs["engine"] = "zarr"
     storage_options = kwargs.pop("storage_options", None)
     filename_or_obj = strict_zarr_store(filename_or_obj, storage_options=storage_options)
   # xarray accepts zarr stores, but its type hints do not list them.
@@ -395,8 +415,11 @@ def open_archive(
   file_paths: list[str] = sorted(fs.glob(glob_pattern))
   if len(file_paths) == 0:
     raise ValueError(f"Provided path '{path}' does not contain any files matching '{glob}'.")
-  # Zarr pieces are read through strict stores, so that a failed read raises (see
-  # `strict_zarr_store`); other engines get plain fsspec mappers.
+  # Zarr pieces (engine given, or guessed from the first piece's name) are read through strict
+  # stores, so that a failed read raises (see `strict_zarr_store`); other engines get plain
+  # fsspec mappers.
+  if reads_as_zarr(file_paths[0], kwargs.get("engine")):
+    kwargs["engine"] = "zarr"
   file_mappers: list[Any] = [
     strict_zarr_store(file_path, fs=fs)
     if kwargs.get("engine") == "zarr"

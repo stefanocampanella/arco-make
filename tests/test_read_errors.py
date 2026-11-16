@@ -96,10 +96,26 @@ def test_open_archive_read_error_fails(source: str):
     open_archive(archive, glob="*.zarr", engine="zarr").load()
 
 
-def test_read_table_read_error_fails(source: str, tmp_path: pathlib.Path):
+def test_open_archive_guessed_engine_read_error_fails(source: str):
+  """Without `engine`, xarray guesses zarr from the names: the pieces are read strictly too."""
+  fail_reads_of(source, "t/3.0")
+  archive = source.removesuffix("/src.zarr")
+  with pytest.raises(TimeoutError):
+    open_archive(archive, glob="*.zarr").load()
+
+
+@pytest.mark.parametrize(
+  "read_table",
+  [
+    'engine = "zarr"',
+    "",  # engine guessed by xarray from the `.zarr` suffix
+    'engine = "zarr"\nstorage_options = {skip_instance_cache = true}',
+  ],
+)
+def test_read_table_read_error_fails(read_table: str, source: str, tmp_path: pathlib.Path):
   """The `[read]` table of `process` (and `validate`, `compute-climatology`) follows the rule."""
   recipe = tmp_path / "process.toml"
-  recipe.write_text('[read]\nengine = "zarr"\n\n[[process]]\nname = "mean"\ndim = "time"\n')
+  recipe.write_text(f'[read]\n{read_table}\n\n[[process]]\nname = "mean"\ndim = "time"\n')
   fail_reads_of(source, "t/3.0")
   args = ["process", "--dask-setup", "threads", str(recipe), source, str(tmp_path / "out.zarr")]
   result = CliRunner().invoke(cli, args)
