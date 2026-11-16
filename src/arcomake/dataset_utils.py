@@ -5,7 +5,7 @@ import logging
 import pathlib
 import posixpath
 import tempfile
-from collections.abc import Hashable, Iterable, Mapping
+from collections.abc import Hashable, Mapping
 from contextlib import ExitStack, nullcontext
 from typing import Annotated, Any, Literal
 
@@ -56,7 +56,7 @@ class ReadConfig(BaseModel):
   use_cftime: bool | Mapping[str, bool] | None = None
   concat_characters: bool | Mapping[str, bool] | None = None
   decode_coords: Literal["coordinates", "all"] | bool | None = None
-  drop_variables: str | Iterable[str] | None = None
+  drop_variables: str | list[str] | None = None
   create_default_indexes: bool = True
   inline_array: bool = False
   chunked_array_type: str | None = None

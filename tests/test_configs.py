@@ -91,6 +91,19 @@ def test_generic_parts_take_open_dataset_arguments():
   assert DatasetConfig.model_validate({"parts": [part]}).parts[0].decode_times is False
 
 
+def test_drop_variables_survive_repeated_dumps():
+  """`drop_variables` reaches every interval: the config is dumped once per part and interval.
+
+  Typed as an `Iterable`, pydantic stored a one-shot iterator, and only the first dump had the
+  names.
+  """
+  part = {"filename_or_obj": "data.nc", "engine": "h5netcdf", "drop_variables": ["a", "b"]}
+  config = DatasetConfig.model_validate({"parts": [part]}).parts[0]
+  assert [config.model_dump()["drop_variables"] for _ in range(2)] == [["a", "b"]] * 2
+  read = ReadConfig(drop_variables=["a"])
+  assert [read.model_dump()["drop_variables"] for _ in range(2)] == [["a"]] * 2
+
+
 def test_climatology_honours_use_flox(tmp_path: pathlib.Path, sources: pathlib.Path, monkeypatch):
   """`use_flox = true` in the recipe selects the flox implementation."""
   seen = {}
