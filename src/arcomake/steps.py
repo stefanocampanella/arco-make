@@ -13,8 +13,9 @@ argument or an argument of the wrong type is an error before any data is read.
 
 import difflib
 import inspect
-from collections.abc import Callable, Mapping
-from typing import Any
+import types
+from collections.abc import Callable, Hashable, Mapping
+from typing import Any, Literal, Union, get_args, get_origin
 
 import xarray as xr
 from pydantic import ConfigDict, TypeAdapter
@@ -120,6 +121,12 @@ def check_arguments(name: str, arguments: Mapping[str, Any]) -> None:
       else [(parameter_name, value)]
     )
     for argument_name, argument_value in items:
+      # A string is an iterable of hashables: without this, `variables = "thetao"` would pass and
+      # then match every variable whose name is a substring of it.
+      if isinstance(argument_value, str) and not _accepts_a_string(parameter.annotation):
+        raise ValueError(
+          f"Invalid argument {argument_name!r} of step {name!r}: expected a list, got a string"
+        )
       try:
         adapter.validate_python(argument_value)
       except PydanticValidationError as exc:
@@ -127,6 +134,18 @@ def check_arguments(name: str, arguments: Mapping[str, Any]) -> None:
         raise ValueError(
           f"Invalid argument {argument_name!r} of step {name!r}: {message}"
         ) from None
+
+
+def _accepts_a_string(annotation: Any) -> bool:
+  """Whether a parameter annotated `annotation` means to accept a single string."""
+  if annotation in (str, Any, Hashable):
+    return True
+  origin = get_origin(annotation)
+  if origin in (Union, types.UnionType):
+    return any(_accepts_a_string(argument) for argument in get_args(annotation))
+  if origin is Literal:
+    return any(isinstance(argument, str) for argument in get_args(annotation))
+  return False
 
 
 def render_reference() -> str:

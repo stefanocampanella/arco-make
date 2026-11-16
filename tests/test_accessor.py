@@ -74,6 +74,15 @@ def test_names_that_are_not_steps_are_rejected_at_load_time(name: str):
       "Unknown argument 'kwarg' of step 'regrid'",
     ),
     ({"name": "drop_attrs", "deeep": False}, "Unknown argument 'deeep' of step 'drop_attrs'"),
+    # A string is an iterable of hashables, but a list was meant: `in` would match substrings.
+    (
+      {"name": "select_variables", "variables": "thetao"},
+      "Invalid argument 'variables' of step 'select_variables': expected a list",
+    ),
+    (
+      {"name": "clip_negative", "variables": "thetao_bottom"},
+      "Invalid argument 'variables' of step 'clip_negative': expected a list",
+    ),
   ],
 )
 def test_step_arguments_are_checked_at_load_time(table: dict, message: str):
