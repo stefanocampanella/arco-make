@@ -5,7 +5,9 @@ import warnings
 from collections.abc import Sequence
 from typing import Any
 
+import cftime
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 from arcomake.checks import CHECKS, ChecksConfig, ValidationError
@@ -32,8 +34,13 @@ class ArcoMakeSelector:
     """
     if time_dim not in self._dataset.coords:
       return self._dataset
-    if not self._dataset.indexes[time_dim].is_monotonic_increasing:
+    index = self._dataset.indexes[time_dim]
+    if not index.is_monotonic_increasing:
       raise ValueError(f"Time coordinate is not sorted: {self._dataset[time_dim]}")
+    if isinstance(index, xr.CFTimeIndex):
+      # cftime dates do not compare with `datetime` or strings: convert the bounds.
+      start_datetime = _as_cftime(start_datetime, index.date_type)
+      end_datetime = _as_cftime(end_datetime, index.date_type)
     selected = self._dataset.sel({time_dim: slice(start_datetime, end_datetime)})
     # The index is sorted, so the stamps before `end` are a prefix. Select them with a slice:
     # an index array would rechunk Dask arrays (and change the order of later reductions).
@@ -102,3 +109,12 @@ class ArcoMakeSelector:
           raise ValidationError(failure_message) from exc
         else:
           warnings.warn(failure_message)
+
+
+def _as_cftime(value: Any, date_type: type) -> Any:
+  """`value` (a cftime date, `datetime`, numpy or pandas time, or string) as `date_type`."""
+  if isinstance(value, date_type):
+    return value
+  # A cftime date of another calendar is taken field by field, as any other time.
+  t = value if isinstance(value, cftime.datetime) else pd.Timestamp(value)
+  return date_type(t.year, t.month, t.day, t.hour, t.minute, t.second, t.microsecond)

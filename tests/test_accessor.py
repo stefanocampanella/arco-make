@@ -162,3 +162,18 @@ def test_time_sel_cftime():
   ds = xr.Dataset({"a": ("time", np.arange(5.0))}, coords={"time": times})
   out = ds.arcomake.time_sel(times[1], times[3])
   assert out.sizes["time"] == 2
+
+
+@pytest.mark.parametrize(
+  ("start", "end"),
+  [
+    (datetime(2001, 1, 2), datetime(2001, 1, 4)),  # what `download` passes
+    ("2001-01-02", "2001-01-04"),
+    (pd.Timestamp("2001-01-02"), np.datetime64("2001-01-04")),
+  ],
+)
+def test_time_sel_cftime_with_other_bounds(start, end):
+  """On a cftime calendar, `datetime`, string and numpy bounds work too (they did not compare)."""
+  times = xr.date_range("2001-01-01", periods=5, freq="1D", calendar="noleap", use_cftime=True)
+  ds = xr.Dataset({"a": ("time", np.arange(5.0))}, coords={"time": times})
+  np.testing.assert_array_equal(ds.arcomake.time_sel(start, end)["a"].values, [1.0, 2.0])
