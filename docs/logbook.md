@@ -149,3 +149,25 @@ with 32 cores and 110 GB, the image's eccodes 2.48, threads scheduler; locations
   - with one of five years missing in one bin, the anomaly variance of that bin is 6 % too low
     (window 1);
   - a bin missing in every year makes its neighbours NaN through the window.
+
+## 2026-11-16: CI on GitHub
+
+- The first PR runs failed before reaching the code. uv picked the runner's newest Python (3.14),
+  for which numcodecs 0.15 has no wheel, and its source build failed. CI now pins 3.13, as the
+  image does. `requires-python = ">=3.13"` still admits 3.14; that resolves with the zarr v3 port.
+- The image workflow pushed to `oras://ghcr.io/...:${tag}` with `tag` never set (C15). The master
+  runs of October passed that step (their logs have expired); the current Apptainer rejects the
+  empty tag. It now pushes as `latest`, the tag the arco-ocean scripts pull, and only from master
+  pushes and manual runs: a pull request builds the image without publishing it.
+- **Decision (maintainer): CI stays offline.** The repository has secrets for Copernicus Marine and
+  EWDS, but PR checks do not use them:
+  - the repository and its Actions logs are public, and GitHub masks only the secrets themselves,
+    not tokens derived from them (Copernicus Marine S3 credentials, for instance);
+  - a pull request from a branch of the repository runs its own code with the secrets;
+  - the services fail and queue for reasons unrelated to the code (window 2 of the baseline failed
+    four times), and their data are revised, so only structural checks would be possible;
+  - a real recipe needs 36–53 GB, a standard runner has 16 GB.
+- What only the live services catch (changes in the services, the toolbox fork or cdsapi; GRIB
+  decoding; N6–N8 were found on real data) goes into a separate, non-blocking workflow: scheduled
+  and manual only, secrets in a protected environment, one tiny request per backend.
+- The NetCDF-over-HTTP backend's download had no test; it is now tested against a local server.

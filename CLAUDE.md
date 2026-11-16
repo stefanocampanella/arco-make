@@ -20,7 +20,7 @@ uv run arco-make --help                         # CLI entry point (arcomake:cli)
 
 Tests live in `tests/`: synthetic fixtures in `conftest.py` (grid with a coastline and slope, Feb 29 crossed), sample recipes in `tests/data/` (rendered with `@SOURCES@` replaced), and CLI end-to-end runs via click's `CliRunner`. Known bugs are pinned as `xfail(strict=True)`; the commit fixing a bug removes its marker. `unpack`, `process` and `compute-climatology` default to `--dask-setup mpi`: pass `threads` in tests.
 
-CI (`.github/workflows/ci.yml`): lint, reuse, gitleaks secret scan, tests with a coverage gate of 80 %. The Apptainer image build is separate.
+CI (`.github/workflows/ci.yml`): lint, reuse, gitleaks secret scan, tests with a coverage gate of 80 %, on Python 3.13 as in the image (numcodecs <0.16 has no wheels for newer Pythons). CI never downloads data or uses credentials, by design: the repository and its Actions logs are public, and pull-request code would run with the secrets. Checks against the live services belong in a separate workflow that never runs on pull requests. The Apptainer image (`apptainer-build-deploy.yml`) is built on pull requests and pushed as `:latest` only from master.
 
 Code style: **2-space indentation**, line length 100 (ruff config in `pyproject.toml`). Files start with an SPDX MIT header.
 
