@@ -47,22 +47,28 @@ The usual workflow is `download` (in pieces, e.g. as a SLURM job array), then `u
 
 Credentials and machine settings come from the environment, never from recipes: Copernicus
 Marine (`COPERNICUSMARINE_SERVICE_USERNAME`, `COPERNICUSMARINE_SERVICE_PASSWORD`), EWDS and CDS
-(`CDSAPI_URL`, `CDSAPI_KEY`), cloud storage (`GOOGLE_APPLICATION_CREDENTIALS`, `AWS_*`), `TMPDIR`
-(use a disk, not RAM: checkpoints and downloads go there) and Dask (`DASK_*`).
+(`CDSAPI_URL`, `CDSAPI_KEY`), cloud storage (`AWS_PROFILE` or `AWS_DEFAULT_PROFILE`, the default
+profile of `s3://` paths;
+`AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE`, `GOOGLE_APPLICATION_CREDENTIALS`), `TMPDIR` (use a
+disk, not RAM: checkpoints and downloads go there) and Dask (`DASK_*`).
 
 Every command first reads `~/.arcomakerc` (or the file named by `ARCOMAKE_RC`; an empty value
-disables it) and sets the variables the environment lacks. One `KEY=VALUE` per line, optionally
-after `export`, so a shell can `source` the same file:
+disables it), a dotenv file, and sets the variables the environment lacks. `export KEY=VALUE` lines
+are allowed, so a shell can `source` the same file:
 
 ```sh
 # ~/.arcomakerc: holds secrets, so `chmod 600 ~/.arcomakerc`
-export TMPDIR=/scratch/$USER/tmp
+export TMPDIR=/scratch/${USER}/tmp
+export AWS_PROFILE=my-bucket-profile
 export CDSAPI_URL=https://ewds.climate.copernicus.eu/api
 export CDSAPI_KEY='...'
 ```
 
-Variables already set win. Single-quoted values are literal; others expand `$VAR`. Values are
-never logged, and a file other users can read is reported.
+Variables already set win. Values are checked when a command starts (e.g. `CDSAPI_URL` must be an
+HTTP URL); secrets are never logged. Keys that are not settings are ignored with a warning naming
+the key, and a file other users can read is reported. A recipe's `storage_options` (e.g.
+`profile`) override `AWS_PROFILE`. An AWS profile that does not exist fails data commands at once:
+every botocore session reads it, the Copernicus Marine toolbox's included.
 
 ## Recipes
 

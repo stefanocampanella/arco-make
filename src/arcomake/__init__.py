@@ -5,7 +5,7 @@
 import click
 
 import arcomake.xarray_accessors  # noqa: F401  (registers the `Dataset.arcomake` accessor)
-from arcomake import rcfile
+from arcomake import settings
 from arcomake.climatology import compute_climatology
 from arcomake.download import download
 from arcomake.process import process
@@ -15,16 +15,23 @@ from arcomake.validate import validate
 
 
 @click.group()
-def cli():
+@click.pass_context
+def cli(ctx: click.Context):
   """Download, join, process, validate and summarize ARCO datasets, as described by TOML recipes.
 
   Every command takes a recipe (TOML) and input/output paths, which may be local or fsspec
   URLs. Outputs are never overwritten without --overwrite.
 
-  Settings missing from the environment (credentials, TMPDIR, DASK_*) are read from
-  ~/.arcomakerc, or the file named by ARCOMAKE_RC: KEY=VALUE lines, optionally after `export`.
+  Settings missing from the environment (credentials, AWS_PROFILE, TMPDIR, DASK_*) are read
+  from ~/.arcomakerc, or the file named by ARCOMAKE_RC: a dotenv file (`export KEY=VALUE`).
   """
-  rcfile.load()
+  settings.load()
+  # Data commands open botocore sessions (S3 paths, Copernicus Marine): fail now, not after retries.
+  if ctx.invoked_subcommand != "steps" and (profile := settings.missing_aws_profile()) is not None:
+    raise click.ClickException(
+      f"The AWS profile {profile!r} (AWS_DEFAULT_PROFILE or AWS_PROFILE) is not configured "
+      "(AWS_CONFIG_FILE, ~/.aws/config). Fix or unset it."
+    )
 
 
 @click.command(name="steps")

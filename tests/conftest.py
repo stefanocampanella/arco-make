@@ -36,6 +36,8 @@ def no_user_settings_file(request: pytest.FixtureRequest, monkeypatch: pytest.Mo
   """Tests never read the user's `~/.arcomakerc` (it holds secrets); live checks may."""
   if request.node.get_closest_marker("network") is None:
     monkeypatch.setenv("ARCOMAKE_RC", "")
+    for name in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE"):
+      monkeypatch.delenv(name, raising=False)
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:

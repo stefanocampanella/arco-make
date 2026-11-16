@@ -31,6 +31,8 @@ dependencies = [
     "xarray-regrid[accel]",
     # TODO: Port to Zarr v3
     "zarr >= 2, < 3",
+    "pydantic-settings>=2.6",
+    "python-dotenv>=1.0",
 ]
 authors = [{name = "Stefano Campanella", email = "scampanella@ogs.it"}]
 description = "Utility to download and preprocess data into ARCO format."

@@ -249,16 +249,33 @@ implementation (S1) is built and timed on the project VM, and the maintainer tim
 ## 2026-11-16: user settings file
 
 **Request (maintainer):** support a user file for secrets and settings, like the one kept on the
-project VM (which must never be read here).
+project VM (which must never be read here), including the default S3 profile. Parsed with
+pydantic-settings (maintainer's choice) rather than by hand.
 
-- `~/.arcomakerc` (or `$ARCOMAKE_RC`; empty disables it) is read by every command before anything
-  else; it sets the environment variables that are missing, so the environment always wins. The
-  format is shell-compatible (`export KEY=VALUE`), so the same file can be `source`d by job scripts.
-  Chosen over a TOML file because every setting arco-make needs (service credentials, `TMPDIR`,
-  `DASK_*`) is already an environment variable read by a library.
-- Values are never logged; an unparsable line is reported by number only; a file other users can
-  access is reported (`chmod 600`). `TMPDIR` and `DASK_*` from the file take effect although
-  `tempfile` and Dask read them earlier.
+- `ArcoMakeSettings` (`settings.py`) reads the environment, then the dotenv file `~/.arcomakerc`
+  (or `$ARCOMAKE_RC`; empty disables it); every command exports the values the environment lacks,
+  since the libraries read only the environment. The environment wins. python-dotenv accepts
+  `export KEY=VALUE`, so job scripts can `source` the same file.
+- Settings: `TMPDIR`, `AWS_PROFILE` (default profile of `s3://` paths), `AWS_CONFIG_FILE`,
+  `AWS_SHARED_CREDENTIALS_FILE`, `GOOGLE_APPLICATION_CREDENTIALS`, Copernicus Marine and CDS/EWDS
+  credentials; `DASK_*` keys go to Dask. Secrets are `SecretStr`; values are checked at start
+  (`CDSAPI_URL` must be HTTP) and never logged. Unknown keys are ignored with a warning naming the
+  key (maintainer's choice: the file may hold exports for job scripts). A file other users can
+  access is reported.
+- `TMPDIR` and `DASK_*` from the file take effect although `tempfile` and Dask read them earlier.
 - Tests never read a real file: an autouse fixture sets `ARCOMAKE_RC=""`, except for the live
   checks, whose credentials may come from it.
+- **S3 profile and Copernicus Marine.** The toolbox (fork 2.4.1) reaches CloudFerro's S3-compatible
+  storage through botocore: `boto3.Session()` (which reads the profile variables) and a client
+  with `signature_version=UNSIGNED` and an explicit `endpoint_url`. So a profile's credentials are
+  never used to sign, and nothing of the AWS identity goes to CloudFerro; explicit endpoint and
+  retries override the profile's. But an unknown profile fails the session: seen live, the
+  Copernicus part failed with `ProfileNotFound` after about 4 min of retries. arco-make now checks
+  the profile botocore will use when a data command starts.
+  - botocore takes `AWS_DEFAULT_PROFILE` before `AWS_PROFILE`; the session environment here sets
+    the former, which hid the test profile in the first two live runs. Both are settings now, and
+    the test fixture unsets both.
+  - Live check with a profile holding fake credentials and `addressing_style = virtual`: the
+    Copernicus Marine download passes (complete, plausible values) in 3 s. The profile's
+    credentials and S3 options do not reach the toolbox's unsigned CloudFerro client.
 

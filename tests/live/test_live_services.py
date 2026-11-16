@@ -20,7 +20,7 @@ import pytest
 import xarray as xr
 from click.testing import CliRunner, Result
 
-from arcomake import cli, rcfile
+from arcomake import cli, settings
 
 RECIPES = pathlib.Path(__file__).parent / "recipes"
 
@@ -99,7 +99,7 @@ def failure_report(result: Result) -> str:
 def test_download_from_live_service(name: str, tmp_path: pathlib.Path):
   """One day from the service: the variable, on a non-empty grid, complete, with plausible values."""
   expected = CASES[name]
-  rcfile.load()  # credentials may come from ~/.arcomakerc, as for the CLI
+  settings.load()  # credentials may come from ~/.arcomakerc, as for the CLI
   if expected.credentials and not credentials_available(expected):
     pytest.fail(f"no credentials: set {', '.join(expected.credentials)}")
   output = tmp_path / f"{name}.zarr"
