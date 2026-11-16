@@ -91,6 +91,33 @@ def test_generic_parts_take_open_dataset_arguments():
   assert DatasetConfig.model_validate({"parts": [part]}).parts[0].decode_times is False
 
 
+@pytest.mark.parametrize(
+  ("part", "model"),
+  [
+    ({"filename_or_obj": "gs://bucket/store.zarr"}, "ZarrPartConfig"),
+    ({"filename_or_obj": "gs://bucket/store.zarr", "storage_options": {}}, "ZarrPartConfig"),
+    ({"filename_or_obj": "cm://dataset"}, "CopernicusMarinePartConfig"),
+    ({"filename_or_obj": "https://host/file.nc"}, "NetCDFOverHTTPPartConfig"),
+    ({"filename_or_obj": "ewds://cems-glofas-historical"}, "EarlyWarningDataStorePartConfig"),
+    ({"filename_or_obj": "data.nc"}, "GenericPartConfig"),
+    ({"filename_or_obj": "gs://bucket/x", "engine": "zarr"}, "ZarrPartConfig"),
+  ],
+)
+def test_parts_without_engine_match_by_url(part: dict, model: str):
+  """Without `engine`, the URL decides the model; it no longer defaults to Copernicus Marine.
+
+  A `gs://...zarr` part without `engine` matched the Copernicus Marine model first (its engine
+  had a default) and opened a Copernicus dataset named after the bucket.
+  """
+  assert type(DatasetConfig.model_validate({"parts": [part]}).parts[0]).__name__ == model
+
+
+def test_zarr_parts_take_open_dataset_arguments():
+  """Zarr parts accept the arguments of `xarray.open_dataset`, as generic parts do."""
+  part = {"filename_or_obj": "gs://b/x.zarr", "engine": "zarr", "decode_times": False}
+  assert DatasetConfig.model_validate({"parts": [part]}).parts[0].decode_times is False
+
+
 def test_drop_variables_survive_repeated_dumps():
   """`drop_variables` reaches every interval: the config is dumped once per part and interval.
 

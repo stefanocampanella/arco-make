@@ -5,7 +5,7 @@ import logging
 import pathlib
 import posixpath
 import tempfile
-from collections.abc import Hashable, Mapping
+from collections.abc import Callable, Hashable, Mapping
 from contextlib import ExitStack, nullcontext
 from typing import Annotated, Any, Literal
 
@@ -16,7 +16,7 @@ import zarr.storage
 from dask.delayed import Delayed
 from dask.diagnostics import ProgressBar
 from numcodecs import Blosc
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 from xarray.backends.common import BackendEntrypoint
 from xarray.backends.plugins import guess_engine
 from xarray.coders import CFDatetimeCoder, CFTimedeltaCoder
@@ -42,12 +42,11 @@ ChunksConfig = (
 )
 
 
-class ReadConfig(BaseModel):
-  """Arguments of `xarray.open_dataset` (the `[read]` table of a recipe)."""
+class OpenDatasetArguments(BaseModel):
+  """Arguments of `xarray.open_dataset`, except `engine`."""
 
   model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
-  engine: EngineType | None = None
   chunks: ChunksConfig | None = None
   cache: bool | None = None
   decode_cf: bool | None = None
@@ -69,6 +68,12 @@ class ReadConfig(BaseModel):
   consolidated: bool | None = None
 
 
+class ReadConfig(OpenDatasetArguments):
+  """Arguments of `xarray.open_dataset` (the `[read]` table of a recipe)."""
+
+  engine: EngineType | None = None
+
+
 class CompressorConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
@@ -78,11 +83,33 @@ class CompressorConfig(BaseModel):
   blocksize: int | None = Field(default=None, ge=0)
 
 
+def _engine_given_or_implied(data: Any, implied: Callable[[str], bool]) -> Any:
+  """A part without `engine` matches a dedicated model only if its URL implies that engine.
+
+  Otherwise it falls through to `GenericPartConfig`, and xarray guesses the engine.
+  """
+  if isinstance(data, Mapping) and data.get("engine") is None:
+    url = data.get("filename_or_obj")
+    if not (isinstance(url, str) and implied(url)):
+      raise ValueError("no `engine` given, and the URL does not imply this one")
+  return data
+
+
+def _has_scheme(url: str, *schemes: str) -> bool:
+  return url.split("://", 1)[0].lower() in schemes if "://" in url else False
+
+
 class CopernicusMarinePartConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
   engine: Literal["copernicusmarine"] | None = "copernicusmarine"
+
+  @model_validator(mode="before")
+  @classmethod
+  def _engine(cls, data: Any) -> Any:
+    return _engine_given_or_implied(data, lambda url: _has_scheme(url, "cm"))
+
   variables: str | list[str] | None = None
   drop_variables: str | list[str] | None = None
   dataset_version: str | None = None
@@ -101,6 +128,13 @@ class NetCDFOverHTTPPartConfig(BaseModel):
   engine: Literal["netcdfoverhttp"] | None = "netcdfoverhttp"
   drop_variables: str | list[str] | None = None
   chunks: ChunksConfig | None = None
+
+  @model_validator(mode="before")
+  @classmethod
+  def _engine(cls, data: Any) -> Any:
+    return _engine_given_or_implied(
+      data, lambda url: _has_scheme(url, "http", "https") and not url.endswith(".zarr")
+    )
 
 
 class EarlyWarningDataStorePartConfig(BaseModel):
@@ -121,16 +155,22 @@ class EarlyWarningDataStorePartConfig(BaseModel):
   longitude_dim: str | None = None
   chunks: ChunksConfig | None = None
 
+  @model_validator(mode="before")
+  @classmethod
+  def _engine(cls, data: Any) -> Any:
+    return _engine_given_or_implied(data, lambda url: _has_scheme(url, "ewds"))
 
-class ZarrPartConfig(BaseModel):
-  model_config = ConfigDict(extra="forbid")
+
+class ZarrPartConfig(OpenDatasetArguments):
+  """A Zarr part: the arguments of `xarray.open_dataset`, read through a strict store."""
 
   filename_or_obj: str
   engine: Literal["zarr"] | None = "zarr"
-  consolidated: bool | None = None
-  storage_options: dict[str, Any] | None = None
-  chunks: ChunksConfig | None = None
-  drop_variables: str | list[str] | None = None
+
+  @model_validator(mode="before")
+  @classmethod
+  def _engine(cls, data: Any) -> Any:
+    return _engine_given_or_implied(data, lambda url: url.rstrip("/").endswith(".zarr"))
 
 
 class GenericPartConfig(ReadConfig):
