@@ -2,11 +2,15 @@
 # SPDX-License-Identifier: MIT
 """Climatology and anomaly variance against a direct NumPy computation."""
 
+import datetime
+
 import numpy as np
+import pandas as pd
+import pydantic
 import pytest
 import xarray as xr
 
-from arcomake.climatology import _compute_climatology, _window_weights
+from arcomake.climatology import ClimatologyConfig, _compute_climatology, _window_weights
 
 PERIOD = 6
 N_PERIODS = 5
@@ -58,7 +62,6 @@ def test_climatology_matches_numpy(window: int, weighting: str):
   np.testing.assert_array_equal(mean.time.values, np.arange(PERIOD))
 
 
-@pytest.mark.xfail(reason="B6: bins count every period even where a period is missing", strict=True)
 def test_climatology_variance_with_a_missing_year():
   """A value missing in one period does not bias the variance of its bin."""
   ds = series()
@@ -70,9 +73,6 @@ def test_climatology_variance_with_a_missing_year():
   np.testing.assert_allclose(var.x.values, ref_var, rtol=1e-12)
 
 
-@pytest.mark.xfail(
-  reason="B6: an all-NaN bin spreads NaN to its neighbours through the window", strict=True
-)
 def test_climatology_window_does_not_spread_nan():
   """A bin missing in every period leaves the smoothed neighbours finite."""
   ds = series()
@@ -84,6 +84,78 @@ def test_climatology_window_does_not_spread_nan():
   np.testing.assert_allclose(mean.x.values, ref_mean, rtol=1e-12)
 
 
+def test_climatology_with_missing_last_steps():
+  """Steps missing at the end of the last period (NaN) count in no bin."""
+  ds = series()
+  values = ds.x.values.copy()
+  values[-2:] = np.nan
+  _, var = _compute_climatology(ds.assign(x=(ds.x.dims, values)), period=PERIOD, window=3)
+  _, ref_var = reference(values, 3, "constant")
+  np.testing.assert_allclose(var.x.values, ref_var, rtol=1e-12)
+
+
+def test_position_bins_need_whole_periods():
+  """Position bins refuse a partial period: leap days or partial years would shift later bins."""
+  with pytest.raises(ValueError, match="whole number of periods"):
+    _compute_climatology(series().isel(time=slice(0, -2)), period=PERIOD)
+
+
+def daily(start: str, end: str, seed: int = 0) -> xr.Dataset:
+  rng = np.random.default_rng(seed)
+  time = pd.date_range(start, end, freq="1D", inclusive="left")
+  return xr.Dataset({"x": ("time", rng.standard_normal(time.size))}, coords={"time": time})
+
+
+def test_day_of_year_bins_put_feb_29_with_feb_28():
+  """Feb 29 counts in Feb 28's bin; later days of a leap year take the same date's bin."""
+  ds = daily("2019-01-01", "2021-01-01")  # 2020 is a leap year
+  mean, var = _compute_climatology(ds, period=365, bins="day_of_year")
+  x = ds.x.to_series()
+  feb_28 = x[(x.index.month == 2) & (x.index.day.isin([28, 29]))]
+  np.testing.assert_allclose(mean.x.values[58], feb_28.mean(), rtol=1e-12)
+  np.testing.assert_allclose(var.x.values[58], feb_28.var(ddof=1), rtol=1e-12)
+  mar_1 = x[(x.index.month == 3) & (x.index.day == 1)]
+  np.testing.assert_allclose(mean.x.values[59], mar_1.mean(), rtol=1e-12)
+  dec_31 = x[(x.index.month == 12) & (x.index.day == 31)]
+  np.testing.assert_allclose(mean.x.values[364], dec_31.mean(), rtol=1e-12)
+  assert mean.sizes["time"] == 365
+
+
+def test_day_of_year_bins_match_position_bins_without_leap_days():
+  """Without Feb 29 and with whole years, day-of-year bins are position bins."""
+  ds = daily("2021-01-01", "2024-01-01")
+  by_day, var_day = _compute_climatology(ds, period=365, window=5, bins="day_of_year")
+  by_position, var_position = _compute_climatology(ds, period=365, window=5)
+  np.testing.assert_allclose(by_day.x.values, by_position.x.values, rtol=1e-12)
+  np.testing.assert_allclose(var_day.x.values, var_position.x.values, rtol=1e-12)
+
+
+def test_climatology_keeps_the_input_dtype():
+  """float32 inputs give float32 statistics (counts are integers internally)."""
+  ds = series().astype("float32")
+  mean, var = _compute_climatology(ds, period=PERIOD, window=3)
+  assert mean.x.dtype == var.x.dtype == np.float32
+
+
+def test_flox_gives_the_same_statistics():
+  """The flox implementation agrees with the folded one, Feb 29 included."""
+  pytest.importorskip("flox")
+  ds = daily("2019-03-01", "2021-07-01").chunk(time=100)
+  with pytest.raises(ValueError, match="one time step per day"):  # checked before either path
+    hourly = xr.Dataset(
+      {"x": ("time", np.zeros(48))},
+      coords={"time": pd.date_range("2020-01-01", periods=48, freq="1h")},
+    )
+    _compute_climatology(hourly, period=365, bins="day_of_year", use_flox=True)
+  values = ds.x.values.copy()
+  values[10:40] = np.nan
+  ds = ds.assign(x=("time", values))
+  mean, var = _compute_climatology(ds, period=365, window=7, bins="day_of_year")
+  mean_f, var_f = _compute_climatology(ds, period=365, window=7, bins="day_of_year", use_flox=True)
+  np.testing.assert_allclose(mean_f.x.values, mean.x.values, rtol=1e-10)
+  np.testing.assert_allclose(var_f.x.values, var.x.values, rtol=1e-10)
+
+
 def test_window_weights():
   """Constant weights are ones; Gaussian and geometric weights decay symmetrically from the centre."""
   np.testing.assert_array_equal(_window_weights([-1, 0, 1], "constant"), [1, 1, 1])
@@ -93,3 +165,26 @@ def test_window_weights():
   np.testing.assert_allclose(geometric[0], 0.1)
   with pytest.raises(ValueError):
     _window_weights([-1, 0, 1], "geometric", scale=2.0)
+
+
+@pytest.mark.parametrize(
+  ("table", "message"),
+  [
+    ({"reference_period": {"start": "2019-01-01", "end": "1993-01-01"}}, "before end"),
+    (
+      {
+        "reference_period": {
+          "start": datetime.datetime(1993, 1, 1, tzinfo=datetime.UTC),
+          "end": "2019-01-01",
+        }
+      },
+      "no time zone",
+    ),
+    ({"bins": "day_of_year", "period": 366}, "needs period = 365"),
+  ],
+)
+def test_climatology_recipes_are_checked_when_loaded(table: dict, message: str):
+  """Inconsistent settings fail when the recipe is read, not after the cluster has started."""
+  base = {"period": 365, "window": 1, "weighting": "constant", "read": {}, "save": {}}
+  with pytest.raises(pydantic.ValidationError, match=message):
+    ClimatologyConfig.model_validate(base | table)

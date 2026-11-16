@@ -5,6 +5,7 @@
 import pathlib
 
 import numpy as np
+import pandas as pd
 import pytest
 import xarray as xr
 import zarr
@@ -119,3 +120,27 @@ def test_climatology_sample_dataset(tmp_path: pathlib.Path, downloaded: pathlib.
   np.testing.assert_allclose(
     xr.open_zarr(std).t2m.values[1], np.abs(t2m[1] - t2m[3]) / np.sqrt(2), rtol=1e-5
   )
+
+
+def test_climatology_reference_period_and_day_of_year(tmp_path: pathlib.Path):
+  """`reference_period` limits the statistics to `[start, end)`; day-of-year bins need no
+  calendar conversion (Feb 29 is in Feb 28's bin)."""
+  time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
+  values = np.random.default_rng(0).standard_normal(time.size).astype("float32")
+  xr.Dataset({"x": ("time", values)}, coords={"time": time}).to_zarr(tmp_path / "in.zarr")
+  recipe = tmp_path / "climatology.toml"
+  recipe.write_text(
+    'period = 365\nbins = "day_of_year"\nwindow = 1\nweighting = "constant"\n'
+    "reference_period = {start = 2020-01-01, end = 2021-01-01}\n\n"
+    '[read]\nengine = "zarr"\n\n[save]\n'
+  )
+  clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
+  args = [str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)]
+  result = run("compute-climatology", *THREADS, *args)
+  assert result.exit_code == 0, result.output
+  out = xr.open_zarr(clim).x.values
+  in_2020 = values[time.year == 2020]
+  np.testing.assert_array_equal(out[:58], in_2020[:58])  # Jan 1 to Feb 27 of 2020 only
+  np.testing.assert_allclose(out[58], in_2020[58:60].mean(), rtol=1e-6)  # Feb 28 and 29
+  np.testing.assert_array_equal(out[59:], in_2020[60:])
+  assert np.isnan(xr.open_zarr(std).x.values[0])  # one value: no variance
