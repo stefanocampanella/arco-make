@@ -3,7 +3,6 @@
 import logging
 
 import click
-import xarray as xr
 from pydantic import BaseModel, ConfigDict
 
 from arcomake.checks import ChecksConfig, ValidationError
@@ -12,7 +11,7 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.dataset_utils import ReadConfig
+from arcomake.dataset_utils import ReadConfig, open_input
 
 logger = logging.getLogger(__name__)
 
@@ -44,11 +43,12 @@ def validate(
   fail: bool = False,
   log_level: str = "info",
 ):
-  """
-  Validate a dataset against checks defined in a configuration file.
+  """Check a dataset against the [checks] of a recipe.
 
-  The function reads the configuration file, opens the input dataset,
-  and applies the validation procedure.
+  Checks: `valid_time_coordinate` (complete, sorted, without duplicates, between `start` and
+  `end` excluded), `valid_global_ecmwf_coordinates` (latitudes increasing within [-90, 90],
+  longitudes within [0, 360)) and `ensure_no_nans` (no missing value inside each mask).
+  Failed checks are warnings, or an error with --fail.
   """
   # Set up logging.
   set_default_logger(log_level)
@@ -59,7 +59,7 @@ def validate(
   # Validate the dataset
   if configs.checks:
     try:
-      with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
+      with open_input(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
         dataset.arcomake.validate(
           checks=configs.checks,
           fail=fail,

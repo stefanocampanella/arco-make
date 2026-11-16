@@ -1,96 +1,138 @@
 # ARCO-MAKE
 
-Arco-make is a tool for automating the preparation of Analysis-Ready Cloud-Optimized (ARCO) timeseries datasets from individual data sources. It operates via "recipes": TOML configuration files that specify where each dataset component is located, alongside the post-processing steps to apply to it. Finally, it allows you to compute data statistics, which are useful for developing data-driven (deep learning) models.
+Arco-make prepares Analysis-Ready Cloud-Optimized (ARCO) timeseries datasets in Zarr from individual data
+sources. It works from *recipes*: TOML files that say where each source is, how to process it (regridding,
+resampling, masks, renaming...), and how to store the result. It also computes statistics of the result,
+such as a climatology, for standardizing the inputs of data-driven models.
+
+It was built to produce [ARCO-OCEAN](https://github.com/inogs/arco-ocean), whose recipes live in that
+repository.
 
 ## Installation
 
-Arco-make requires Python 3.13 or later. We recommend installing it using [uv](https://github.com/astral-sh/uv) or `pip`:
+Arco-make requires Python 3.13 or later. Install it with [uv](https://github.com/astral-sh/uv) or `pip`:
 
 ```bash
 pip install .
-
 ```
 
-For development, you can install the package with its extra dependencies:
+For development, with the test and lint tools:
 
 ```bash
-pip install -e ".[dev]"
-
+uv sync --extra dev
 ```
 
-Alternatively, you can pull the latest image from the GitHub Container Registry. For example:
+A container image with an MPI build is published on the GitHub Container Registry:
 
 ```bash
 apptainer exec oras://ghcr.io/stefanocampanella/arco-make:latest arco-make download --help
-
 ```
 
-## Usage
+## Commands
 
-The typical workflow consists of three steps:
+| Command | What it does |
+|---|---|
+| `arco-make download RECIPE OUTPUT` | Downloads, processes and merges the datasets of a recipe into one Zarr store |
+| `arco-make unpack RECIPE INPUT_DIR OUTPUT` | Joins pieces written by separate `download` runs into one dataset |
+| `arco-make validate RECIPE INPUT` | Checks a dataset: time axis, grid, missing values inside masks |
+| `arco-make process RECIPE INPUT OUTPUT` | Applies recipe steps to a dataset (e.g. a time mean) |
+| `arco-make compute-climatology RECIPE INPUT CLIMATOLOGY ANOMALY_STD` | Computes a periodic climatology and the standard deviation of the anomalies |
+| `arco-make steps` | Prints the reference of the processing steps ([docs/steps.md](docs/steps.md)) |
 
-1. Download a collection of Zarr datasets using `arco-make download` (optionally using SLURM job arrays or GNU Parallel) and optionally save them as zip archives.
-2. If needed, unpack the zip archives into a single dataset using `arco-make unpack`.
-3. Compute statistics using `arco-make stats`.
+Every command documents its options with `--help`. Paths may be local or fsspec URLs (e.g. `s3://`, `gs://`).
+The usual workflow is `download` (in pieces, e.g. as a SLURM job array), then `unpack`, `validate`, and
+`compute-climatology`.
 
-Detailed documentation for these commands is available directly via the command-line interface.
+## Recipes
 
-### HPC and Cluster Considerations
-
-The download phase is the most critical part of the workflow. Most of its design choices were motivated by the constraints of running workflows on HPC clusters, where nodes with internet access face strict limits on memory, I/O, and compute time. To navigate these limitations, `arco-make download` takes the following actions:
-
-1. **Memory Management:** High-resolution spatial or temporal source datasets can yield segments that exceed available memory. To prevent this, `arco-make` downloads and postprocesses from each source separately, saving regridded/resampled intermediate results to disk. To reduce the memory footprint further, it splits timeseries segments into smaller, temporary segments defined by the `checkpointing_step` key for each dataset.
-2. **Storage Optimization:** It can save the resulting Zarr datasets directly into zip archives. This prevents the creation of a plethora of small files, which would otherwise degrade performance on parallel filesystems like Lustre or on tape storage systems.
-
-Arco-make supports downloading from various data providers (such as Copernicus Marine or the Climate Data Store) and online resources (including Google Cloud Storage or remote NetCDF files served over HTTP).
-
-> [!IMPORTANT]
-> Temporary storage is used heavily for saving intermediate results, as well as during downloads from the Climate Data Store or remote NetCDFs. If your system's default temporary directory resides in RAM, we recommend setting the `TMPDIR` environment variable to point to physical disk storage instead.
-
-> [!NOTE]
-> `arco-make` leverages `xarray` and `dask`. Regridding operations are powered by `xarray-regrid`.
-
-## Download Recipes
-
-Contrary to what the name might suggest, Arco-make does not use a declarative syntax like GNU Make. Instead, it processes operations sequentially in an imperative style, as its primary purpose is to automate repetitive processing pipelines across multiple data sources simultaneously.
-
-Arco-make was originally built to produce [ARCO-OCEAN](https://github.com/inogs/arco-ocean), utilizing the recipe file located at `arco-ocean/configs/download/arco-ocean_tres-1d_res-0p25_levels-10.toml`. This file serves as an illustrative example of the expected TOML schema. We provide samples under `arco-make/sample_configs/` suggest using them as templates and adapting them to your specific use case.
-
-A valid recipe follows this pattern:
+A download recipe has a top table for the whole dataset, one table per source dataset, steps applied
+after merging, and the stored layout. A complete example, run by the tests on synthetic sources, is
+[`tests/data/sample_download.toml`](tests/data/sample_download.toml); its shape is:
 
 ```toml
-# Top table contains info related to the whole dataset
-start = 1970-01-01T00:00:00
-end = 2026-06-01T00:00:00
+time_dim = "time"
+start = 2020-02-26T00:00:00
+end = 2020-03-02T00:00:00      # excluded: intervals are [start, end)
+step = "2D"                    # blocks written (then appended) one at a time
 
-[datasets.fictitious-dataset]
-checkpointing_step = '2W'
+[datasets.ocean.checkpointing] # optional: process this source in sub-blocks saved to temporary Zarr
+step = "1D"
 
-[[datasets.fictitious-dataset.parts]]
-# Info to download dataset part 1
+[[datasets.ocean.parts]]       # one or more parts, merged into the dataset
+filename_or_obj = "gs://bucket/ocean.zarr"
+engine = "zarr"
+chunks = {time = 1, depth = 1, latitude = -1, longitude = -1}
 
-[[datasets.fictitious-dataset.parts]]
-# Info to download dataset part 2
+[[datasets.ocean.postprocess]] # steps applied to this dataset, in order
+name = "regrid"
+method = "conservative"
+grid = {south = -1.5, north = 1.5, west = 0.5, east = 3.5, resolution_lat = 1.0, resolution_lon = 1.0}
+kwargs = {skipna = true, nan_threshold = 1.0}
 
-[[datasets.fictitious-dataset.postprocess]]
-# Preprocessing step 1 (applies to parts 1 and 2)
+[[postprocess]]                # steps applied after merging all datasets
+name = "masked_fill"
+mask_name = "sea_mask"
+fill_value = {thetao = "thetao_bottom"}
+variables = ["thetao"]
 
-[[datasets.fictitious-dataset.postprocess]]
-# Preprocessing step 2
-
-[[postprocess]]
-# Preprocessing applied to all datasets 
-
-[save]
-# Save options
-
-[checks]
-# Validation options
-
+[save]                         # the layout on disk
+chunks = {time = 1, depth = 1, lat = -1, lon = -1}
+compressor = {cname = "lz4", clevel = 1}
 ```
 
-## Contributing & Roadmap
+Sources are read with xarray: any of its engines (e.g. `zarr`, `h5netcdf`), or one of the backends of
+arco-make, `copernicusmarine` (Copernicus Marine, `cm://DATASET_ID`), `earlywarningdatastore` (EWDS,
+`ewds://DATASET`) and `netcdfoverhttp` (a NetCDF file served over HTTP). Credentials come from the
+environment of each service's client, never from recipes.
 
-Currently, the codebase has minimal documentation and lacks comprehensive unit testing. We plan to address both of these gaps in the future, and contributions in these areas, as well as new features or bug fixes, are welcome!
+Each step is a table whose `name` is a step of arco-make or one of a few `xarray.Dataset` methods; the
+other keys are its arguments. See [docs/steps.md](docs/steps.md). The `unpack`, `process`, `validate`
+and `compute-climatology` recipes have the same `[read]`, step and `[save]` tables; see the other samples
+in [`tests/data`](tests/data).
 
-*Arco-make is a best-effort project; use at your own peril!*
+## Guarantees
+
+- **A recipe runs as written, or fails before reading any data.** Unknown keys, unknown steps, unknown or
+  missing step arguments, and arguments of the wrong type are errors when the recipe is loaded.
+- **Steps never modify their input** (values, attributes, encodings): each returns a new dataset. Steps are
+  lazy, and the data are computed once, when written.
+- **Time intervals are right-open**, `[start, end)`, for the recipe, the blocks of `download` and the time
+  selection of each source, so consecutive pieces never overlap.
+- **An existing output is never replaced without `--overwrite`**, and a destination whose existence cannot
+  be checked stops the command.
+- **Downloads proceed in blocks**, so that a failure costs one block, and memory stays bounded: within a run
+  by `step` (and per source by `checkpointing.step`), and across runs by writing separate pieces that
+  `unpack` joins. Pieces joined by `unpack` equal a single run.
+- **Static variables** (without the time dimension) are identical in every piece and written once.
+- **Temporary data never outlive the process**: they are removed on exit, on errors and on SIGTERM/SIGHUP,
+  and leftovers of killed runs are removed by the next run.
+
+## HPC and cluster considerations
+
+The download phase is the most demanding part of the workflow, and its design follows the constraints of
+HPC clusters, where nodes with internet access have strict limits on memory, I/O and compute time:
+
+1. **Memory:** high-resolution sources can yield blocks larger than memory. Each source is processed
+   separately, and `checkpointing.step` splits it further into sub-blocks saved to temporary Zarr.
+2. **Storage:** outputs can be written directly as zip archives (`OUTPUT.zip`), avoiding many small files on
+   parallel filesystems such as Lustre, or on tape.
+
+> [!IMPORTANT]
+> Temporary storage is used heavily for intermediate results and for downloads from the Climate Data Store
+> or remote NetCDF files. If your system's default temporary directory is in RAM, set `TMPDIR` to a disk.
+
+> [!NOTE]
+> Arco-make relies on `xarray` and `dask`; regridding uses `xarray-regrid`. GRIB sources (EWDS) need a
+> recent ecCodes (2.48 is used in the container image).
+
+## Development
+
+```bash
+uv run pytest                            # offline tests on synthetic data
+uv run ruff check && uv run ruff format --check
+uv run ty check
+uv run pre-commit run --all-files        # also REUSE and secret scanning
+```
+
+See [CLAUDE.md](CLAUDE.md) for the architecture and [docs/logbook.md](docs/logbook.md) for dated records.
+Contributions are welcome. *Arco-make is a best-effort project; use at your own peril!*

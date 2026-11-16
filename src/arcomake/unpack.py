@@ -26,13 +26,6 @@ from arcomake.processing_utils import ProcessingStepConfig
 logger = logging.getLogger(__name__)
 
 
-class ArchiveConfig(BaseModel):
-  model_config = ConfigDict(extra="allow")
-
-  attrs_to_drop: list[str] | None = None
-  read: ReadConfig
-
-
 class UnpackConfig(BaseModel):
   model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
@@ -106,12 +99,13 @@ def unpack(
   progress: bool = False,
   use_frisky: bool = False,
 ):
-  """
-  Unpack a collection of zip files containing Zarr datasets into a single Zarr dataset.
+  """Join the pieces written by separate `download` runs into one Zarr dataset.
 
-  The command reads zipped Zarr fragments with xarray.open_mfdataset(engine='zarr'),
-  optionally slices the time range, rechunks, and saves to a DirectoryStore at the
-  given output path.
+  INPUT_PATH is a directory (local or fsspec URL) holding the pieces; the recipe's `glob` selects
+  them (e.g. "*.zarr" or "*.zip") and [read] gives the arguments to open each. Variables with the
+  time dimension are concatenated in time order; static variables must be identical in every
+  piece and are written once. Attributes listed in `attrs_to_drop` are removed before joining.
+  The optional [[postprocess]] steps run on the joined dataset, which is saved per [save].
   """
 
   # Set up logging.
@@ -119,10 +113,9 @@ def unpack(
   # Set up Dask client.
   with get_client(dask_setup=dask_setup, use_frisky=use_frisky):
     try:
-      # Check output path
-      check_if_overwriting(output_path, overwrite=overwrite)
-      # Read configs
+      # Read configs, then check the output path (with the recipe's storage options).
       configs = read_configs(configs_path, schema=UnpackConfig)
+      check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
       # Unpack archive
       with open_archive(
         input_path,

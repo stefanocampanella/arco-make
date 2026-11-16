@@ -26,7 +26,6 @@ dependencies = [
     "pydantic",
     "requests",
     "s3fs>2026",
-    "scipy",
     "tqdm",
     "xarray[complete]",
     "xarray-regrid[accel]",
@@ -41,8 +40,10 @@ license = "MIT"
 [project.optional-dependencies]
 dev = [
     "pandas-stubs~=3.0.3",
-    "scipy-stubs~=1.18.1",
     "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "reuse",
     "ruff",
     "ty",
     "memray",
@@ -98,5 +99,13 @@ include = ["src/arcomake/**/*.py"]
 respect-ignore-files = true
 
 [tool.ty.rules]
-# Disable type-checking for now.
+# Every rule is an error: the type checker gates commits (pre-commit) and CI.
 all = "error"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+xfail_strict = true
+markers = [
+    "network: needs network access and credentials; never run in CI",
+]

@@ -4,7 +4,6 @@ import logging
 from typing import get_args
 
 import click
-import xarray as xr
 from pydantic import BaseModel, ConfigDict, Field
 
 from arcomake.cli_utils import (
@@ -14,7 +13,7 @@ from arcomake.cli_utils import (
   set_default_logger,
 )
 from arcomake.dask_utils import DaskSetupType, get_client
-from arcomake.dataset_utils import ReadConfig, SaveConfig, safe_to_zarr
+from arcomake.dataset_utils import ReadConfig, SaveConfig, open_input, safe_to_zarr
 from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
@@ -23,11 +22,6 @@ logger = logging.getLogger(__name__)
 class ProcessConfig(BaseModel):
   model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-  time_dim: str = "time"
-  skipna: bool = Field(
-    default=False,
-    description="Whether to skip NaNs when computing the statistic.",
-  )
   read: ReadConfig = Field(default_factory=ReadConfig)
   process: list[ProcessingStepConfig] = Field(default_factory=list)
   save: SaveConfig = Field(default_factory=SaveConfig)
@@ -88,23 +82,11 @@ def process(
   use_frisky: bool = False,
   log_level: str = "info",
 ):
-  """
-  Compute a statistic of a Zarr dataset over time and save it to Zarr.
+  """Apply recipe steps to a dataset and save the result to Zarr.
 
-  Parameters
-  ----------
-  configs_path : pathlib.Path
-      Path to TOML configuration file containing configuration options.
-  input_path : pathlib.Path
-      Path to the input Zarr dataset.
-  output_path : pathlib.Path
-      Path to the output Zarr dataset.
-  overwrite : bool, default False
-      Whether to overwrite existing output.
-  dask_setup : DaskSetupType, default "mpi"
-      Type of Dask scheduler to use.
-  log_level : {"debug", "info", "warning", "error", "critical"}, default "info"
-      Logging verbosity.
+  CONFIGS_PATH is a TOML recipe with a [read] table (arguments of xarray.open_dataset), a list of
+  [[process]] steps (see `arco-make steps`; e.g. a time mean) and a [save] table. INPUT_PATH and
+  OUTPUT_PATH may be local paths or fsspec URLs.
   """
 
   # Set up logging.
@@ -113,13 +95,12 @@ def process(
   # Set up Dask client.
   with get_client(dask_setup=dask_setup, use_frisky=use_frisky):
     try:
-      # Check output path.
-      check_if_overwriting(output_path, overwrite=overwrite)
-      # Read configs
+      # Read configs, then check the output path (with the recipe's storage options).
       configs = read_configs(configs_path, schema=ProcessConfig)
+      check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
       # Read input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
-      with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
+      with open_input(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
         # Process dataset
         if configs.process:
           dataset = dataset.arcomake.process(steps=configs.process)

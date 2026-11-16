@@ -5,18 +5,20 @@ import logging
 import pathlib
 import posixpath
 import tempfile
-from collections.abc import Hashable, Iterable, Mapping
+from collections.abc import Callable, Hashable, Mapping
 from contextlib import ExitStack, nullcontext
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import fsspec
 import xarray as xr
+import zarr.errors
 import zarr.storage
 from dask.delayed import Delayed
 from dask.diagnostics import ProgressBar
 from numcodecs import Blosc
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 from xarray.backends.common import BackendEntrypoint
+from xarray.backends.plugins import guess_engine
 from xarray.coders import CFDatetimeCoder, CFTimedeltaCoder
 from zarr.storage import DirectoryStore, ZipStore
 
@@ -40,10 +42,11 @@ ChunksConfig = (
 )
 
 
-class ReadConfig(BaseModel):
-  model_config = ConfigDict(arbitrary_types_allowed=True, extra="allow")
+class OpenDatasetArguments(BaseModel):
+  """Arguments of `xarray.open_dataset`, except `engine`."""
 
-  engine: EngineType | None = None
+  model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
+
   chunks: ChunksConfig | None = None
   cache: bool | None = None
   decode_cf: bool | None = None
@@ -53,12 +56,22 @@ class ReadConfig(BaseModel):
   use_cftime: bool | Mapping[str, bool] | None = None
   concat_characters: bool | Mapping[str, bool] | None = None
   decode_coords: Literal["coordinates", "all"] | bool | None = None
-  drop_variables: str | Iterable[str] | None = None
+  drop_variables: str | list[str] | None = None
   create_default_indexes: bool = True
   inline_array: bool = False
   chunked_array_type: str | None = None
   from_array_kwargs: dict[str, Any] | None = None
   backend_kwargs: dict[str, Any] | None = None
+  # Options of the fsspec filesystem of a remote input (credentials, `requests_timeout`...).
+  storage_options: dict[str, Any] | None = None
+  # Zarr inputs: whether to read consolidated metadata.
+  consolidated: bool | None = None
+
+
+class ReadConfig(OpenDatasetArguments):
+  """Arguments of `xarray.open_dataset` (the `[read]` table of a recipe)."""
+
+  engine: EngineType | None = None
 
 
 class CompressorConfig(BaseModel):
@@ -70,11 +83,33 @@ class CompressorConfig(BaseModel):
   blocksize: int | None = Field(default=None, ge=0)
 
 
+def _engine_given_or_implied(data: Any, implied: Callable[[str], bool]) -> Any:
+  """A part without `engine` matches a dedicated model only if its URL implies that engine.
+
+  Otherwise it falls through to `GenericPartConfig`, and xarray guesses the engine.
+  """
+  if isinstance(data, Mapping) and data.get("engine") is None:
+    url = data.get("filename_or_obj")
+    if not (isinstance(url, str) and implied(url)):
+      raise ValueError("no `engine` given, and the URL does not imply this one")
+  return data
+
+
+def _has_scheme(url: str, *schemes: str) -> bool:
+  return url.split("://", 1)[0].lower() in schemes if "://" in url else False
+
+
 class CopernicusMarinePartConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
   engine: Literal["copernicusmarine"] | None = "copernicusmarine"
+
+  @model_validator(mode="before")
+  @classmethod
+  def _engine(cls, data: Any) -> Any:
+    return _engine_given_or_implied(data, lambda url: _has_scheme(url, "cm"))
+
   variables: str | list[str] | None = None
   drop_variables: str | list[str] | None = None
   dataset_version: str | None = None
@@ -94,6 +129,13 @@ class NetCDFOverHTTPPartConfig(BaseModel):
   drop_variables: str | list[str] | None = None
   chunks: ChunksConfig | None = None
 
+  @model_validator(mode="before")
+  @classmethod
+  def _engine(cls, data: Any) -> Any:
+    return _engine_given_or_implied(
+      data, lambda url: _has_scheme(url, "http", "https") and not url.endswith(".zarr")
+    )
+
 
 class EarlyWarningDataStorePartConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
@@ -105,7 +147,6 @@ class EarlyWarningDataStorePartConfig(BaseModel):
   product_type: str | None = None
   timespan: str | None = None
   variable: str | list[str] | None = None
-  variables: str | list[str] | None = None
   drop_variables: str | list[str] | None = None
   start_datetime: datetime.datetime | str | None = None
   end_datetime: datetime.datetime | str | None = None
@@ -114,25 +155,41 @@ class EarlyWarningDataStorePartConfig(BaseModel):
   longitude_dim: str | None = None
   chunks: ChunksConfig | None = None
 
+  @model_validator(mode="before")
+  @classmethod
+  def _engine(cls, data: Any) -> Any:
+    return _engine_given_or_implied(data, lambda url: _has_scheme(url, "ewds"))
 
-class ZarrPartConfig(BaseModel):
-  model_config = ConfigDict(extra="forbid")
+
+class ZarrPartConfig(OpenDatasetArguments):
+  """A Zarr part: the arguments of `xarray.open_dataset`, read through a strict store."""
 
   filename_or_obj: str
   engine: Literal["zarr"] | None = "zarr"
-  consolidated: bool | None = None
-  storage_options: dict[str, Any] | None = None
-  chunks: ChunksConfig | None = None
-  drop_variables: str | list[str] | None = None
+
+  @model_validator(mode="before")
+  @classmethod
+  def _engine(cls, data: Any) -> Any:
+    return _engine_given_or_implied(data, lambda url: url.rstrip("/").endswith(".zarr"))
 
 
-class GenericPartConfig(BaseModel):
-  model_config = ConfigDict(extra="allow")
+class GenericPartConfig(ReadConfig):
+  """A part read by any other xarray engine, with the arguments of `xarray.open_dataset`."""
 
   filename_or_obj: str
-  engine: str | None = None
-  chunks: ChunksConfig | None = None
-  drop_variables: str | list[str] | None = None
+
+  @field_validator("engine")
+  @classmethod
+  def _not_a_dedicated_engine(cls, value: EngineType | None) -> EngineType | None:
+    # Engines with a dedicated model must match it: a typo there is not a generic part.
+    if value in DEDICATED_ENGINES:
+      raise ValueError(f"invalid options for engine {value!r}")
+    return value
+
+
+DEDICATED_ENGINES = frozenset(
+  {"copernicusmarine", "netcdfoverhttp", "earlywarningdatastore", "zarr"}
+)
 
 
 DatasetPartConfig = (
@@ -145,24 +202,54 @@ DatasetPartConfig = (
 
 
 class VariableEncodingConfig(BaseModel):
-  model_config = ConfigDict(extra="allow")
+  """One variable's encoding in `[save.encoding]`, as `xarray.Dataset.to_zarr` takes it.
+
+  The fill value is `_FillValue` (`fill_value` is accepted too); `scale_factor` and `add_offset`
+  pack floats into integers. `chunks` are explicit sizes, one per dimension.
+  """
+
+  model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
   units: str | None = None
   calendar: str | None = None
   dtype: str | None = None
-  chunks: list[int] | None = None
+  chunks: list[Annotated[int, Field(ge=1)]] | None = None
   compressor: CompressorConfig | None = None
-  fill_value: float | int | str | bool | None = None
+  fill_value: float | int | str | bool | None = Field(
+    default=None,
+    validation_alias=AliasChoices("_FillValue", "fill_value"),
+    serialization_alias="_FillValue",
+  )
+  scale_factor: float | None = None
+  add_offset: float | None = None
+
+
+StoredChunk = Annotated[int, Field(ge=-1)]
+# The layout on disk: one size per dimension (-1: the whole dimension), or one size for all.
+StoredChunksConfig = StoredChunk | dict[str, StoredChunk] | tuple[StoredChunk, ...]
 
 
 class SaveConfig(BaseModel):
-  model_config = ConfigDict(extra="allow")
+  """The `[save]` table: layout, compression and encodings of the stored arrays."""
+
+  model_config = ConfigDict(extra="forbid")
 
   consolidated: bool | None = None
-  chunks: ChunksConfig | None = None
+  chunks: StoredChunksConfig | None = None
   compressor: CompressorConfig | None = None
   encoding: dict[str, VariableEncodingConfig] | None = None
   storage_options: dict[str, Any] | None = None
+  group: str | None = None
+
+  @field_validator("chunks")
+  @classmethod
+  def _no_zero_chunks(cls, value: StoredChunksConfig | None) -> StoredChunksConfig | None:
+    sizes = (
+      value.values() if isinstance(value, dict) else value if isinstance(value, tuple) else [value]
+    )
+    if any(size == 0 for size in sizes or []):
+      raise ValueError("chunk sizes are positive, or -1 for a whole dimension")
+    return value
 
 
 class CheckpointingConfig(BaseModel):
@@ -175,6 +262,61 @@ class CheckpointingConfig(BaseModel):
   @classmethod
   def parse_step(cls, value: str | datetime.timedelta) -> datetime.timedelta:
     return may_parse_timedelta(value)
+
+
+def strict_zarr_store(
+  path: str,
+  *,
+  fs: fsspec.AbstractFileSystem | None = None,
+  storage_options: Mapping[str, Any] | None = None,
+) -> zarr.storage.FSStore:
+  """A read-only fsspec Zarr store on which only a missing object is a missing chunk.
+
+  zarr 2 reads a chunk whose object does not exist as the fill value (that is how sparse stores
+  work). Its `FSStore` does the same, by default, for `PermissionError` and any `OSError`, which
+  include timeouts and connection errors: a failed read would become NaN with no message, and a
+  later mean would skip it. This store raises those errors instead.
+
+  Args:
+    path: URL of the store, or its path on `fs`.
+    fs: The filesystem of `path`; by default, the one its URL names.
+    storage_options: Options of that filesystem (when `fs` is not given).
+  """
+  return zarr.storage.FSStore(
+    path, mode="r", fs=fs, exceptions=(KeyError,), **dict(storage_options or {})
+  )
+
+
+def reads_as_zarr(filename_or_obj: str, engine: str | None) -> bool:
+  """Whether `xarray.open_dataset(filename_or_obj, engine=engine)` uses the zarr engine.
+
+  Without an engine, xarray guesses one from the name (e.g. a `.zarr` suffix).
+  """
+  if engine is not None:
+    return engine == "zarr"
+  try:
+    return guess_engine(filename_or_obj) == "zarr"
+  except ValueError:
+    return False
+
+
+def open_input(filename_or_obj: Any, **kwargs: Any) -> xr.Dataset:
+  """`xarray.open_dataset`, raising read errors of Zarr stores given as fsspec URLs.
+
+  A URL (`gs://`, `s3://`, `https://`, chained `::` URLs...) read with the zarr engine, given or
+  guessed by xarray, is opened as a `strict_zarr_store`, with the `storage_options` given. Local
+  paths keep zarr's directory and zip stores, which already raise read errors. Other engines are
+  not affected.
+  """
+  is_url = isinstance(filename_or_obj, str) and (
+    "://" in filename_or_obj or "::" in filename_or_obj
+  )
+  if is_url and reads_as_zarr(filename_or_obj, kwargs.get("engine")):
+    kwargs["engine"] = "zarr"
+    storage_options = kwargs.pop("storage_options", None)
+    filename_or_obj = strict_zarr_store(filename_or_obj, storage_options=storage_options)
+  # xarray accepts zarr stores, but its type hints do not list them.
+  return xr.open_dataset(filename_or_obj, **kwargs)  # ty: ignore[invalid-argument-type]
 
 
 class DatasetConfig(BaseModel):
@@ -190,6 +332,7 @@ def download_and_process(
   configs: DatasetConfig,
   start_datetime: datetime.datetime,
   end_datetime: datetime.datetime,
+  time_dim: str = "time",
 ) -> xr.Dataset:
   """
   Downloads and pre-processes a dataset based on provided configurations.
@@ -202,10 +345,12 @@ def download_and_process(
   for raw_part in configs.parts:
     part_conf = raw_part.model_dump(exclude_unset=True)
     engine = getattr(raw_part, "engine", None) or part_conf.get("engine")
+    if engine is not None:
+      part_conf["engine"] = engine
     if engine == "earlywarningdatastore" or engine == "copernicusmarine":
       part_conf.update(start_datetime=start_datetime, end_datetime=end_datetime)
-    part = xr.open_dataset(**part_conf)
-    part = part.arcomake.time_sel(start_datetime, end_datetime)
+    part = open_input(**part_conf)
+    part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
     parts.append(part)
   if not parts:
     raise ValueError("No parts found in the dataset configuration")
@@ -232,10 +377,10 @@ def maybe_checkpointing_download_and_process(
   )
 
   if checkpointing_step is None:
-    return download_and_process(configs, start_datetime, end_datetime)
+    return download_and_process(configs, start_datetime, end_datetime, time_dim=time_dim)
   parsed_step = may_parse_timedelta(checkpointing_step)
   if parsed_step >= end_datetime - start_datetime:
-    return download_and_process(configs, start_datetime, end_datetime)
+    return download_and_process(configs, start_datetime, end_datetime, time_dim=time_dim)
 
   registry = get_current_temp_registry()
   if registry is not None:
@@ -250,9 +395,14 @@ def maybe_checkpointing_download_and_process(
   date_intervals = IterableDateInterval(start_datetime, end_datetime, parsed_step)
   is_first_checkpoint = True
   for date_interval in date_intervals:
-    with download_and_process(configs, date_interval.start, date_interval.end) as dataset:
-      for var in dataset.data_vars:
-        dataset[var].encoding["compressor"] = compressor
+    with download_and_process(
+      configs, date_interval.start, date_interval.end, time_dim=time_dim
+    ) as downloaded:
+      # A shallow copy has its own encodings: the downloaded dataset is left unchanged.
+      dataset = downloaded.copy(deep=False)
+      if compressor is not None:
+        for var in dataset.data_vars:
+          dataset[var].encoding["compressor"] = compressor
       logger.info(f"Saving checkpoint {date_interval}")
       progress_bar = nullcontext if not progress else ProgressBar
       with progress_bar():
@@ -305,7 +455,17 @@ def open_archive(
   file_paths: list[str] = sorted(fs.glob(glob_pattern))
   if len(file_paths) == 0:
     raise ValueError(f"Provided path '{path}' does not contain any files matching '{glob}'.")
-  file_mappers = [fs.get_mapper(file_path) for file_path in file_paths]
+  # Zarr pieces (engine given, or guessed from the first piece's name) are read through strict
+  # stores, so that a failed read raises (see `strict_zarr_store`); other engines get plain
+  # fsspec mappers.
+  if reads_as_zarr(file_paths[0], kwargs.get("engine")):
+    kwargs["engine"] = "zarr"
+  file_mappers: list[Any] = [
+    strict_zarr_store(file_path, fs=fs)
+    if kwargs.get("engine") == "zarr"
+    else fs.get_mapper(file_path)
+    for file_path in file_paths
+  ]
   logger.info(f"Reading {len(file_mappers)} datasets from {path}")
 
   # Drop the possibly conflicting attributes so that combining with
@@ -390,6 +550,9 @@ def safe_to_zarr(
   if configs is None:
     configs = SaveConfig()
   mode = mode or "w"
+  # The stored layout is set through the variables' encodings. A shallow copy has its own
+  # encodings (data are shared), so the caller's dataset is left unchanged.
+  dataset = dataset.copy(deep=False)
 
   logger.info(f"Saving dataset to {destination} with {configs}")
   chunk_conf = configs.chunks
@@ -398,8 +561,9 @@ def safe_to_zarr(
     if configs.compressor is not None
     else None
   )
+  # by_alias: encodings use xarray's names (`_FillValue`).
   to_zarr_kwargs = configs.model_dump(
-    exclude_none=True, exclude={"chunks", "compressor", "storage_options"}
+    exclude_none=True, by_alias=True, exclude={"chunks", "compressor", "storage_options"}
   )
 
   if chunk_conf is not None:
@@ -411,16 +575,23 @@ def safe_to_zarr(
     for var in dataset.data_vars:
       dims = dataset[var].dims
       if isinstance(chunk_conf, dict):
-        chunk_sizes = tuple(
-          chunk_conf[dim] if dim in chunk_conf else dataset[var].sizes[dim] for dim in dims
-        )
+        requested = [chunk_conf.get(str(dim), -1) for dim in dims]
       elif isinstance(chunk_conf, tuple):
-        chunk_sizes = chunk_conf
+        requested = list(chunk_conf)
       else:
-        chunk_sizes = tuple(chunk_conf for _ in dims)
+        requested = [chunk_conf for _ in dims]
+      # -1 means the whole dimension. Resolve it here: xarray's check that Dask chunks do not
+      # straddle Zarr chunks passes for -1 (`n % -1 == 0`), and overlapping Dask chunks would
+      # then write into the same Zarr chunk concurrently, losing data.
+      chunk_sizes = tuple(
+        dataset[var].sizes[dim] if size == -1 else size
+        for dim, size in zip(dims, requested, strict=True)
+      )
       dataset[var].encoding["chunks"] = chunk_sizes
-  for var in dataset.data_vars:
-    dataset[var].encoding["compressor"] = compressor
+  if compressor is not None:
+    # Without `[save] compressor`, the variables keep their own (or zarr's default) compressor.
+    for var in dataset.data_vars:
+      dataset[var].encoding["compressor"] = compressor
 
   if "encoding" in to_zarr_kwargs and isinstance(to_zarr_kwargs["encoding"], dict):
     for var_enc in to_zarr_kwargs["encoding"].values():
@@ -456,7 +627,8 @@ def safe_to_zarr(
       }
       if not to_zarr_kwargs["encoding"]:
         to_zarr_kwargs.pop("encoding", None)
-    except Exception:
+    except zarr.errors.GroupNotFoundError:
+      # Nothing written yet (e.g. mode "a" on a new store): every encoding applies.
       pass
 
   close_fn = getattr(store, "close", None)

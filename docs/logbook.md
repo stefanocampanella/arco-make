@@ -1,0 +1,207 @@
+# Logbook
+
+Dated records of what was run, measured or decided while working on arco-make. Newest last.
+Entries marked **[Moby-Dick]** are relevant to consumers of ARCO-OCEAN and feed the report due
+after the correctness PRs are merged.
+
+## 2026-11-13: correctness PR (groups 0–5 and 10 of the findings guide)
+
+**Decisions (maintainer):**
+- Scope: groups 0–5 and 10 now; climatology (6), blocks (7), chunk planner (8) and recipe
+  capabilities (9) in follow-up PRs.
+- `gaussian_blur_extrapolate` is removed, not fixed. `diff_std` is removed (tendency std moves to
+  Moby-Dick).
+- Feb 29, for group 6: keep 365 bins with a documented Feb 28 mapping.
+
+**Provenance of the published 0.25° dataset [Moby-Dick]:**
+- The 0.25° levels-50 download (30 Sep – 8 Oct 2026, on the project VM) ran in the cached
+  Apptainer image of 30 Sep. Its `src/arcomake` is identical to commit **`6f0e2f1`**
+  (2026-09-30), not to `847b6f2`. `6f0e2f1..847b6f2` changes `download.py`, `dataset_utils.py`,
+  `climatology.py` and the Dask setup.
+- It ran as 45 pieces of 256 days, about 3.3 h each and 165 h in total. Pieces 1, 16, 19, 20, 34 and
+  41 failed on the first attempt and were rerun with `--overwrite` (7–8 Oct); 41 needed a third try.
+  The errors in the logs are transient network ones: EWDS retries, DNS failures, connect timeouts.
+- In the arco-ocean checkout, the logs of that 0.25° run sit in a folder named for the 0.5° recipe
+  (machine details: `CLAUDE.local.md`, not committed).
+
+**Environment:**
+- The host's apt eccodes 2.45 cannot decode the GloFAS GRIB served by EWDS (`Unable to find
+  template localSection from grib2/local.98.65535.def`, then `KeyError: 'gridType'`). The image
+  builds eccodes 2.48 from source, which works. Local runs use the image's library and
+  definitions via `ECCODES_DIR`, `ECCODES_DEFINITION_PATH` and `ECCODES_SAMPLES_PATH`.
+
+**Real-data baseline at `847b6f2`** (a pinned copy of the 0.25° levels-50 recipe, on the project VM
+with 32 cores and 110 GB, the image's eccodes 2.48, threads scheduler; locations in
+`CLAUDE.local.md`, not committed):
+
+| Window | Result | Wall time | Peak RSS | Output |
+|---|---|---|---|---|
+| 1993-01-01 → 01-03 | ok | 22 min | 36 GB | 832 MB |
+| 2012-12-30 → 2013-01-02 | attempt 1: `ConnectTimeout` on `confluence.ecmwf.int` (GloFAS `uparea`, NetCDF over HTTP: no retry) after 25 min; attempt 2: **segmentation fault** after 22 s; attempts 3 and 4: **hung** (no progress for 2 h 11 min and for 15 min, stopped by hand); attempt 5, with a GCS timeout: ok, but **two ERA5 hours silently lost** (N8) | 5 min | 31 GB | 1.3 GB |
+| 2020-02-26 → 03-02 | ok | 3 min | 53 GB | 2.1 GB |
+
+- Wall time is dominated by the remote services' queues (EWDS above all) and varies by an order of
+  magnitude between runs. Peak memory is the meaningful number: 36–53 GB for 2–5 days. The
+  recipe header's "32 CPUs and about 110 GB" is consistent with this; `download.slurm`'s 8 CPUs and
+  30 GB is not.
+- **N6, new bug:** the segfault (`fatal flex scanner internal error--end of buffer missed`) came from
+  ecCodes. The EWDS backend sends one request per month on a thread pool, and each thread opens its
+  GRIB files with cfgrib. cfgrib locks reads but not opens, and ecCodes' definition parser is not
+  thread-safe. So any interval spanning two or more months can crash; the 2020 window, also
+  spanning two months, happened not to.
+- **[Moby-Dick]** The production pieces of 256 days always span several months. *Hypothesis:* some of
+  the pieces that failed and were rerun in the 0.25° download (1, 16, 19, 20, 34, 41) crashed this
+  way. Their logs were overwritten by the reruns, so this cannot be checked. A crash aborts the
+  piece and writes nothing wrong, so the published data are not affected.
+- The ConnectTimeout is the failure class seen in production: a transient error aborts the whole
+  block (group 7).
+- **Hang, a third failure class (N7):** attempts 3 and 4 both stopped about two minutes in, while
+  writing, with 1.3 GB on disk: every array was complete except ERA5 `10v`, which had no chunk.
+  The process then sat at 0 % CPU with no I/O (stopped by hand after 2 h 11 min and 15 min).
+  - A py-spy dump of attempt 4: the main thread waits in `Dataset.to_zarr` for Dask; two Dask
+    workers wait in `fsspec.asyn.sync` (`Event.wait`, no timeout) on `FSMap.getitems` of the ERA5
+    store on Google Cloud Storage; the fsspec event loop is idle in `epoll`. Nothing deadlocked: a
+    read never got an answer and nothing gave up on it. (The 30 CLOSE-WAIT connections to Copernicus
+    Marine are idle leftovers.)
+  - Cause: gcsfs (2026.10.0) passes `requests_timeout=None` to every aiohttp request by default,
+    and aiohttp (3.14.5) turns an explicit `None` into `ClientTimeout(total=None)`, which removes
+    its own 5-minute default. Any GCS read can wait forever, at any arco-make commit.
+  - Setting `requests_timeout` in the recipe is **not** a fix with code older than `f9fcd45`: see
+    N8. Without the N8 fix, a timeout turns the hang into silent data loss.
+  - The PR's code finished this window once (2 min 20 s); it has the same dependencies, so it is
+    exposed the same way.
+- **N8, silent loss of source chunks (all commits) [Moby-Dick]:** attempt 5 ran the old code with
+  `requests_timeout = 120` on the ERA5 parts (a copy of the pinned recipe, nothing else changed).
+  It finished in 5 min 20 s, 31 GB, exit 0, with no error or warning in the log. Its output differs
+  from the PR's in two fields only: `2t` on 2012-12-30 (max 0.70 K, mean 0.043 K) and `msl` on
+  2013-01-01 (max 74 Pa, mean 7.2 Pa).
+  - Recomputed from the public ERA5 store: the PR's two fields equal the 24-hour means bit for bit;
+    the old run's are, bit for bit, the means without 09:00 (`2t`) and without 05:00 (`msl`).
+  - Mechanism: zarr 2.18's `FSStore.getitems` treats `KeyError`, `PermissionError` and `IOError` as
+    "chunk missing" and returns the fill value (NaN). `TimeoutError`, aiohttp's `ClientOSError` and
+    `ServerTimeoutError` are all `OSError`. So a chunk read that times out, or fails with a
+    connection error once gcsfs's retries are spent, becomes NaN with no message. The daily
+    `resample` mean skips NaN, so the output is a mean over 23 hours and has no NaN to detect.
+  - Reproduced offline with the PR's environment: a `TimeoutError` on one hourly chunk of a
+    memory-filesystem Zarr store gives NaN at that hour and a wrong mean, silently.
+  - Exposure: every source opened with `engine = "zarr"` over fsspec (ERA5 in ARCO-OCEAN). The
+    published download ran with no timeout, so the trigger there is a connection error that
+    outlasts gcsfs's 6 retries. Days without such an error are exact.
+  - Fixed in this PR (`f9fcd45`, maintainer's decision): remote Zarr inputs (download parts,
+    `unpack` pieces, `[read]` tables) are opened as `FSStore(..., exceptions=(KeyError,))`, so a
+    failed read raises; a missing object is still a fill value. Tests in
+    `tests/test_read_errors.py`. Timeouts and retries per block stay in group 7: with this fix, a
+    timeout aborts the piece instead of losing data. Window 1 with `f9fcd45` and the pinned recipe:
+    identical to `847b6f2` (37 arrays, bit for bit), 3 min 7 s, 37 GB.
+  - Side effect: on S3 buckets that answer 403 for a missing object (no list permission), a
+    sparse store now fails instead of reading fill values. No ARCO-OCEAN source is affected (ERA5
+    on GCS answers 404).
+- **N9, the Copernicus Marine toolbox has the same flaw [Moby-Dick]:** the fork used by arco-make
+  (`copernicusmarine` 2.4.1, branch `arco-make`, `3009add`) reads Zarr through its own
+  `CustomS3StoreZarrV2`. Its `__getitem__` turns every S3 error response (`ClientError`: 403,
+  500, 503 SlowDown...) into `KeyError`, which zarr reads as a missing chunk. Its retry wrapper
+  tries 9 times over about 8.5 minutes first, so only a long outage or expired credentials during
+  a read would lose data. Connection errors (no response) are raised. Seen in the code, not in a
+  run. Fix belongs in the fork: raise unless the error is 404/`NoSuchKey`. Exposed: every
+  Copernicus Marine variable (GLORYS12, WAVERYS, ...).
+- **Window 2, result:** apart from those two fields, explained by the old run's lost chunks, the
+  37 arrays are identical. The PR's output matches the source where the old one does not.
+- **[Moby-Dick]** A production piece could hang the same way rather than fail. A killed piece leaves
+  a partial store that must be rewritten with `--overwrite`, as the failed pieces were; the cost is
+  lost time, not wrong data, provided every killed piece was rerun.
+- **Comparison, `b6b2cd7` vs `847b6f2` on window 1:** the array metadata were identical (dtype,
+  chunks, compressor, fill value, attributes), but ERA5 values (`2t`, `msl`, `ssrd`...) and a few
+  wave points differed by a few float32 ULP, e.g. 1.2e-4 K on `2t`.
+  - Cause: the B5 fix selected the time range with an index array. That rechunked the hourly
+    source (24 → 16 steps per chunk), so the daily resample summed in another order.
+  - Fixed in `210bdbd` (slice selection), with a test on the chunks.
+  - Note: any rechunking before a reduction changes float32 results at this level. "Same output"
+    has to be checked bit for bit, not with a tolerance.
+- **PR head `210bdbd`, same recipe and host:** window 1: 3 min 27 s, 35.5 GB, identical; window 2:
+  2 min 20 s, 44 GB, identical apart from the old run's lost chunks (N8); window 3: 5 min 12 s,
+  50 GB, identical (37 arrays each, compared bit for bit with metadata and encodings). Peak memory
+  is unchanged by the PR.
+
+**Strict recipes (group 3):**
+- All arco-ocean recipes at the local checkout (`c67b8ab` plus uncommitted and untracked files) were
+  loaded with the strict models; nothing was downloaded.
+- These load: the download recipes for levels-50 at 0.25°, 0.5° and 1.0°, every unpack and
+  climatology recipe, and both validate recipes.
+- These are rejected, for arco-ocean A13/A17:
+  - levels-10 (0.25°, 0.5°, 1.0°) and arco-med: `step` is missing (already rejected before), and
+    `[save] chunk` is a typo for `chunks`;
+  - anfc: `step` is missing;
+  - both stats recipes: `[save] chunk`, plus `time_dim` and `skipna`, which never had an effect
+    (B15, C2).
+- The step names and arguments of every recipe pass the new load-time checks.
+
+**Code findings beyond the guide (confirmed by tests in `tests/`):**
+- N1: `safe_to_zarr` writes uncompressed arrays when `[save]` has no compressor. **[Moby-Dick]**
+  Not affected: the arco-ocean download, unpack and climatology recipes all set lz4.
+- N2: `astype` with `dtype` and no `casting` is a no-op, and its per-variable form drops the
+  unlisted variables. **[Moby-Dick]** Not affected: every recipe call sets both.
+- N3: the ECMWF-coordinates check has different lat/lon defaults in its model and its function.
+- B12 went further than a deprecation: `valid_time_coordinate` built the expected cftime axis
+  with `datetime` bounds, which makes xarray ignore both `calendar` and `inclusive`. The check
+  therefore failed on every cftime dataset. Published data were not affected: the dataset uses
+  numpy datetimes and the climatology integer bins.
+- B6, measured on synthetic data **[Moby-Dick]:**
+  - with one of five years missing in one bin, the anomaly variance of that bin is 6 % too low
+    (window 1);
+  - a bin missing in every year makes its neighbours NaN through the window.
+
+## 2026-11-16: CI on GitHub
+
+- The first PR runs failed before reaching the code. uv picked the runner's newest Python (3.14),
+  for which numcodecs 0.15 has no wheel, and its source build failed. CI now pins 3.13, as the
+  image does. `requires-python = ">=3.13"` still admits 3.14; that resolves with the zarr v3 port.
+- The image workflow pushed to `oras://ghcr.io/...:${tag}` with `tag` never set (C15). The master
+  runs of October passed that step (their logs have expired); the current Apptainer rejects the
+  empty tag. It now pushes as `latest`, the tag the arco-ocean scripts pull, and only from master
+  pushes and manual runs: a pull request builds the image without publishing it.
+- **Decision (maintainer): CI stays offline.** The repository has secrets for Copernicus Marine and
+  EWDS, but PR checks do not use them:
+  - the repository and its Actions logs are public, and GitHub masks only the secrets themselves,
+    not tokens derived from them (Copernicus Marine S3 credentials, for instance);
+  - a pull request from a branch of the repository runs its own code with the secrets;
+  - the services fail and queue for reasons unrelated to the code (window 2 of the baseline failed
+    four times), and their data are revised, so only structural checks would be possible;
+  - a real recipe needs 36–53 GB, a standard runner has 16 GB.
+- What only the live services catch (changes in the services, the toolbox fork or cdsapi; GRIB
+  decoding; N6–N8 were found on real data) goes into a separate, non-blocking workflow: scheduled
+  and manual only, secrets in a protected environment, one tiny request per backend.
+- The NetCDF-over-HTTP backend's download had no test; it is now tested against a local server.
+
+## 2026-11-16: code review of the PR (effort high)
+
+A review of the whole PR found ten issues; each was reproduced before being fixed, one commit and
+test each.
+
+- **N10, silent corruption with `-1` save chunks (also at `847b6f2`) [Moby-Dick]:** `[save]
+  chunks` passed -1 ("whole dimension") into the Zarr encoding. xarray's check that Dask chunks
+  do not straddle Zarr chunks computes `n % -1 == 0` and passes, so Dask chunks smaller than the
+  dimension wrote into the same Zarr chunk concurrently. On a 2 × 400 × 400 array in 10 × 10 Dask
+  chunks, about 95 % of the values read back wrong, with no error, at both commits. -1 is now
+  resolved to the dimension's size, and such a write fails.
+  - Not affected: ARCO-OCEAN. Its download, unpack and climatology recipes all rechunk `lat` and
+    `lon` to -1 (a `chunk` step, or `[read] chunks`) before saving, so Dask and Zarr chunks align;
+    the baseline outputs were identical across runs and commits, which a race would not give.
+- The other findings, fixed:
+  - `drop_variables` in `[read]` and generic parts was a one-shot iterator after validation: only
+    the first interval dropped the variables.
+  - `[save.encoding]` forbade `_FillValue` and passed `fill_value`, which `to_zarr` rejects: no
+    recipe could set a fill value. `_FillValue`, `scale_factor` and `add_offset` are accepted.
+  - `[read]` had no `storage_options`, so remote inputs needing credentials could not be read.
+  - The N8 fix applied only with `engine = "zarr"` spelled out; with the engine guessed from a
+    `.zarr` name (the arco-ocean stats recipes), timeouts still became NaN.
+  - A bare string passed the load-time check of list arguments, and steps then matched substrings
+    (`clip_negative`, `apply_mask` and `masked_fill` would act on the wrong variables).
+  - `time_sel` failed on cftime calendars with the `datetime` bounds `download` passes.
+  - A part without `engine` matched the Copernicus Marine model; Zarr parts refused the other
+    `open_dataset` arguments.
+- Not fixed, recorded: three commits change output for some recipes without the `output:` prefix
+  of the commit rules, `astype` with `dtype` alone or per variable (N2), `apply_mask` no longer
+  masking the mask by default, and `get_sea_mask`'s default `depth_dim`. None applies to the
+  arco-ocean recipes: they set both `astype` arguments, pass `depth_dim` to `get_sea_mask` and do
+  not use `apply_mask`. The PR description lists them under "Behaviour changes". Rewording would
+  rename every later commit.

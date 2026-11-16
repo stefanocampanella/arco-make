@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-import sys
 import warnings
+from collections.abc import Callable, Hashable
 from datetime import datetime
 from typing import Literal, Self
 
@@ -11,7 +11,6 @@ import xarray as xr
 from pydantic import BaseModel, ConfigDict, model_validator
 
 logger = logging.getLogger(__name__)
-checks_module = sys.modules[__name__]
 
 
 class ValidationError(Exception):
@@ -29,7 +28,7 @@ class ValidTimeCoordinateCheck(BaseModel):
   model_config = ConfigDict(extra="forbid")
   start: datetime
   end: datetime
-  freq: str | None = None
+  freq: str = "1D"
   time_dim: str = "time"
 
   @model_validator(mode="after")
@@ -40,30 +39,44 @@ class ValidTimeCoordinateCheck(BaseModel):
 
 
 class EnsureNoNansCheck(BaseModel):
+  """`time_dim`, and one key per mask: `MASK = ["variable", ...]` checks those variables inside it."""
+
   model_config = ConfigDict(extra="allow")
 
   time_dim: str | None = None
 
+  @model_validator(mode="after")
+  def _masks_map_to_variable_lists(self) -> Self:
+    # The extra keys are mask names, each with the list of variables it applies to.
+    for mask_name, variables in (self.model_extra or {}).items():
+      if not (isinstance(variables, list) and all(isinstance(v, str) for v in variables)):
+        raise ValueError(f"mask {mask_name!r} must map to a list of variable names")
+    return self
+
 
 class ChecksConfig(BaseModel):
-  model_config = ConfigDict(extra="allow")
+  model_config = ConfigDict(extra="forbid")
 
   valid_global_ecmwf_coordinates: ValidGlobalECMWFCoordinatesCheck | None = None
   valid_time_coordinate: ValidTimeCoordinateCheck | None = None
   ensure_no_nans: EnsureNoNansCheck | None = None
 
 
-ValidGlobalECMWFCoordinates = ValidGlobalECMWFCoordinatesCheck
-ValidTimeCoordinate = ValidTimeCoordinateCheck
-EnsureNoNans = EnsureNoNansCheck
-
-
 def ensure_no_nans(
   dataset: xr.Dataset,
   time_dim: str = "time",
-  **kwargs,
+  **kwargs: list[str],
 ) -> None:
-  variable_mask_mapping = {}
+  """Check that variables have no missing value, inside their mask if one is given.
+
+  Each extra argument maps a mask to the variables it applies to, e.g.
+  `glorys_mask = ["thetao", "so"]`: those are checked only where the mask is True (the first
+  level of a 3D mask for 2D variables). Other variables are checked everywhere.
+
+  Raises:
+    ValidationError: listing, per time step, the variables with missing values.
+  """
+  variable_mask_mapping: dict[Hashable, str] = {}
   for mask_name, variable_names in kwargs.items():
     for variable_name in variable_names:
       if variable_name in dataset.data_vars:
@@ -105,23 +118,26 @@ def ensure_no_nans(
 
 
 def valid_global_ecmwf_coordinates(
-  ds: xr.Dataset, latitude_dim: str = "latitude", longitude_dim: str = "longitude"
+  ds: xr.Dataset, latitude_dim: str = "lat", longitude_dim: str = "lon"
 ) -> None:
+  """Check a global grid: latitudes within [-90, 90] and increasing, longitudes within [0, 360).
+
+  Raises:
+    ValidationError: describing the first violation.
+  """
   logger.info("Checking that coordinates use ECMWF global convention.")
 
-  # Check that each dataset contains all latitudes in [-90, 90], and use the [-90, 90] convention
   if latitude_dim not in ds.dims:
     raise ValidationError(f"Latitude dimension {latitude_dim} not found in dataset")
   if ds[latitude_dim].min().item() < -90 or ds[latitude_dim].max().item() > 90:
-    raise ValueError("Dataset has latitudes outside the [-90, 90] range")
+    raise ValidationError("Dataset has latitudes outside the [-90, 90] range")
   if ds[latitude_dim][0].item() > ds[latitude_dim][-1].item():
-    raise ValueError("Dataset does not use the [90, -90] convention for latitude")
+    raise ValidationError("Latitudes are decreasing; they must increase from south to north")
 
-  # Check that each dataset uses the [0, 360) convention for longitude
   if longitude_dim not in ds.dims:
     raise ValidationError(f"Longitude dimension {longitude_dim} not found in dataset")
   if ds[longitude_dim].min().item() < 0 or ds[longitude_dim].max().item() >= 360:
-    raise ValueError("Dataset does not use the [0, 360) convention for longitude")
+    raise ValidationError("Dataset does not use the [0, 360) convention for longitude")
 
 
 def valid_time_coordinate(
@@ -132,15 +148,20 @@ def valid_time_coordinate(
   inclusive: Literal["left", "right", "both", "neither"] = "left",
   time_dim="time",
 ) -> None:
-  """
-  Check that time coordinate is sorted, that all dates are within the specified range, and that there are no duplicates
-  or missing dates.
+  """Check that the time coordinate is exactly the regular axis from `start` to `end`.
+
+  The axis must be sorted, without duplicates, and equal to the stamps every `freq` from `start`
+  to `end` (`end` excluded by default), in the dataset's calendar (numpy or cftime).
 
   Args:
-    dataset: The dataset to check
-    start_datetime: Start date (required)
-    end_datetime: End date (required)
-    dataset_name: Optional name of the dataset for the warning message
+    dataset: The dataset to check.
+    start, end: Bounds of the expected axis.
+    freq: Spacing of the expected axis (a pandas frequency, e.g. "1D").
+    inclusive: Which bounds are part of the axis (default: `start` only).
+    time_dim: Name of the time coordinate.
+
+  Raises:
+    ValidationError: on disorder, duplicates, or missing or irregular stamps.
   """
   logger.info(
     f"Checking that time coordinate contains all dates between {start} and {end}, with frequency {freq}."
@@ -214,10 +235,16 @@ def valid_cftime_index(
     raise ValidationError(f"Duplicate timestamps found in time coordinate: {preview}{more}")
 
   # Regularity check (daily frequency across CF calendars)
-  calendar = getattr(idx, "calendar", None)
+  calendar = getattr(idx, "calendar", None) or "standard"
   # Build expected daily sequence with same calendar
-  expected = xr.cftime_range(
-    start=start_date, end=end_date, freq=freq, inclusive=inclusive, calendar=calendar
+  # Bounds as ISO strings: given as `datetime` objects, the calendar and `inclusive` are ignored.
+  expected = xr.date_range(
+    start=start_date.isoformat(),
+    end=end_date.isoformat(),
+    freq=freq,
+    inclusive=inclusive,
+    calendar=calendar,
+    use_cftime=True,
   )
   if not idx.equals(expected):
     # Compute missing days between min and max dates for helpful diagnostics
@@ -225,3 +252,12 @@ def valid_cftime_index(
     preview = ", ".join(str(ts) for ts in missing[:5])
     more = "" if len(missing) <= 5 else f" and {len(missing) - 5} more"
     raise ValidationError(f"Missing or irregular dates detected: {preview}{more}")
+
+
+# The checks a recipe may name: each field of `ChecksConfig` maps to its function.
+CHECKS: dict[str, Callable[..., None]] = {
+  "valid_global_ecmwf_coordinates": valid_global_ecmwf_coordinates,
+  "valid_time_coordinate": valid_time_coordinate,
+  "ensure_no_nans": ensure_no_nans,
+}
+assert set(CHECKS) == set(ChecksConfig.model_fields)

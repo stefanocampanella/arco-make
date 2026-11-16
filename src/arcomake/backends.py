@@ -1,7 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Stefano Campanella
+# SPDX-License-Identifier: MIT
 import datetime
 import logging
 import os
-import tempfile
+import threading
 import warnings
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +22,16 @@ from arcomake.datetime_utils import DateInterval
 from arcomake.temporary_utils import get_current_temp_registry, set_current_temp_registry
 
 logger = logging.getLogger(__name__)
+
+# Serializes the opening of GRIB files by concurrent EWDS requests (see `_process_request`).
+_GRIB_OPEN_LOCK = threading.Lock()
+
+
+def _drop_variables(dataset: xr.Dataset, names: str | Iterable[str] | None) -> xr.Dataset:
+  """Apply `drop_variables` as xarray's own backends do: listed variables absent are ignored."""
+  if names is None:
+    return dataset
+  return dataset.drop_vars([names] if isinstance(names, str) else list(names), errors="ignore")
 
 
 class CopernicusMarine(BackendEntrypoint):
@@ -75,7 +87,7 @@ class CopernicusMarine(BackendEntrypoint):
       chunk_size_limit=False,
     )
     assert isinstance(dataset, xr.Dataset)
-    return dataset
+    return _drop_variables(dataset, drop_variables)
 
   @override
   def guess_can_open(
@@ -151,7 +163,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
 
   def __init__(self, *args, **kwargs):
     super().__init__(*args, **kwargs)
-    # Avoid annoying copernicusmarine log handling
+    # No progress bars; cdsapi messages go to this module's logger.
     self.progress = False
     self.client_logger = logger
 
@@ -188,9 +200,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
     registry = get_current_temp_registry()
     if registry is None:
       raise ValueError("No temporary directory registry available.")
-    consecutive_dates = self._consecutive_dates_with_same_month_or_year(
-      start_datetime, end_datetime
-    )
+    consecutive_dates = self._consecutive_dates_by_month(start_datetime, end_datetime)
 
     requests = [
       {
@@ -224,13 +234,13 @@ class EarlyWarningDataStore(BackendEntrypoint):
       # _process_request drops the time dimension if of length one
       if len(dates) == 1:
         dataset = dataset.expand_dims(dim=time_dim, axis=0)
-        dataset = dataset.assign_coords(time=dates)
+        dataset = dataset.assign_coords({time_dim: dates})
       datasets.append(dataset)
 
-    return xr.concat(datasets, dim=time_dim)
+    return _drop_variables(xr.concat(datasets, dim=time_dim), drop_variables)
 
   @staticmethod
-  def _consecutive_dates_with_same_month_or_year(
+  def _consecutive_dates_by_month(
     start_datetime: datetime.datetime,
     end_datetime: datetime.datetime,
   ) -> list[list[datetime.datetime]]:
@@ -251,10 +261,10 @@ class EarlyWarningDataStore(BackendEntrypoint):
       part.append(subseq)
       return part
 
-    def same_month_or_year(x: datetime.datetime, y: datetime.datetime) -> bool:
+    def same_month_and_year(x: datetime.datetime, y: datetime.datetime) -> bool:
       return x.month == y.month and x.year == y.year
 
-    return partition(same_month_or_year, days)
+    return partition(same_month_and_year, days)
 
   def _process_requests(
     self,
@@ -281,28 +291,32 @@ class EarlyWarningDataStore(BackendEntrypoint):
       return list(executor.map(_worker, requests))
 
   def _process_request(self, dataset_name: str, request: dict[str, Any], **kwargs) -> xr.Dataset:
-    """Submit a request to the Climate Data Store, download some temporary NetCDFs, and returns a dataset.
-    Temporary files are deleted when the temporary directory registry context closes.
+    """Submit a request to the Climate Data Store, download its GRIB files, and return a dataset.
+
+    Every file (the zip and its content) lives in a directory of the current temporary registry,
+    so it is removed when the registry closes, including on SIGTERM (intent 9).
     """
-    with tempfile.NamedTemporaryFile("w+", suffix=".zip") as file:
-      client = self.get_cdsapi_client(
-        progress=self.progress, client_logger=self.client_logger, **kwargs
-      )
-      client.retrieve(dataset_name, request, file.name)
+    registry = get_current_temp_registry()
+    if registry is None:
+      raise ValueError("No temporary directory registry available.")
+    path = registry.create_temp_dir()
+    archive = path / "request.zip"
 
-      registry = get_current_temp_registry()
-      if registry is None:
-        raise ValueError("No temporary directory registry available.")
-      path = registry.create_temp_dir()
-
-      with ZipFile(file.name) as zipfile:
-        zipfile.extractall(path=path)
-      # FIXME: when reading grib files eccodes emits the following warning:
-      #    ECCODES WARNING :  g2date:unpack_long: Date is not valid! year=0 month=0 day=0
-      #  see: https://git.ecmwf.int/users/erds/repos/eccodes/browse/src/accessor/grib_accessor_class_g2date.cc?at=f10d3f3c1be3737a231d4a2c19f45535de4d4424#71-75
-      #  Also, cdsapi download one NetCDF per variable, ugly. :(
-      dataset = xr.open_mfdataset(list(path.glob("*.grib")), engine="cfgrib")
-      return dataset
+    client = self.get_cdsapi_client(
+      progress=self.progress, client_logger=self.client_logger, **kwargs
+    )
+    client.retrieve(dataset_name, request, str(archive))
+    with ZipFile(archive) as zipfile:
+      zipfile.extractall(path=path)
+    archive.unlink()  # The extracted files are all that is needed.
+    # FIXME: when reading grib files eccodes emits the following warning:
+    #    ECCODES WARNING :  g2date:unpack_long: Date is not valid! year=0 month=0 day=0
+    #  see: https://git.ecmwf.int/users/erds/repos/eccodes/browse/src/accessor/grib_accessor_class_g2date.cc?at=f10d3f3c1be3737a231d4a2c19f45535de4d4424#71-75
+    #  Also, cdsapi download one NetCDF per variable, ugly. :(
+    # Requests run on a thread pool, but ecCodes' definition parser is not thread-safe, and
+    # cfgrib only locks reads, not opens: concurrent opens crashed the process (segfault).
+    with _GRIB_OPEN_LOCK:
+      return xr.open_mfdataset(list(path.glob("*.grib")), engine="cfgrib")
 
   # Credits to the amazing Stefano Piani from OGS
   @staticmethod
@@ -313,12 +327,12 @@ class EarlyWarningDataStore(BackendEntrypoint):
     submitted)
 
     Args:
-      url (str): the url of the endpoint of the cdsapi. If it is None, it will be
-        read from the ~/.cdsapi file (if exists)
-      key (str): the key of the cdsapi user account. If it is None, it will be
-        read from the ~/.cdsapi file (if exists)
+      url (str): the url of the endpoint of the cdsapi. If it is None, the client reads it
+        from its configuration (the CDSAPI_URL environment variable or ~/.cdsapirc).
       client_logger (logging.Logger): Logger that the returned client
         will use to print its messages
+      **kwargs: Other arguments of `cdsapi.Client` (e.g. `key`, read from CDSAPI_KEY or
+        ~/.cdsapirc when not given).
 
     Returns:
       cdsapi.Client instance
@@ -350,7 +364,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
       **kwargs,
     }
 
-    if url is None:
+    if url is not None:
       client_kwargs["url"] = url
 
     cdsapi_client = cdsapi.Client(**client_kwargs)
