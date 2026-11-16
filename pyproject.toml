@@ -48,6 +48,11 @@ dev = [
     "ty",
     "memray",
 ]
+# Live checks (tests/live): ECMWF's ecCodes build, recent enough for GloFAS GRIB, matching the
+# `eccodes` bindings in uv.lock.
+live = [
+    "eccodeslib==2.49.*",
+]
 experimental = [
     "flox>=0.11.2",
     "frisky",
@@ -104,8 +109,9 @@ all = "error"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Live checks (marker `network`) are skipped unless `--live` is given (tests/conftest.py).
 addopts = ["-ra", "--strict-markers"]
 xfail_strict = true
 markers = [
-    "network: needs network access and credentials; never run in CI",
+    "network: needs the live services and their credentials; never run on pull requests",
 ]

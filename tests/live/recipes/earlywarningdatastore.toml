@@ -1,0 +1,24 @@
+# Live check: the Early Warning Data Store (GloFAS historical, GRIB), one day, a small box.
+# Needs CDSAPI_URL and CDSAPI_KEY for EWDS. Requests queue: this can take a while.
+time_dim = "time"
+start = 2020-01-01T00:00:00
+end = 2020-01-02T00:00:00
+step = "1D"
+
+[[datasets.glofas.parts]]
+filename_or_obj = "ewds://cems-glofas-historical"
+engine = "earlywarningdatastore"
+system_version = "version_5_0"
+hydrological_model = "lisflood"
+product_type = "consolidated"
+timespan = "time_mean"
+variable = "average_river_discharge_in_the_last_24_hours"
+chunks = {time = 1, latitude = -1, longitude = -1}
+
+[[datasets.glofas.postprocess]]
+name = "sel"
+latitude = {start = 46.0, stop = 40.0}
+longitude = {start = 12.0, stop = 20.0}
+
+[save]
+compressor = {cname = "lz4", clevel = 1}

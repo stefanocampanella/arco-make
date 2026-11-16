@@ -1,0 +1,66 @@
+name: Live services
+
+# One tiny download per remote backend from the real services (tests/live), to catch changes in the
+# services, in their client libraries or in arco-make's use of them. Not a merge gate.
+#
+# Never runs on pull requests: their code would run with the secrets, and the logs are public.
+# The secrets belong to the `live-services` environment; restrict its deployment branches to
+# master in the repository settings, so that no other branch can read them. Actions are pinned to
+# commits: this job holds the secrets.
+on:
+  schedule:
+    - cron: "17 5 * * 1"  # Mondays, 05:17 UTC
+  # Also after merges that touch the backends or the dependencies. These pushes also keep the
+  # schedule alive: GitHub disables scheduled workflows after 60 days without repository activity.
+  push:
+    branches: [ master ]
+    paths:
+      - "src/arcomake/backends.py"
+      - "src/arcomake/dataset_utils.py"
+      - "uv.lock"
+      - "tests/live/**"
+      - ".github/workflows/live-services.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-services
+  cancel-in-progress: false
+
+jobs:
+  live:
+    name: ${{ matrix.backend }}
+    runs-on: ubuntu-latest
+    environment: live-services
+    # No backend has a request timeout yet (group 7): this bounds a hung read.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [zarr_gcs, copernicusmarine, earlywarningdatastore, netcdfoverhttp]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
+        with:
+          python-version: "3.13"
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenmpi-dev
+      # The `live` extra adds ECMWF's ecCodes build (eccodeslib, locked): the distribution's ecCodes
+      # is too old for GloFAS GRIB.
+      - run: uv sync --frozen --extra dev --extra live
+      - name: Download from the live service
+        # Each backend gets only its own credentials. --show-capture=no and the test's failure
+        # report keep the services' messages (which may carry temporary tokens) out of the log.
+        env:
+          COPERNICUSMARINE_SERVICE_USERNAME: ${{ matrix.backend == 'copernicusmarine' && secrets.COPERNICUSMARINE_SERVICE_USERNAME || '' }}
+          COPERNICUSMARINE_SERVICE_PASSWORD: ${{ matrix.backend == 'copernicusmarine' && secrets.COPERNICUSMARINE_SERVICE_PASSWORD || '' }}
+          CDSAPI_URL: ${{ matrix.backend == 'earlywarningdatastore' && secrets.CDSAPI_URL || '' }}
+          CDSAPI_KEY: ${{ matrix.backend == 'earlywarningdatastore' && secrets.CDSAPI_KEY || '' }}
+        run: >
+          uv run --frozen --no-sync
+          pytest --live tests/live -k ${{ matrix.backend }}
+          -p no:cacheprovider --show-capture=no -q

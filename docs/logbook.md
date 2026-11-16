@@ -171,6 +171,20 @@ with 32 cores and 110 GB, the image's eccodes 2.48, threads scheduler; locations
   decoding; N6–N8 were found on real data) goes into a separate, non-blocking workflow: scheduled
   and manual only, secrets in a protected environment, one tiny request per backend.
 - The NetCDF-over-HTTP backend's download had no test; it is now tested against a local server.
+- Live checks (`tests/live/`, `live-services.yml`): one day of 2020 over the Adriatic per backend
+  (ERA5 on GCS, GLORYS12 from Copernicus Marine, GloFAS from EWDS, the GloFAS upstream-area NetCDF
+  over HTTPS). On the project VM with the project credentials: all four pass in 82 s, EWDS included
+  (no queue that day). They use `eccodeslib` 2.49, ECMWF's binary wheel, which also avoids the
+  host's old ecCodes. Secrets go to an environment restricted to master, without required
+  reviewers, so that the weekly run needs no approval; only reviewed code on master can read them.
+  - After the code review of the live checks: `eccodeslib` is locked (the `live` extra) instead of
+    installed unpinned next to the secrets; actions are pinned to commits; the tests check the
+    fraction of finite values (ERA5 1.0; GLORYS 0.41, GloFAS 0.62 measured on 16 Nov), so a lost
+    chunk fails; a failure reports the chain of exception types (the services' messages stay out
+    of the public log); the live tests are skipped without `--live` instead of deselected; they
+    also run after merges touching the backends, which keeps the schedule from being disabled
+    after 60 days without activity. Still open: the NetCDF-over-HTTP backend has no request
+    timeout (group 7); the job timeout bounds a hang.
 
 ## 2026-11-16: code review of the PR (effort high)
 
