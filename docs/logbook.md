@@ -278,4 +278,14 @@ pydantic-settings (maintainer's choice) rather than by hand.
   - Live check with a profile holding fake credentials and `addressing_style = virtual`: the
     Copernicus Marine download passes (complete, plausible values) in 3 s. The profile's
     credentials and S3 options do not reach the toolbox's unsigned CloudFerro client.
+- After the code review of this PR: values from the environment are checked even without a file;
+  errors become CLI messages naming the variable (no value, no traceback); the AWS profile is
+  checked only for runs with `s3://` paths or Copernicus Marine parts (local runs and `--help`
+  are not affected); empty values count as unset (a template `CDSAPI_KEY=` hid `~/.cdsapirc`);
+  `TMPDIR` must be an existing writable directory (tempfile silently fell back to `/tmp`); a
+  missing file named by `ARCOMAKE_RC` is reported; AWS credentials, region, endpoint and the
+  `ECCODES_*` paths are settings too; `DASK_*` keys are merged into Dask's configuration instead
+  of `dask.config.refresh()`, which dropped values set in the process; the test fixture no longer
+  leaks the exported values into later tests. Commands no longer reduce their own `ClickException`
+  messages (e.g. the overwrite refusal) to "An error occurred (ClickException)".
 

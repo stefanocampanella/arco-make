@@ -64,11 +64,15 @@ export CDSAPI_URL=https://ewds.climate.copernicus.eu/api
 export CDSAPI_KEY='...'
 ```
 
-Variables already set win. Values are checked when a command starts (e.g. `CDSAPI_URL` must be an
-HTTP URL); secrets are never logged. Keys that are not settings are ignored with a warning naming
-the key, and a file other users can read is reported. A recipe's `storage_options` (e.g.
-`profile`) override `AWS_PROFILE`. An AWS profile that does not exist fails data commands at once:
-every botocore session reads it, the Copernicus Marine toolbox's included.
+Variables already set win, and empty values (`KEY=`) count as unset. Values are checked when a
+command starts, from the environment or the file (`CDSAPI_URL` must be an HTTP URL, `TMPDIR` an
+existing writable directory); errors name the variable, never its value. Keys that are not
+settings are ignored with a warning naming the key; a file other users can read, or a missing file
+named by `ARCOMAKE_RC`, is reported. Also accepted: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_ENDPOINT_URL` and the `ECCODES_*`
+paths. A recipe's `storage_options` (e.g. `profile`) override `AWS_PROFILE`. Runs with `s3://`
+paths or Copernicus Marine parts (both use botocore) fail at once if the AWS profile does not
+exist.
 
 ## Recipes
 

@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict
 
 from arcomake.checks import ChecksConfig, ValidationError
 from arcomake.cli_utils import (
+  check_aws_profile,
   check_path,
   read_configs,
   set_default_logger,
@@ -55,6 +56,7 @@ def validate(
 
   # Read configs
   configs = read_configs(configs_path, schema=ValidateConfig)
+  check_aws_profile(input_path)
 
   # Validate the dataset
   if configs.checks:
@@ -66,6 +68,8 @@ def validate(
         )
     except ValidationError as exc:
       raise click.ClickException(f"Validation failed: {exc}") from exc
+    except click.ClickException:
+      raise
     except Exception as exc:
       logger.exception("An error occurred during validation")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

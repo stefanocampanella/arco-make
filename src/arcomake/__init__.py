@@ -15,8 +15,7 @@ from arcomake.validate import validate
 
 
 @click.group()
-@click.pass_context
-def cli(ctx: click.Context):
+def cli():
   """Download, join, process, validate and summarize ARCO datasets, as described by TOML recipes.
 
   Every command takes a recipe (TOML) and input/output paths, which may be local or fsspec
@@ -25,13 +24,10 @@ def cli(ctx: click.Context):
   Settings missing from the environment (credentials, AWS_PROFILE, TMPDIR, DASK_*) are read
   from ~/.arcomakerc, or the file named by ARCOMAKE_RC: a dotenv file (`export KEY=VALUE`).
   """
-  settings.load()
-  # Data commands open botocore sessions (S3 paths, Copernicus Marine): fail now, not after retries.
-  if ctx.invoked_subcommand != "steps" and (profile := settings.missing_aws_profile()) is not None:
-    raise click.ClickException(
-      f"The AWS profile {profile!r} (AWS_DEFAULT_PROFILE or AWS_PROFILE) is not configured "
-      "(AWS_CONFIG_FILE, ~/.aws/config). Fix or unset it."
-    )
+  try:
+    settings.load()
+  except settings.SettingsError as error:
+    raise click.ClickException(str(error)) from None
 
 
 @click.command(name="steps")

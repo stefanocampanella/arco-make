@@ -12,6 +12,7 @@ from dask.diagnostics import ProgressBar
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from arcomake.cli_utils import (
+  check_aws_profile,
   check_if_overwriting,
   check_path,
   read_configs,
@@ -145,6 +146,12 @@ def download(
     if end_datetime is not None:
       update_time_interval["end"] = end_datetime
     configs = read_configs(configs_path, inject=update_time_interval, schema=DownloadConfig)
+    parts = [part for dataset in configs.datasets.values() for part in dataset.parts]
+    check_aws_profile(
+      output_path,
+      *(part.filename_or_obj for part in parts),
+      copernicus_marine=any(part.engine == "copernicusmarine" for part in parts),
+    )
     # Check if the output destination exists.
     check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
     # Iterate over date intervals.
@@ -213,6 +220,8 @@ def download(
                   append_dim=configs.time_dim,
                   compute=True,
                 )
+      except click.ClickException:
+        raise
       except Exception as exc:
         logger.exception("An error occurred during download")
         raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

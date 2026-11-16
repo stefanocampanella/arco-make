@@ -52,6 +52,7 @@ from dask.graph_manipulation import bind
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from arcomake.cli_utils import (
+  check_aws_profile,
   check_if_overwriting,
   check_path,
   read_configs,
@@ -217,6 +218,7 @@ def compute_climatology(
     try:
       # Read configs, then check the output paths (with the recipe's storage options).
       configs = read_configs(configs_path, schema=ClimatologyConfig)
+      check_aws_profile(input_path, climatology_output_path, anomaly_std_output_path)
       for path in (climatology_output_path, anomaly_std_output_path):
         check_if_overwriting(path, overwrite=overwrite, save_configs=configs.save)
       # Open input dataset
@@ -273,6 +275,8 @@ def compute_climatology(
           dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
         logger.info("Climatology writes completed; output stores closed.")
       logger.info("Input dataset closed; closing Dask client.")
+    except click.ClickException:
+      raise
     except Exception as exc:
       logger.exception("An error occurred while processing the climatology and anomaly std.")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

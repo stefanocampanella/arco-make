@@ -18,6 +18,7 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 def check_path(exists=True, file_okay=True, dir_okay=True):
 
   def _check_path(ctx: click.Context, param: click.Parameter, value: str) -> str:
+    check_aws_profile(value)  # checking existence opens a botocore session for s3:// paths
     fs, path = fsspec.url_to_fs(value)
     if exists and not fs.exists(path):
       raise click.ClickException(f"{path} does not exist")
@@ -86,3 +87,17 @@ def set_default_logger(log_level: str = "info"):
     level=log_level.upper(),
     force=True,
   )
+
+
+def check_aws_profile(*paths: object, copernicus_marine: bool = False) -> None:
+  """Fail before any work if `s3://` paths or Copernicus Marine parts meet an unknown AWS profile.
+
+  Raises:
+    click.ClickException: naming the profile (see `settings.check_aws_profile`).
+  """
+  from arcomake import settings
+
+  try:
+    settings.check_aws_profile(paths, copernicus_marine=copernicus_marine)
+  except settings.SettingsError as error:
+    raise click.ClickException(str(error)) from None
