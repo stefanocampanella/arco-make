@@ -171,3 +171,37 @@ with 32 cores and 110 GB, the image's eccodes 2.48, threads scheduler; locations
   decoding; N6–N8 were found on real data) goes into a separate, non-blocking workflow: scheduled
   and manual only, secrets in a protected environment, one tiny request per backend.
 - The NetCDF-over-HTTP backend's download had no test; it is now tested against a local server.
+
+## 2026-11-16: code review of the PR (effort high)
+
+A review of the whole PR found ten issues; each was reproduced before being fixed, one commit and
+test each.
+
+- **N10, silent corruption with `-1` save chunks (also at `847b6f2`) [Moby-Dick]:** `[save]
+  chunks` passed -1 ("whole dimension") into the Zarr encoding. xarray's check that Dask chunks
+  do not straddle Zarr chunks computes `n % -1 == 0` and passes, so Dask chunks smaller than the
+  dimension wrote into the same Zarr chunk concurrently. On a 2 × 400 × 400 array in 10 × 10 Dask
+  chunks, about 95 % of the values read back wrong, with no error, at both commits. -1 is now
+  resolved to the dimension's size, and such a write fails.
+  - Not affected: ARCO-OCEAN. Its download, unpack and climatology recipes all rechunk `lat` and
+    `lon` to -1 (a `chunk` step, or `[read] chunks`) before saving, so Dask and Zarr chunks align;
+    the baseline outputs were identical across runs and commits, which a race would not give.
+- The other findings, fixed:
+  - `drop_variables` in `[read]` and generic parts was a one-shot iterator after validation: only
+    the first interval dropped the variables.
+  - `[save.encoding]` forbade `_FillValue` and passed `fill_value`, which `to_zarr` rejects: no
+    recipe could set a fill value. `_FillValue`, `scale_factor` and `add_offset` are accepted.
+  - `[read]` had no `storage_options`, so remote inputs needing credentials could not be read.
+  - The N8 fix applied only with `engine = "zarr"` spelled out; with the engine guessed from a
+    `.zarr` name (the arco-ocean stats recipes), timeouts still became NaN.
+  - A bare string passed the load-time check of list arguments, and steps then matched substrings
+    (`clip_negative`, `apply_mask` and `masked_fill` would act on the wrong variables).
+  - `time_sel` failed on cftime calendars with the `datetime` bounds `download` passes.
+  - A part without `engine` matched the Copernicus Marine model; Zarr parts refused the other
+    `open_dataset` arguments.
+- Not fixed, recorded: three commits change output for some recipes without the `output:` prefix
+  of the commit rules, `astype` with `dtype` alone or per variable (N2), `apply_mask` no longer
+  masking the mask by default, and `get_sea_mask`'s default `depth_dim`. None applies to the
+  arco-ocean recipes: they set both `astype` arguments, pass `depth_dim` to `get_sea_mask` and do
+  not use `apply_mask`. The PR description lists them under "Behaviour changes". Rewording would
+  rename every later commit.
