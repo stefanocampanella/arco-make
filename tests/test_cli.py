@@ -144,3 +144,91 @@ def test_climatology_reference_period_and_day_of_year(tmp_path: pathlib.Path):
   np.testing.assert_allclose(out[58], in_2020[58:60].mean(), rtol=1e-6)  # Feb 28 and 29
   np.testing.assert_array_equal(out[59:], in_2020[60:])
   assert np.isnan(xr.open_zarr(std).x.values[0])  # one value: no variance
+
+
+def test_climatology_one_series_at_a_time(tmp_path: pathlib.Path):
+  """`split_dims` (S1) writes the same outputs as one Dask graph, series by series."""
+  time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
+  rng = np.random.default_rng(0)
+  ds = xr.Dataset(
+    {
+      "t3": (("time", "depth", "lat"), rng.standard_normal((time.size, 3, 4)).astype("float32")),
+      "t2": (("time", "lat"), rng.standard_normal((time.size, 4)).astype("float32")),
+    },
+    coords={"time": time, "depth": [0.5, 1.5, 2.5], "lat": [0.0, 1.0, 2.0, 3.0]},
+  )
+  ds.to_zarr(tmp_path / "in.zarr")
+  common = (
+    'period = 365\nbins = "day_of_year"\nwindow = 5\nweighting = "gaussian"\n'
+    'weighting_scale = 2.0\n{split}\n[read]\nengine = "zarr"\n\n'
+    '[[postprocess_climatology]]\nname = "assign_attrs"\ntitle = "clim"\n\n'
+    "[save]\nchunks = {{time = 1, depth = 1, lat = -1}}\n"
+  )
+  outputs = {}
+  for label, split in [("graph", ""), ("series", 'split_dims = ["depth"]')]:
+    recipe = tmp_path / f"{label}.toml"
+    recipe.write_text(common.format(split=split))
+    clim, std = tmp_path / f"{label}_clim.zarr", tmp_path / f"{label}_std.zarr"
+    result = run(
+      "compute-climatology", *THREADS, str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)
+    )
+    assert result.exit_code == 0, result.output
+    outputs[label] = (xr.open_zarr(clim).load(), xr.open_zarr(std).load())
+  for graph, series in zip(outputs["graph"], outputs["series"], strict=True):
+    xr.testing.assert_allclose(series, graph, rtol=1e-5)
+    assert series.attrs == graph.attrs
+  assert outputs["series"][0].attrs["title"] == "clim"
+  assert xr.open_zarr(tmp_path / "series_clim.zarr").t3.encoding["chunks"] == (1, 1, 4)
+
+
+def climatology_input(tmp_path: pathlib.Path, depth_coordinate: bool = True) -> pathlib.Path:
+  time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
+  values = np.random.default_rng(2).standard_normal((time.size, 3, 4)).astype("float32")
+  coords = {"time": time, "lat": [0.0, 1.0, 2.0, 3.0]}
+  if depth_coordinate:
+    coords["depth"] = [0.5, 1.5, 2.5]
+  ds = xr.Dataset({"t3": (("time", "depth", "lat"), values)}, coords=coords)
+  path = tmp_path / ("in.zarr" if depth_coordinate else "in_nodepth.zarr")
+  ds.to_zarr(path)
+  return path
+
+
+def run_climatology(tmp_path: pathlib.Path, source: pathlib.Path, label: str, extra: str):
+  recipe = tmp_path / f"{label}.toml"
+  recipe.write_text(
+    f'period = 365\nbins = "day_of_year"\nwindow = 3\nweighting = "constant"\n{extra}\n'
+    '[read]\nengine = "zarr"\n'
+  )
+  clim, std = tmp_path / f"{label}_clim.zarr", tmp_path / f"{label}_std.zarr"
+  return run("compute-climatology", *THREADS, str(recipe), str(source), str(clim), str(std)), clim
+
+
+def test_one_series_at_a_time_without_coordinates_or_save_chunks(tmp_path: pathlib.Path):
+  """A split dimension without coordinate is written index by index (region "auto" mapped every
+  series to index 0); without [save] chunks, the split dimension is stored one index per chunk."""
+  source = climatology_input(tmp_path, depth_coordinate=False)
+  graph, graph_clim = run_climatology(tmp_path, source, "graph", "\n[save]\n")
+  series, series_clim = run_climatology(
+    tmp_path, source, "series", 'split_dims = ["depth"]\n[save]\n'
+  )
+  assert graph.exit_code == 0 and series.exit_code == 0, series.output
+  # Float32 rounding differs between the paths (one unit in the last place near zero).
+  xr.testing.assert_allclose(
+    xr.open_zarr(series_clim).load(), xr.open_zarr(graph_clim).load(), atol=1e-6
+  )
+  assert xr.open_zarr(series_clim).t3.encoding["chunks"][1] == 1
+
+
+@pytest.mark.parametrize(
+  ("extra", "message"),
+  [
+    ('split_dims = ["depth"]\n[save]\nchunks = {depth = 3}\n', "must be 1"),
+    ('split_dims = ["depth"]\n[save]\ngroup = "g"\n', "group is not supported"),
+    ('split_dims = ["detph"]\n[save]\n', "not dimensions of the input"),
+    ('split_dims = ["time"]\n[save]\n', "cannot include the time dimension"),
+  ],
+)
+def test_one_series_at_a_time_checks_before_computing(tmp_path, extra: str, message: str):
+  """Settings that cannot work fail before the first series is computed."""
+  result, _ = run_climatology(tmp_path, climatology_input(tmp_path), "bad", extra)
+  assert result.exit_code != 0 and message in result.output
