@@ -329,4 +329,13 @@ size on S3: experiments that read less than a whole shard must still perform wel
   - These figures are for today's layout (zarr v2, daily chunks, no shards). The statistics will
     be recomputed on the new zarr v3, sharded dataset: the read block follows the input's chunks
     (or shards), and grouping several levels per pass waits for the shard layout.
+- After the code review of S1: the Dask path now runs the same window function as the per-series
+  path (`xr.apply_ufunc`, block by block), so the formulas exist once; writes use explicit regions
+  (`region="auto"` put every series of a dimension without coordinate at index 0, silently); the
+  split dimensions are stored one index per chunk (other sizes, `[save] group`, unknown
+  `split_dims` and the time dimension are refused before any work); Dask-backed coordinates are
+  written with the template; the per-series path checks one step per day like the Dask path; read
+  blocks follow the stored chunks when the input has no Dask chunks (they can still straddle
+  stored chunks when `reference_period` starts inside one); the per-series path uses local threads
+  whatever `--dask-setup` says; numba is a declared dependency, compiled on first use.
 

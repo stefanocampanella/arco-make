@@ -38,9 +38,9 @@
 # which would further distort the results. However, the quantities computed here are aimed at standardizing the input
 # features in a deep-learning model, and therefore such approximations are reasonably acceptable.
 import datetime
+import functools
 import itertools
 import logging
-import operator
 import os
 import time
 from collections.abc import Callable, Hashable, Sequence
@@ -52,7 +52,6 @@ import click
 import dask
 import dask.array
 import fsspec
-import numba
 import numpy as np
 import xarray as xr
 import zarr
@@ -133,6 +132,12 @@ class ClimatologyConfig(BaseModel):
   postprocess_climatology: list[ProcessingStepConfig] = Field(default_factory=list)
   postprocess_anomaly_std: list[ProcessingStepConfig] = Field(default_factory=list)
   save: SaveConfig
+
+  @model_validator(mode="after")
+  def _split_dims_not_time(self) -> "ClimatologyConfig":
+    if self.split_dims is not None and self.time_dim in self.split_dims:
+      raise ValueError(f"split_dims cannot include the time dimension {self.time_dim!r}")
+    return self
 
   @model_validator(mode="after")
   def _day_of_year_bins(self) -> "ClimatologyConfig":
@@ -398,6 +403,21 @@ def day_of_year_bins(time: xr.DataArray) -> tuple[np.ndarray, np.ndarray]:
   return bins, is_feb_29
 
 
+def _day_of_year_positions(time: xr.DataArray, period: int) -> tuple[np.ndarray, ...]:
+  """Day-of-year bins, Feb 29 flags and positions on a (year, bin) grid of daily steps.
+
+  Raises:
+    ValueError: if two steps fall on the same day (sub-daily data).
+  """
+  labels, is_feb_29 = day_of_year_bins(time)
+  years = np.asarray(time.dt.year.values)
+  position = (years - years.min()) * period + labels
+  regular = ~is_feb_29
+  if np.unique(position[regular]).size != np.count_nonzero(regular):
+    raise ValueError("day_of_year bins need at most one time step per day")
+  return labels, is_feb_29, position
+
+
 def _fold_statistics(folded: xr.Dataset) -> BinStatistics:
   """Count, mean and sum of squared deviations over `_period`, skipping NaN."""
   count = folded.count("_period")
@@ -426,12 +446,7 @@ def _bin_statistics(
   """
   size = dataset.sizes[time_dim]
   if bins == "day_of_year":
-    labels, is_feb_29 = day_of_year_bins(dataset[time_dim])
-    years = np.asarray(dataset[time_dim].dt.year.values)
-    position = (years - years.min()) * period + labels
-    regular = ~is_feb_29
-    if np.unique(position[regular]).size != np.count_nonzero(regular):
-      raise ValueError("day_of_year bins need at most one time step per day")
+    labels, is_feb_29, position = _day_of_year_positions(dataset[time_dim], period)
   else:
     if size % period != 0:
       raise ValueError(
@@ -549,48 +564,35 @@ def _compute_climatology(
   if bins == "day_of_year" and period != 365:
     raise ValueError(f"day_of_year bins need period = 365, got {period}")
   count, mean, m2 = _bin_statistics(dataset, period, bins, time_dim, use_flox)
-  # Counts as the data's float type, so that float32 inputs are combined in float32 (memory).
-  count = count.astype({name: mean[name].dtype for name in count.data_vars})
-
   half = window // 2
   offsets = list(range(-half, window - half))
-  terms = list(
-    zip(offsets, _window_weights(offsets, weighting, scale=weighting_scale), strict=True)
-  )
+  weights = _window_weights(offsets, weighting, scale=weighting_scale)
 
-  def shifted(stat: xr.Dataset, offset: int) -> xr.Dataset:
-    return stat.roll({time_dim: -offset}, roll_coords=False)
-
-  def window_sum(parts: list[xr.Dataset]) -> xr.Dataset:
-    return balanced_tree_reduce(operator.add, parts)
-
-  # Reliability weights: each value of bin b + k has the weight w_k of its offset.
-  mean0 = mean.fillna(0.0)
-  v1 = window_sum([float(w) * shifted(count, o) for o, w in terms])
-  v2 = window_sum([float(w) ** 2 * shifted(count, o) for o, w in terms])
-  climatology = (window_sum([float(w) * shifted(count * mean0, o) for o, w in terms]) / v1).where(
-    v1 > 0
-  )
-  clim0 = climatology.fillna(0.0)
-  total_m2 = window_sum(
-    [
-      float(w) * (shifted(m2, o) + shifted(count, o) * (shifted(mean0, o) - clim0) ** 2)
-      for o, w in terms
-    ]
-  )
-  denominator = v1 - v2 / v1.where(v1 > 0)
-  variance = (total_m2 / denominator).where(denominator > 0)
-
-  def as_input_types(result: xr.Dataset) -> xr.Dataset:
-    return result.astype(
-      {
-        name: dataset[name].dtype
-        for name in result.data_vars
-        if np.issubdtype(dataset[name].dtype, np.floating)
-      }
+  def window_block(n: np.ndarray, mu: np.ndarray, s2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    # apply_ufunc puts the bins (the core dimension) last; the window wants them first.
+    c, v = _window_statistics_in_memory(
+      np.moveaxis(n, -1, 0), np.moveaxis(mu, -1, 0), np.moveaxis(s2, -1, 0), offsets, weights, 1
     )
+    return np.moveaxis(c, 0, -1), np.moveaxis(v, 0, -1)
 
-  return as_input_types(climatology), as_input_types(variance)
+  results: tuple[dict[str, xr.DataArray], dict[str, xr.DataArray]] = ({}, {})
+  for name, var in mean.data_vars.items():
+    # One implementation of the window for both paths: the in-memory one, block by block.
+    statistics = xr.apply_ufunc(
+      window_block,
+      count[name],
+      var,
+      m2[name],
+      input_core_dims=[[time_dim]] * 3,
+      output_core_dims=[[time_dim]] * 2,
+      dask="parallelized",
+      output_dtypes=[np.float64, np.float64],
+      dask_gufunc_kwargs={"allow_rechunk": True},
+    )
+    dtype = dataset[name].dtype if np.issubdtype(dataset[name].dtype, np.floating) else np.float64
+    for out, value in zip(results, statistics, strict=True):
+      out[str(name)] = value.transpose(*var.dims).astype(dtype)
+  return xr.Dataset(results[0]), xr.Dataset(results[1])
 
 
 def _rolled_into(out: np.ndarray, src: np.ndarray, shift: int) -> np.ndarray:
@@ -608,6 +610,7 @@ def _window_statistics_in_memory(
   m2: np.ndarray,
   offsets: list[int],
   weights: np.ndarray,
+  workers: int | None = None,
   band: int = 1 << 15,
 ) -> tuple[np.ndarray, np.ndarray]:
   """The window step of `_compute_climatology` on in-memory per-bin statistics (bins on axis 0).
@@ -653,7 +656,7 @@ def _window_statistics_in_memory(
     variance[part] = var
 
   # Bands are independent, and NumPy releases the GIL: compute them in parallel.
-  with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1)) as pool:
+  with ThreadPoolExecutor(max_workers=workers or min(16, os.cpu_count() or 1)) as pool:
     list(pool.map(window_band, range(0, rows, band)))
   return climatology.reshape(shape), variance.reshape(shape)
 
@@ -705,6 +708,23 @@ def _compute_series(
   return climatology, variance
 
 
+def _one_index_per_chunk(save: SaveConfig, split_dims: list[str]) -> SaveConfig:
+  """`save` with stored chunks of 1 along the split dimensions, which each series writes alone.
+
+  Raises:
+    ValueError: if `[save] chunks` asks for another size along a split dimension.
+  """
+  chunks = save.chunks
+  if chunks is not None and not isinstance(chunks, dict):
+    raise ValueError("with split_dims, [save] chunks must be a table of sizes per dimension")
+  chunks = dict(chunks or {})
+  for dim in split_dims:
+    if chunks.get(dim, 1) != 1:
+      raise ValueError(f"with split_dims, [save] chunks along {dim!r} must be 1 (one series each)")
+    chunks[dim] = 1
+  return save.model_copy(update={"chunks": chunks})
+
+
 def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Dataset:
   """The outputs' layout, lazily (never computed): `period` bins along time, other dims kept."""
   data_vars = {}
@@ -712,7 +732,9 @@ def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Data
     shape = tuple(period if d == time_dim else var.sizes[d] for d in var.dims)
     dtype = var.dtype if np.issubdtype(var.dtype, np.floating) else np.float64
     data_vars[name] = (var.dims, dask.array.zeros(shape, dtype=dtype, chunks=-1))
-  coords = {name: coord for name, coord in dataset.coords.items() if time_dim not in coord.dims}
+  coords = {
+    name: coord.load() for name, coord in dataset.coords.items() if time_dim not in coord.dims
+  }
   coords[time_dim] = np.arange(period)
   return xr.Dataset(data_vars, coords=coords)
 
@@ -737,13 +759,19 @@ def _compute_by_series(
   for path, _ in outputs:
     if str(path).endswith(".zip"):
       raise ValueError("split_dims writes region by region: zip outputs are not supported")
+  if configs.save.group is not None:
+    raise ValueError("split_dims writes region by region: [save] group is not supported")
+  unknown = [d for d in configs.split_dims if d not in dataset.dims]
+  if unknown:
+    raise ValueError(f"split_dims {unknown} are not dimensions of the input: {list(dataset.dims)}")
+  save = _one_index_per_chunk(configs.save, configs.split_dims)
   template = _output_template(dataset, configs.period, configs.time_dim)
   with ExitStack() as store_stack:
     for path, steps in outputs:
       safe_to_zarr(
         template.arcomake.process(steps=steps) if steps else template,
         path,
-        configs=configs.save,
+        configs=save,
         compute=False,
         store_stack=store_stack,
       )
@@ -760,8 +788,12 @@ def _compute_by_series(
     for path, _ in outputs
   ]
 
-  def write(results: tuple[xr.Dataset, xr.Dataset], label: str) -> None:
+  def write(results: tuple[xr.Dataset, xr.Dataset], index: dict[str, int], label: str) -> None:
     writing = time.monotonic()
+    # Explicit regions: "auto" maps a dimension without coordinate to index 0.
+    region = {configs.time_dim: slice(0, configs.period)} | {
+      d: slice(i, i + 1) for d, i in index.items()
+    }
     for (path, steps), result, chunks in zip(outputs, results, stored_chunks, strict=True):
       if steps:
         result = result.arcomake.process(steps=steps)
@@ -772,15 +804,19 @@ def _compute_by_series(
           for dim, size in zip(result[name].dims, chunks[str(name)], strict=True)
         }
       )
+      result = result.drop_vars(
+        [name for name, var in result.variables.items() if not set(var.dims) & set(region)]
+      )
       result.to_zarr(
-        path, region="auto", mode="r+", consolidated=False, storage_options=storage_options or None
+        path, region=region, mode="r+", consolidated=False, storage_options=storage_options or None
       )
     logger.info(f"{label} written in {time.monotonic() - writing:.0f} s")
 
   series = _series(dataset, configs.split_dims)
   started = time.monotonic()
-  # Each series is written in the background while the next one is read.
-  with ThreadPoolExecutor(max_workers=1) as writer:
+  # Each series is written in the background while the next one is read. Reads and writes use
+  # local threads whatever --dask-setup says: results live in this process.
+  with dask.config.set(scheduler="threads"), ThreadPoolExecutor(max_workers=1) as writer:
     pending = None
     for number, (name, index) in enumerate(series, start=1):
       piece = dataset[[name]].isel({d: slice(i, i + 1) for d, i in index.items()})
@@ -797,7 +833,7 @@ def _compute_by_series(
       assert isinstance(anomaly_std, xr.Dataset)
       if pending is not None:
         pending.result()  # one write at a time; errors surface here
-      pending = writer.submit(write, (climatology, anomaly_std), f"{name} {index}")
+      pending = writer.submit(write, (climatology, anomaly_std), index, f"{name} {index}")
       elapsed = time.monotonic() - started
       logger.info(
         f"Series {number}/{len(series)} ({name} {index}) computed; {elapsed / number:.0f} s per"
@@ -820,7 +856,13 @@ def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> i
     1, da.dtype.itemsize * int(np.prod([da.sizes[d] for d in da.dims if d != time_dim]))
   )
   steps = max(1, int(target_bytes // step_bytes))
-  chunk = da.chunks[da.get_axis_num(time_dim)][0] if da.chunks is not None else 1
+  axis = da.get_axis_num(time_dim)
+  if da.chunks is not None:
+    chunk = int(da.chunks[axis][0])
+  else:  # stored chunks (or shards), as the zarr backend reports them
+    preferred = da.encoding.get("preferred_chunks", {}).get(time_dim)
+    stored = da.encoding.get("chunks")
+    chunk = int(preferred or (stored[axis] if stored else 1))
   return max(chunk, steps // chunk * chunk)
 
 
@@ -837,7 +879,7 @@ def _stream_bin_statistics(
   da = da.transpose(time_dim, ...)
   size = da.sizes[time_dim]
   if bins == "day_of_year":
-    labels, _ = day_of_year_bins(da[time_dim])
+    labels, _, _ = _day_of_year_positions(da[time_dim], period)
   else:
     labels = np.arange(size) % period
   shape = (period, *da.shape[1:])
@@ -857,7 +899,7 @@ def _stream_bin_statistics(
       values = pending.result()
       if k + 1 < len(starts):
         pending = prefetch.submit(read, starts[k + 1])
-      _welford_block(
+      _welford_kernel()(
         count.reshape(period, -1),
         mean.reshape(period, -1),
         m2.reshape(period, -1),
@@ -868,19 +910,26 @@ def _stream_bin_statistics(
   return count, mean, m2
 
 
-@numba.njit(parallel=True, nogil=True)
-def _welford_block(count, mean, m2, values, labels):  # pragma: no cover (compiled)
-  """Add row j of `values` (steps × points) to bin `labels[j]`, skipping NaN (Welford, float64).
+@functools.cache
+def _welford_kernel():
+  """The numba Welford kernel, compiled on first use (importing numba is slow)."""
+  import numba
 
-  One fused pass per step, parallel over points; `count`, `mean` and `m2` are (bins × points).
-  """
-  for j in range(values.shape[0]):
-    b = labels[j]
-    for i in numba.prange(values.shape[1]):
-      x = values[j, i]
-      if np.isfinite(x):
-        n = count[b, i] + 1
-        count[b, i] = n
-        delta = x - mean[b, i]
-        mean[b, i] += delta / n
-        m2[b, i] += delta * (x - mean[b, i])
+  @numba.njit(parallel=True, nogil=True)
+  def welford_block(count, mean, m2, values, labels):  # pragma: no cover (compiled)
+    """Add row j of `values` (steps × points) to bin `labels[j]`, skipping NaN (float64).
+
+    One fused pass per step, parallel over points; `count`, `mean`, `m2` are (bins × points).
+    """
+    for j in range(values.shape[0]):
+      b = labels[j]
+      for i in numba.prange(values.shape[1]):
+        x = values[j, i]
+        if np.isfinite(x):
+          n = count[b, i] + 1
+          count[b, i] = n
+          delta = x - mean[b, i]
+          mean[b, i] += delta / n
+          m2[b, i] += delta * (x - mean[b, i])
+
+  return welford_block

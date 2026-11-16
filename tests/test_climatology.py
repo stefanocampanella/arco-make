@@ -219,3 +219,28 @@ def test_climatology_recipes_are_checked_when_loaded(table: dict, message: str):
   base = {"period": 365, "window": 1, "weighting": "constant", "read": {}, "save": {}}
   with pytest.raises(pydantic.ValidationError, match=message):
     ClimatologyConfig.model_validate(base | table)
+
+
+def test_in_memory_series_reject_sub_daily_data():
+  """The per-series path checks day-of-year bins like the Dask path (one step per day)."""
+  hourly = xr.Dataset(
+    {"x": ("time", np.zeros(48))},
+    coords={"time": pd.date_range("2020-01-01", periods=48, freq="1h")},
+  )
+  with pytest.raises(ValueError, match="one time step per day"):
+    _compute_series(
+      hourly,
+      period=365,
+      window=1,
+      weighting="constant",
+      weighting_scale=None,
+      time_dim="time",
+      bins="day_of_year",
+    )
+
+
+def test_read_blocks_follow_stored_chunks_without_dask():
+  """Without Dask chunks, blocks follow the stored chunks the zarr backend reports."""
+  da = xr.DataArray(np.zeros((1000, 721, 1440), dtype="float32"), dims=("time", "lat", "lon"))
+  da.encoding["preferred_chunks"] = {"time": 50, "lat": 721, "lon": 1440}
+  assert _read_block(da, "time") == 200
