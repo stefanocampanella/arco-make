@@ -81,6 +81,10 @@ class ArcoMakeSettings(BaseSettings):
   copernicusmarine_service_password: SecretStr | None = Field(
     default=None, validation_alias="COPERNICUSMARINE_SERVICE_PASSWORD"
   )
+  # Connections per Copernicus Marine S3 client (toolbox default 10, fewer than Dask's threads).
+  copernicusmarine_max_pool_connections: int | None = Field(
+    default=None, ge=1, validation_alias="COPERNICUSMARINE_MAX_POOL_CONNECTIONS"
+  )
   cdsapi_url: str | None = Field(default=None, validation_alias="CDSAPI_URL", pattern=r"^https?://")
   cdsapi_key: SecretStr | None = Field(default=None, validation_alias="CDSAPI_KEY")
   eccodes_dir: str | None = Field(default=None, validation_alias="ECCODES_DIR")
@@ -137,7 +141,7 @@ def apply(settings: ArcoMakeSettings, environ: MutableMapping[str, str] | None =
     value = getattr(settings, name)
     if value is not None:
       alias = str(field.validation_alias)
-      values[alias] = value.get_secret_value() if isinstance(value, SecretStr) else value
+      values[alias] = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
   dask_values: dict[str, str] = {}
   for key, value in (settings.model_extra or {}).items():
     if key.startswith("DASK_"):
