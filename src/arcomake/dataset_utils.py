@@ -499,11 +499,18 @@ def safe_to_zarr(
     for var in dataset.data_vars:
       dims = dataset[var].dims
       if isinstance(chunk_conf, dict):
-        chunk_sizes = tuple(chunk_conf.get(str(dim), dataset[var].sizes[dim]) for dim in dims)
+        requested = [chunk_conf.get(str(dim), -1) for dim in dims]
       elif isinstance(chunk_conf, tuple):
-        chunk_sizes = chunk_conf
+        requested = list(chunk_conf)
       else:
-        chunk_sizes = tuple(chunk_conf for _ in dims)
+        requested = [chunk_conf for _ in dims]
+      # -1 means the whole dimension. Resolve it here: xarray's check that Dask chunks do not
+      # straddle Zarr chunks passes for -1 (`n % -1 == 0`), and overlapping Dask chunks would
+      # then write into the same Zarr chunk concurrently, losing data.
+      chunk_sizes = tuple(
+        dataset[var].sizes[dim] if size == -1 else size
+        for dim, size in zip(dims, requested, strict=True)
+      )
       dataset[var].encoding["chunks"] = chunk_sizes
   if compressor is not None:
     # Without `[save] compressor`, the variables keep their own (or zarr's default) compressor.

@@ -31,6 +31,24 @@ def test_safe_to_zarr_directory_layout(ocean_ds: xr.Dataset, tmp_path: pathlib.P
   xr.testing.assert_allclose(xr.open_zarr(tmp_path / "out.zarr").load(), ocean_ds)
 
 
+def test_safe_to_zarr_whole_dimension_with_split_dask_chunks(tmp_path: pathlib.Path):
+  """`-1` with Dask chunks smaller than the dimension fails instead of losing data.
+
+  xarray's check that Dask chunks do not straddle Zarr chunks passed for -1 (`n % -1 == 0`), so
+  several Dask chunks wrote into the same Zarr chunk concurrently: about 95 % of the values were
+  wrong, with no error.
+  """
+  data = np.random.default_rng(0).random((2, 40, 40)).astype("float32")
+  ds = xr.Dataset({"v": (("time", "lat", "lon"), data)}).chunk({"time": 1, "lat": 10, "lon": 10})
+  conf = SaveConfig(chunks={"time": 1, "lat": -1, "lon": -1})
+  with pytest.raises(ValueError, match="overlap multiple Dask chunks"):
+    safe_to_zarr(ds, tmp_path / "split.zarr", configs=conf)
+  safe_to_zarr(ds.chunk({"lat": -1, "lon": -1}), tmp_path / "whole.zarr", configs=conf)
+  out = xr.open_zarr(tmp_path / "whole.zarr")["v"]
+  assert out.encoding["chunks"] == (1, 40, 40)
+  np.testing.assert_array_equal(out.values, data)
+
+
 def test_safe_to_zarr_zip_and_append(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
   """A `.zip` destination is a ZipStore; appending along time gives the same data as one write."""
   path = tmp_path / "out.zip"
