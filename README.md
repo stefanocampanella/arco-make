@@ -43,6 +43,27 @@ Every command documents its options with `--help`. Paths may be local or fsspec 
 The usual workflow is `download` (in pieces, e.g. as a SLURM job array), then `unpack`, `validate`, and
 `compute-climatology`.
 
+## Settings and credentials
+
+Credentials and machine settings come from the environment, never from recipes: Copernicus
+Marine (`COPERNICUSMARINE_SERVICE_USERNAME`, `COPERNICUSMARINE_SERVICE_PASSWORD`), EWDS and CDS
+(`CDSAPI_URL`, `CDSAPI_KEY`), cloud storage (`GOOGLE_APPLICATION_CREDENTIALS`, `AWS_*`), `TMPDIR`
+(use a disk, not RAM: checkpoints and downloads go there) and Dask (`DASK_*`).
+
+Every command first reads `~/.arcomakerc` (or the file named by `ARCOMAKE_RC`; an empty value
+disables it) and sets the variables the environment lacks. One `KEY=VALUE` per line, optionally
+after `export`, so a shell can `source` the same file:
+
+```sh
+# ~/.arcomakerc: holds secrets, so `chmod 600 ~/.arcomakerc`
+export TMPDIR=/scratch/$USER/tmp
+export CDSAPI_URL=https://ewds.climate.copernicus.eu/api
+export CDSAPI_KEY='...'
+```
+
+Variables already set win. Single-quoted values are literal; others expand `$VAR`. Values are
+never logged, and a file other users can read is reported.
+
 ## Recipes
 
 A download recipe has a top table for the whole dataset, one table per source dataset, steps applied

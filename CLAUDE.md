@@ -42,6 +42,8 @@ Registered in `src/arcomake/__init__.py`: `download`, `unpack`, `process`, `comp
 
 **Dask setup** (`dask_utils.get_client`, a context manager): `--dask-setup` is one of `synchronous|threads|processes|mpi|localcluster`. `download` defaults to `threads` because the custom remote backends don't serialize to distributed workers. `unpack` and `compute-climatology` default to `mpi` (dask-mpi under SLURM). `mpi` and `localcluster` read extra kwargs from Dask env config (`DASK_MPI__*`, `DASK_LOCALCLUSTER__*`) via `get_dask_env_options`. Optional `frisky` (from the `experimental` extra) can wrap the client.
 
+**User settings** (`rcfile.py`): the `cli` group first reads `~/.arcomakerc` (or `$ARCOMAKE_RC`; empty disables it) and sets the environment variables that are missing: credentials, `TMPDIR`, `DASK_*` (then `dask.config.refresh()`). Shell-compatible `KEY=VALUE` lines; values are never logged. Such files hold secrets: never read a real one; tests point `ARCOMAKE_RC` at temporary files (an autouse fixture disables it, except for live checks).
+
 **Temp storage** (`temporary_utils.TempDirectoryRegistry`): a context-var-scoped registry of temp dirs, cleaned up on exit, atexit and signals, with stale-dir detection by PID. Checkpoints and remote downloads use it heavily, so `TMPDIR` should point to disk, not RAM.
 
 **Zarr v2 only**: dependencies pin `zarr >=2,<3` and `numcodecs <0.16`, and the code uses `zarr.storage.DirectoryStore`/`ZipStore` and `numcodecs.Blosc`. Porting to v3 is a TODO.

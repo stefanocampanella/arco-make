@@ -246,3 +246,19 @@ implementation (S1) is built and timed on the project VM, and the maintainer tim
   and `day_of_year` with `period = 365` are checked when the recipe is loaded; flox again uses the
   communication-free "blockwise" method when time chunks hold whole periods.
 
+## 2026-11-16: user settings file
+
+**Request (maintainer):** support a user file for secrets and settings, like the one kept on the
+project VM (which must never be read here).
+
+- `~/.arcomakerc` (or `$ARCOMAKE_RC`; empty disables it) is read by every command before anything
+  else; it sets the environment variables that are missing, so the environment always wins. The
+  format is shell-compatible (`export KEY=VALUE`), so the same file can be `source`d by job scripts.
+  Chosen over a TOML file because every setting arco-make needs (service credentials, `TMPDIR`,
+  `DASK_*`) is already an environment variable read by a library.
+- Values are never logged; an unparsable line is reported by number only; a file other users can
+  access is reported (`chmod 600`). `TMPDIR` and `DASK_*` from the file take effect although
+  `tempfile` and Dask read them earlier.
+- Tests never read a real file: an autouse fixture sets `ARCOMAKE_RC=""`, except for the live
+  checks, whose credentials may come from it.
+
