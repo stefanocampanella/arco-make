@@ -7,11 +7,18 @@ import pathlib
 import click
 import pydantic
 import pytest
+import xarray as xr
 
 from arcomake import cli_utils, climatology
 from arcomake.checks import ChecksConfig
 from arcomake.cli_utils import check_if_overwriting, read_configs
-from arcomake.dataset_utils import DatasetConfig, ReadConfig, SaveConfig, VariableEncodingConfig
+from arcomake.dataset_utils import (
+  DatasetConfig,
+  ReadConfig,
+  SaveConfig,
+  VariableEncodingConfig,
+  write_output,
+)
 from arcomake.download import DownloadConfig
 from arcomake.process import ProcessConfig
 from tests.conftest import make_ocean_dataset, render_recipe
@@ -145,7 +152,7 @@ def test_climatology_honours_use_flox(tmp_path: pathlib.Path, sources: pathlib.P
     recipe.read_text().replace('weighting = "constant"', 'weighting = "constant"\nuse_flox = true')
   )
   dataset = tmp_path / "in.zarr"
-  make_ocean_dataset().isel(time=slice(0, 4)).to_zarr(dataset)
+  write_output(make_ocean_dataset().isel(time=slice(0, 4)), dataset, message="input")
   with pytest.raises(click.ClickException):
     climatology.compute_climatology.callback(  # type: ignore[misc]
       str(recipe),
@@ -158,11 +165,16 @@ def test_climatology_honours_use_flox(tmp_path: pathlib.Path, sources: pathlib.P
 
 
 def test_check_if_overwriting(tmp_path: pathlib.Path):
-  """An existing destination needs `--overwrite`; a missing one is fine."""
+  """An existing destination needs `--overwrite`, which only replaces an Icechunk repository (in
+  a new commit); anything else at that path is left alone. A missing destination is fine."""
   check_if_overwriting(str(tmp_path / "absent.zarr"))
   with pytest.raises(click.ClickException, match="already exists"):
     check_if_overwriting(str(tmp_path))
-  check_if_overwriting(str(tmp_path), overwrite=True)
+  with pytest.raises(click.ClickException, match="not an Icechunk repository"):
+    check_if_overwriting(str(tmp_path), overwrite=True)
+  repository = tmp_path / "out.zarr"
+  write_output(xr.Dataset({"x": ("t", [1.0])}), repository, message="test")
+  check_if_overwriting(str(repository), overwrite=True)
 
 
 def test_check_if_overwriting_fails_when_destination_is_unreachable(

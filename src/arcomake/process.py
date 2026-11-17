@@ -14,7 +14,7 @@ from arcomake.cli_utils import (
   set_default_logger,
 )
 from arcomake.dask_utils import DaskSetupType, get_client
-from arcomake.dataset_utils import ReadConfig, SaveConfig, open_input, safe_to_zarr
+from arcomake.dataset_utils import ReadConfig, SaveConfig, open_input, write_output
 from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
@@ -107,12 +107,7 @@ def process(
         if configs.process:
           dataset = dataset.arcomake.process(steps=configs.process)
         # Save stats
-        safe_to_zarr(
-          dataset=dataset,
-          destination=output_path,
-          configs=configs.save,
-          compute=True,
-        )
+        write_output(dataset, output_path, configs.save, message=f"process {input_path}")
     except click.ClickException:
       raise
     except Exception as exc:

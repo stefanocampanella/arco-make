@@ -8,6 +8,7 @@ import click
 import fsspec
 from pydantic import BaseModel, ValidationError
 
+from arcomake import icechunk_utils
 from arcomake.dataset_utils import SaveConfig
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ def check_if_overwriting(
     # Zip outputs were removed with Zarr v3: a `.zip` name would silently become a directory.
     raise click.ClickException(f"{path}: zip outputs are not supported; write a directory or a URL")
   storage_options = getattr(save_configs, "storage_options", None) if save_configs else None
-  fs, fs_path = fsspec.url_to_fs(path, **(storage_options or {}))
+  fs, fs_path = fsspec.url_to_fs(path, **icechunk_utils.fsspec_options(path, storage_options))
   try:
     exists = fs.exists(fs_path)
   except Exception as exc:
@@ -77,10 +78,14 @@ def check_if_overwriting(
     raise click.ClickException(f"Could not check whether {path} exists: {exc}") from exc
 
   if exists:
-    if overwrite:
-      logger.info(f"Overwriting existing output destination {path}")
-    else:
+    if not overwrite:
       raise click.ClickException(f"Output destination {path} already exists")
+    # Outputs are Icechunk repositories, overwritten in a new commit: anything else is left alone.
+    if not icechunk_utils.is_repository(path, storage_options):
+      raise click.ClickException(
+        f"Output destination {path} exists and is not an Icechunk repository: remove it first"
+      )
+    logger.info(f"Overwriting {path} in a new commit (earlier versions stay in its history)")
 
 
 def set_default_logger(log_level: str = "info"):

@@ -53,8 +53,10 @@ import dask.array
 import numpy as np
 import xarray as xr
 from dask.graph_manipulation import bind
+from icechunk.xarray import to_icechunk
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from arcomake import icechunk_utils
 from arcomake.cli_utils import (
   check_aws_profile,
   check_if_overwriting,
@@ -66,10 +68,9 @@ from arcomake.dask_utils import DaskSetupType, get_client
 from arcomake.dataset_utils import (
   ReadConfig,
   SaveConfig,
-  consolidate_metadata,
   open_input,
-  safe_to_zarr,
-  storage_options_for,
+  prepare_for_writing,
+  write_outputs_together,
 )
 from arcomake.processing_utils import ProcessingStepConfig
 
@@ -284,16 +285,14 @@ def compute_climatology(
         assert isinstance(anomaly_std, xr.Dataset)
         if configs.postprocess_anomaly_std:
           anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
-        # Compute and save the climatology and anomaly std in parallel.
+        # Compute and save the climatology and anomaly std together (see write_outputs_together).
         logger.info("Processing climatology and anomaly standard deviation.")
-        _climatology_delayed_save = safe_to_zarr(
-          climatology, climatology_output_path, configs=configs.save, compute=False
+        write_outputs_together(
+          [(climatology, climatology_output_path), (anomaly_std, anomaly_std_output_path)],
+          configs.save,
+          message="compute-climatology",
         )
-        _anomaly_std_delayed_save = safe_to_zarr(
-          anomaly_std, anomaly_std_output_path, configs=configs.save, compute=False
-        )
-        dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
-        logger.info("Climatology writes completed; output stores closed.")
+        logger.info("Climatology and anomaly standard deviation committed.")
       logger.info("Input dataset closed; closing Dask client.")
     except click.ClickException:
       raise
@@ -764,26 +763,22 @@ def _compute_by_series(
     raise ValueError(f"split_dims {unknown} are not dimensions of the input: {list(dataset.dims)}")
   save = _one_index_per_chunk(configs.save, configs.split_dims)
   template = _output_template(dataset, configs.period, configs.time_dim)
-  for path, steps in outputs:
+  # One writable session per output, committed once every series is written: an interrupted run
+  # commits nothing.
+  sessions = [icechunk_utils.writable_session(path, save.storage_options) for path, _ in outputs]
+  for (_, steps), session in zip(outputs, sessions, strict=True):
     # Metadata only: the data of the template are never computed.
-    safe_to_zarr(
-      template.arcomake.process(steps=steps) if steps else template,
-      path,
-      configs=save,
-      compute=False,
-    )
+    prepare_for_writing(
+      template.arcomake.process(steps=steps) if steps else template, save
+    ).to_zarr(session.store, mode="w", compute=False, consolidated=False, zarr_format=3)
   # Stored chunks (shards, if any: the units of writing) of every output variable: results are
   # chunked alike, so that Dask writes the chunks of a region in parallel.
   stored_chunks = [
     {
       name: var.encoding.get("shards") or var.encoding["chunks"]
-      for name, var in xr.open_zarr(
-        path,
-        storage_options=storage_options_for(path, configs.save.storage_options),
-        consolidated=False,
-      ).data_vars.items()
+      for name, var in xr.open_zarr(session.store, consolidated=False).data_vars.items()
     }
-    for path, _ in outputs
+    for session in sessions
   ]
 
   def write(results: tuple[xr.Dataset, xr.Dataset], index: dict[str, int], label: str) -> None:
@@ -792,7 +787,9 @@ def _compute_by_series(
     region = {configs.time_dim: slice(0, configs.period)} | {
       d: slice(i, i + 1) for d, i in index.items()
     }
-    for (path, steps), result, chunks in zip(outputs, results, stored_chunks, strict=True):
+    for (_, steps), result, chunks, session in zip(
+      outputs, results, stored_chunks, sessions, strict=True
+    ):
       if steps:
         result = result.arcomake.process(steps=steps)
       result = result.drop_attrs().chunk(
@@ -805,13 +802,7 @@ def _compute_by_series(
       result = result.drop_vars(
         [name for name, var in result.variables.items() if not set(var.dims) & set(region)]
       )
-      result.to_zarr(
-        path,
-        region=region,
-        mode="r+",
-        consolidated=False,
-        storage_options=storage_options_for(path, configs.save.storage_options),
-      )
+      to_icechunk(result, session, region=region, mode="r+")
     logger.info(f"{label} written in {time.monotonic() - writing:.0f} s")
 
   series = _series(dataset, configs.split_dims)
@@ -843,9 +834,9 @@ def _compute_by_series(
       )
     if pending is not None:
       pending.result()
-  if configs.save.consolidated is not False:
-    for path, _ in outputs:
-      consolidate_metadata(path, configs.save.storage_options)
+  for (path, _), session in zip(outputs, sessions, strict=True):
+    snapshot = session.commit(f"compute-climatology: {len(series)} series")
+    logger.info(f"Committed {snapshot} to {path}")
 
 
 def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:

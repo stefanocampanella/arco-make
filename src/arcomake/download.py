@@ -23,7 +23,7 @@ from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
   maybe_checkpointing_download_and_process,
-  safe_to_zarr,
+  write_output,
 )
 from arcomake.datetime_utils import IterableDateInterval, may_parse_timedelta
 from arcomake.processing_utils import ProcessingStepConfig
@@ -124,8 +124,9 @@ def download(
   `step`: for each block, every dataset is read from its parts, time-sliced and processed by
   its [[postprocess]] steps (optionally in sub-blocks checkpointed to temporary Zarr, per
   `checkpointing.step`); the datasets are merged, the global [[postprocess]] steps run, and the
-  block is written (first block) or appended along time. OUTPUT_PATH may be a directory or an
-  fsspec URL; it is never overwritten without --overwrite.
+  block is written (first block) or appended along time, one commit per block. OUTPUT_PATH is an
+  Icechunk repository: a directory, an s3:// or a gs:// URL; it is never overwritten without
+  --overwrite (which replaces its content in a new commit; older versions stay in its history).
   """
 
   # Set up logging.
@@ -201,24 +202,23 @@ def download(
             progress_bar = (
               ProgressBar if (progress and dask_setup in ["processes", "threads"]) else nullcontext
             )
+            # One commit per block, named by its interval: the repository's history tells which
+            # blocks are in.
+            block = (
+              f"download [{date_interval.start:%Y-%m-%dT%H:%M}, {date_interval.end:%Y-%m-%dT%H:%M})"
+            )
             with progress_bar():
               if is_first_date_interval:
-                safe_to_zarr(
-                  dataset=dataset,
-                  destination=output_path,
-                  configs=configs.save,
-                  mode="w",
-                  compute=True,
-                )
+                write_output(dataset, output_path, configs.save, message=block, mode="w")
                 is_first_date_interval = False
               else:
-                safe_to_zarr(
-                  dataset=dataset,
-                  destination=output_path,
-                  configs=configs.save,
+                write_output(
+                  dataset,
+                  output_path,
+                  configs.save,
+                  message=block,
                   mode="a-",
                   append_dim=configs.time_dim,
-                  compute=True,
                 )
       except click.ClickException:
         raise

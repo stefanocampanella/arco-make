@@ -9,12 +9,11 @@ from collections.abc import Callable, Generator, Hashable, Mapping
 from contextlib import contextmanager, nullcontext
 from typing import Annotated, Any, Literal
 
+import dask
 import fsspec
 import fsspec.utils
 import numpy as np
 import xarray as xr
-import zarr
-import zarr.errors
 from dask.delayed import Delayed
 from dask.diagnostics import ProgressBar
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -24,6 +23,7 @@ from zarr.abc.codec import ArrayArrayCodec, ArrayBytesCodec, BytesBytesCodec
 from zarr.errors import ZarrUserWarning
 from zarr.registry import get_codec_class
 
+from arcomake import icechunk_utils
 from arcomake.datetime_utils import (
   IterableDateInterval,
   may_parse_timedelta,
@@ -288,7 +288,6 @@ class SaveConfig(BaseModel):
 
   model_config = ConfigDict(extra="forbid")
 
-  consolidated: bool | None = None
   chunks: StoredChunksConfig | None = None
   shards: StoredChunksConfig | None = None
   # Compressors of the data variables; without them, zarr's default (zstd).
@@ -307,7 +306,7 @@ class SaveConfig(BaseModel):
   @model_validator(mode="after")
   def _shards_hold_whole_chunks(self) -> "SaveConfig":
     """Shards hold whole chunks: checked here wherever both sizes are explicit. A whole
-    dimension (-1, or not listed) is only known once the data are open: `safe_to_zarr` checks
+    dimension (-1, or not listed) is only known once the data are open: `prepare_for_writing` checks
     those before writing (before any data are computed, unless a source is checkpointed)."""
     if self.shards is None:
       return self
@@ -580,38 +579,19 @@ def _resolve_sizes(conf: StoredChunksConfig, var: xr.DataArray) -> tuple[int, ..
   )
 
 
-def safe_to_zarr(
-  dataset: xr.Dataset,
-  destination: str | pathlib.Path,
-  configs: SaveConfig | None = None,
-  compute: bool = True,
-  *,
-  mode: Literal["w", "w-", "a", "a-", "r+", "r"] | None = None,
-  append_dim: str | None = None,
-) -> xr.backends.ZarrStore | Delayed:
-  """Write a dataset to a Zarr store in format 3 (a local directory or an fsspec URL) with the
-  layout, compression and encodings of `[save]`.
+def prepare_for_writing(dataset: xr.Dataset, configs: SaveConfig | None = None) -> xr.Dataset:
+  """A copy of `dataset` whose encodings carry the layout, compression and encodings of `[save]`.
 
   `[save] chunks`, `shards` and `compressors` apply to the data variables; `[save.encoding.VAR]`
   is merged over them, key by key. Codecs read from Zarr v2 sources are dropped (see
-  `_without_zarr2_codecs`). With `compute=False`, returns the task that writes the data (the
-  metadata are written now).
+  `_without_zarr2_codecs`). The caller's dataset is left unchanged.
 
   Raises:
-    ValueError: for a `.zip` destination (zip outputs were removed with Zarr v3), shards that do
-      not hold whole chunks, or `[save.encoding]` naming a variable the dataset lacks.
+    ValueError: shards that do not hold whole chunks, or `[save.encoding]` naming a variable the
+      dataset lacks.
   """
-  if configs is None:
-    configs = SaveConfig()
-  mode = mode or "w"
-  path = str(destination)
-  if path.rstrip("/").lower().endswith(".zip"):
-    raise ValueError(f"{path}: zip outputs are not supported; write a directory or a URL")
-  # The stored layout is set through the variables' encodings, on a copy: the caller's dataset is
-  # left unchanged.
+  configs = configs or SaveConfig()
   dataset = _without_zarr2_codecs(dataset)
-
-  logger.info(f"Saving dataset to {destination} with {configs}")
   chunk_conf = configs.chunks
   if chunk_conf is not None:
     # Set the on-disk Zarr chunk layout via encoding, without altering the
@@ -652,21 +632,91 @@ def safe_to_zarr(
     if "shards" in overrides:
       overrides["shards"] = tuple(overrides["shards"])
     encoding.update(overrides)
+  return dataset
 
-  to_zarr_kwargs = configs.model_dump(exclude_none=True, include={"consolidated", "group"})
-  return _write_zarr(
-    dataset,
+
+def _check_output_path(destination: str | pathlib.Path) -> str:
+  path = str(destination)
+  if path.rstrip("/").lower().endswith(".zip"):
+    raise ValueError(f"{path}: zip outputs are not supported; write a directory or a URL")
+  return path
+
+
+def write_output(
+  dataset: xr.Dataset,
+  destination: str | pathlib.Path,
+  configs: SaveConfig | None = None,
+  *,
+  message: str,
+  mode: Literal["w", "w-", "a", "a-", "r+"] = "w",
+  append_dim: str | None = None,
+) -> str:
+  """Write a dataset to the Icechunk repository at `destination` in one commit (see
+  `icechunk_utils`), with the layout of `[save]` (see `prepare_for_writing`); return the commit.
+
+  Raises:
+    ValueError: for a `.zip` destination (zip outputs were removed with Zarr v3), or a layout
+      `prepare_for_writing` refuses.
+  """
+  configs = configs or SaveConfig()
+  path = _check_output_path(destination)
+  logger.info(f"Writing to {path} ({message}) with {configs}")
+  return icechunk_utils.write(
+    prepare_for_writing(dataset, configs),
     path,
-    compute=compute,
+    storage_options=configs.storage_options,
+    message=message,
     mode=mode,
     append_dim=append_dim,
-    storage_options=storage_options_for(path, configs.storage_options),
-    **to_zarr_kwargs,
+    group=configs.group,
   )
 
 
-def consolidate_metadata(path: str, storage_options: Mapping[str, Any] | None = None) -> None:
-  """Write the consolidated metadata of a Zarr store, as `safe_to_zarr` does."""
-  options = storage_options_for(path, storage_options)
-  with quiet_consolidated_metadata():
-    zarr.consolidate_metadata(zarr.open_group(str(path), mode="r+", storage_options=options).store)
+def _distributed_client() -> bool:
+  """Whether Dask computes on a distributed client (workers outside this process)."""
+  try:
+    from distributed import default_client
+
+    default_client()
+  except (ImportError, ValueError):
+    return False
+  return True
+
+
+def write_outputs_together(
+  outputs: list[tuple[xr.Dataset, str | pathlib.Path]], configs: SaveConfig, *, message: str
+) -> list[str]:
+  """Write datasets that share a computation to their repositories, one commit each.
+
+  With a local scheduler (threads, processes are not used for writes), all data are computed
+  once, written into the repositories' sessions from this process. On a distributed client the
+  sessions cannot collect the workers' writes in one computation (icechunk merges the writes of
+  one session at a time): each dataset is written in turn, and what they share is computed again.
+  """
+  if _distributed_client():
+    logger.warning(
+      "Distributed scheduler: each output is computed separately, shared work is repeated"
+    )
+    return [write_output(ds, path, configs, message=message) for ds, path in outputs]
+  sessions, writes = [], []
+  for dataset, destination in outputs:
+    path = _check_output_path(destination)
+    session = icechunk_utils.writable_session(path, configs.storage_options)
+    writes.append(
+      prepare_for_writing(dataset, configs).to_zarr(
+        session.store,
+        mode="w",
+        compute=False,
+        consolidated=False,
+        zarr_format=3,
+        group=configs.group,
+      )
+    )
+    sessions.append((path, session))
+  with dask.config.set(scheduler="threads"):
+    dask.compute(*writes)
+  snapshots: list[str] = []
+  for path, session in sessions:
+    snapshots.append(str(session.commit(message)))
+    logger.info(f"Committed {snapshots[-1]} to {path}: {message}")
+  return snapshots

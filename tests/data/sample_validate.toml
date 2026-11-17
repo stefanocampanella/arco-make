@@ -1,6 +1,6 @@
 # Checks of the sample dataset.
 [read]
-engine = "zarr"
+engine = "icechunk"  # the output of the sample download
 
 [checks.valid_time_coordinate]
 start = 2020-02-26T00:00:00
