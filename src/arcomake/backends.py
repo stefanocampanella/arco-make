@@ -12,7 +12,6 @@ from urllib.parse import urlparse
 from zipfile import ZipFile
 
 import cdsapi
-import copernicusmarine as cm
 import requests
 import xarray as xr
 from xarray.backends import AbstractDataStore, BackendEntrypoint
@@ -34,15 +33,24 @@ def _drop_variables(dataset: xr.Dataset, names: str | Iterable[str] | None) -> x
   return dataset.drop_vars([names] if isinstance(names, str) else list(names), errors="ignore")
 
 
-class CopernicusMarine(BackendEntrypoint):
-  def __init__(self, *args, **kwargs):
-    super().__init__(*args, **kwargs)
-    # Avoid annoying copernicusmarine log handling
-    cm_logger = logging.getLogger("copernicus_marine_root_logger")
-    for handler in cm_logger.handlers:
-      cm_logger.removeHandler(handler)
-    cm_logger.setLevel(level=logging.getLevelName(logger.getEffectiveLevel()))
+def _copernicusmarine() -> Any:
+  """The toolbox, imported at first use, with its log handlers removed.
 
+  The toolbox reads some settings (COPERNICUSMARINE_MAX_POOL_CONNECTIONS) when it is imported.
+  xarray imports this module whenever it lists its backends, possibly before the settings file
+  is applied (library use, tests): importing the toolbox here would fix those settings early.
+  """
+  import copernicusmarine
+
+  # Avoid annoying copernicusmarine log handling (its handlers are installed at import).
+  cm_logger = logging.getLogger("copernicus_marine_root_logger")
+  for handler in list(cm_logger.handlers):
+    cm_logger.removeHandler(handler)
+  cm_logger.setLevel(level=logging.getLevelName(logger.getEffectiveLevel()))
+  return copernicusmarine
+
+
+class CopernicusMarine(BackendEntrypoint):
   @override
   def open_dataset(
     self,
@@ -73,7 +81,7 @@ class CopernicusMarine(BackendEntrypoint):
     else:
       variables_list = list(variables)
 
-    dataset = cm.open_dataset(
+    dataset = _copernicusmarine().open_dataset(
       dataset_id=dataset_id,
       dataset_version=dataset_version,
       variables=variables_list,
@@ -81,9 +89,9 @@ class CopernicusMarine(BackendEntrypoint):
       service=service,
       start_datetime=start_datetime,
       end_datetime=end_datetime,
-      # IMPORTANT: Copernicus Marine force chunking (it's not clear why),
-      # unless `chunk_size_limit` is set to False (a bit of a hack).
-      # `chunk_size_limit` is an experimental feature and might break in the future. Crossing fingers...
+      # IMPORTANT: the toolbox returns Dask arrays of its own chunking (e.g. time 2, all depths),
+      # unless `chunk_size_limit` is falsy (undocumented): then it returns lazily indexed arrays,
+      # and the part's `chunks` decide the reads. tests/live checks that this still holds.
       chunk_size_limit=False,
     )
     assert isinstance(dataset, xr.Dataset)
