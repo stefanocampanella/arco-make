@@ -592,3 +592,19 @@ day D is [D 00:00, D+1 00:00) UTC, stamped D 00:00):
   differences, acc(24(k+1)) - acc(24k), exactly lead day k. Lead days 0-9.
 - GLO12 physics and waves forecast runs from the 00 UTC release of day R: lead day k is the
   daily value of R + k; lead days 0-9 (negative leads, the hindcast part of a release, dropped).
+
+## 2026-11-17: ERA5 accumulations corrected (maintainer's decision)
+
+- arco-make: parts take a `time_offset`, added to their time coordinate before each block's
+  time selection (backends with a time range get it shifted the other way). The arco-ocean
+  recipes set `time_offset = "-1h"` on their ERA5 accumulation parts (five download recipes).
+- Baseline window 2 (code `6fa30bb`, recipe with the offset): tp, ssrd and strd equal ERA5 summed
+  over the stamps 01:00 of D to 00:00 of D+1 (largest relative difference about 1e-7, float32
+  rounding); the previous output equals the sums over 00:00-23:00 of D. The two windows differ by
+  up to 8-12 % of the field's maximum for tp and ssrd, 1.3 % for strd. The other 34 variables are
+  bit for bit the same. 4 min 29 s, peak 37.4 GB (single run; the shifted hours no longer align
+  with the source's 24-hour Dask chunks, so each day spans two of them).
+- New script `check_era5_accumulations.py` (baseline scripts): which 24 hours an output's daily
+  accumulations cover.
+- **[Moby-Dick]** The published ERA5 accumulations are the one-hour-early sums; the corrected ones
+  come with the next download.
