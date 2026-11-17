@@ -775,3 +775,41 @@ tag, takes new commits, and expires and garbage-collects there; the original is 
 Conditions: copy while nothing writes to it (a reference copied before the snapshot it names
 would be dangling), and only native chunks move (virtual references, which arco-make does not
 write, keep their absolute URLs).
+
+
+## 2026-11-17: --blocks 2 on real data; one lock for netCDF4 and HDF5
+
+Baseline window 2 (30 Dec 2012 – 2 Jan 2013, 0.25°, 50 levels, one-day blocks, 600 s GCS
+timeout), without GloFAS (EWDS queued requests for hours that day), on the project VM, one run
+at a time:
+
+| Run | Code | Wall time | Peak RSS | 600 s read timeouts (each retried once, successfully) |
+|---|---|---|---|---|
+| `--blocks 1` | `083d8a4` | 38:22 | 22.0 GiB | 2 (days 2, 3) |
+| `--blocks 1`, again | `083d8a4` | 33:37 | 20.9 GiB | 2 (day 2, twice) |
+| `--blocks 2` | `083d8a4` | failed after 36 s | | |
+| `--blocks 2` | first fix (static file read whole) | 19:27 | 28.6 GiB | 1 (day 1) |
+| `--blocks 2` | second fix | 20:37 | 23.7 GiB | 2 (days 2, 3) |
+| `--blocks 2` | final fix (`hdf5_lock`) | 8:34 | 23.8 GiB | none |
+
+All five complete outputs are identical bit for bit (36 variables: values, attributes, array
+metadata). Reads that sent nothing until the 600 s timeout (empty `TimeoutError`, so GCS:
+ERA5) dominate the wall times: each costs about 11 minutes (timeout, wait, redone block). The
+one run without them did three days in 8.5 minutes with two blocks at once; the one-block runs
+less their stalls took about 15 minutes, consistent with the expected factor of about 2. The
+stalls are not explained: they hit any day, also day 1 at the start of a process, so idle
+connections cannot explain all of them. To investigate before the production download (a
+shorter GCS timeout would bound their cost).
+
+**`--blocks 2` failed at once**: two blocks opened the GloFAS static file (`netcdfoverhttp`) at
+the same moment and netCDF4 raised "NetCDF: Can't open HDF5 attribute". netCDF-C and HDF5 are
+not thread-safe, and xarray locks reads of array values only, not what it reads while opening a
+file; eight threads opening files at once crash the interpreter (tests, for the backend and for
+generic NetCDF parts and `[read]` tables, also when xarray guesses the engine). Every netCDF4 or
+h5netcdf file is now opened through `hdf5_lock.open_dataset`, which holds one reentrant
+process-wide lock during the open and gives it to xarray for the later reads; a test fails if
+other code opens datasets with xarray directly. Two reviews shaped it: a first fix read the
+static file whole under xarray's own lock and covered one backend only; a version that also took
+xarray's two locks inside ours could deadlock (xarray combines locks in arbitrary order). GRIB
+opens were already serialized by one module lock (N6); 240 GRIB opens overlapping reads of
+other files ran without error on ecCodes 2.48 and 2.49, so they are left as they are.
