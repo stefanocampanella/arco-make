@@ -6,6 +6,7 @@ from typing import get_args
 import click
 from pydantic import BaseModel, ConfigDict, Field
 
+from arcomake import icechunk_utils
 from arcomake.cli_utils import (
   check_aws_profile,
   check_destination,
@@ -49,8 +50,8 @@ class ProcessConfig(BaseModel):
 @click.option(
   "--replace/--no-replace",
   help=(
-    "Write a new version of an existing output (an Icechunk repository); earlier versions stay in"
-    " its history"
+    "Write a new version of an existing output (an Icechunk repository): it replaces what `main`"
+    " shows once the run succeeds; earlier versions stay in its history"
   ),
   default=False,
   is_flag=True,
@@ -110,9 +111,13 @@ def process(
         if configs.process:
           dataset = dataset.arcomake.process(steps=configs.process)
         # Save stats
-        write_output(dataset, output_path, configs.save, message=f"process {input_path}")
+        write_output(
+          dataset, output_path, configs.save, message=f"process {input_path}", command="process"
+        )
     except click.ClickException:
       raise
+    except icechunk_utils.PromotionError as exc:
+      raise click.ClickException(str(exc)) from exc
     except Exception as exc:
       logger.exception("An error occurred while processing dataset")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

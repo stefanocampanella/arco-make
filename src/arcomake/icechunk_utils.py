@@ -30,6 +30,8 @@ from icechunk.xarray import to_icechunk
 logger = logging.getLogger(__name__)
 
 BRANCH = "main"
+# Commit metadata key of the run a commit belongs to (see `Run`).
+RUN_KEY = "arcomake_run"
 S3_OPTIONS = {"profile", "region", "endpoint_url", "anon", "network_stream_timeout_seconds"}
 # Seconds without progress before an S3 request is retried (icechunk's default: 60). Requests
 # stall now and then: on the project bucket, whole reads that take 6-7 s took up to 107 s with
@@ -184,6 +186,18 @@ def is_repository(
   return icechunk.Repository.exists(storage(path, storage_options))
 
 
+def has_no_version(repository_storage: icechunk.Storage) -> bool:
+  """Whether `main` of the repository is still its first snapshot (no run finished there)."""
+  tip = next(iter(icechunk.Repository.open(repository_storage).ancestry(branch=BRANCH)))
+  return tip.parent_id is None
+
+
+def run_label(command: str) -> str:
+  """A label for one run of `command`: its start time, to the microsecond (branch names, commit
+  metadata, and the messages that tie the outputs of one run together)."""
+  return f"{command}-{datetime.datetime.now(datetime.UTC):%Y%m%dT%H%M%S%fZ}"
+
+
 def write(
   dataset: xr.Dataset,
   path: str | pathlib.Path,
@@ -193,24 +207,17 @@ def write(
   mode: Literal["w", "w-", "a", "a-", "r+"] = "w",
   append_dim: Hashable | None = None,
   group: str | None = None,
+  command: str = "write",
 ) -> str:
-  """Write `dataset` (its variables' encodings set the layout) in one commit; return its id.
+  """Write `dataset` in a run of `command` of a single commit (see `Run`); return the new tip of
+  `main`.
 
-  The repository is created if missing. Mode "w" replaces the content in a new commit: earlier
+  The repository is created if missing. Mode "w" replaces the content in the new version: earlier
   versions stay in the repository's history.
   """
-  session = writable_session(path, storage_options)
-  to_icechunk(dataset, session, mode=mode, append_dim=append_dim, group=group)
-  snapshot = session.commit(message)
-  logger.info(f"Committed {snapshot} to {path}: {message}")
-  return snapshot
-
-
-def writable_session(
-  path: str | pathlib.Path, storage_options: Mapping[str, Any] | None = None
-) -> icechunk.Session:
-  """A writable session on `main` of the repository at `path` (created if missing)."""
-  return icechunk.Repository.open_or_create(storage(path, storage_options)).writable_session(BRANCH)
+  run = Run(path, storage_options, run_label(command))
+  run.write(dataset, message=message, mode=mode, append_dim=append_dim, group=group)
+  return run.finish()
 
 
 def readonly_store(
@@ -236,3 +243,75 @@ def fsspec_options(
   if fsspec.utils.get_protocol(str(path)) in ("s3", "s3a") and "region" in options:
     options.setdefault("client_kwargs", {})["region_name"] = options.pop("region")
   return options
+
+
+class PromotionError(RuntimeError):
+  """`main` changed during a run: its output was not promoted (it stays on the run's branch)."""
+
+
+class Run:
+  """The writes of one run of a command to one repository, on a branch of their own.
+
+  The branch (`run/<label>`) starts at the tip of `main`; every write of the run is a commit on
+  it, with the run's label in the commit metadata. `finish` moves `main` to the run's last commit
+  if `main` has not changed meanwhile, then deletes the branch.
+  A run that fails before `finish` leaves `main` as it was (its branch stays, with what was
+  written).
+  """
+
+  def __init__(
+    self, path: str | pathlib.Path, storage_options: Mapping[str, Any] | None, label: str
+  ) -> None:
+    self.path = str(path)
+    self.label = label
+    self.branch = f"run/{label}"
+    self.repo = icechunk.Repository.open_or_create(storage(path, storage_options))
+    self.base = self.repo.lookup_branch(BRANCH)
+    self.repo.create_branch(self.branch, self.base)
+    logger.info(f"Writing {self.path} on branch {self.branch} (from {self.base})")
+
+  def session(self) -> icechunk.Session:
+    return self.repo.writable_session(self.branch)
+
+  def commit(self, session: icechunk.Session, message: str) -> str:
+    snapshot = str(session.commit(message, metadata={RUN_KEY: self.label}))
+    logger.info(f"Committed {snapshot} to {self.path} ({self.branch}): {message}")
+    return snapshot
+
+  def write(
+    self,
+    dataset: xr.Dataset,
+    *,
+    message: str,
+    mode: Literal["w", "w-", "a", "a-", "r+"] = "w",
+    append_dim: Hashable | None = None,
+    group: str | None = None,
+  ) -> str:
+    """Write `dataset` (its variables' encodings set the layout) in one commit of the run."""
+    session = self.session()
+    to_icechunk(dataset, session, mode=mode, append_dim=append_dim, group=group)
+    return self.commit(session, message)
+
+  def finish(self) -> str:
+    """Move `main` to the run's last commit (if `main` is still where the run started), then
+    delete the run's branch; return the new tip of `main`.
+
+    Once `main` has moved the run has succeeded: an error deleting the branch is logged, not
+    raised.
+
+    Raises:
+      PromotionError: if `main` changed during the run; the run's branch is kept.
+    """
+    tip = self.repo.lookup_branch(self.branch)
+    try:
+      self.repo.reset_branch(BRANCH, tip, from_snapshot_id=self.base)
+    except icechunk.ConflictError as error:
+      raise PromotionError(
+        f"{self.path}: main changed during the run, which stays on branch {self.branch}"
+      ) from error
+    logger.info(f"{self.path}: main is now {tip} (run {self.label})")
+    try:
+      self.repo.delete_branch(self.branch)
+    except Exception:
+      logger.exception(f"{self.path}: branch {self.branch} could not be deleted (main is promoted)")
+    return tip

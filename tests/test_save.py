@@ -101,7 +101,7 @@ def test_outputs_written_together_share_one_computation(ocean_ds, tmp_path, monk
   chunked = ocean_ds.chunk(time=1)
   shared = chunked.map_blocks(lambda block: calls.append(1) or block, template=chunked)
   snapshots = write_outputs_together(
-    [(shared, tmp_path / "a.zarr"), (shared * 2, tmp_path / "b.zarr")], SAVE, message="both"
+    [(shared, tmp_path / "a.zarr"), (shared * 2, tmp_path / "b.zarr")], SAVE, label="both"
   )
   assert len(snapshots) == 2
   xr.testing.assert_allclose(open_output(tmp_path / "a.zarr").load(), ocean_ds)

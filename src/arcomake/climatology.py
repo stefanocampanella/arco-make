@@ -177,8 +177,8 @@ class ClimatologyConfig(BaseModel):
 @click.option(
   "--replace/--no-replace",
   help=(
-    "Write a new version of an existing output (an Icechunk repository); earlier versions stay in"
-    " its history"
+    "Write a new version of an existing output (an Icechunk repository): it replaces what `main`"
+    " shows once the run succeeds; earlier versions stay in its history"
   ),
   default=False,
   is_flag=True,
@@ -250,9 +250,9 @@ def compute_climatology(
       check_aws_profile(input_path, climatology_output_path, anomaly_std_output_path)
       for path in (climatology_output_path, anomaly_std_output_path):
         check_destination(path, replace=replace, save_configs=configs.save)
-      # The commit message of both outputs: their commits are not atomic together, equal
-      # messages show that they come from the same run.
-      message = f"compute-climatology {datetime.datetime.now(datetime.UTC):%Y-%m-%dT%H:%M:%SZ}"
+      # Both outputs are written in runs with this label (branches, commit metadata, messages);
+      # `main` moves in each repository only once both are written.
+      label = icechunk_utils.run_label("compute-climatology")
       # Open input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
       with open_input(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
@@ -272,7 +272,7 @@ def compute_climatology(
           raise ValueError("Input dataset contains no data variables.")
         if configs.split_dims is not None:
           _compute_by_series(
-            dataset, configs, climatology_output_path, anomaly_std_output_path, message=message
+            dataset, configs, climatology_output_path, anomaly_std_output_path, label=label
           )
           logger.info("Climatology writes completed, one series at a time.")
           return
@@ -298,12 +298,14 @@ def compute_climatology(
         write_outputs_together(
           [(climatology, climatology_output_path), (anomaly_std, anomaly_std_output_path)],
           configs.save,
-          message=message,
+          label=label,
         )
         logger.info("Climatology and anomaly standard deviation committed.")
       logger.info("Input dataset closed; closing Dask client.")
     except click.ClickException:
       raise
+    except icechunk_utils.PromotionError as exc:
+      raise click.ClickException(str(exc)) from exc
     except Exception as exc:
       logger.exception("An error occurred while processing the climatology and anomaly std.")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
@@ -753,7 +755,7 @@ def _compute_by_series(
   climatology_output_path: str,
   anomaly_std_output_path: str,
   *,
-  message: str,
+  label: str,
 ) -> None:
   """S1: one series (variable, index of `split_dims`) at a time, written into its region.
 
@@ -773,9 +775,10 @@ def _compute_by_series(
     raise ValueError(f"split_dims {unknown} are not dimensions of the input: {list(dataset.dims)}")
   save = _one_index_per_chunk(configs.save, configs.split_dims)
   template = _output_template(dataset, configs.period, configs.time_dim)
-  # One writable session per output, committed once every series is written: an interrupted run
-  # commits nothing.
-  sessions = [icechunk_utils.writable_session(path, save.storage_options) for path, _ in outputs]
+  # One run per output (its own branch) and one session on it, committed once every series is
+  # written: an interrupted run commits nothing, and `main` is untouched until both are written.
+  runs = [icechunk_utils.Run(path, save.storage_options, label) for path, _ in outputs]
+  sessions = [run.session() for run in runs]
   for (_, steps), session in zip(outputs, sessions, strict=True):
     # Metadata only: the data of the template are never computed.
     write_into_session(
@@ -844,9 +847,11 @@ def _compute_by_series(
       )
     if pending is not None:
       pending.result()
-  for (path, _), session in zip(outputs, sessions, strict=True):
-    snapshot = session.commit(f"{message}: {len(series)} series")
-    logger.info(f"Committed {snapshot} to {path}")
+  for run, session in zip(runs, sessions, strict=True):
+    run.commit(session, f"{label}: {len(series)} series")
+  # Both outputs are written: only now does `main` move, in one repository after the other.
+  for run in runs:
+    run.finish()
 
 
 def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:

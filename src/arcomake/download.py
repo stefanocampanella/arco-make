@@ -11,6 +11,7 @@ import xarray as xr
 from dask.diagnostics import ProgressBar
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from arcomake import icechunk_utils
 from arcomake.cli_utils import (
   check_aws_profile,
   check_destination,
@@ -84,8 +85,8 @@ class DownloadConfig(BaseModel):
 @click.option(
   "--replace/--no-replace",
   help=(
-    "Write a new version of an existing output (an Icechunk repository); earlier versions stay in"
-    " its history"
+    "Write a new version of an existing output (an Icechunk repository): it replaces what `main`"
+    " shows once the run succeeds; earlier versions stay in its history"
   ),
   default=False,
   is_flag=True,
@@ -128,8 +129,10 @@ def download(
   its [[postprocess]] steps (optionally in sub-blocks checkpointed to temporary Zarr, per
   `checkpointing.step`); the datasets are merged, the global [[postprocess]] steps run, and the
   block is written (first block) or appended along time, one commit per block. OUTPUT_PATH is an
-  Icechunk repository: a directory, an s3:// or a gs:// URL; an existing one is only written with
-  --replace (a new version; older versions stay in its history).
+  Icechunk repository: a directory, an s3:// or a gs:// URL. The blocks are committed on a branch
+  of their own; `main` moves to them only when the last one is written, so a failed run leaves
+  the repository's current version as it was. An existing repository is only written with
+  --replace; the version it replaces stays in the history.
   """
 
   # Set up logging.
@@ -156,8 +159,14 @@ def download(
       *(part.filename_or_obj for part in parts),
       copernicus_marine=any(part.engine == "copernicusmarine" for part in parts),
     )
-    # Check if the output destination exists.
+    # Check the output destination, then start a run on a branch of its own.
     check_destination(output_path, replace=replace, save_configs=configs.save)
+    try:
+      run = icechunk_utils.Run(
+        output_path, configs.save.storage_options, icechunk_utils.run_label("download")
+      )
+    except Exception as exc:
+      raise click.ClickException(f"Could not start writing {output_path}: {exc}") from exc
     # Iterate over date intervals.
     is_first_date_interval = True
     for date_interval in IterableDateInterval(configs.start, configs.end, configs.step):
@@ -212,12 +221,12 @@ def download(
             )
             with progress_bar():
               if is_first_date_interval:
-                write_output(dataset, output_path, configs.save, message=block, mode="w")
+                write_output(dataset, run, configs.save, message=block, mode="w")
                 is_first_date_interval = False
               else:
                 write_output(
                   dataset,
-                  output_path,
+                  run,
                   configs.save,
                   message=block,
                   mode="a-",
@@ -227,4 +236,12 @@ def download(
         raise
       except Exception as exc:
         logger.exception("An error occurred during download")
-        raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
+        raise click.ClickException(
+          f"An error occurred ({type(exc).__name__}). Aborting: the blocks written are on branch"
+          f" {run.branch}, `main` is unchanged."
+        ) from exc
+    # Every block is written: `main` moves to them.
+    try:
+      run.finish()
+    except icechunk_utils.PromotionError as exc:
+      raise click.ClickException(str(exc)) from exc

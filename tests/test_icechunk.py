@@ -51,7 +51,7 @@ def test_outputs_written_in_turn_on_a_distributed_scheduler(ocean_ds, tmp_path, 
   """On a distributed client each output is written (and computed) in its own commit."""
   monkeypatch.setattr(dataset_utils, "_distributed_client", lambda: True)
   outputs = [(ocean_ds, tmp_path / "a.zarr"), (ocean_ds * 2, tmp_path / "b.zarr")]
-  assert len(write_outputs_together(outputs, SaveConfig(), message="both")) == 2
+  assert len(write_outputs_together(outputs, SaveConfig(), label="both")) == 2
   xr.testing.assert_allclose(open_output(tmp_path / "b.zarr").load(), ocean_ds * 2)
 
 
@@ -200,7 +200,7 @@ def test_climatology_outputs_share_their_commit_message(tmp_path: pathlib.Path, 
     next(iter(icechunk.Repository.open(icechunk_utils.storage(p)).ancestry(branch="main"))).message
     for p in (clim, std)
   ]
-  assert messages[0] == messages[1] and messages[0].startswith("compute-climatology ")
+  assert messages[0] == messages[1] and messages[0].startswith("compute-climatology-")
 
 
 def test_s3_credentials_are_resolved_once_while_valid(monkeypatch: pytest.MonkeyPatch):

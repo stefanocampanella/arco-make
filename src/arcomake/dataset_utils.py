@@ -644,31 +644,42 @@ def _check_output_path(destination: str | pathlib.Path) -> str:
 
 def write_output(
   dataset: xr.Dataset,
-  destination: str | pathlib.Path,
+  destination: "str | pathlib.Path | icechunk_utils.Run",
   configs: SaveConfig | None = None,
   *,
   message: str,
   mode: Literal["w", "w-", "a", "a-", "r+"] = "w",
   append_dim: str | None = None,
+  command: str = "write",
 ) -> str:
-  """Write a dataset to the Icechunk repository at `destination` in one commit (see
-  `icechunk_utils`), with the layout of `[save]` (see `prepare_for_writing`); return the commit.
+  """Write a dataset with the layout of `[save]` (see `prepare_for_writing`) in one commit.
+
+  `destination` is a run (`icechunk_utils.Run`, which the caller finishes) or the path of a
+  repository: then the write is a run of its own (labelled with `command`), finished at once
+  (`main` moves to it). Returns the commit.
 
   Raises:
     ValueError: for a `.zip` destination (zip outputs were removed with Zarr v3), or a layout
       `prepare_for_writing` refuses.
   """
   configs = configs or SaveConfig()
+  prepared = prepare_for_writing(dataset, configs)
+  if isinstance(destination, icechunk_utils.Run):
+    logger.info(f"Writing to {destination.path} ({message}) with {configs}")
+    return destination.write(
+      prepared, message=message, mode=mode, append_dim=append_dim, group=configs.group
+    )
   path = _check_output_path(destination)
   logger.info(f"Writing to {path} ({message}) with {configs}")
   return icechunk_utils.write(
-    prepare_for_writing(dataset, configs),
+    prepared,
     path,
     storage_options=configs.storage_options,
     message=message,
     mode=mode,
     append_dim=append_dim,
     group=configs.group,
+    command=command,
   )
 
 
@@ -712,35 +723,42 @@ def _local_scheduler() -> str:
 
 
 def write_outputs_together(
-  outputs: list[tuple[xr.Dataset, str | pathlib.Path]], configs: SaveConfig, *, message: str
+  outputs: list[tuple[xr.Dataset, str | pathlib.Path]], configs: SaveConfig, *, label: str
 ) -> list[str]:
-  """Write datasets that share a computation to their repositories, one commit each.
+  """Write datasets that share a computation to their repositories, each in a run named `label`
+  (`icechunk_utils.Run`); `main` moves in every repository only once all are written. Returns
+  the new tips of `main`.
 
-  With a local scheduler, all data are computed once and written into the repositories' sessions
-  from this process (`write_into_session`). On a distributed client, writes run on the workers,
-  and icechunk collects them into a session by computing that session's writes (its Dask writer
+  With a local scheduler, all data are computed once and written into the runs' sessions from
+  this process (`write_into_session`). On a distributed client, writes run on the workers, and
+  icechunk collects them into a session by computing that session's writes (its Dask writer
   merges their changesets as part of the computation, one session at a time): each dataset is
   written in turn, and what they share is computed again (logged).
 
-  The commits are one per repository, not atomic across them: give them a common `message`, so a
-  run whose last commit failed shows (rerun it with --replace).
+  Raises:
+    icechunk_utils.PromotionError: if `main` of a repository changed meanwhile (that run stays
+      on its branch; repositories promoted before it keep the new version).
   """
+  runs = [
+    icechunk_utils.Run(_check_output_path(path), configs.storage_options, label)
+    for _, path in outputs
+  ]
   if _distributed_client():
     logger.warning(
       "Distributed scheduler: each output is computed separately, shared work is repeated"
     )
-    return [write_output(ds, path, configs, message=message) for ds, path in outputs]
-  sessions, writes = [], []
-  for dataset, destination in outputs:
-    path = _check_output_path(destination)
-    logger.info(f"Writing to {path} ({message}) with {configs}")
-    session = icechunk_utils.writable_session(path, configs.storage_options)
-    writes.append(write_into_session(dataset, session, configs, compute=False))
-    sessions.append((path, session))
-  with dask.config.set(scheduler=_local_scheduler()):
-    dask.compute(*writes)
-  snapshots: list[str] = []
-  for path, session in sessions:
-    snapshots.append(str(session.commit(message)))
-    logger.info(f"Committed {snapshots[-1]} to {path}: {message}")
-  return snapshots
+    for (dataset, _), run in zip(outputs, runs, strict=True):
+      write_output(dataset, run, configs, message=label)
+  else:
+    sessions, writes = [], []
+    for (dataset, _), run in zip(outputs, runs, strict=True):
+      logger.info(f"Writing to {run.path} ({label}) with {configs}")
+      session = run.session()
+      writes.append(write_into_session(dataset, session, configs, compute=False))
+      sessions.append(session)
+    with dask.config.set(scheduler=_local_scheduler()):
+      dask.compute(*writes)
+    for run, session in zip(runs, sessions, strict=True):
+      run.commit(session, label)
+  # Every output is written: only now does `main` move, repository after repository.
+  return [run.finish() for run in runs]

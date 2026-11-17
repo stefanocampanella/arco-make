@@ -82,21 +82,28 @@ def check_destination(
   except Exception as exc:
     raise click.ClickException(f"Could not check whether {path} exists: {exc}") from exc
 
-  if exists:
-    if not replace:
-      raise click.ClickException(
-        f"Output destination {path} already exists (--replace writes a new version of it)"
-      )
-    # Outputs are Icechunk repositories, replaced by a new version: anything else is left alone.
-    try:
-      repository = icechunk.Repository.exists(storage)
-    except Exception as exc:
-      raise click.ClickException(f"Could not check whether {path} is a repository: {exc}") from exc
-    if not repository:
-      raise click.ClickException(
-        f"Output destination {path} exists and is not an Icechunk repository: remove it first"
-      )
-    logger.info(f"Writing a new version of {path} (the current one stays in its history)")
+  if not exists:
+    return
+  # Outputs are Icechunk repositories, replaced by a new version: anything else is left alone.
+  try:
+    repository = icechunk.Repository.exists(storage)
+    # A repository whose `main` is still its first snapshot holds no version yet: a first run
+    # failed there (its branch may hold what it wrote), and a retry needs no --replace.
+    unwritten = repository and icechunk_utils.has_no_version(storage)
+  except Exception as exc:
+    raise click.ClickException(f"Could not check whether {path} is a repository: {exc}") from exc
+  if unwritten:
+    logger.info(f"{path} holds no version yet: writing its first one")
+    return
+  if not replace:
+    raise click.ClickException(
+      f"Output destination {path} already exists (--replace writes a new version of it)"
+    )
+  if not repository:
+    raise click.ClickException(
+      f"Output destination {path} exists and is not an Icechunk repository: remove it first"
+    )
+  logger.info(f"Writing a new version of {path} (the current one stays in its history)")
 
 
 def set_default_logger(log_level: str = "info"):

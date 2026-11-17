@@ -124,10 +124,13 @@ accumulations (the value stamped 00:00 covers the last hour of the previous day)
 read over the block moved the other way, so that every day holds its own hours.
 
 Every output is an [Icechunk](https://icechunk.io) repository (Zarr format 3 with versions): a local
-directory, an `s3://` or a `gs://` URL. Each write is a commit on branch `main`: one per block for
-`download` (its message names the block's interval), one for `process` and for each output of
-`compute-climatology`. `--replace` writes a new version of an existing repository (earlier versions
-stay in its history) and refuses anything at the path that is not a repository. Read outputs with
+directory, an `s3://` or a `gs://` URL. Every run writes on a branch of its own (`run/<command>-<start
+time>`), in commits: one per block for `download` (its message names the block's interval), one for
+`process` and for each output of `compute-climatology`. Only when the run succeeds does branch `main`,
+the version readers see, move to the run's output (if `main` changed meanwhile, the run stays on its
+branch); a failed run leaves `main` as it was. An existing output is written only with `--replace`,
+which keeps the version it replaces in the history and refuses anything at the path that is not a
+repository. Read outputs with
 `engine = "icechunk"`, or with Icechunk and xarray directly. `[save] storage_options` for an S3
 repository: `profile`, `region` (by default the bucket's, asked to S3, else the profile's),
 `endpoint_url`, `anon`, `network_stream_timeout_seconds` (default 20: a request without progress for
@@ -156,8 +159,8 @@ other keys are its arguments. See [docs/steps.md](docs/steps.md). The `process`,
   lazy, and the data are computed once, when written.
 - **Time intervals are right-open**, `[start, end)`, for the recipe, the blocks of `download` and the time
   selection of each source, so consecutive pieces never overlap.
-- **An existing output is never replaced without `--replace`**, and a destination whose existence cannot
-  be checked stops the command.
+- **An existing output is never replaced without `--replace`**, a run that fails leaves the current
+  version as it was, and a destination whose existence cannot be checked stops the command.
 - **Downloads proceed in blocks**, so that memory stays bounded: by `step` (and per source by
   `checkpointing.step`). Blocks appended to the output equal a single block.
 - **Static variables** (without the time dimension) are written once, with the first block.
