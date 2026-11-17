@@ -10,13 +10,12 @@ from arcomake.climatology import compute_climatology
 from arcomake.download import download
 from arcomake.process import process
 from arcomake.steps import render_reference
-from arcomake.unpack import unpack
 from arcomake.validate import validate
 
 
 @click.group()
 def cli():
-  """Download, join, process, validate and summarize ARCO datasets, as described by TOML recipes.
+  """Download, process, validate and summarize ARCO datasets, as described by TOML recipes.
 
   Every command takes a recipe (TOML) and input/output paths, which may be local or fsspec
   URLs. Outputs are never overwritten without --overwrite.
@@ -37,7 +36,6 @@ def steps_reference():
 
 
 cli.add_command(download)
-cli.add_command(unpack)
 cli.add_command(process)
 cli.add_command(compute_climatology)
 cli.add_command(validate)

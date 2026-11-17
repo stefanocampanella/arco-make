@@ -45,16 +45,13 @@ import os
 import time
 from collections.abc import Callable, Hashable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
 from typing import Any, Literal, get_args
 
 import click
 import dask
 import dask.array
-import fsspec
 import numpy as np
 import xarray as xr
-import zarr
 from dask.graph_manipulation import bind
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -66,7 +63,14 @@ from arcomake.cli_utils import (
   set_default_logger,
 )
 from arcomake.dask_utils import DaskSetupType, get_client
-from arcomake.dataset_utils import ReadConfig, SaveConfig, open_input, safe_to_zarr
+from arcomake.dataset_utils import (
+  ReadConfig,
+  SaveConfig,
+  consolidate_metadata,
+  open_input,
+  safe_to_zarr,
+  storage_options_for,
+)
 from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
@@ -282,22 +286,13 @@ def compute_climatology(
           anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
         # Compute and save the climatology and anomaly std in parallel.
         logger.info("Processing climatology and anomaly standard deviation.")
-        with ExitStack() as store_stack:
-          _climatology_delayed_save = safe_to_zarr(
-            climatology,
-            climatology_output_path,
-            configs=configs.save,
-            compute=False,
-            store_stack=store_stack,
-          )
-          _anomaly_std_delayed_save = safe_to_zarr(
-            anomaly_std,
-            anomaly_std_output_path,
-            configs=configs.save,
-            compute=False,
-            store_stack=store_stack,
-          )
-          dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
+        _climatology_delayed_save = safe_to_zarr(
+          climatology, climatology_output_path, configs=configs.save, compute=False
+        )
+        _anomaly_std_delayed_save = safe_to_zarr(
+          anomaly_std, anomaly_std_output_path, configs=configs.save, compute=False
+        )
+        dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
         logger.info("Climatology writes completed; output stores closed.")
       logger.info("Input dataset closed; closing Dask client.")
     except click.ClickException:
@@ -709,20 +704,26 @@ def _compute_series(
 
 
 def _one_index_per_chunk(save: SaveConfig, split_dims: list[str]) -> SaveConfig:
-  """`save` with stored chunks of 1 along the split dimensions, which each series writes alone.
+  """`save` with stored chunks (and shards, if any) of 1 along the split dimensions, which each
+  series writes alone.
 
   Raises:
-    ValueError: if `[save] chunks` asks for another size along a split dimension.
+    ValueError: if `[save] chunks` or `shards` ask for another size along a split dimension.
   """
-  chunks = save.chunks
-  if chunks is not None and not isinstance(chunks, dict):
-    raise ValueError("with split_dims, [save] chunks must be a table of sizes per dimension")
-  chunks = dict(chunks or {})
-  for dim in split_dims:
-    if chunks.get(dim, 1) != 1:
-      raise ValueError(f"with split_dims, [save] chunks along {dim!r} must be 1 (one series each)")
-    chunks[dim] = 1
-  return save.model_copy(update={"chunks": chunks})
+  update = {}
+  for key in ("chunks", "shards"):
+    sizes = getattr(save, key)
+    if key == "shards" and sizes is None:
+      continue
+    if sizes is not None and not isinstance(sizes, dict):
+      raise ValueError(f"with split_dims, [save] {key} must be a table of sizes per dimension")
+    sizes = dict(sizes or {})
+    for dim in split_dims:
+      if sizes.get(dim, 1) != 1:
+        raise ValueError(f"with split_dims, [save] {key} along {dim!r} must be 1 (one series each)")
+      sizes[dim] = 1
+    update[key] = sizes
+  return save.model_copy(update=update)
 
 
 def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Dataset:
@@ -756,9 +757,6 @@ def _compute_by_series(
     (climatology_output_path, configs.postprocess_climatology),
     (anomaly_std_output_path, configs.postprocess_anomaly_std),
   )
-  for path, _ in outputs:
-    if str(path).endswith(".zip"):
-      raise ValueError("split_dims writes region by region: zip outputs are not supported")
   if configs.save.group is not None:
     raise ValueError("split_dims writes region by region: [save] group is not supported")
   unknown = [d for d in configs.split_dims if d not in dataset.dims]
@@ -766,23 +764,23 @@ def _compute_by_series(
     raise ValueError(f"split_dims {unknown} are not dimensions of the input: {list(dataset.dims)}")
   save = _one_index_per_chunk(configs.save, configs.split_dims)
   template = _output_template(dataset, configs.period, configs.time_dim)
-  with ExitStack() as store_stack:
-    for path, steps in outputs:
-      safe_to_zarr(
-        template.arcomake.process(steps=steps) if steps else template,
-        path,
-        configs=save,
-        compute=False,
-        store_stack=store_stack,
-      )
-  storage_options = configs.save.storage_options or {}
-  # Stored chunks of every output variable: results are chunked alike, so that Dask writes the
-  # chunks of a region in parallel.
+  for path, steps in outputs:
+    # Metadata only: the data of the template are never computed.
+    safe_to_zarr(
+      template.arcomake.process(steps=steps) if steps else template,
+      path,
+      configs=save,
+      compute=False,
+    )
+  # Stored chunks (shards, if any: the units of writing) of every output variable: results are
+  # chunked alike, so that Dask writes the chunks of a region in parallel.
   stored_chunks = [
     {
-      name: var.encoding["chunks"]
+      name: var.encoding.get("shards") or var.encoding["chunks"]
       for name, var in xr.open_zarr(
-        path, storage_options=storage_options or None, consolidated=False
+        path,
+        storage_options=storage_options_for(path, configs.save.storage_options),
+        consolidated=False,
       ).data_vars.items()
     }
     for path, _ in outputs
@@ -808,7 +806,11 @@ def _compute_by_series(
         [name for name, var in result.variables.items() if not set(var.dims) & set(region)]
       )
       result.to_zarr(
-        path, region=region, mode="r+", consolidated=False, storage_options=storage_options or None
+        path,
+        region=region,
+        mode="r+",
+        consolidated=False,
+        storage_options=storage_options_for(path, configs.save.storage_options),
       )
     logger.info(f"{label} written in {time.monotonic() - writing:.0f} s")
 
@@ -843,7 +845,7 @@ def _compute_by_series(
       pending.result()
   if configs.save.consolidated is not False:
     for path, _ in outputs:
-      zarr.consolidate_metadata(fsspec.get_mapper(str(path), **storage_options))
+      consolidate_metadata(path, configs.save.storage_options)
 
 
 def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:

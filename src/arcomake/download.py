@@ -124,8 +124,8 @@ def download(
   `step`: for each block, every dataset is read from its parts, time-sliced and processed by
   its [[postprocess]] steps (optionally in sub-blocks checkpointed to temporary Zarr, per
   `checkpointing.step`); the datasets are merged, the global [[postprocess]] steps run, and the
-  block is written (first block) or appended along time. OUTPUT_PATH may be a directory, a
-  `.zip` archive or an fsspec URL; it is never overwritten without --overwrite.
+  block is written (first block) or appended along time. OUTPUT_PATH may be a directory or an
+  fsspec URL; it is never overwritten without --overwrite.
   """
 
   # Set up logging.

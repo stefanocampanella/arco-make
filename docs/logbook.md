@@ -445,3 +445,150 @@ Corrects the toolbox bullets of 16 Nov.
 - The toolbox writes its version into the dataset attributes (`copernicusmarine_version`), now
   `2.5.0` (upstream main reports the version of the last release branch). Outputs of recipes that
   keep those attributes change; ARCO-OCEAN's do not (its recipes drop them).
+
+## 2026-11-17: Zarr v3 migration
+
+**Maintainer's decisions (17 Nov):** outputs in Zarr format 3 only, no compatibility with format 2
+outputs; `unpack` and zip outputs removed; shards set by the recipe, unsharded without `shards`;
+compressors as Zarr v3 codec metadata (a list of `{name, configuration}`), as flexible as zarr
+and free to adopt in the arco-ocean recipes; consolidated metadata kept.
+
+**Versions:** zarr 3.4.2, numcodecs 0.17.1 (no longer a direct dependency, so the `<0.16` pin and
+its Python 3.13 constraint are gone; CI and the image stay on 3.13).
+
+**Findings while porting:**
+- Variables read from format 2 stores (ERA5, GLORYS) carry numcodecs codecs (`Blosc`) in their
+  encodings, coordinates included; zarr 3 refuses them in format 3 ("Expected a BytesBytesCodec").
+  They are dropped before writing (the recipe's compressors or zarr's default, zstd, apply); codecs
+  of format 3 sources are kept. The synthetic test sources are now format 2 with Blosc.
+- zarr 3's fsspec store reads only `FileNotFoundError` (and directory errors) as missing chunks;
+  timeouts and connection errors raise. The N8 safeguard (`strict_zarr_store`) is no longer
+  needed; the read-error tests run on sources of both formats.
+- The toolbox, under zarr 3, uses its own zarr 3 store: only 403 and 404 answers become missing
+  chunks, other errors raise after its 9 retries (N9 narrower; code reading).
+- Consolidated metadata are not in the format 3 specification: zarr warns at every write (silenced
+  at arco-make's writes). Icechunk will not use them.
+- xarray keeps the CF `_FillValue` as an attribute (a float is stored base64-encoded) apart from
+  the array's own fill value (used for chunks never written).
+- Shards: xarray refuses Dask chunks straddling a shard; appending into a partial last shard works.
+  Blocks need not be multiples of the time shard, but each partial shard is rewritten on append.
+- Appending in format 3 to a format 2 store fails with an unclear xarray message ("append_dim ...
+  does not match any existing dataset dimensions {}"); no compatibility, by decision.
+
+**Copernicus Marine toolbox (PR #7) breaks the ARCO-OCEAN recipes.** Found by baseline window 2:
+upstream main refuses coordinates in `variables` ("The variable 'depth' is neither a variable or a
+standard name in the dataset"). Upstream #534 (`e34a30b`, 8 Oct, "standard names can also be used
+for sparse subset") checks requested names against the catalogue's variables, which exclude
+coordinates; before, against the dataset's variables. It precedes #532 on main, so every commit
+with the pool setting has it; 2.5.1 (cut from 2.5.0) and the fork accept `depth`. The GLORYS
+static parts of four arco-ocean recipes (0.25°, 0.5°, 1.0° levels-50, anfc levels-10) ask for
+`["deptho", "depth"]`: `depth` is needed by `get_sea_mask`. Workaround in the recipes: ask for
+`["deptho", "mask"]` (the 3D mask brings the same depth coordinate, checked on both static
+datasets) and drop `mask` as the first step, before anything reads it. The live checks did not
+catch it: their recipe asks for `thetao` only.
+
+**Baseline window 2** (2012-12-30 – 2013-01-02, code `5eb0587`, the 0.25° levels-50 recipe with
+`compressors` and the static workaround): all 37 variables equal the PR #1 output (`656503f`, format
+2) bit for bit, values, dtypes and attributes; same size on disk (1.3 GB). 3 min 58 s and 37.5 GB
+peak, against 2 min 48 s and 35.6 GB for `656503f` (one run each; not investigated, for the
+performance pass). New script `compare_values.py` (baseline scripts) compares across formats.
+
+**arco-ocean (fork stack):** the static workaround (for arco-make #7); `compressor` to `compressors`
+in every recipe (same Blosc lz4 settings, byte shuffle); the unpack recipes, `unpack.slurm` and
+the `--zip` options removed. The download scripts still write one store per piece, which nothing
+joins any more: they are to be reworked with group 7 (resumable blocks).
+
+## 2026-11-17: review of PR #8, Icechunk decisions, forecast time axes
+
+**Review of PR #8 (Zarr v3), high effort: 9 findings, all fixed** (one commit, each fix with a
+test that fails on the previous commit):
+- `[save.encoding.VAR]` went to xarray as `encoding=`, which replaces a variable's whole
+  encoding: a variable listed for its dtype lost the `[save]` chunks, shards and compressors
+  (also true before Zarr v3). Now merged key by key; appends reuse the stored encodings, so the
+  pruning of encodings in append mode (which read the existing store) is gone.
+- Shards read from a format 3 source survived new `[save] chunks`; an uncompressed source gave an
+  uncompressed output (N1 again); zarr 3 refuses `storage_options` for local stores (plain paths,
+  `file://`), which broke `open_input` and the one-series-at-a-time climatology on local
+  outputs; `.zip` outputs silently became directories; shard/chunk divisibility was checked at
+  load only when both were tables.
+- After the fixes: offline suite 261 passed, live checks 5 passed. Baseline window 2 (code
+  `9e9fa8c`) is still bit for bit equal to the PR #1 output in values and attributes, `time`
+  stored as before; 3 min 54 s, peak 44.5 GB (37.5 GB on `5eb0587`, 35.6 GB on `656503f`: single
+  runs, for the performance pass). A first attempt failed after 10 min on a GCS read timeout
+  (600 s) while opening the ERA5 store's consolidated metadata, before any download: the network
+  failures group 7 is to retry.
+
+**Maintainer's decisions (17 Nov):**
+- The upstream toolbox refusing coordinates in `variables`: keep the recipe workaround, with a
+  comment stating the issue (mercator-ocean/copernicus-marine-toolbox#534) for later.
+- Icechunk: every command writes Icechunk repositories; `process` and `compute-climatology`
+  should ideally read both Zarr v3 and Icechunk, weighed against code complexity; one commit per
+  block, its message naming the block's time range. Measure the effect of Icechunk on memory and
+  time.
+- Forecasts: the Icechunk code will have to handle forecast time series (initialization time
+  and lead time) as well as historical ones.
+
+**Forecast time axes** (investigation, nothing implemented):
+- Mercator GLO12 (GLOBAL_ANALYSISFORECAST_PHY_001_024): one `time` axis, the valid time (checked:
+  June 2022 to today + 9 days for the daily dataset), no run dimension or forecast metadata. Run
+  daily at 00 UTC, 10-day forecast, published by 12:00 UTC. The series is a best estimate
+  overwritten daily (product user manual): each validity date gets about 15 releases (forecast,
+  simulation, near-real-time analysis on Thursdays, best analysis), the last 11-15 days change
+  every day, and dates older than 15-21 days are final. Original files carry the run date
+  (`..._R<run date>.nc`) but are overwritten too: past forecasts are not archived. Daily means
+  run midnight to midnight, stamped 00:00.
+- ECMWF IFS: runs at 00/06/12/18 UTC (00 and 12 UTC to 240 h: 3-hourly to 144 h, then
+  6-hourly). GRIB through cfgrib gives `time` (initialization) x `step` and a 2D `valid_time`.
+  Open data keep the last ~12 runs; full history needs a service agreement. dynamical.org
+  archives IFS ENS (00 UTC since April 2024) as Icechunk, as `init_time` x `lead_time` x
+  `ensemble_member`, `valid_time` = init + lead.
+- **Maintainer's decisions (17 Nov):** forecast runs, not best-estimate series; GLO12 runs built
+  from the release date (an archive collected from now on); products: GLO12 physics
+  (GLOBAL_ANALYSISFORECAST_PHY_001_024), GLO12 waves (GLOBAL_ANALYSISFORECAST_WAV_001_027), ECMWF
+  IFS open data at 0.25° (0.1° possibly later) and the GloFAS river discharge forecast
+  (`cems-glofas-forecast`, EWDS); dynamical.org's names (`init_time`, `lead_time`,
+  `ensemble_member`, `valid_time`).
+- GLO12 waves (Météo-France MFWAM, 1/12°): one `time` axis, 3-hourly instantaneous (checked: Nov
+  2022 to today + 10 days, 19 variables). Two bulletins a day, 00 and 12 UTC: each releases a
+  10-day forecast and 24 h (00 UTC) or 12 h (12 UTC) of hindcast, overwriting the series; original
+  files are named `mfwamglocep_<field date>_R<bulletin date>_<00H|12H>.nc` (product user manual).
+- GloFAS forecast (EWDS `cems-glofas-forecast`, GloFAS v4, 0.05°, global without Antarctica):
+  river discharge in the last 24 hours, runoff, snow depth water equivalent, soil wetness; one
+  run a day since 5 Nov 2019; `leadtime_hour` 24 to 720 by 24; `product_type` control forecast or
+  perturbed ensemble members; GRIB2 or NetCDF (request form). The value at lead 24 h is the
+  discharge of the first day: aligned with daily means stamped at the start of the day, it is lead
+  day 0 (the C10 question, here for forecasts).
+- Still open: which IFS stream (HRES `oper` or ENS `enfo`, 51 members), runs other than 00 UTC
+  (waves and IFS have 12 UTC), and whether 3-hourly fields (waves, IFS) stay 3-hourly or become
+  daily means.
+
+## 2026-11-17: forecast design decisions; what "day D" means for every source
+
+**Maintainer's decisions (17 Nov):** IFS HRES (one member), 00 UTC runs only, daily resolution,
+`lat`/`lon` for the horizontal coordinates (dynamical.org's names for the time dimensions:
+`init_time`, `lead_time`, `valid_time`).
+
+**Day D in each source** (checked on the data and GRIB keys, 17 Nov; the convention to keep:
+day D is [D 00:00, D+1 00:00) UTC, stamped D 00:00):
+- GLORYS reanalysis and GLO12 forecast daily means: stamped 00:00, midnight to midnight (GLO12
+  product user manual). In sync.
+- WAVERYS and GLO12 waves: instantaneous every 3 h, 00:00 to 21:00; `resample` with
+  `label = closed = "left"` averages 00:00-21:00 of D. In sync.
+- ERA5 instantaneous variables: hourly 00:00-23:00 of D, averaged the same way. In sync.
+- **ERA5 accumulations (`tp`, `ssrd`, `strd`): one hour early.** ECMWF: an hourly accumulation
+  covers the hour ending at its stamp, so the value stamped 00:00 is the last hour of the previous
+  day. The recipe sums the stamps 00:00-23:00 of D: [D-1 23:00, D 23:00). **[Moby-Dick]** this
+  holds for the published data (C10 confirmed). A recipe-only fix (`closed = "right"`) would
+  break at block edges (the first stamp of a block forms a one-hour bin, the last day misses its
+  24:00 hour): it needs a part-level time offset applied before the block's time selection, or
+  reading one hour past the block (arco-make, group 9).
+- GloFAS historical (v5, `time_mean`): the request for day D is the mean over [D 00:00, D+1
+  00:00) (GRIB `dataDate` D, `stepRange` 0-24, `validityDate` D+1); arco-make stamps it D. In
+  sync: the feared one-day offset of `dis24` (C10, B9) does not exist for this variable.
+- GloFAS forecast: lead 24 h is the mean over the run day (`stepRange` 0-24), lead 48 h the next
+  day: lead day k = `leadtime_hour` 24(k+1), so a shift of -24 h gives lead days 0-29.
+- IFS HRES 00 UTC (to build): daily mean of lead day k from the instantaneous steps 24k to 24k+21
+  (3-hourly to 144 h, then 6-hourly: 8 then 4 samples, ERA5 has 24); accumulations as
+  differences, acc(24(k+1)) - acc(24k), exactly lead day k. Lead days 0-9.
+- GLO12 physics and waves forecast runs from the 00 UTC release of day R: lead day k is the
+  daily value of R + k; lead days 0-9 (negative leads, the hindcast part of a release, dropped).

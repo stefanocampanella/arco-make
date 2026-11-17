@@ -29,4 +29,4 @@ closed = "left"
 reduce = "mean"
 
 [save]
-compressor = {cname = "lz4", clevel = 1}
+compressors = [{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuffle = "shuffle"}}]

@@ -65,6 +65,9 @@ def read_configs(
 def check_if_overwriting(
   path: str, overwrite: bool = False, save_configs: SaveConfig | None = None
 ) -> None:
+  if str(path).rstrip("/").lower().endswith(".zip"):
+    # Zip outputs were removed with Zarr v3: a `.zip` name would silently become a directory.
+    raise click.ClickException(f"{path}: zip outputs are not supported; write a directory or a URL")
   storage_options = getattr(save_configs, "storage_options", None) if save_configs else None
   fs, fs_path = fsspec.url_to_fs(path, **(storage_options or {}))
   try:

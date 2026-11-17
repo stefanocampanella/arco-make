@@ -26,7 +26,7 @@ def run(*args: str) -> Result:
 def recipes(tmp_path: pathlib.Path, sources: pathlib.Path) -> dict[str, pathlib.Path]:
   directory = tmp_path / "recipes"
   directory.mkdir()
-  names = ["download", "unpack", "validate", "process", "climatology"]
+  names = ["download", "validate", "process", "climatology"]
   return {
     name: render_recipe(f"sample_{name}.toml", directory, SOURCES=str(sources)) for name in names
   }
@@ -68,22 +68,19 @@ def test_download_refuses_to_overwrite(downloaded: pathlib.Path, recipes):
   assert result.exit_code == 0, result.output
 
 
-def test_pieces_and_unpack_equal_one_download(
-  tmp_path: pathlib.Path, downloaded: pathlib.Path, recipes
-):
-  """Downloading in pieces and joining them with `unpack` gives the same dataset as one run (intent 7)."""
-  archive = tmp_path / "archive"
-  archive.mkdir()
-  for start, end in [("2020-02-26", "2020-02-28"), ("2020-02-28", "2020-03-02")]:
-    piece = archive / f"{start}_{end}.zarr"
-    result = run(
-      "download", *THREADS, f"--start={start}", f"--end={end}", str(recipes["download"]), str(piece)
-    )
-    assert result.exit_code == 0, result.output
-  joined = tmp_path / "joined.zarr"
-  result = run("unpack", *THREADS, str(recipes["unpack"]), str(archive), str(joined))
+def test_blocks_equal_one_block(tmp_path: pathlib.Path, downloaded: pathlib.Path, recipes):
+  """Downloading in blocks of `step`, appended to the output, gives the same dataset as one block
+  (intent 7); static variables are written once."""
+  recipe = recipes["download"]
+  whole = recipe.with_name("one_block.toml")
+  text = recipe.read_text()
+  assert 'step = "2D"' in text
+  whole.write_text(text.replace('step = "2D"', 'step = "5D"'))
+  output = tmp_path / "one_block.zarr"
+  result = run("download", *THREADS, str(whole), str(output))
   assert result.exit_code == 0, result.output
-  xr.testing.assert_identical(xr.open_zarr(joined).load(), xr.open_zarr(downloaded).load())
+  xr.testing.assert_identical(xr.open_zarr(output).load(), xr.open_zarr(downloaded).load())
+  assert "time" not in xr.open_zarr(downloaded).deptho.dims
 
 
 def test_validate_sample_dataset(downloaded: pathlib.Path, recipes):
@@ -146,8 +143,17 @@ def test_climatology_reference_period_and_day_of_year(tmp_path: pathlib.Path):
   assert np.isnan(xr.open_zarr(std).x.values[0])  # one value: no variance
 
 
-def test_climatology_one_series_at_a_time(tmp_path: pathlib.Path):
-  """`split_dims` (S1) writes the same outputs as one Dask graph, series by series."""
+@pytest.mark.parametrize(
+  ("save", "chunks", "shards"),
+  [
+    ("chunks = {{time = 1, depth = 1, lat = -1}}\n", (1, 1, 4), None),
+    ("chunks = {{time = 1, depth = 1, lat = 2}}\nshards = {{time = 73}}\n", (1, 1, 2), (73, 1, 4)),
+  ],
+  ids=["chunks", "shards"],
+)
+def test_climatology_one_series_at_a_time(tmp_path: pathlib.Path, save: str, chunks, shards):
+  """`split_dims` (S1) writes the same outputs as one Dask graph, series by series; shards along
+  the split dimensions are 1, like chunks."""
   time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
   rng = np.random.default_rng(0)
   ds = xr.Dataset(
@@ -162,7 +168,7 @@ def test_climatology_one_series_at_a_time(tmp_path: pathlib.Path):
     'period = 365\nbins = "day_of_year"\nwindow = 5\nweighting = "gaussian"\n'
     'weighting_scale = 2.0\n{split}\n[read]\nengine = "zarr"\n\n'
     '[[postprocess_climatology]]\nname = "assign_attrs"\ntitle = "clim"\n\n'
-    "[save]\nchunks = {{time = 1, depth = 1, lat = -1}}\n"
+    "[save]\n" + save
   )
   outputs = {}
   for label, split in [("graph", ""), ("series", 'split_dims = ["depth"]')]:
@@ -178,7 +184,8 @@ def test_climatology_one_series_at_a_time(tmp_path: pathlib.Path):
     xr.testing.assert_allclose(series, graph, rtol=1e-5)
     assert series.attrs == graph.attrs
   assert outputs["series"][0].attrs["title"] == "clim"
-  assert xr.open_zarr(tmp_path / "series_clim.zarr").t3.encoding["chunks"] == (1, 1, 4)
+  stored = xr.open_zarr(tmp_path / "series_clim.zarr").t3.encoding
+  assert stored["chunks"] == chunks and stored["shards"] == shards
 
 
 def climatology_input(tmp_path: pathlib.Path, depth_coordinate: bool = True) -> pathlib.Path:
@@ -223,6 +230,7 @@ def test_one_series_at_a_time_without_coordinates_or_save_chunks(tmp_path: pathl
   ("extra", "message"),
   [
     ('split_dims = ["depth"]\n[save]\nchunks = {depth = 3}\n', "must be 1"),
+    ('split_dims = ["depth"]\n[save]\nchunks = {depth = 1}\nshards = {depth = 3}\n', "must be 1"),
     ('split_dims = ["depth"]\n[save]\ngroup = "g"\n', "group is not supported"),
     ('split_dims = ["detph"]\n[save]\n', "not dimensions of the input"),
     ('split_dims = ["time"]\n[save]\n', "cannot include the time dimension"),
@@ -232,3 +240,22 @@ def test_one_series_at_a_time_checks_before_computing(tmp_path, extra: str, mess
   """Settings that cannot work fail before the first series is computed."""
   result, _ = run_climatology(tmp_path, climatology_input(tmp_path), "bad", extra)
   assert result.exit_code != 0 and message in result.output
+
+
+def test_one_series_at_a_time_with_storage_options_on_a_local_output(tmp_path: pathlib.Path):
+  """`[save] storage_options` (e.g. a recipe shared with remote runs) do not break a local output:
+  zarr 3 refuses them for local stores, so they are dropped there."""
+  source = climatology_input(tmp_path)
+  extra = 'split_dims = ["depth"]\n[save]\nstorage_options = {anon = true}\n'
+  result, clim = run_climatology(tmp_path, source, "series", extra)
+  assert result.exit_code == 0, result.output
+  assert xr.open_zarr(clim).t3.notnull().all()
+
+
+def test_zip_outputs_are_refused_before_any_work(recipes, tmp_path: pathlib.Path):
+  """Zip outputs were removed with Zarr v3: a `.zip` output path fails at once, before any
+  download, instead of becoming a directory with that name."""
+  output = tmp_path / "piece.zip"
+  result = CliRunner().invoke(cli, ["download", *THREADS, str(recipes["download"]), str(output)])
+  assert result.exit_code != 0 and "zip outputs are not supported" in result.output
+  assert not output.exists()

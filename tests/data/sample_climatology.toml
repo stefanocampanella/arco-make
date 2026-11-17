@@ -16,4 +16,4 @@ name = "drop_static_vars"
 time_dim = "time"
 
 [save]
-compressor = {cname = "lz4", clevel = 1}
+compressors = [{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuffle = "shuffle"}}]
