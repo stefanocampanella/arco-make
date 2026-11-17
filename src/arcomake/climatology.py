@@ -69,6 +69,7 @@ from arcomake.dataset_utils import (
   consolidate_metadata,
   open_input,
   safe_to_zarr,
+  storage_options_for,
 )
 from arcomake.processing_utils import ProcessingStepConfig
 
@@ -771,14 +772,15 @@ def _compute_by_series(
       configs=save,
       compute=False,
     )
-  storage_options = configs.save.storage_options or {}
   # Stored chunks (shards, if any: the units of writing) of every output variable: results are
   # chunked alike, so that Dask writes the chunks of a region in parallel.
   stored_chunks = [
     {
       name: var.encoding.get("shards") or var.encoding["chunks"]
       for name, var in xr.open_zarr(
-        path, storage_options=storage_options or None, consolidated=False
+        path,
+        storage_options=storage_options_for(path, configs.save.storage_options),
+        consolidated=False,
       ).data_vars.items()
     }
     for path, _ in outputs
@@ -804,7 +806,11 @@ def _compute_by_series(
         [name for name, var in result.variables.items() if not set(var.dims) & set(region)]
       )
       result.to_zarr(
-        path, region=region, mode="r+", consolidated=False, storage_options=storage_options or None
+        path,
+        region=region,
+        mode="r+",
+        consolidated=False,
+        storage_options=storage_options_for(path, configs.save.storage_options),
       )
     logger.info(f"{label} written in {time.monotonic() - writing:.0f} s")
 
@@ -839,7 +845,7 @@ def _compute_by_series(
       pending.result()
   if configs.save.consolidated is not False:
     for path, _ in outputs:
-      consolidate_metadata(path, storage_options)
+      consolidate_metadata(path, configs.save.storage_options)
 
 
 def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:

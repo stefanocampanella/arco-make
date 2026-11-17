@@ -5,10 +5,12 @@ import logging
 import pathlib
 import tempfile
 import warnings
-from collections.abc import Callable, Hashable, Mapping
-from contextlib import nullcontext
+from collections.abc import Callable, Generator, Hashable, Mapping
+from contextlib import contextmanager, nullcontext
 from typing import Annotated, Any, Literal
 
+import fsspec
+import fsspec.utils
 import xarray as xr
 import zarr
 import zarr.errors
@@ -285,16 +287,47 @@ class SaveConfig(BaseModel):
 
   @model_validator(mode="after")
   def _shards_hold_whole_chunks(self) -> "SaveConfig":
+    """Shards hold whole chunks: checked here wherever both sizes are explicit. A whole
+    dimension (-1, or not listed) is only known once the data are open: `safe_to_zarr` checks
+    those before writing (before any data are computed, unless a source is checkpointed)."""
     if self.shards is None:
       return self
     if self.chunks is None:
       raise ValueError("shards need chunks: each shard holds a whole number of chunks")
-    if isinstance(self.shards, dict) and isinstance(self.chunks, dict):
-      for dim, shard in self.shards.items():
-        chunk = self.chunks.get(dim, -1)
-        if shard > 0 and chunk > 0 and shard % chunk:
-          raise ValueError(f"shards along {dim!r} ({shard}) must be a multiple of chunks ({chunk})")
+    for where, shard, chunk in _explicit_size_pairs(self.shards, self.chunks):
+      if shard > 0 and chunk > 0 and shard % chunk:
+        raise ValueError(f"shards {where}({shard}) must be a multiple of chunks ({chunk})")
     return self
+
+
+def _explicit_size_pairs(
+  shards: StoredChunksConfig, chunks: StoredChunksConfig
+) -> list[tuple[str, int, int]]:
+  """(where, shard, chunk) for every dimension whose sizes both forms state, without the data."""
+  if isinstance(shards, dict) or isinstance(chunks, dict):
+    if isinstance(shards, tuple) or isinstance(chunks, tuple):
+      return []  # positions against names: unknown without the data
+    names = set(shards) if isinstance(shards, dict) else set()
+    names |= set(chunks) if isinstance(chunks, dict) else set()
+    pairs = []
+    for name in sorted(names):
+      shard = shards.get(name, -1) if isinstance(shards, dict) else shards
+      chunk = chunks.get(name, -1) if isinstance(chunks, dict) else chunks
+      pairs.append((f"along {name!r} ", shard, chunk))
+    return pairs
+  if isinstance(shards, tuple) and isinstance(chunks, tuple):
+    if len(shards) != len(chunks):
+      raise ValueError("shards and chunks give sizes for different numbers of dimensions")
+    return [
+      (f"at position {i} ", s, c) for i, (s, c) in enumerate(zip(shards, chunks, strict=True))
+    ]
+  if isinstance(shards, tuple):
+    assert isinstance(chunks, int)
+    return [(f"at position {i} ", s, chunks) for i, s in enumerate(shards)]
+  assert isinstance(shards, int)
+  if isinstance(chunks, tuple):
+    return [(f"at position {i} ", shards, c) for i, c in enumerate(chunks)]
+  return [("", shards, chunks)]
 
 
 class CheckpointingConfig(BaseModel):
@@ -309,12 +342,44 @@ class CheckpointingConfig(BaseModel):
     return may_parse_timedelta(value)
 
 
+def is_remote(path: Any) -> bool:
+  """Whether `path` is a URL of a remote filesystem (`file://` and plain paths are local)."""
+  return isinstance(path, str | pathlib.Path) and fsspec.utils.get_protocol(str(path)) not in (
+    "file",
+    "local",
+  )
+
+
+def storage_options_for(path: Any, options: Mapping[str, Any] | None) -> dict[str, Any] | None:
+  """`options` for a remote `path`, `None` for a local one: zarr 3 refuses storage options for
+  local stores (zarr 2 accepted and ignored them), and recipes may share them across both."""
+  if options is None or not len(options) or not is_remote(path):
+    return None
+  return dict(options)
+
+
+@contextmanager
+def quiet_consolidated_metadata() -> Generator[None]:
+  """Consolidated metadata are written by choice: hide zarr's warning that they are not part of
+  the format 3 specification."""
+  with warnings.catch_warnings():
+    warnings.filterwarnings(
+      "ignore", message="Consolidated metadata is currently not part", category=ZarrUserWarning
+    )
+    yield
+
+
 def open_input(filename_or_obj: Any, **kwargs: Any) -> xr.Dataset:
   """`xarray.open_dataset`, the one way arco-make opens its inputs.
 
   Read errors of Zarr stores raise (N8): zarr 3 reads only a missing object as the fill value
   (sparse stores); timeouts and connection errors raise (`tests/test_read_errors.py`).
+  `storage_options` are dropped for local paths.
   """
+  if "storage_options" in kwargs:
+    options = storage_options_for(filename_or_obj, kwargs.pop("storage_options"))
+    if options is not None:
+      kwargs["storage_options"] = options
   return xr.open_dataset(filename_or_obj, **kwargs)
 
 
@@ -378,7 +443,9 @@ def _without_zarr2_codecs(dataset: xr.Dataset) -> xr.Dataset:
 
   Variables read from a format 2 store carry numcodecs codecs in their encoding, which zarr 3
   cannot write in format 3: they are dropped, so the recipe's codecs or zarr's defaults apply.
-  Codecs read from format 3 stores are kept.
+  Codecs read from format 3 stores are kept. An empty list of compressors read from a source
+  (uncompressed, in either format) is dropped too: outputs are compressed unless the recipe says
+  `compressors = []` (N1).
   """
   dataset = dataset.copy(deep=False)
   for variable in dataset.variables.values():
@@ -388,20 +455,15 @@ def _without_zarr2_codecs(dataset: xr.Dataset) -> xr.Dataset:
       codecs = encoding.get(key)
       if codecs is None:
         continue
-      if not all(
-        isinstance(c, kind) for c in (codecs if isinstance(codecs, list | tuple) else [codecs])
-      ):
+      codecs = codecs if isinstance(codecs, list | tuple) else [codecs]
+      if not all(isinstance(c, kind) for c in codecs) or (key == "compressors" and not codecs):
         del encoding[key]
   return dataset
 
 
 def _write_zarr(dataset: xr.Dataset, path: str, **kwargs: Any) -> xr.backends.ZarrStore | Delayed:
-  """`Dataset.to_zarr` in Zarr format 3. Consolidated metadata are written as asked (by default),
-  without zarr's warning that they are not part of the format 3 specification."""
-  with warnings.catch_warnings():
-    warnings.filterwarnings(
-      "ignore", message="Consolidated metadata is currently not part", category=ZarrUserWarning
-    )
+  """`Dataset.to_zarr` in Zarr format 3 (consolidated metadata as asked, by default)."""
+  with quiet_consolidated_metadata():
     written = dataset.to_zarr(path, zarr_format=3, **kwargs)
   assert isinstance(written, xr.backends.ZarrStore | Delayed)
   return written
@@ -500,23 +562,27 @@ def safe_to_zarr(
   """Write a dataset to a Zarr store in format 3 (a local directory or an fsspec URL) with the
   layout, compression and encodings of `[save]`.
 
-  Codecs read from Zarr v2 sources are dropped (see `_without_zarr2_codecs`). With
-  `compute=False`, returns the task that writes the data (the metadata are written now).
+  `[save] chunks`, `shards` and `compressors` apply to the data variables; `[save.encoding.VAR]`
+  is merged over them, key by key. Codecs read from Zarr v2 sources are dropped (see
+  `_without_zarr2_codecs`). With `compute=False`, returns the task that writes the data (the
+  metadata are written now).
+
+  Raises:
+    ValueError: for a `.zip` destination (zip outputs were removed with Zarr v3), shards that do
+      not hold whole chunks, or `[save.encoding]` naming a variable the dataset lacks.
   """
   if configs is None:
     configs = SaveConfig()
   mode = mode or "w"
+  path = str(destination)
+  if path.rstrip("/").lower().endswith(".zip"):
+    raise ValueError(f"{path}: zip outputs are not supported; write a directory or a URL")
   # The stored layout is set through the variables' encodings, on a copy: the caller's dataset is
   # left unchanged.
   dataset = _without_zarr2_codecs(dataset)
 
   logger.info(f"Saving dataset to {destination} with {configs}")
   chunk_conf = configs.chunks
-  # by_alias: encodings use xarray's names (`_FillValue`).
-  to_zarr_kwargs = configs.model_dump(
-    exclude_none=True, by_alias=True, exclude={"chunks", "shards", "compressors", "storage_options"}
-  )
-
   if chunk_conf is not None:
     # Set the on-disk Zarr chunk layout via encoding, without altering the
     # underlying Dask chunking. This requires the existing Dask chunks to be
@@ -524,57 +590,53 @@ def safe_to_zarr(
     # (or shards) along each dimension; otherwise to_zarr will raise a ValueError.
     # see: https://github.com/pydata/xarray/issues/4380
     for var in dataset.data_vars:
+      encoding = dataset[var].encoding
       chunk_sizes = _resolve_sizes(chunk_conf, dataset[var])
-      dataset[var].encoding["chunks"] = chunk_sizes
-      if configs.shards is not None:
-        shard_sizes = _resolve_sizes(configs.shards, dataset[var])
-        for dim, shard, chunk in zip(dataset[var].dims, shard_sizes, chunk_sizes, strict=True):
-          if shard % chunk:
-            raise ValueError(
-              f"{var}: shards along {dim!r} ({shard}) must be a multiple of chunks ({chunk})"
-            )
-        dataset[var].encoding["shards"] = shard_sizes
+      encoding["chunks"] = chunk_sizes
+      if configs.shards is None:
+        # Shards read from a format 3 source were sized for its chunks, not these.
+        encoding.pop("shards", None)
+        continue
+      shard_sizes = _resolve_sizes(configs.shards, dataset[var])
+      for dim, shard, chunk in zip(dataset[var].dims, shard_sizes, chunk_sizes, strict=True):
+        if shard % chunk:
+          raise ValueError(
+            f"{var}: shards along {dim!r} ({shard}) must be a multiple of chunks ({chunk})"
+          )
+      encoding["shards"] = shard_sizes
   if configs.compressors is not None:
     # Without `[save] compressors`, the variables keep their own (zarr 3) codecs or zarr's default.
     for var in dataset.data_vars:
       dataset[var].encoding["compressors"] = _codecs(configs.compressors)
 
-  path = str(destination)
-  storage_options = (configs.storage_options or None) if "://" in path else None
+  # by_alias: encodings use xarray's names (`_FillValue`).
+  for name, conf in (configs.encoding or {}).items():
+    if name not in dataset.variables:
+      raise ValueError(f"[save.encoding] names {name!r}, which the dataset does not have")
+    encoding = dataset.variables[name].encoding
+    overrides = conf.model_dump(exclude_none=True, by_alias=True)
+    if "chunks" in overrides:
+      overrides["chunks"] = tuple(overrides["chunks"])
+      if "shards" not in overrides and configs.shards is None:
+        encoding.pop("shards", None)
+    if "shards" in overrides:
+      overrides["shards"] = tuple(overrides["shards"])
+    encoding.update(overrides)
 
-  if mode in ("a", "a-", "r+") and "encoding" in to_zarr_kwargs and to_zarr_kwargs["encoding"]:
-    try:
-      zg = zarr.open_group(
-        path, mode="r", path=to_zarr_kwargs.get("group"), storage_options=storage_options
-      )
-      existing_keys = set(zg.keys())
-      to_zarr_kwargs["encoding"] = {
-        k: v for k, v in to_zarr_kwargs["encoding"].items() if k not in existing_keys
-      }
-      if not to_zarr_kwargs["encoding"]:
-        to_zarr_kwargs.pop("encoding", None)
-    except (FileNotFoundError, zarr.errors.GroupNotFoundError):
-      # Nothing written yet (e.g. mode "a" on a new store): every encoding applies.
-      pass
-
+  to_zarr_kwargs = configs.model_dump(exclude_none=True, include={"consolidated", "group"})
   return _write_zarr(
     dataset,
     path,
     compute=compute,
     mode=mode,
     append_dim=append_dim,
-    storage_options=storage_options,
+    storage_options=storage_options_for(path, configs.storage_options),
     **to_zarr_kwargs,
   )
 
 
 def consolidate_metadata(path: str, storage_options: Mapping[str, Any] | None = None) -> None:
-  """Write the consolidated metadata of a Zarr store (as `safe_to_zarr` does, without zarr's
-  warning about format 3)."""
-  path = str(path)
-  options = dict(storage_options or {}) or None if "://" in path else None
-  with warnings.catch_warnings():
-    warnings.filterwarnings(
-      "ignore", message="Consolidated metadata is currently not part", category=ZarrUserWarning
-    )
-    zarr.consolidate_metadata(zarr.open_group(path, mode="r+", storage_options=options).store)
+  """Write the consolidated metadata of a Zarr store, as `safe_to_zarr` does."""
+  options = storage_options_for(path, storage_options)
+  with quiet_consolidated_metadata():
+    zarr.consolidate_metadata(zarr.open_group(str(path), mode="r+", storage_options=options).store)

@@ -240,3 +240,22 @@ def test_one_series_at_a_time_checks_before_computing(tmp_path, extra: str, mess
   """Settings that cannot work fail before the first series is computed."""
   result, _ = run_climatology(tmp_path, climatology_input(tmp_path), "bad", extra)
   assert result.exit_code != 0 and message in result.output
+
+
+def test_one_series_at_a_time_with_storage_options_on_a_local_output(tmp_path: pathlib.Path):
+  """`[save] storage_options` (e.g. a recipe shared with remote runs) do not break a local output:
+  zarr 3 refuses them for local stores, so they are dropped there."""
+  source = climatology_input(tmp_path)
+  extra = 'split_dims = ["depth"]\n[save]\nstorage_options = {anon = true}\n'
+  result, clim = run_climatology(tmp_path, source, "series", extra)
+  assert result.exit_code == 0, result.output
+  assert xr.open_zarr(clim).t3.notnull().all()
+
+
+def test_zip_outputs_are_refused_before_any_work(recipes, tmp_path: pathlib.Path):
+  """Zip outputs were removed with Zarr v3: a `.zip` output path fails at once, before any
+  download, instead of becoming a directory with that name."""
+  output = tmp_path / "piece.zip"
+  result = CliRunner().invoke(cli, ["download", *THREADS, str(recipes["download"]), str(output)])
+  assert result.exit_code != 0 and "zip outputs are not supported" in result.output
+  assert not output.exists()

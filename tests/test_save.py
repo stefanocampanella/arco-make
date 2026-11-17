@@ -183,27 +183,112 @@ def test_safe_to_zarr_append_mode_on_a_new_store(ocean_ds: xr.Dataset, tmp_path:
   assert zarr.open_group(str(path), mode="r")["time"].attrs["units"] == "days since 2020-01-01"
 
 
-def test_safe_to_zarr_append_does_not_hide_store_errors(
-  ocean_ds: xr.Dataset, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
-):
-  """An unexpected error reading the existing store is raised, not ignored."""
+def test_appending_with_per_variable_encodings(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
+  """`[save.encoding]` applies when a variable is created; appended blocks reuse the stored
+  encoding (time units included), so every block gets the same recipe and the data match one
+  write. The existing store is not read beforehand: errors reading it come from xarray itself."""
   path = tmp_path / "out.zarr"
   configs = SaveConfig(encoding={"time": {"units": "days since 2020-01-01"}})
   safe_to_zarr(ocean_ds.isel(time=slice(0, 3)), path, configs=configs)
+  safe_to_zarr(
+    ocean_ds.isel(time=slice(3, None)), path, configs=configs, mode="a-", append_dim="time"
+  )
+  assert zarr.open_group(str(path), mode="r")["time"].attrs["units"] == "days since 2020-01-01"
+  xr.testing.assert_allclose(xr.open_zarr(path).load(), ocean_ds)
 
-  open_group = zarr.open_group
 
-  def broken_read_only_open_group(*args, **kwargs):
-    # Only the read-only inspection of the existing store fails; xarray's own writes still work.
-    if kwargs.get("mode") == "r":
-      raise PermissionError("store not readable")
-    return open_group(*args, **kwargs)
+def test_per_variable_encoding_keeps_the_save_layout(ocean_ds: xr.Dataset, tmp_path):
+  """`[save.encoding.VAR]` is merged over `[save]` key by key: a variable listed only for its
+  dtype keeps the chunks, shards and compressors of `[save]` (xarray's `encoding=` argument
+  would replace them all)."""
+  conf = SaveConfig.model_validate(
+    {
+      "chunks": {"time": 1, "depth": 1, "latitude": 4, "longitude": -1},
+      "shards": {"time": 2},
+      "compressors": [LZ4],
+      "encoding": {"zos": {"dtype": "float32"}, "thetao": {"chunks": [2, 3, 8, 8]}},
+    }
+  )
+  safe_to_zarr(ocean_ds, tmp_path / "out.zarr", configs=conf)
+  group = zarr.open_group(str(tmp_path / "out.zarr"), mode="r")
+  zos, thetao = group["zos"], group["thetao"]
+  assert zos.dtype == np.float32 and zos.chunks == (1, 4, 8) and zos.shards == (2, 8, 8)
+  assert type(zos.compressors[0]).__name__ == "BloscCodec"
+  assert thetao.chunks == (2, 3, 8, 8) and thetao.shards == (2, 3, 8, 8)
 
-  monkeypatch.setattr(dataset_utils.zarr, "open_group", broken_read_only_open_group)
-  with pytest.raises(PermissionError):
-    safe_to_zarr(
-      ocean_ds.isel(time=slice(3, None)), path, configs=configs, mode="a-", append_dim="time"
-    )
+
+def test_per_variable_encoding_of_a_missing_variable_fails(ocean_ds, tmp_path):
+  """A name in `[save.encoding]` that the dataset lacks is an error, as with xarray."""
+  conf = SaveConfig.model_validate({"encoding": {"nope": {"dtype": "float32"}}})
+  with pytest.raises(ValueError, match="'nope'"):
+    safe_to_zarr(ocean_ds, tmp_path / "out.zarr", configs=conf)
+
+
+def test_shards_of_a_sharded_source_do_not_outlive_new_chunks(ocean_ds, tmp_path):
+  """Rewriting a sharded output with other chunks and no shards writes it unsharded (the
+  source's shards were sized for its own chunks)."""
+  safe_to_zarr(ocean_ds, tmp_path / "sharded.zarr", configs=SHARDED)
+  read = xr.open_zarr(tmp_path / "sharded.zarr")
+  assert read.thetao.encoding["shards"] == (2, 3, 8, 8)
+  # Dask chunks of one time step: the stale shards (2 time steps) would straddle them.
+  conf = SaveConfig.model_validate({"chunks": {"time": 1, "depth": 1, "latitude": 4}})
+  safe_to_zarr(read, tmp_path / "out.zarr", configs=conf)
+  out = zarr.open_group(str(tmp_path / "out.zarr"), mode="r")["thetao"]
+  assert out.chunks == (1, 1, 4, 8) and out.shards is None
+
+
+def test_uncompressed_sources_give_compressed_outputs(ocean_ds, tmp_path):
+  """A source stored uncompressed (in either format) does not make the output uncompressed: the
+  empty list of compressors it reports is dropped, and zarr's default applies (N1)."""
+  for zarr_format in (2, 3):
+    source = tmp_path / f"raw{zarr_format}.zarr"
+    ocean_ds.to_zarr(source, zarr_format=zarr_format, encoding={"thetao": {"compressors": None}})
+    read = xr.open_zarr(source)
+    assert tuple(read.thetao.encoding["compressors"]) == ()
+    safe_to_zarr(read, tmp_path / f"out{zarr_format}.zarr", configs=SaveConfig())
+    out = zarr.open_group(str(tmp_path / f"out{zarr_format}.zarr"), mode="r")["thetao"]
+    assert out.compressors != ()
+  safe_to_zarr(read, tmp_path / "raw.zarr", configs=SaveConfig(compressors=[]))
+  assert zarr.open_group(str(tmp_path / "raw.zarr"), mode="r")["thetao"].compressors == ()
+
+
+@pytest.mark.parametrize("destination", ["local", "file_url"])
+def test_storage_options_are_ignored_for_local_paths(ocean_ds, tmp_path, destination: str):
+  """Recipes may give `storage_options` for remote runs: zarr 3 refuses them for local stores
+  (plain paths and `file://` URLs), so they are dropped there, for writing and reading."""
+  path = tmp_path / "out.zarr"
+  target = str(path) if destination == "local" else path.as_uri()
+  conf = SaveConfig(storage_options={"anon": True})
+  safe_to_zarr(ocean_ds, target, configs=conf)
+  read = dataset_utils.open_input(target, engine="zarr", storage_options={"anon": True})
+  xr.testing.assert_allclose(read.load(), ocean_ds)
+  dataset_utils.consolidate_metadata(target, {"anon": True})
+
+
+def test_zip_destinations_are_refused(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
+  """Zip outputs were removed with Zarr v3: a `.zip` destination is refused instead of
+  becoming a directory with that name."""
+  with pytest.raises(ValueError, match="zip outputs are not supported"):
+    safe_to_zarr(ocean_ds, tmp_path / "out.zip")
+  assert not (tmp_path / "out.zip").exists()
+
+
+@pytest.mark.parametrize(
+  "save",
+  [
+    {"chunks": 3, "shards": 4},
+    {"chunks": (1, 3), "shards": (2, 4)},
+    {"chunks": {"lat": 3}, "shards": 4},
+    {"chunks": 3, "shards": {"lat": 4}},
+    {"chunks": (1, 3), "shards": 4},
+  ],
+)
+def test_shard_sizes_known_at_load_are_checked_at_load(save: dict):
+  """Every pair of explicit sizes is checked when the recipe is loaded, whatever form the
+  sizes take; whole dimensions are checked before writing."""
+  with pytest.raises(ValidationError, match="must be a multiple of chunks"):
+    SaveConfig.model_validate(save)
+  SaveConfig.model_validate({"chunks": {"lat": 100}, "shards": {"time": 10}})  # lat: known later
 
 
 SHARDED = SaveConfig.model_validate(
