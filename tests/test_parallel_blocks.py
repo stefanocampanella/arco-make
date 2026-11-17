@@ -7,8 +7,10 @@ and encodings included."""
 import datetime
 import importlib
 import pathlib
+import shutil
 import threading
 
+import numpy as np
 import pytest
 import xarray as xr
 import zarr
@@ -85,6 +87,46 @@ def test_checkpoints_go_with_their_block(
   result = run(recipe, tmp_path / "out.zarr")
   assert result.exit_code == 0, result.output
   assert left == [[], [], []]
+
+
+def test_at_most_n_blocks_are_held(recipe, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+  """With --blocks 2, a block starts only when fewer than two are staging or staged (memory and
+  disk are sized for N blocks, not N + 1)."""
+  real_stage, real_committed = download_module._stage_block, download_module._committed
+  lock = threading.Lock()
+  counts = {"held": 0, "most": 0}
+
+  def stage(configs, interval):
+    with lock:
+      counts["held"] += 1
+      counts["most"] = max(counts["most"], counts["held"])
+    return real_stage(configs, interval)
+
+  def committed(run, interval):
+    result = real_committed(run, interval)
+    with lock:
+      counts["held"] -= 1  # released once committed (rmtree follows before the next start)
+    return result
+
+  monkeypatch.setattr(download_module, "_stage_block", stage)
+  monkeypatch.setattr(download_module, "_committed", committed)
+  result = run(recipe, tmp_path / "out.zarr", "--blocks", "2")
+  assert result.exit_code == 0, result.output
+  assert counts["most"] == 2
+
+
+def test_variables_read_without_chunks_come_from_the_stage(tmp_path: pathlib.Path):
+  """A variable opened without `chunks` is lazily indexed, not Dask: it is taken from the stage
+  too, not read again from its source (closed, and gone here, by the time of the commit)."""
+  source = tmp_path / "source.zarr"
+  xr.Dataset({"mask": (("y", "x"), np.ones((2, 3)))}, coords={"y": [0, 1]}).to_zarr(source)
+  prepared = xr.open_zarr(source, chunks=None)
+  assert prepared["mask"].chunks is None and not prepared["mask"].variable._in_memory
+  stage = tmp_path / "stage.zarr"
+  prepared.to_zarr(stage)
+  shutil.rmtree(source)
+  dataset = download_module._from_stage(download_module._Staged(stage, prepared))
+  assert dataset["mask"].values.tolist() == [[1.0] * 3] * 2
 
 
 def test_a_failed_stage_is_removed(recipe, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):

@@ -379,14 +379,17 @@ def _stage_block(configs: DownloadConfig, date_interval: DateInterval) -> _Stage
 
 def _from_stage(staged: _Staged) -> xr.Dataset:
   """The block as its direct write would see it: the prepared dataset with the staged values in
-  place of every lazy variable, in the same Dask chunks."""
+  place of every variable not in memory: Dask arrays in the same chunks, lazily indexed arrays
+  (parts opened without `chunks`) loaded, as their direct write would. The block's sources are
+  closed by then: nothing may read them again."""
   values = xr.open_zarr(str(staged.path), consolidated=False)
   dataset = staged.prepared.copy(deep=False)
   for name, variable in dataset.variables.items():
-    chunks = variable.chunks
-    if chunks is None:  # in memory (index coordinates, loaded variables): kept as they are
+    if variable._in_memory:  # index coordinates, loaded variables: kept as they are
       continue
-    variable.data = values[name].data.rechunk(chunks)
+    stored = values[name].variable
+    chunks = variable.chunks
+    variable.data = stored.values if chunks is None else stored.data.rechunk(chunks)
   return dataset
 
 
@@ -439,7 +442,6 @@ def _write_blocks_staged(
   while pending:
     number, interval, future = pending.popleft()
     staged = future.result()
-    start_next()
     first = number == 0
 
     def commit(staged: _Staged = staged, interval: DateInterval = interval, first: bool = first):
@@ -456,6 +458,8 @@ def _write_blocks_staged(
 
     with_retries(commit, configs.retries, f"{_describe(interval)} (commit)")
     shutil.rmtree(staged.path, ignore_errors=True)
+    # Only now: at most `blocks_at_once` blocks are staging or staged at any time.
+    start_next()
 
 
 def _committed(run: icechunk_utils.Run, interval: DateInterval) -> bool:
