@@ -204,3 +204,63 @@ def test_safe_to_zarr_append_does_not_hide_store_errors(
     safe_to_zarr(
       ocean_ds.isel(time=slice(3, None)), path, configs=configs, mode="a-", append_dim="time"
     )
+
+
+SHARDED = SaveConfig.model_validate(
+  {
+    "chunks": {"time": 1, "depth": 1, "latitude": 4, "longitude": -1},
+    "shards": {"time": 2, "depth": -1},
+    "compressors": [LZ4],
+  }
+)
+
+
+def test_shards_group_whole_chunks(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
+  """`[save] shards` (per dimension; -1 or not listed: whole dimension) store several chunks per
+  object; without them, every chunk is an object."""
+  safe_to_zarr(ocean_ds, tmp_path / "out.zarr", configs=SHARDED)
+  group = zarr.open_group(str(tmp_path / "out.zarr"), mode="r")
+  assert group["thetao"].chunks == (1, 1, 4, 8) and group["thetao"].shards == (2, 3, 8, 8)
+  assert group["zos"].chunks == (1, 4, 8) and group["zos"].shards == (2, 8, 8)
+  xr.testing.assert_allclose(xr.open_zarr(tmp_path / "out.zarr").load(), ocean_ds)
+  safe_to_zarr(ocean_ds, tmp_path / "plain.zarr", configs=SAVE)
+  assert zarr.open_group(str(tmp_path / "plain.zarr"), mode="r")["thetao"].shards is None
+
+
+def test_appending_into_a_partial_shard(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
+  """Blocks need not fill whole shards: appending completes the last shard."""
+  path = tmp_path / "out.zarr"
+  safe_to_zarr(ocean_ds.isel(time=slice(0, 3)), path, configs=SHARDED)
+  safe_to_zarr(
+    ocean_ds.isel(time=slice(3, None)), path, configs=SHARDED, mode="a-", append_dim="time"
+  )
+  xr.testing.assert_allclose(xr.open_zarr(path).load(), ocean_ds)
+
+
+def test_dask_chunks_may_not_straddle_shards(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
+  """Two Dask chunks writing into one shard would race: xarray refuses."""
+  with pytest.raises(ValueError):
+    safe_to_zarr(ocean_ds.chunk(time=1), tmp_path / "out.zarr", configs=SHARDED)
+  safe_to_zarr(ocean_ds.chunk(time=2), tmp_path / "out.zarr", configs=SHARDED)
+
+
+@pytest.mark.parametrize(
+  "save, message",
+  [
+    ({"shards": {"time": 2}}, "shards need chunks"),
+    ({"chunks": {"time": 2}, "shards": {"time": 3}}, "must be a multiple of chunks"),
+    ({"chunks": {"time": 1}, "shards": {"time": 0}}, "sizes are positive"),
+  ],
+)
+def test_invalid_shards_fail_when_loaded(save: dict, message: str):
+  """Shards hold whole chunks: impossible layouts fail when the recipe is loaded."""
+  with pytest.raises(ValidationError, match=message):
+    SaveConfig.model_validate(save)
+
+
+def test_shards_of_whole_dimensions_hold_whole_chunks(ocean_ds: xr.Dataset, tmp_path):
+  """A layout that fails only once -1 is resolved (8 latitudes, chunks of 3) fails before writing."""
+  conf = SaveConfig.model_validate({"chunks": {"latitude": 3}, "shards": {"latitude": -1}})
+  with pytest.raises(ValueError, match="must be a multiple of chunks"):
+    safe_to_zarr(ocean_ds, tmp_path / "out.zarr", configs=conf)
+  assert not (tmp_path / "out.zarr").exists()

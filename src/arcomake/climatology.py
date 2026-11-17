@@ -703,20 +703,26 @@ def _compute_series(
 
 
 def _one_index_per_chunk(save: SaveConfig, split_dims: list[str]) -> SaveConfig:
-  """`save` with stored chunks of 1 along the split dimensions, which each series writes alone.
+  """`save` with stored chunks (and shards, if any) of 1 along the split dimensions, which each
+  series writes alone.
 
   Raises:
-    ValueError: if `[save] chunks` asks for another size along a split dimension.
+    ValueError: if `[save] chunks` or `shards` ask for another size along a split dimension.
   """
-  chunks = save.chunks
-  if chunks is not None and not isinstance(chunks, dict):
-    raise ValueError("with split_dims, [save] chunks must be a table of sizes per dimension")
-  chunks = dict(chunks or {})
-  for dim in split_dims:
-    if chunks.get(dim, 1) != 1:
-      raise ValueError(f"with split_dims, [save] chunks along {dim!r} must be 1 (one series each)")
-    chunks[dim] = 1
-  return save.model_copy(update={"chunks": chunks})
+  update = {}
+  for key in ("chunks", "shards"):
+    sizes = getattr(save, key)
+    if key == "shards" and sizes is None:
+      continue
+    if sizes is not None and not isinstance(sizes, dict):
+      raise ValueError(f"with split_dims, [save] {key} must be a table of sizes per dimension")
+    sizes = dict(sizes or {})
+    for dim in split_dims:
+      if sizes.get(dim, 1) != 1:
+        raise ValueError(f"with split_dims, [save] {key} along {dim!r} must be 1 (one series each)")
+      sizes[dim] = 1
+    update[key] = sizes
+  return save.model_copy(update=update)
 
 
 def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Dataset:
@@ -766,11 +772,11 @@ def _compute_by_series(
       compute=False,
     )
   storage_options = configs.save.storage_options or {}
-  # Stored chunks of every output variable: results are chunked alike, so that Dask writes the
-  # chunks of a region in parallel.
+  # Stored chunks (shards, if any: the units of writing) of every output variable: results are
+  # chunked alike, so that Dask writes the chunks of a region in parallel.
   stored_chunks = [
     {
-      name: var.encoding["chunks"]
+      name: var.encoding.get("shards") or var.encoding["chunks"]
       for name, var in xr.open_zarr(
         path, storage_options=storage_options or None, consolidated=False
       ).data_vars.items()

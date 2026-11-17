@@ -224,8 +224,8 @@ class VariableEncodingConfig(BaseModel):
   """One variable's encoding in `[save.encoding]`, as `xarray.Dataset.to_zarr` takes it.
 
   The fill value is `_FillValue` (`fill_value` is accepted too); `scale_factor` and `add_offset`
-  pack floats into integers. `chunks` are explicit sizes, one per dimension. `compressors` replace
-  those of `[save]` for this variable.
+  pack floats into integers. `chunks` and `shards` are explicit sizes, one per dimension.
+  `compressors` replace those of `[save]` for this variable.
   """
 
   model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -234,6 +234,7 @@ class VariableEncodingConfig(BaseModel):
   calendar: str | None = None
   dtype: str | None = None
   chunks: list[Annotated[int, Field(ge=1)]] | None = None
+  shards: list[Annotated[int, Field(ge=1)]] | None = None
   compressors: CompressorsConfig | None = None
   fill_value: float | int | str | bool | None = Field(
     default=None,
@@ -249,28 +250,51 @@ StoredChunk = Annotated[int, Field(ge=-1)]
 StoredChunksConfig = StoredChunk | dict[str, StoredChunk] | tuple[StoredChunk, ...]
 
 
+def _sizes(value: StoredChunksConfig) -> list[int]:
+  if isinstance(value, dict):
+    return list(value.values())
+  return list(value) if isinstance(value, tuple) else [value]
+
+
 class SaveConfig(BaseModel):
-  """The `[save]` table: layout, compression and encodings of the stored arrays."""
+  """The `[save]` table: layout, compression and encodings of the stored arrays.
+
+  `chunks` are the units of reading. `shards`, if given, group whole chunks into one stored
+  object each (Zarr v3 sharding), in the same form as `chunks`: per dimension (-1, or a dimension
+  not listed: the whole dimension), one size per dimension, or one size for all. Without
+  `shards`, every chunk is an object. Dask chunks may not straddle shards when writing.
+  """
 
   model_config = ConfigDict(extra="forbid")
 
   consolidated: bool | None = None
   chunks: StoredChunksConfig | None = None
+  shards: StoredChunksConfig | None = None
   # Compressors of the data variables; without them, zarr's default (zstd).
   compressors: CompressorsConfig | None = None
   encoding: dict[str, VariableEncodingConfig] | None = None
   storage_options: dict[str, Any] | None = None
   group: str | None = None
 
-  @field_validator("chunks")
+  @field_validator("chunks", "shards")
   @classmethod
   def _no_zero_chunks(cls, value: StoredChunksConfig | None) -> StoredChunksConfig | None:
-    sizes = (
-      value.values() if isinstance(value, dict) else value if isinstance(value, tuple) else [value]
-    )
-    if any(size == 0 for size in sizes or []):
-      raise ValueError("chunk sizes are positive, or -1 for a whole dimension")
+    if value is not None and 0 in _sizes(value):
+      raise ValueError("sizes are positive, or -1 for a whole dimension")
     return value
+
+  @model_validator(mode="after")
+  def _shards_hold_whole_chunks(self) -> "SaveConfig":
+    if self.shards is None:
+      return self
+    if self.chunks is None:
+      raise ValueError("shards need chunks: each shard holds a whole number of chunks")
+    if isinstance(self.shards, dict) and isinstance(self.chunks, dict):
+      for dim, shard in self.shards.items():
+        chunk = self.chunks.get(dim, -1)
+        if shard > 0 and chunk > 0 and shard % chunk:
+          raise ValueError(f"shards along {dim!r} ({shard}) must be a multiple of chunks ({chunk})")
+    return self
 
 
 class CheckpointingConfig(BaseModel):
@@ -445,6 +469,25 @@ def maybe_checkpointing_download_and_process(
   return dataset
 
 
+def _resolve_sizes(conf: StoredChunksConfig, var: xr.DataArray) -> tuple[int, ...]:
+  """Sizes per dimension of `var` from `[save] chunks` or `shards`.
+
+  -1 (or a dimension not listed) is the whole dimension. Resolved here: xarray's check that Dask
+  chunks do not straddle Zarr chunks passes for -1 (`n % -1 == 0`), and overlapping Dask chunks
+  would then write into the same Zarr chunk concurrently, losing data.
+  """
+  dims = var.dims
+  if isinstance(conf, dict):
+    requested = [conf.get(str(dim), -1) for dim in dims]
+  elif isinstance(conf, tuple):
+    requested = list(conf)
+  else:
+    requested = [conf for _ in dims]
+  return tuple(
+    var.sizes[dim] if size == -1 else size for dim, size in zip(dims, requested, strict=True)
+  )
+
+
 def safe_to_zarr(
   dataset: xr.Dataset,
   destination: str | pathlib.Path,
@@ -471,31 +514,26 @@ def safe_to_zarr(
   chunk_conf = configs.chunks
   # by_alias: encodings use xarray's names (`_FillValue`).
   to_zarr_kwargs = configs.model_dump(
-    exclude_none=True, by_alias=True, exclude={"chunks", "compressors", "storage_options"}
+    exclude_none=True, by_alias=True, exclude={"chunks", "shards", "compressors", "storage_options"}
   )
 
   if chunk_conf is not None:
     # Set the on-disk Zarr chunk layout via encoding, without altering the
     # underlying Dask chunking. This requires the existing Dask chunks to be
     # an integer multiple of (and evenly divide into) the requested chunks
-    # along each dimension; otherwise to_zarr will raise a ValueError.
+    # (or shards) along each dimension; otherwise to_zarr will raise a ValueError.
     # see: https://github.com/pydata/xarray/issues/4380
     for var in dataset.data_vars:
-      dims = dataset[var].dims
-      if isinstance(chunk_conf, dict):
-        requested = [chunk_conf.get(str(dim), -1) for dim in dims]
-      elif isinstance(chunk_conf, tuple):
-        requested = list(chunk_conf)
-      else:
-        requested = [chunk_conf for _ in dims]
-      # -1 means the whole dimension. Resolve it here: xarray's check that Dask chunks do not
-      # straddle Zarr chunks passes for -1 (`n % -1 == 0`), and overlapping Dask chunks would
-      # then write into the same Zarr chunk concurrently, losing data.
-      chunk_sizes = tuple(
-        dataset[var].sizes[dim] if size == -1 else size
-        for dim, size in zip(dims, requested, strict=True)
-      )
+      chunk_sizes = _resolve_sizes(chunk_conf, dataset[var])
       dataset[var].encoding["chunks"] = chunk_sizes
+      if configs.shards is not None:
+        shard_sizes = _resolve_sizes(configs.shards, dataset[var])
+        for dim, shard, chunk in zip(dataset[var].dims, shard_sizes, chunk_sizes, strict=True):
+          if shard % chunk:
+            raise ValueError(
+              f"{var}: shards along {dim!r} ({shard}) must be a multiple of chunks ({chunk})"
+            )
+        dataset[var].encoding["shards"] = shard_sizes
   if configs.compressors is not None:
     # Without `[save] compressors`, the variables keep their own (zarr 3) codecs or zarr's default.
     for var in dataset.data_vars:
