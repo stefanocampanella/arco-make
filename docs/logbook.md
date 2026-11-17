@@ -608,3 +608,45 @@ day D is [D 00:00, D+1 00:00) UTC, stamped D 00:00):
   accumulations cover.
 - **[Moby-Dick]** The published ERA5 accumulations are the one-hour-early sums; the corrected ones
   come with the next download.
+
+## 2026-11-17: Icechunk outputs
+
+**Maintainer's decisions (17 Nov):** every command writes an Icechunk repository; `process` and
+`compute-climatology` read Zarr v3 and Icechunk inputs (weighed against code complexity: an
+explicit `engine = "icechunk"`); one commit per block, named by its interval; measure the effect
+on memory and time.
+
+**Design:** icechunk 2.3.1. `download` commits each block (`download [start, end)`), `process`
+once, `compute-climatology` once per output with the same message. `--overwrite` is a new commit
+(older versions stay) and refuses anything that is not a repository. Checkpoints stay plain Zarr
+v3; `[save] consolidated` is gone. On a distributed client the two climatology outputs are
+computed in turn (each repository's writes are merged by computing them; one shared computation
+would need icechunk's and xarray's private writers); with local schedulers once.
+
+**S3 access:** icechunk's own AWS client cannot use the project VM's profile ("credentials-login"
+feature missing) and needs a region the profile does not set: credentials come from botocore
+(as for every other S3 access), the region from S3 (`eu-south-1` for the project bucket).
+
+**Measurements** (window 2, 0.25° levels-50, 1.3 GB; the same in both formats, values and
+attributes bit for bit):
+- End to end on the VM, one successful run each (two other runs, one per format, failed on GCS
+  read timeouts of ERA5, 600 s): plain Zarr v3 4 min 09 s, 43.4 GB peak; Icechunk 5 min 40 s,
+  36.9 GB. The download dominates; the difference is within the run-to-run spread seen so far
+  (3:54-4:29 for the same code).
+- The format alone (`bench_formats.py`, writing and reading window 2's output, one process each):
+  - Local disk: write 5.1 s (Zarr) / 5.8 s (Icechunk); whole read 2.8 / 3.4 s; one point of
+    every variable 2.2 / 3.0 s; peak memory equal (0.67 GB writing, 4.5 GB reading).
+  - Project bucket: write 58 s / 266 s at first, 57.6 s once credentials were resolved once
+    (botocore session and credential process for every client or fork before); open 6.5 / 0.7
+    s, whole read 20 / 6-7 s, one point 14 / 6 s. Icechunk reads stalled now and then for about
+    its stream timeout (60 s; up to 107 s for a whole read): with 10 s at most 22 s. arco-make
+    uses 20 s (`network_stream_timeout_seconds`). **[Moby-Dick]** consumers reading from S3 with
+    icechunk's defaults may see such stalls: a shorter stream timeout avoids them.
+- Repositories of the measurements: `experiments/icechunk-probe-20261117/` and
+  `experiments/bench-formats-20261117/` in the project bucket (about 4 GB, may be deleted).
+
+**Review (high effort), 10 findings:** 9 fixed (bucket region over the profile's, asked at the
+endpoint and for anonymous access; unusable destinations fail before any download; GCS tokens;
+equal commit messages for the two climatology outputs; synchronous scheduler kept; one helper for
+writes into sessions); one not: the proposed shared computation for distributed clients relied
+on `write_lazy` returning lazily, which it does not (it computes).
