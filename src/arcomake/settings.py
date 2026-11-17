@@ -3,7 +3,8 @@
 """User settings: credentials and machine settings from the environment and `~/.arcomakerc`.
 
 The settings are the environment variables that arco-make's libraries read (Copernicus Marine and
-CDS/EWDS credentials, AWS profile and credentials, ecCodes paths, `TMPDIR`, `DASK_*`).
+CDS/EWDS credentials, the Copernicus Marine pool size, AWS profile and credentials, ecCodes paths,
+`TMPDIR`, `DASK_*`).
 `ArcoMakeSettings` reads them from the environment and from a dotenv file, `~/.arcomakerc` (or the
 file named by `ARCOMAKE_RC`; an empty value disables it). `export KEY=VALUE` lines are allowed, so
 job scripts can `source` the same file::
@@ -82,8 +83,10 @@ class ArcoMakeSettings(BaseSettings):
     default=None, validation_alias="COPERNICUSMARINE_SERVICE_PASSWORD"
   )
   # Connections per Copernicus Marine S3 client (toolbox default 10, fewer than Dask's threads).
-  copernicusmarine_max_pool_connections: int | None = Field(
-    default=None, ge=1, validation_alias="COPERNICUSMARINE_MAX_POOL_CONNECTIONS"
+  # Text, as the toolbox reads it with `int()`, which silently falls back to 10 on values pydantic
+  # would take as integers ("32.0"); a value from the environment is not rewritten.
+  copernicusmarine_max_pool_connections: str | None = Field(
+    default=None, pattern=r"^[1-9][0-9]*$", validation_alias="COPERNICUSMARINE_MAX_POOL_CONNECTIONS"
   )
   cdsapi_url: str | None = Field(default=None, validation_alias="CDSAPI_URL", pattern=r"^https?://")
   cdsapi_key: SecretStr | None = Field(default=None, validation_alias="CDSAPI_KEY")
