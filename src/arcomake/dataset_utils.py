@@ -124,6 +124,45 @@ class PartTimeOffset(BaseModel):
     return may_parse_timedelta(value) if isinstance(value, str) else value
 
 
+# Seconds a request may take before it fails (and the block is retried). gcsfs waits forever by
+# default (N7): two downloads hung on a read from Google Cloud Storage.
+DEFAULT_TIMEOUT = 120.0
+
+
+class PartTimeout(BaseModel):
+  """`timeout` of a part: seconds a request to its source may take (default `DEFAULT_TIMEOUT`).
+
+  Applied to Zarr stores on Google Cloud Storage (gcsfs's `requests_timeout`) and on S3 (botocore's
+  connect and read timeouts), to NetCDF files over HTTP and to EWDS requests. Copernicus Marine
+  parts do not take it: the toolbox sets its own timeouts and retries.
+  """
+
+  timeout: float | None = Field(default=None, gt=0)
+
+
+def _with_timeout(part_conf: dict[str, Any], engine: str | None, timeout: float | None) -> None:
+  """Give the part's source a request timeout (`PartTimeout`), unless its options set one."""
+  seconds = timeout if timeout is not None else DEFAULT_TIMEOUT
+  if engine in ("netcdfoverhttp", "earlywarningdatastore"):
+    part_conf.setdefault("timeout", seconds)
+    return
+  url = part_conf.get("filename_or_obj")
+  if not isinstance(url, str):
+    return
+  protocol = fsspec.utils.get_protocol(url)
+  options = dict(part_conf.get("storage_options") or {})
+  if protocol in ("gs", "gcs"):
+    options.setdefault("requests_timeout", seconds)
+  elif protocol in ("s3", "s3a") and timeout is not None:
+    config = dict(options.get("config_kwargs") or {})
+    config.setdefault("connect_timeout", timeout)
+    config.setdefault("read_timeout", timeout)
+    options["config_kwargs"] = config
+  else:
+    return
+  part_conf["storage_options"] = options
+
+
 def _engine_given_or_implied(data: Any, implied: Callable[[str], bool]) -> Any:
   """A part without `engine` matches a dedicated model only if its URL implies that engine.
 
@@ -162,7 +201,7 @@ class CopernicusMarinePartConfig(PartTimeOffset):
   storage_options: dict[str, Any] | None = None
 
 
-class NetCDFOverHTTPPartConfig(PartTimeOffset):
+class NetCDFOverHTTPPartConfig(PartTimeOffset, PartTimeout):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
@@ -178,7 +217,7 @@ class NetCDFOverHTTPPartConfig(PartTimeOffset):
     )
 
 
-class EarlyWarningDataStorePartConfig(PartTimeOffset):
+class EarlyWarningDataStorePartConfig(PartTimeOffset, PartTimeout):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
@@ -202,7 +241,7 @@ class EarlyWarningDataStorePartConfig(PartTimeOffset):
     return _engine_given_or_implied(data, lambda url: _has_scheme(url, "ewds"))
 
 
-class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset):
+class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout):
   """A Zarr part: the arguments of `xarray.open_dataset`, read through a strict store."""
 
   filename_or_obj: str
@@ -214,7 +253,7 @@ class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset):
     return _engine_given_or_implied(data, lambda url: url.rstrip("/").endswith(".zarr"))
 
 
-class GenericPartConfig(ReadConfig, PartTimeOffset):
+class GenericPartConfig(ReadConfig, PartTimeOffset, PartTimeout):
   """A part read by any other xarray engine, with the arguments of `xarray.open_dataset`."""
 
   filename_or_obj: str
@@ -463,10 +502,12 @@ def download_and_process(
   parts = []
   for raw_part in configs.parts:
     offset = raw_part.time_offset or datetime.timedelta(0)
-    part_conf = raw_part.model_dump(exclude_unset=True, exclude={"time_offset"})
+    part_conf = raw_part.model_dump(exclude_unset=True, exclude={"time_offset", "timeout"})
     engine = getattr(raw_part, "engine", None) or part_conf.get("engine")
     if engine is not None:
       part_conf["engine"] = engine
+    if engine != "copernicusmarine":
+      _with_timeout(part_conf, engine, getattr(raw_part, "timeout", None))
     if engine == "earlywarningdatastore" or engine == "copernicusmarine":
       part_conf.update(start_datetime=start_datetime - offset, end_datetime=end_datetime - offset)
     part = open_input(**part_conf)

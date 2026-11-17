@@ -122,7 +122,10 @@ class NetCDFOverHTTP(BackendEntrypoint):
     filename_or_obj,
     *,
     drop_variables: str | Iterable[str] | None = None,
+    timeout: float | None = None,
   ) -> xr.Dataset:
+    """Download the file (requests wait at most `timeout` seconds for a connection or for data),
+    then open it with netCDF4."""
     logger.info(f"Downloading NetCDF from: {filename_or_obj}")
 
     registry = get_current_temp_registry()
@@ -131,7 +134,9 @@ class NetCDFOverHTTP(BackendEntrypoint):
     temp_dir = registry.create_temp_dir()
 
     temp_path = temp_dir / "downloaded.nc"
-    with requests.get(filename_or_obj, stream=True) as response:
+    # Without a timeout, a stalled connection hangs until the job's time limit (6.2).
+    request_timeout = None if timeout is None else (min(30.0, timeout), timeout)
+    with requests.get(filename_or_obj, stream=True, timeout=request_timeout) as response:
       response.raise_for_status()  # Raise an exception for HTTP errors
 
       with open(temp_path, "wb") as f:
@@ -192,6 +197,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
     latitude_dim: str = "latitude",
     longitude_dim: str = "longitude",
     max_workers: int | None = None,
+    timeout: float | None = None,
   ) -> xr.Dataset:
     url = urlparse(filename_or_obj)
     if url.path or url.query or url.fragment:
@@ -226,7 +232,10 @@ class EarlyWarningDataStore(BackendEntrypoint):
       for dates in consecutive_dates
     ]
 
-    raw_datasets = self._process_requests(dataset_name, requests, max_workers=max_workers)
+    client_options = {} if timeout is None else {"timeout": timeout}
+    raw_datasets = self._process_requests(
+      dataset_name, requests, max_workers=max_workers, **client_options
+    )
 
     datasets: list[xr.Dataset] = []
     for dates, dataset in zip(consecutive_dates, raw_datasets, strict=True):

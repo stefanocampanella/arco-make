@@ -123,6 +123,10 @@ accumulations (the value stamped 00:00 covers the last hour of the previous day)
 `time_offset = "-1h"`: the time coordinate is moved before each block is selected, and the part is
 read over the block moved the other way, so that every day holds its own hours.
 
+Every request to a source times out: a part's `timeout` (seconds, default 120) applies to Zarr stores on
+Google Cloud Storage and S3, NetCDF files over HTTP and EWDS requests (Copernicus Marine parts rely on
+the toolbox's own timeouts and retries).
+
 Every output is an [Icechunk](https://icechunk.io) repository (Zarr format 3 with versions): a local
 directory, an `s3://` or a `gs://` URL. Every run writes on a branch of its own (`run/<command>-<start
 time>`), in commits: one per block for `download` (its message names the block's interval), one for
