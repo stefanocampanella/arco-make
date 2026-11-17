@@ -138,4 +138,4 @@ From: ubuntu:26.04
 
     USAGE EXAMPLE:
 
-      apptainer run arco-make.sif download /absolute/path/to/config.toml /absolute/path/to/output.zip
+      apptainer run arco-make.sif download /absolute/path/to/config.toml /absolute/path/to/output.zarr

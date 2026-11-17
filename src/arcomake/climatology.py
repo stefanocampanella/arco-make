@@ -45,7 +45,6 @@ import os
 import time
 from collections.abc import Callable, Hashable, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack
 from typing import Any, Literal, get_args
 
 import click
@@ -282,22 +281,13 @@ def compute_climatology(
           anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
         # Compute and save the climatology and anomaly std in parallel.
         logger.info("Processing climatology and anomaly standard deviation.")
-        with ExitStack() as store_stack:
-          _climatology_delayed_save = safe_to_zarr(
-            climatology,
-            climatology_output_path,
-            configs=configs.save,
-            compute=False,
-            store_stack=store_stack,
-          )
-          _anomaly_std_delayed_save = safe_to_zarr(
-            anomaly_std,
-            anomaly_std_output_path,
-            configs=configs.save,
-            compute=False,
-            store_stack=store_stack,
-          )
-          dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
+        _climatology_delayed_save = safe_to_zarr(
+          climatology, climatology_output_path, configs=configs.save, compute=False
+        )
+        _anomaly_std_delayed_save = safe_to_zarr(
+          anomaly_std, anomaly_std_output_path, configs=configs.save, compute=False
+        )
+        dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
         logger.info("Climatology writes completed; output stores closed.")
       logger.info("Input dataset closed; closing Dask client.")
     except click.ClickException:
@@ -756,9 +746,6 @@ def _compute_by_series(
     (climatology_output_path, configs.postprocess_climatology),
     (anomaly_std_output_path, configs.postprocess_anomaly_std),
   )
-  for path, _ in outputs:
-    if str(path).endswith(".zip"):
-      raise ValueError("split_dims writes region by region: zip outputs are not supported")
   if configs.save.group is not None:
     raise ValueError("split_dims writes region by region: [save] group is not supported")
   unknown = [d for d in configs.split_dims if d not in dataset.dims]
@@ -766,15 +753,14 @@ def _compute_by_series(
     raise ValueError(f"split_dims {unknown} are not dimensions of the input: {list(dataset.dims)}")
   save = _one_index_per_chunk(configs.save, configs.split_dims)
   template = _output_template(dataset, configs.period, configs.time_dim)
-  with ExitStack() as store_stack:
-    for path, steps in outputs:
-      safe_to_zarr(
-        template.arcomake.process(steps=steps) if steps else template,
-        path,
-        configs=save,
-        compute=False,
-        store_stack=store_stack,
-      )
+  for path, steps in outputs:
+    # Metadata only: the data of the template are never computed.
+    safe_to_zarr(
+      template.arcomake.process(steps=steps) if steps else template,
+      path,
+      configs=save,
+      compute=False,
+    )
   storage_options = configs.save.storage_options or {}
   # Stored chunks of every output variable: results are chunked alike, so that Dask writes the
   # chunks of a region in parallel.

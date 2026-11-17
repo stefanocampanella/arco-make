@@ -22,7 +22,7 @@ from click.testing import CliRunner
 from fsspec.implementations.memory import MemoryFileSystem
 
 from arcomake import cli
-from arcomake.dataset_utils import DatasetConfig, ZarrPartConfig, download_and_process, open_archive
+from arcomake.dataset_utils import DatasetConfig, ZarrPartConfig, download_and_process
 
 TIMES = pd.date_range("2020-01-01", periods=24, freq="1h")
 
@@ -86,22 +86,6 @@ def test_download_part_read_error_fails(source: str):
   fail_reads_of(source, "t/3.0")
   with pytest.raises(TimeoutError):
     read_part(source)
-
-
-def test_open_archive_read_error_fails(source: str):
-  """`unpack` reads its pieces through fsspec mappers: the same rule applies."""
-  fail_reads_of(source, "t/3.0")
-  archive = source.removesuffix("/src.zarr")
-  with pytest.raises(TimeoutError):
-    open_archive(archive, glob="*.zarr", engine="zarr").load()
-
-
-def test_open_archive_guessed_engine_read_error_fails(source: str):
-  """Without `engine`, xarray guesses zarr from the names: the pieces are read strictly too."""
-  fail_reads_of(source, "t/3.0")
-  archive = source.removesuffix("/src.zarr")
-  with pytest.raises(TimeoutError):
-    open_archive(archive, glob="*.zarr").load()
 
 
 @pytest.mark.parametrize(

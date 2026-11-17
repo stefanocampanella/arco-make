@@ -3,10 +3,9 @@
 import datetime
 import logging
 import pathlib
-import posixpath
 import tempfile
 from collections.abc import Callable, Hashable, Mapping
-from contextlib import ExitStack, nullcontext
+from contextlib import nullcontext
 from typing import Annotated, Any, Literal
 
 import fsspec
@@ -20,7 +19,7 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 from xarray.backends.common import BackendEntrypoint
 from xarray.backends.plugins import guess_engine
 from xarray.coders import CFDatetimeCoder, CFTimedeltaCoder
-from zarr.storage import DirectoryStore, ZipStore
+from zarr.storage import DirectoryStore
 
 from arcomake.datetime_utils import (
   IterableDateInterval,
@@ -305,7 +304,7 @@ def open_input(filename_or_obj: Any, **kwargs: Any) -> xr.Dataset:
 
   A URL (`gs://`, `s3://`, `https://`, chained `::` URLs...) read with the zarr engine, given or
   guessed by xarray, is opened as a `strict_zarr_store`, with the `storage_options` given. Local
-  paths keep zarr's directory and zip stores, which already raise read errors. Other engines are
+  paths keep zarr's directory stores, which already raise read errors. Other engines are
   not affected.
   """
   is_url = isinstance(filename_or_obj, str) and (
@@ -422,131 +421,20 @@ def maybe_checkpointing_download_and_process(
   return dataset
 
 
-def open_archive(
-  path: str, glob: str, time_dim: str = "time", attrs_to_drop: list[str] | None = None, **kwargs
-) -> xr.Dataset:
-  """
-  Open multiple Zarr datasets matching `glob` and combine them as xarray.open_mfdataset would, with a
-  specific behavior for static variables (those without the provided time dimension):
-
-  - Time-varying variables (containing `time_dim` among their dimensions) are merged along
-    coordinates (typically along the time dimension) using xarray.open_mfdataset(combine='by_coords').
-  - Static variables (that do not contain `time_dim`) are expected to be identical across the
-    input datasets if duplicated; they are validated and included once, as-is, in the output.
-
-  Parameters
-  ---------
-  path: str | pathlib.Path
-      Directory of the Zarr datasets.
-  glob: str
-      Glob pattern to match the Zarr datasets.
-  time_dim: str
-      Name of the time dimension. Variables that do not include this dimension are considered static.
-
-  Returns
-  -------
-  xr.Dataset
-      Dataset obtained by combining the time-varying variables by coordinates and adding the static
-      variables (validated to be equal across inputs) unchanged.
-  """
-  storage_options = kwargs.pop("storage_options", {})
-  fs, fs_root_path = fsspec.url_to_fs(str(path), **storage_options)
-  glob_pattern = posixpath.join(fs_root_path, glob.lstrip("/"))
-  file_paths: list[str] = sorted(fs.glob(glob_pattern))
-  if len(file_paths) == 0:
-    raise ValueError(f"Provided path '{path}' does not contain any files matching '{glob}'.")
-  # Zarr pieces (engine given, or guessed from the first piece's name) are read through strict
-  # stores, so that a failed read raises (see `strict_zarr_store`); other engines get plain
-  # fsspec mappers.
-  if reads_as_zarr(file_paths[0], kwargs.get("engine")):
-    kwargs["engine"] = "zarr"
-  file_mappers: list[Any] = [
-    strict_zarr_store(file_path, fs=fs)
-    if kwargs.get("engine") == "zarr"
-    else fs.get_mapper(file_path)
-    for file_path in file_paths
-  ]
-  logger.info(f"Reading {len(file_mappers)} datasets from {path}")
-
-  # Drop the possibly conflicting attributes so that combining with
-  # combine_attrs="no_conflicts" does not fail when it differs across inputs.
-  attrs_to_drop_list: list[str] = [] if attrs_to_drop is None else attrs_to_drop
-
-  # Open each dataset quickly to inspect static variables. Keep inline_array=False to avoid huge graphs.
-  static_vars: dict[str, xr.DataArray] = {}
-  for file_mapper in file_mappers:
-    with xr.open_dataset(file_mapper, **kwargs) as ds:
-      for name, var in ds.data_vars.items():
-        for key in attrs_to_drop_list:
-          var.attrs.pop(key, None)
-        if time_dim not in var.dims:
-          if name in static_vars:
-            try:
-              xr.testing.assert_identical(var, static_vars[name])  # type: ignore
-            except AssertionError as exc:
-              raise ValueError(
-                f"Static variable '{name}' differs across inputs. All static variables must be identical."
-              ) from exc
-          else:
-            static_vars[name] = var.copy(deep=True)  # type: ignore
-
-  # Combine time-varying variables by coordinates using open_mfdataset
-  def _drop_static(ds: xr.Dataset) -> xr.Dataset:
-    to_drop = [name for name, var in ds.data_vars.items() if time_dim not in var.dims]
-    if to_drop:
-      # Drop only those present to avoid errors if some files lack certain static vars
-      ds = ds.drop_vars(to_drop)
-    # Drop the possibly conflicting attributes so that combining with
-    # combine_attrs="no_conflicts" does not fail when it differs across inputs.
-    for key in attrs_to_drop_list:
-      ds.attrs.pop(key, None)
-      for var in ds.variables.values():
-        var.attrs.pop(key, None)
-    return ds
-
-  ds_dynamic = xr.open_mfdataset(
-    file_mappers,
-    combine="by_coords",
-    combine_attrs="no_conflicts",
-    preprocess=_drop_static,
-    **kwargs,
-  )
-
-  # Merge back the validated static variables (if any)
-  if static_vars:
-    ds_static = xr.Dataset({k: v for k, v in static_vars.items()})
-    # xr.merge will align coordinates as needed; prefer dynamic attrs
-    ds_dynamic: xr.Dataset = xr.merge(
-      [ds_dynamic, ds_static], compat="no_conflicts", combine_attrs="no_conflicts"
-    )
-
-  return ds_dynamic
-
-
 def safe_to_zarr(
   dataset: xr.Dataset,
-  destination: str | pathlib.Path | zarr.storage.BaseStore | fsspec.mapping.FSMap,
+  destination: str | pathlib.Path,
   configs: SaveConfig | None = None,
   compute: bool = True,
   *,
   mode: Literal["w", "w-", "a", "a-", "r+", "r"] | None = None,
   append_dim: str | None = None,
-  store_stack: ExitStack | None = None,
 ) -> xr.backends.ZarrStore | Delayed:
-  """Write a dataset, explicitly managing the underlying store's lifetime.
+  """Write a dataset to a Zarr store (a local directory or an fsspec URL) with the layout,
+  compression and encodings of `[save]`.
 
-  Eager writes close their store before returning, including on failure. The
-  returned Xarray backend is already closed and needs no further cleanup.
-  For ``compute=False``, the caller must supply an active ``ExitStack`` and
-  finish computing the returned task before leaving it. The stack closes the
-  original store even if graph construction or computation fails, or the task
-  is never computed. Calling ``close`` on a Delayed object is not cleanup.
-
-  Zip stores must not be written from multiple processes; use directory stores
-  for distributed writes and archive the completed output separately.
+  With `compute=False`, returns the task that writes the data (the metadata are written now).
   """
-  if not compute and store_stack is None:
-    raise ValueError("Delayed writes require a store_stack kept open through computation")
   if configs is None:
     configs = SaveConfig()
   mode = mode or "w"
@@ -598,28 +486,17 @@ def safe_to_zarr(
       if isinstance(var_enc, dict) and isinstance(var_enc.get("compressor"), dict):
         var_enc["compressor"] = Blosc(**var_enc["compressor"])
 
-  if isinstance(destination, (zarr.storage.BaseStore, fsspec.mapping.FSMap)):
-    store = destination
-  elif isinstance(destination, str) and "://" in destination:
-    storage_options = getattr(configs, "storage_options", None) or {}
+  if isinstance(destination, str) and "://" in destination:
+    storage_options = configs.storage_options or {}
     store = fsspec.get_mapper(destination, **storage_options)
   else:
-    path_obj = pathlib.Path(destination)
-    if path_obj.suffix == ".zip":
-      # Notice that parallel writes to Zarr using zip store are (apparently) not supported.
-      zip_mode = "a" if "a" in mode else "w"
-      store = ZipStore(path=str(path_obj), mode=zip_mode, compression=0, allowZip64=True)
-    else:
-      store = DirectoryStore(path=str(path_obj))
+    store = DirectoryStore(path=str(destination))
 
   if mode in ("a", "a-", "r+") and "encoding" in to_zarr_kwargs and to_zarr_kwargs["encoding"]:
     try:
       group = to_zarr_kwargs.get("group")
-      open_mode = mode if isinstance(store, ZipStore) else "r"
       zg = (
-        zarr.open_group(store, mode=open_mode, path=group)
-        if group
-        else zarr.open_group(store, mode=open_mode)
+        zarr.open_group(store, mode="r", path=group) if group else zarr.open_group(store, mode="r")
       )
       existing_keys = set(zg.keys())
       to_zarr_kwargs["encoding"] = {
@@ -631,18 +508,6 @@ def safe_to_zarr(
       # Nothing written yet (e.g. mode "a" on a new store): every encoding applies.
       pass
 
-  close_fn = getattr(store, "close", None)
-  if not compute:
-    assert store_stack is not None
-    if close_fn is not None:
-      store_stack.callback(close_fn)
-    return dataset.to_zarr(
-      store=store, compute=False, mode=mode, append_dim=append_dim, **to_zarr_kwargs
-    )
-  try:
-    return dataset.to_zarr(
-      store=store, compute=True, mode=mode, append_dim=append_dim, **to_zarr_kwargs
-    )
-  finally:
-    if close_fn is not None:
-      close_fn()
+  return dataset.to_zarr(
+    store=store, compute=compute, mode=mode, append_dim=append_dim, **to_zarr_kwargs
+  )

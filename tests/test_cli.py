@@ -26,7 +26,7 @@ def run(*args: str) -> Result:
 def recipes(tmp_path: pathlib.Path, sources: pathlib.Path) -> dict[str, pathlib.Path]:
   directory = tmp_path / "recipes"
   directory.mkdir()
-  names = ["download", "unpack", "validate", "process", "climatology"]
+  names = ["download", "validate", "process", "climatology"]
   return {
     name: render_recipe(f"sample_{name}.toml", directory, SOURCES=str(sources)) for name in names
   }
@@ -68,22 +68,19 @@ def test_download_refuses_to_overwrite(downloaded: pathlib.Path, recipes):
   assert result.exit_code == 0, result.output
 
 
-def test_pieces_and_unpack_equal_one_download(
-  tmp_path: pathlib.Path, downloaded: pathlib.Path, recipes
-):
-  """Downloading in pieces and joining them with `unpack` gives the same dataset as one run (intent 7)."""
-  archive = tmp_path / "archive"
-  archive.mkdir()
-  for start, end in [("2020-02-26", "2020-02-28"), ("2020-02-28", "2020-03-02")]:
-    piece = archive / f"{start}_{end}.zarr"
-    result = run(
-      "download", *THREADS, f"--start={start}", f"--end={end}", str(recipes["download"]), str(piece)
-    )
-    assert result.exit_code == 0, result.output
-  joined = tmp_path / "joined.zarr"
-  result = run("unpack", *THREADS, str(recipes["unpack"]), str(archive), str(joined))
+def test_blocks_equal_one_block(tmp_path: pathlib.Path, downloaded: pathlib.Path, recipes):
+  """Downloading in blocks of `step`, appended to the output, gives the same dataset as one block
+  (intent 7); static variables are written once."""
+  recipe = recipes["download"]
+  whole = recipe.with_name("one_block.toml")
+  text = recipe.read_text()
+  assert 'step = "2D"' in text
+  whole.write_text(text.replace('step = "2D"', 'step = "5D"'))
+  output = tmp_path / "one_block.zarr"
+  result = run("download", *THREADS, str(whole), str(output))
   assert result.exit_code == 0, result.output
-  xr.testing.assert_identical(xr.open_zarr(joined).load(), xr.open_zarr(downloaded).load())
+  xr.testing.assert_identical(xr.open_zarr(output).load(), xr.open_zarr(downloaded).load())
+  assert "time" not in xr.open_zarr(downloaded).deptho.dims
 
 
 def test_validate_sample_dataset(downloaded: pathlib.Path, recipes):
