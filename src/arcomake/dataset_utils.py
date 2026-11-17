@@ -10,8 +10,9 @@ import tempfile
 import warnings
 from collections.abc import Callable, Generator, Hashable, Mapping
 from contextlib import contextmanager, nullcontext
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
+import aiohttp
 import dask
 import fsspec
 import fsspec.utils
@@ -67,7 +68,8 @@ class OpenDatasetArguments(BaseModel):
   chunked_array_type: str | None = None
   from_array_kwargs: dict[str, Any] | None = None
   backend_kwargs: dict[str, Any] | None = None
-  # Options of the fsspec filesystem of a remote input (credentials, `requests_timeout`...).
+  # Options of the fsspec filesystem of a remote input (credentials...). Download parts take their
+  # request timeouts from `timeout` (`PartTimeout`); `[read]` tables get none from arco-make.
   storage_options: dict[str, Any] | None = None
   # Zarr inputs: whether to read consolidated metadata.
   consolidated: bool | None = None
@@ -126,22 +128,60 @@ class PartTimeOffset(BaseModel):
     return may_parse_timedelta(value) if isinstance(value, str) else value
 
 
-# Seconds a request may take before it fails (and the block is retried). gcsfs waits forever by
-# default (N7): two downloads hung on a read from Google Cloud Storage.
+# Seconds a source may stay silent (no connection, no data) before the request fails. gcsfs
+# waits forever by default (N7): two downloads hung on a read from Google Cloud Storage.
 DEFAULT_TIMEOUT = 120.0
 
 
 class PartTimeout(BaseModel):
-  """`timeout` of a part: seconds a request to its source may take (default `DEFAULT_TIMEOUT`).
+  """`timeout` of a part: seconds a source may stay silent before a request to it fails
+  (default `DEFAULT_TIMEOUT`).
 
   Applied to Zarr stores on Google Cloud Storage (gcsfs's `requests_timeout`, which has none by
-  default), to NetCDF files over HTTP and to EWDS requests; on S3, only when given (botocore's
-  connect and read timeouts, 60 s by default otherwise). Copernicus Marine parts do not take it:
-  the toolbox sets its own timeouts and retries. Neither do Icechunk inputs, whose storage has
-  its own (`network_stream_timeout_seconds` on S3).
+  default), to NetCDF files over HTTP (connection at most 30 s, then each wait for data) and to
+  EWDS requests; on S3, only when given (botocore's connect and read timeouts, 60 s by default
+  otherwise). Copernicus Marine parts do not take it: the toolbox sets its own timeouts and
+  retries. Neither do Icechunk inputs, whose storage has its own
+  (`network_stream_timeout_seconds` on S3).
+
+  On GCS (`gcs_timeout`) it bounds the connection (at most 30 s) and each wait for data, not
+  the whole request: a stalled answer fails with aiohttp's `SocketTimeoutError`, which gcsfs
+  requests again (6 attempts in all, waits of about 1, 2, 4, 8 and 16 s between them), so one
+  stalled chunk costs about the timeout, not the block. GCS answers stall now and then (one ERA5
+  chunk took 212 s on 17 Nov, four at once past 600 s, each block waiting for them alone). When
+  GCS does not answer at all, a chunk fails after 6 attempts (about 3.5 minutes if no connection
+  can be made, 12.6 if connections are made but nothing comes, at the default), then its block
+  is retried. gcsfs's own `requests_timeout` is refused in a part's storage options: as a
+  number it bounds a whole request, and gcsfs does not retry the plain `TimeoutError` it raises.
+
+  No timeout bounds a whole request: large chunks over slow links are not cut, and waits for a
+  pooled connection end as the requests holding them do. An answer that trickles in more often
+  than once per `timeout` would not be cut either; none was seen.
   """
 
   timeout: float | None = Field(default=None, gt=0)
+
+  @model_validator(mode="after")
+  def _no_gcsfs_timeout(self) -> Self:
+    options = getattr(self, "storage_options", None) or {}
+    if _is_gcs(getattr(self, "filename_or_obj", None)) and "requests_timeout" in options:
+      raise ValueError(
+        "storage_options.requests_timeout: set the part's `timeout` instead (seconds of silence,"
+        " retried by gcsfs; requests_timeout is a total, which gcsfs does not retry)"
+      )
+    return self
+
+
+def _is_gcs(url: Any) -> bool:
+  """Whether `url` names a Google Cloud Storage object (chained URLs such as `simplecache::gs://`
+  are not: their storage options are per protocol)."""
+  return isinstance(url, str) and fsspec.utils.get_protocol(url) in ("gs", "gcs")
+
+
+def gcs_timeout(seconds: float) -> aiohttp.ClientTimeout:
+  """gcsfs's `requests_timeout` for a part's `timeout`: the connection and each wait for data,
+  no total (see `PartTimeout`)."""
+  return aiohttp.ClientTimeout(total=None, sock_connect=min(30.0, seconds), sock_read=seconds)
 
 
 def _with_timeout(part_conf: dict[str, Any], engine: str | None, timeout: float | None) -> None:
@@ -157,8 +197,8 @@ def _with_timeout(part_conf: dict[str, Any], engine: str | None, timeout: float 
     return
   protocol = fsspec.utils.get_protocol(url)
   options = dict(part_conf.get("storage_options") or {})
-  if protocol in ("gs", "gcs"):
-    options.setdefault("requests_timeout", seconds)
+  if _is_gcs(url):  # a recipe cannot set requests_timeout here (`PartTimeout`)
+    options.setdefault("requests_timeout", gcs_timeout(seconds))
   elif protocol in ("s3", "s3a") and timeout is not None:
     config = dict(options.get("config_kwargs") or {})
     config.setdefault("connect_timeout", timeout)
