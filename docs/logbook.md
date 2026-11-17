@@ -753,3 +753,25 @@ lost would be retried and append its block twice (each attempt now checks the br
 block first); `--blocks N` held N + 1 blocks. Found while fixing: checkpoints were removed only
 at the end of a run, harmless for 256-day pieces but filling the disk over a whole resumable
 download; they now go with their block.
+
+## 2026-11-17: ARCO-OCEAN path scheme; Icechunk repositories can be moved
+
+Maintainer's decisions for the new version of ARCO-OCEAN:
+- One repository per product type and resolution, hive-style, levels left out (every dataset has
+  50): `historical/res=0p25` (every product that is not a forecast, GloFAS's hindcast included),
+  `forecast/res=0p25` (one recipe, all products homogenized; GloFAS keeps 10 lead days like the
+  others), `climatology/res=0p25`, `anomaly-std/res=0p25`, later `observations/res=0p25`; the
+  same for `0p5` and `1p0`. Downloads write there directly: no pieces, no `archive/` (the
+  download scripts of the fork are reworked accordingly, recipes renamed after the scheme, e.g.
+  `historical_res-0p25.toml`).
+- `anomaly-std` takes a hyphen (the published path is `anomaly_std`), so only the published
+  climatology occupies a new path. The published statistics may be deleted or overwritten once
+  the historical dataset is downloaded (Moby-Dick keeps a local copy).
+
+**An Icechunk repository can be moved by copying its objects** (icechunk 2.3.1, checked locally
+and on S3 with server-side copies): no object names the repository's location, so a copy opens
+at its new path with its branches, tags and history, reads identical data at `main` and at a
+tag, takes new commits, and expires and garbage-collects there; the original is unaffected.
+Conditions: copy while nothing writes to it (a reference copied before the snapshot it names
+would be dangling), and only native chunks move (virtual references, which arco-make does not
+write, keep their absolute URLs).
