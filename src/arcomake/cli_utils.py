@@ -6,6 +6,7 @@ from typing import Any, TypeVar, overload
 
 import click
 import fsspec
+import icechunk
 from pydantic import BaseModel, ValidationError
 
 from arcomake import icechunk_utils
@@ -70,18 +71,24 @@ def check_if_overwriting(
     # Zip outputs were removed with Zarr v3: a `.zip` name would silently become a directory.
     raise click.ClickException(f"{path}: zip outputs are not supported; write a directory or a URL")
   storage_options = getattr(save_configs, "storage_options", None) if save_configs else None
-  fs, fs_path = fsspec.url_to_fs(path, **icechunk_utils.fsspec_options(path, storage_options))
+  # Fail before any work: a destination Icechunk cannot use (path, storage options, unknown S3
+  # region) or cannot reach would fail at the first write, or be overwritten.
   try:
+    storage = icechunk_utils.storage(path, storage_options)
+    fs, fs_path = fsspec.url_to_fs(path, **icechunk_utils.fsspec_options(path, storage_options))
     exists = fs.exists(fs_path)
   except Exception as exc:
-    # Fail before any work: an unreachable destination would fail late, or be overwritten.
     raise click.ClickException(f"Could not check whether {path} exists: {exc}") from exc
 
   if exists:
     if not overwrite:
       raise click.ClickException(f"Output destination {path} already exists")
     # Outputs are Icechunk repositories, overwritten in a new commit: anything else is left alone.
-    if not icechunk_utils.is_repository(path, storage_options):
+    try:
+      repository = icechunk.Repository.exists(storage)
+    except Exception as exc:
+      raise click.ClickException(f"Could not check whether {path} is a repository: {exc}") from exc
+    if not repository:
       raise click.ClickException(
         f"Output destination {path} exists and is not an Icechunk repository: remove it first"
       )

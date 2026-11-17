@@ -683,15 +683,47 @@ def _distributed_client() -> bool:
   return True
 
 
+def write_into_session(
+  dataset: xr.Dataset, session: Any, configs: SaveConfig, *, compute: bool = True
+) -> Delayed | None:
+  """Write `dataset` (with the layout of `[save]`) into a writable Icechunk session, from this
+  process: its threads may write, but no other process or worker (their writes would not reach
+  the session). With `compute=False`, only the metadata are written; returns the data's task."""
+  written = prepare_for_writing(dataset, configs).to_zarr(
+    session.store,
+    mode="w",
+    compute=compute,
+    consolidated=False,
+    zarr_format=3,
+    group=configs.group,
+  )
+  return written if isinstance(written, Delayed) else None
+
+
+def _local_scheduler() -> str:
+  """The scheduler for writes into sessions: synchronous if chosen (debugging), else threads
+  (processes cannot write into this process's sessions)."""
+  scheduler = dask.config.get("scheduler", None)
+  if scheduler in ("synchronous", "sync", "single-threaded"):
+    return "synchronous"
+  if scheduler not in (None, "threads", "threading"):
+    logger.info(f"Writing with threads instead of the {scheduler!r} scheduler")
+  return "threads"
+
+
 def write_outputs_together(
   outputs: list[tuple[xr.Dataset, str | pathlib.Path]], configs: SaveConfig, *, message: str
 ) -> list[str]:
   """Write datasets that share a computation to their repositories, one commit each.
 
-  With a local scheduler (threads, processes are not used for writes), all data are computed
-  once, written into the repositories' sessions from this process. On a distributed client the
-  sessions cannot collect the workers' writes in one computation (icechunk merges the writes of
-  one session at a time): each dataset is written in turn, and what they share is computed again.
+  With a local scheduler, all data are computed once and written into the repositories' sessions
+  from this process (`write_into_session`). On a distributed client, writes run on the workers,
+  and icechunk collects them into a session by computing that session's writes (its Dask writer
+  merges their changesets as part of the computation, one session at a time): each dataset is
+  written in turn, and what they share is computed again (logged).
+
+  The commits are one per repository, not atomic across them: give them a common `message`, so a
+  run whose last commit failed shows (rerun it with --overwrite).
   """
   if _distributed_client():
     logger.warning(
@@ -701,19 +733,11 @@ def write_outputs_together(
   sessions, writes = [], []
   for dataset, destination in outputs:
     path = _check_output_path(destination)
+    logger.info(f"Writing to {path} ({message}) with {configs}")
     session = icechunk_utils.writable_session(path, configs.storage_options)
-    writes.append(
-      prepare_for_writing(dataset, configs).to_zarr(
-        session.store,
-        mode="w",
-        compute=False,
-        consolidated=False,
-        zarr_format=3,
-        group=configs.group,
-      )
-    )
+    writes.append(write_into_session(dataset, session, configs, compute=False))
     sessions.append((path, session))
-  with dask.config.set(scheduler="threads"):
+  with dask.config.set(scheduler=_local_scheduler()):
     dask.compute(*writes)
   snapshots: list[str] = []
   for path, session in sessions:

@@ -9,7 +9,7 @@ import pydantic
 import pytest
 import xarray as xr
 
-from arcomake import cli_utils, climatology
+from arcomake import cli_utils, climatology, icechunk_utils
 from arcomake.checks import ChecksConfig
 from arcomake.cli_utils import check_if_overwriting, read_configs
 from arcomake.dataset_utils import (
@@ -187,5 +187,6 @@ def test_check_if_overwriting_fails_when_destination_is_unreachable(
       raise PermissionError("access denied")
 
   monkeypatch.setattr(cli_utils.fsspec, "url_to_fs", lambda path, **kwargs: (Unreachable(), path))
+  monkeypatch.setattr(icechunk_utils, "_bucket_region", lambda *args: "eu-south-1")  # no request
   with pytest.raises((click.ClickException, PermissionError)):
     check_if_overwriting("s3://bucket/output.zarr")

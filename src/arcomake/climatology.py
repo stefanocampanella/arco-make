@@ -69,7 +69,7 @@ from arcomake.dataset_utils import (
   ReadConfig,
   SaveConfig,
   open_input,
-  prepare_for_writing,
+  write_into_session,
   write_outputs_together,
 )
 from arcomake.processing_utils import ProcessingStepConfig
@@ -247,6 +247,9 @@ def compute_climatology(
       check_aws_profile(input_path, climatology_output_path, anomaly_std_output_path)
       for path in (climatology_output_path, anomaly_std_output_path):
         check_if_overwriting(path, overwrite=overwrite, save_configs=configs.save)
+      # The commit message of both outputs: their commits are not atomic together, equal
+      # messages show that they come from the same run.
+      message = f"compute-climatology {datetime.datetime.now(datetime.UTC):%Y-%m-%dT%H:%M:%SZ}"
       # Open input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
       with open_input(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
@@ -265,7 +268,9 @@ def compute_climatology(
         if not dataset.data_vars:
           raise ValueError("Input dataset contains no data variables.")
         if configs.split_dims is not None:
-          _compute_by_series(dataset, configs, climatology_output_path, anomaly_std_output_path)
+          _compute_by_series(
+            dataset, configs, climatology_output_path, anomaly_std_output_path, message=message
+          )
           logger.info("Climatology writes completed, one series at a time.")
           return
         climatology, anomaly_var = _compute_climatology(
@@ -290,7 +295,7 @@ def compute_climatology(
         write_outputs_together(
           [(climatology, climatology_output_path), (anomaly_std, anomaly_std_output_path)],
           configs.save,
-          message="compute-climatology",
+          message=message,
         )
         logger.info("Climatology and anomaly standard deviation committed.")
       logger.info("Input dataset closed; closing Dask client.")
@@ -744,6 +749,8 @@ def _compute_by_series(
   configs: ClimatologyConfig,
   climatology_output_path: str,
   anomaly_std_output_path: str,
+  *,
+  message: str,
 ) -> None:
   """S1: one series (variable, index of `split_dims`) at a time, written into its region.
 
@@ -768,9 +775,9 @@ def _compute_by_series(
   sessions = [icechunk_utils.writable_session(path, save.storage_options) for path, _ in outputs]
   for (_, steps), session in zip(outputs, sessions, strict=True):
     # Metadata only: the data of the template are never computed.
-    prepare_for_writing(
-      template.arcomake.process(steps=steps) if steps else template, save
-    ).to_zarr(session.store, mode="w", compute=False, consolidated=False, zarr_format=3)
+    write_into_session(
+      template.arcomake.process(steps=steps) if steps else template, session, save, compute=False
+    )
   # Stored chunks (shards, if any: the units of writing) of every output variable: results are
   # chunked alike, so that Dask writes the chunks of a region in parallel.
   stored_chunks = [
@@ -835,7 +842,7 @@ def _compute_by_series(
     if pending is not None:
       pending.result()
   for (path, _), session in zip(outputs, sessions, strict=True):
-    snapshot = session.commit(f"compute-climatology: {len(series)} series")
+    snapshot = session.commit(f"{message}: {len(series)} series")
     logger.info(f"Committed {snapshot} to {path}")
 
 

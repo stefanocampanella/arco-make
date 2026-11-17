@@ -5,10 +5,12 @@
 A path names a repository on a local filesystem (a directory, or a `file://` URL), on S3
 (`s3://bucket/prefix`) or on Google Cloud Storage (`gs://bucket/prefix`). Recipes give its options
 in `storage_options`, as for fsspec, but only these are understood (others are an error):
-- S3: `profile` (else `AWS_PROFILE`), `region` (else the profile's, else the bucket's, asked to
-  S3), `endpoint_url`, `anon`; credentials come from botocore, as for every other S3 access of
-  arco-make (icechunk's own AWS client cannot use some profiles), refreshed before they expire.
-- GCS: `token = "anon"` for anonymous access; otherwise the environment's credentials.
+- S3: `profile` (else `AWS_PROFILE`), `region` (else the bucket's, asked to S3 at the endpoint;
+  else the profile's), `endpoint_url`, `anon`; credentials come from botocore, as for every other
+  S3 access of arco-make (icechunk's own AWS client cannot use some profiles), refreshed before
+  they expire.
+- GCS: `token = "anon"` for anonymous access, or the path of a service account file; otherwise
+  the environment's credentials.
 """
 
 import datetime
@@ -50,16 +52,35 @@ def _botocore_credentials(profile: str | None) -> icechunk.S3StaticCredentials:
 
 
 @functools.cache
-def _bucket_region(bucket: str, profile: str | None) -> str | None:
-  """The region of an S3 bucket: the profile's, else the one S3 reports for the bucket."""
+def _bucket_region(
+  bucket: str, profile: str | None, endpoint_url: str | None, anonymous: bool
+) -> str:
+  """The region of an S3 bucket, as S3 reports it (`x-amz-bucket-region`, also in the error
+  answers, e.g. 301 or 403); else the profile's; else, for an S3-compatible endpoint, us-east-1.
+
+  Asked to the recipe's endpoint, signed or not as the repository's requests will be.
+  """
+  import botocore
+  import botocore.config
+  import botocore.exceptions
   import botocore.session
 
   session = botocore.session.Session(profile=profile)
-  region = session.get_config_variable("region")
-  if not region:
-    response = session.create_client("s3").head_bucket(Bucket=bucket)
-    region = response["ResponseMetadata"]["HTTPHeaders"].get("x-amz-bucket-region")
-  return str(region) if region else None
+  configured = session.get_config_variable("region")
+  config = botocore.config.Config(signature_version=botocore.UNSIGNED) if anonymous else None
+  client = session.create_client(
+    "s3", endpoint_url=endpoint_url, region_name=configured or "us-east-1", config=config
+  )
+  try:
+    headers = client.head_bucket(Bucket=bucket)["ResponseMetadata"]["HTTPHeaders"]
+  except botocore.exceptions.ClientError as error:
+    headers = error.response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+  region = headers.get("x-amz-bucket-region") or configured
+  if region:
+    return str(region)
+  if endpoint_url is not None:
+    return "us-east-1"
+  raise ValueError(f"the region of bucket {bucket!r} is unknown: set storage_options.region")
 
 
 def _unknown(options: Mapping[str, Any], known: set[str], where: str) -> None:
@@ -73,7 +94,12 @@ def _unknown(options: Mapping[str, Any], known: set[str], where: str) -> None:
 def storage(
   path: str | pathlib.Path, storage_options: Mapping[str, Any] | None = None
 ) -> icechunk.Storage:
-  """The Icechunk storage of a repository path (see the module's docstring)."""
+  """The Icechunk storage of a repository path (see the module's docstring).
+
+  Raises:
+    ValueError: for a path Icechunk cannot store a repository at, an option it cannot honour, or
+      an S3 bucket whose region cannot be found.
+  """
   options = dict(storage_options or {})
   path = str(path)
   protocol = fsspec.utils.get_protocol(path)
@@ -81,33 +107,40 @@ def storage(
     return icechunk.local_filesystem_storage(
       str(pathlib.Path(path.removeprefix("file://")).absolute())
     )
+  if protocol not in ("s3", "s3a", "gs", "gcs"):
+    raise ValueError(f"{path}: Icechunk repositories live on local paths, s3:// or gs:// URLs")
   bucket, _, prefix = path.split("://", 1)[1].partition("/")
   prefix = prefix.strip("/") or None
   if protocol in ("s3", "s3a"):
     _unknown(options, S3_OPTIONS, "S3 repositories")
-    if options.get("anon"):
+    anonymous = bool(options.get("anon"))
+    profile, endpoint_url = options.get("profile"), options.get("endpoint_url")
+    region = options.get("region") or _bucket_region(bucket, profile, endpoint_url, anonymous)
+    if anonymous:
       return icechunk.s3_storage(
-        bucket=bucket,
-        prefix=prefix,
-        region=options.get("region"),
-        endpoint_url=options.get("endpoint_url"),
-        anonymous=True,
+        bucket=bucket, prefix=prefix, region=region, endpoint_url=endpoint_url, anonymous=True
       )
-    profile = options.get("profile")
     return icechunk.s3_storage(
       bucket=bucket,
       prefix=prefix,
-      region=options.get("region") or _bucket_region(bucket, profile),
-      endpoint_url=options.get("endpoint_url"),
+      region=region,
+      endpoint_url=endpoint_url,
       get_credentials=functools.partial(_botocore_credentials, profile),
     )
-  if protocol in ("gs", "gcs"):
-    _unknown(options, GCS_OPTIONS, "GCS repositories")
-    anonymous = options.get("token") == "anon"
+  _unknown(options, GCS_OPTIONS, "GCS repositories")
+  token = options.get("token")
+  if token == "anon":
+    return icechunk.gcs_storage(bucket=bucket, prefix=prefix, anonymous=True)
+  if token is None:
+    return icechunk.gcs_storage(bucket=bucket, prefix=prefix, from_env=True)
+  if isinstance(token, str) and pathlib.Path(token).expanduser().is_file():
     return icechunk.gcs_storage(
-      bucket=bucket, prefix=prefix, anonymous=anonymous or None, from_env=not anonymous or None
+      bucket=bucket, prefix=prefix, service_account_file=str(pathlib.Path(token).expanduser())
     )
-  raise ValueError(f"{path}: Icechunk repositories live on local paths, s3:// or gs:// URLs")
+  raise ValueError(
+    'storage_options.token for GCS repositories: "anon" or a service account file '
+    "(without it, the environment's credentials)"
+  )
 
 
 def is_repository(
@@ -132,8 +165,7 @@ def write(
   The repository is created if missing. Mode "w" replaces the content in a new commit: earlier
   versions stay in the repository's history.
   """
-  repo = icechunk.Repository.open_or_create(storage(path, storage_options))
-  session = repo.writable_session(BRANCH)
+  session = writable_session(path, storage_options)
   to_icechunk(dataset, session, mode=mode, append_dim=append_dim, group=group)
   snapshot = session.commit(message)
   logger.info(f"Committed {snapshot} to {path}: {message}")
