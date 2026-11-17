@@ -126,22 +126,24 @@ class NetCDFOverHTTP(BackendEntrypoint):
   ) -> xr.Dataset:
     """Download the file (requests wait at most `timeout` seconds for a connection or for data),
     then open it with netCDF4."""
-    logger.info(f"Downloading NetCDF from: {filename_or_obj}")
+    logger.info(f"Reading NetCDF from: {filename_or_obj}")
 
     registry = get_current_temp_registry()
     if registry is None:
       raise ValueError("No temporary directory registry available.")
-    temp_dir = registry.create_temp_dir()
 
-    temp_path = temp_dir / "downloaded.nc"
-    # Without a timeout, a stalled connection hangs until the job's time limit (6.2).
-    request_timeout = None if timeout is None else (min(30.0, timeout), timeout)
-    with requests.get(filename_or_obj, stream=True, timeout=request_timeout) as response:
-      response.raise_for_status()  # Raise an exception for HTTP errors
+    def fetch(path) -> None:
+      # Without a timeout, a stalled connection hangs until the job's time limit (6.2).
+      request_timeout = None if timeout is None else (min(30.0, timeout), timeout)
+      with requests.get(filename_or_obj, stream=True, timeout=request_timeout) as response:
+        response.raise_for_status()  # Raise an exception for HTTP errors
+        with open(path, "wb") as f:
+          for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
 
-      with open(temp_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-          f.write(chunk)
+    # Fetched once per run (registry): every block of a download reads the same file, and a
+    # server outage after the first block no longer fails the others (as on 16 Nov for GloFAS).
+    temp_path = registry.cached_file(filename_or_obj, "downloaded.nc", fetch)
 
     # Open the downloaded file as xarray Dataset
     dataset = xr.open_dataset(temp_path, engine="netcdf4", drop_variables=drop_variables)

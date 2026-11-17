@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import uuid
+from collections.abc import Callable
 from typing import Any, Self
 
 logger = logging.getLogger(__name__)
@@ -149,6 +150,10 @@ class TempDirectoryRegistry:
     self._token: contextvars.Token[TempDirectoryRegistry | None] | None = None
     self._pid = os.getpid()
     self._closed = False
+    # Files fetched once for the registry's lifetime (`cached_file`), and the lock that makes
+    # concurrent requests for the same key wait for one fetch.
+    self._files: dict[str, pathlib.Path] = {}
+    self._files_lock = threading.Lock()
 
     parent_base = pathlib.Path(base_dir) if base_dir is not None else self.get_base_scratch_dir()
     parent_base.mkdir(parents=True, exist_ok=True)
@@ -181,6 +186,26 @@ class TempDirectoryRegistry:
       )
       path = pathlib.Path(tmpdir)
       logger.info(f"Created temporary directory: {path}")
+      return path
+
+  def cached_file(self, key: str, name: str, fetch: Callable[[pathlib.Path], None]) -> pathlib.Path:
+    """The file `name` fetched once for `key` (e.g. a URL) in this registry's lifetime.
+
+    `fetch(path)` writes it the first time; a fetch that fails is not remembered (its directory
+    is removed), so the next request tries again. The file is removed with the registry.
+    """
+    with self._files_lock:
+      cached = self._files.get(key)
+      if cached is not None and cached.exists():
+        return cached
+      directory = self.create_temp_dir()
+      path = directory / name
+      try:
+        fetch(path)
+      except BaseException:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+      self._files[key] = path
       return path
 
   def register[T: contextlib.AbstractContextManager[Any]](self, context_or_cleanup: T) -> T:
