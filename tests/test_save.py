@@ -3,29 +3,36 @@
 """Writing outputs (`safe_to_zarr`)."""
 
 import pathlib
+import warnings
 
 import dask
+import numcodecs
 import numpy as np
 import pytest
 import xarray as xr
 import zarr
+import zarr.errors
+from pydantic import ValidationError
 
 from arcomake import dataset_utils
-from arcomake.dataset_utils import CompressorConfig, SaveConfig, safe_to_zarr
+from arcomake.dataset_utils import SaveConfig, safe_to_zarr
 
-SAVE = SaveConfig(
-  chunks={"time": 1, "depth": 1, "latitude": -1, "longitude": -1},
-  compressor=CompressorConfig(cname="lz4", clevel=1),
+LZ4 = {"name": "blosc", "configuration": {"cname": "lz4", "clevel": 1, "shuffle": "shuffle"}}
+SAVE = SaveConfig.model_validate(
+  {"chunks": {"time": 1, "depth": 1, "latitude": -1, "longitude": -1}, "compressors": [LZ4]}
 )
 
 
 def test_safe_to_zarr_directory_layout(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
-  """`[save] chunks` sets the stored chunks per dimension (-1: whole dimension) and the compressor."""
+  """`[save] chunks` sets the stored chunks per dimension (-1: whole dimension) and `compressors`
+  the compressors, in Zarr format 3."""
   safe_to_zarr(ocean_ds, tmp_path / "out.zarr", configs=SAVE)
   group = zarr.open_group(str(tmp_path / "out.zarr"), mode="r")
+  assert group.metadata.zarr_format == 3
   assert group["thetao"].chunks == (1, 1, 8, 8)
   assert group["zos"].chunks == (1, 8, 8)
-  assert group["thetao"].compressor.cname == "lz4"
+  (codec,) = group["thetao"].compressors
+  assert (codec.cname, codec.clevel, codec.shuffle) == ("lz4", 1, "shuffle")
   xr.testing.assert_allclose(xr.open_zarr(tmp_path / "out.zarr").load(), ocean_ds)
 
 
@@ -49,7 +56,9 @@ def test_safe_to_zarr_whole_dimension_with_split_dask_chunks(tmp_path: pathlib.P
 
 @pytest.mark.parametrize("key", ["_FillValue", "fill_value"])
 def test_safe_to_zarr_sets_the_fill_value(key: str, tmp_path: pathlib.Path):
-  """`[save.encoding.<var>] _FillValue` (or `fill_value`) becomes the stored fill value.
+  """`[save.encoding.<var>] _FillValue` (or `fill_value`) becomes the CF fill value: missing
+  values are stored as it, and the `_FillValue` attribute names it (in Zarr format 3, xarray keeps
+  it apart from the array's own fill value, used for chunks never written).
 
   The model forbade `_FillValue` and passed `fill_value`, which xarray rejects: the write failed
   after the first interval was downloaded.
@@ -57,8 +66,11 @@ def test_safe_to_zarr_sets_the_fill_value(key: str, tmp_path: pathlib.Path):
   ds = xr.Dataset({"v": ("x", np.array([1.0, np.nan, 3.0]))})
   conf = SaveConfig.model_validate({"encoding": {"v": {key: -9.0}}})
   safe_to_zarr(ds, tmp_path / "out.zarr", configs=conf)
-  assert zarr.open_array(str(tmp_path / "out.zarr" / "v"), mode="r").fill_value == -9.0
-  xr.testing.assert_identical(xr.open_zarr(tmp_path / "out.zarr").load(), ds)
+  stored = zarr.open_array(str(tmp_path / "out.zarr" / "v"), mode="r")
+  assert stored[:].tolist() == [1.0, -9.0, 3.0]
+  out = xr.open_zarr(tmp_path / "out.zarr")
+  assert out["v"].encoding["_FillValue"] == -9.0
+  xr.testing.assert_identical(out.load(), ds)
 
 
 def test_safe_to_zarr_packs_with_scale_factor(tmp_path: pathlib.Path):
@@ -97,9 +109,70 @@ def test_safe_to_zarr_does_not_modify_input_encoding(ocean_ds: xr.Dataset, tmp_p
 
 
 def test_safe_to_zarr_default_compression(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
-  """Without a compressor in the recipe, zarr's default compressor is used, not none."""
+  """Without compressors in the recipe, zarr's default compressor is used, not none; an empty
+  list stores the data uncompressed."""
   safe_to_zarr(ocean_ds, tmp_path / "out.zarr", configs=SaveConfig())
-  assert zarr.open_group(str(tmp_path / "out.zarr"), mode="r")["thetao"].compressor is not None
+  assert zarr.open_group(str(tmp_path / "out.zarr"), mode="r")["thetao"].compressors != ()
+  safe_to_zarr(ocean_ds, tmp_path / "raw.zarr", configs=SaveConfig(compressors=[]))
+  assert zarr.open_group(str(tmp_path / "raw.zarr"), mode="r")["thetao"].compressors == ()
+
+
+def test_consolidated_metadata_without_warning(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
+  """Consolidated metadata are written by default (maintainer's choice), without zarr's warning
+  that they are not part of the format 3 specification."""
+  with warnings.catch_warnings():
+    warnings.simplefilter("error", zarr.errors.ZarrUserWarning)
+    safe_to_zarr(ocean_ds, tmp_path / "out.zarr", configs=SAVE)
+  assert zarr.open_group(str(tmp_path / "out.zarr"), mode="r").metadata.consolidated_metadata
+
+
+@pytest.mark.parametrize("compressors", [[LZ4], None])
+def test_codecs_of_zarr2_sources_are_replaced(
+  compressors, ocean_ds: xr.Dataset, tmp_path: pathlib.Path
+):
+  """Data read from a Zarr v2 store (numcodecs codecs in their encoding, as the remote sources
+  have) are written in format 3, with the recipe's compressors or zarr's default."""
+  source = tmp_path / "v2.zarr"
+  ocean_ds.to_zarr(
+    source, zarr_format=2, encoding={"thetao": {"compressors": [numcodecs.Blosc("zstd", 3)]}}
+  )
+  read = xr.open_zarr(source)
+  assert isinstance(read.thetao.encoding["compressors"][0], numcodecs.Blosc)
+  safe_to_zarr(read, tmp_path / "out.zarr", configs=SaveConfig(compressors=compressors))
+  out = zarr.open_group(str(tmp_path / "out.zarr"), mode="r")
+  expected = "BloscCodec" if compressors else "ZstdCodec"
+  assert [type(c).__name__ for c in out["thetao"].compressors] == [expected]
+  assert read.thetao.encoding["compressors"][0] == numcodecs.Blosc("zstd", 3)  # input unchanged
+  xr.testing.assert_identical(xr.open_zarr(tmp_path / "out.zarr").load(), read.load())
+
+
+def test_per_variable_compressors(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
+  """`[save.encoding.<var>] compressors` replace those of `[save]` for that variable."""
+  zstd = {"name": "zstd", "configuration": {"level": 5}}
+  conf = SaveConfig.model_validate(
+    {"compressors": [LZ4], "encoding": {"zos": {"compressors": [zstd]}}}
+  )
+  safe_to_zarr(ocean_ds, tmp_path / "out.zarr", configs=conf)
+  group = zarr.open_group(str(tmp_path / "out.zarr"), mode="r")
+  assert type(group["thetao"].compressors[0]).__name__ == "BloscCodec"
+  assert type(group["zos"].compressors[0]).__name__ == "ZstdCodec"
+
+
+@pytest.mark.parametrize(
+  "codec, message",
+  [
+    ({"name": "lz5"}, "invalid codec 'lz5'"),
+    ({"name": "blosc", "configuration": {"cname": "lz4", "clevl": 1}}, "clevl"),
+    ({"name": "blosc", "configuration": {"cname": "lz5"}}, "cname"),
+    ({"name": "bytes"}, "not a compressor"),
+    ({"name": "zstd", "level": 3}, "Extra inputs"),
+  ],
+)
+def test_invalid_compressors_fail_when_loaded(codec: dict, message: str):
+  """Unknown codecs, unknown or invalid settings and codecs that are not compressors are errors
+  when the recipe is loaded, before any download."""
+  with pytest.raises(ValidationError, match=message):
+    SaveConfig.model_validate({"compressors": [codec]})
 
 
 def test_safe_to_zarr_append_mode_on_a_new_store(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):

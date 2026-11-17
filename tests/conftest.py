@@ -13,6 +13,7 @@ Below the bathymetry and on land the 3D fields are NaN, as in a real ocean reana
 import pathlib
 import tempfile
 
+import numcodecs
 import numpy as np
 import pandas as pd
 import pytest
@@ -120,12 +121,20 @@ def atmosphere_ds() -> xr.Dataset:
 
 @pytest.fixture
 def sources(tmp_path: pathlib.Path) -> pathlib.Path:
-  """Write the synthetic sources as local Zarr stores and return their directory."""
+  """Write the synthetic sources as local Zarr stores and return their directory.
+
+  In Zarr format 2 with numcodecs' Blosc, as the remote sources (ERA5, GLORYS) are: their codecs
+  reach the encodings of the data read, which outputs in format 3 must not reuse.
+  """
   directory = tmp_path / "sources"
   directory.mkdir()
-  make_ocean_dataset().to_zarr(directory / "ocean.zarr", mode="w")
-  make_static_dataset().to_zarr(directory / "static.zarr", mode="w")
-  make_atmosphere_dataset().to_zarr(directory / "atmosphere.zarr", mode="w")
+  for name, ds in [
+    ("ocean", make_ocean_dataset()),
+    ("static", make_static_dataset()),
+    ("atmosphere", make_atmosphere_dataset()),
+  ]:
+    encoding = {var: {"compressors": [numcodecs.Blosc("lz4", 5)]} for var in ds.data_vars}
+    ds.to_zarr(directory / f"{name}.zarr", mode="w", zarr_format=2, encoding=encoding)
   return directory
 
 

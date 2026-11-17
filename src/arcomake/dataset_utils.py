@@ -4,22 +4,22 @@ import datetime
 import logging
 import pathlib
 import tempfile
+import warnings
 from collections.abc import Callable, Hashable, Mapping
 from contextlib import nullcontext
 from typing import Annotated, Any, Literal
 
-import fsspec
 import xarray as xr
+import zarr
 import zarr.errors
-import zarr.storage
 from dask.delayed import Delayed
 from dask.diagnostics import ProgressBar
-from numcodecs import Blosc
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 from xarray.backends.common import BackendEntrypoint
-from xarray.backends.plugins import guess_engine
 from xarray.coders import CFDatetimeCoder, CFTimedeltaCoder
-from zarr.storage import DirectoryStore
+from zarr.abc.codec import ArrayArrayCodec, ArrayBytesCodec, BytesBytesCodec
+from zarr.errors import ZarrUserWarning
+from zarr.registry import get_codec_class
 
 from arcomake.datetime_utils import (
   IterableDateInterval,
@@ -73,13 +73,33 @@ class ReadConfig(OpenDatasetArguments):
   engine: EngineType | None = None
 
 
-class CompressorConfig(BaseModel):
+class CodecConfig(BaseModel):
+  """A Zarr v3 compressor (a bytes-to-bytes codec), as Zarr array metadata write it.
+
+  For example `{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuffle = "shuffle"}}`
+  or `{name = "zstd", configuration = {level = 3}}`. The codec is built when the recipe is loaded,
+  so unknown codecs and invalid configurations fail before any work.
+  """
+
   model_config = ConfigDict(extra="forbid")
 
-  cname: Literal["lz4", "lz4hc", "zstd", "zlib", "snappy"]
-  clevel: int = Field(ge=0, le=9)
-  shuffle: Literal[0, 1, 2] | None = None
-  blocksize: int | None = Field(default=None, ge=0)
+  name: str
+  configuration: dict[str, Any] = Field(default_factory=dict)
+
+  @model_validator(mode="after")
+  def _known_compressor(self) -> "CodecConfig":
+    try:
+      codec_class = get_codec_class(self.name)
+      codec_class.from_dict(self.model_dump())
+    except Exception as error:  # unknown codec, unknown or invalid configuration
+      raise ValueError(f"invalid codec {self.name!r}: {error}") from None
+    if not issubclass(codec_class, BytesBytesCodec):
+      raise ValueError(f"codec {self.name!r} is not a compressor (bytes-to-bytes codec)")
+    return self
+
+
+# Compressors of an array, applied in order; an empty list stores the data uncompressed.
+CompressorsConfig = list[CodecConfig]
 
 
 def _engine_given_or_implied(data: Any, implied: Callable[[str], bool]) -> Any:
@@ -204,7 +224,8 @@ class VariableEncodingConfig(BaseModel):
   """One variable's encoding in `[save.encoding]`, as `xarray.Dataset.to_zarr` takes it.
 
   The fill value is `_FillValue` (`fill_value` is accepted too); `scale_factor` and `add_offset`
-  pack floats into integers. `chunks` are explicit sizes, one per dimension.
+  pack floats into integers. `chunks` are explicit sizes, one per dimension. `compressors` replace
+  those of `[save]` for this variable.
   """
 
   model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -213,7 +234,7 @@ class VariableEncodingConfig(BaseModel):
   calendar: str | None = None
   dtype: str | None = None
   chunks: list[Annotated[int, Field(ge=1)]] | None = None
-  compressor: CompressorConfig | None = None
+  compressors: CompressorsConfig | None = None
   fill_value: float | int | str | bool | None = Field(
     default=None,
     validation_alias=AliasChoices("_FillValue", "fill_value"),
@@ -235,7 +256,8 @@ class SaveConfig(BaseModel):
 
   consolidated: bool | None = None
   chunks: StoredChunksConfig | None = None
-  compressor: CompressorConfig | None = None
+  # Compressors of the data variables; without them, zarr's default (zstd).
+  compressors: CompressorsConfig | None = None
   encoding: dict[str, VariableEncodingConfig] | None = None
   storage_options: dict[str, Any] | None = None
   group: str | None = None
@@ -255,7 +277,7 @@ class CheckpointingConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   step: datetime.timedelta
-  compressor: CompressorConfig | None = None
+  compressors: CompressorsConfig | None = None
 
   @field_validator("step", mode="before")
   @classmethod
@@ -263,59 +285,13 @@ class CheckpointingConfig(BaseModel):
     return may_parse_timedelta(value)
 
 
-def strict_zarr_store(
-  path: str,
-  *,
-  fs: fsspec.AbstractFileSystem | None = None,
-  storage_options: Mapping[str, Any] | None = None,
-) -> zarr.storage.FSStore:
-  """A read-only fsspec Zarr store on which only a missing object is a missing chunk.
-
-  zarr 2 reads a chunk whose object does not exist as the fill value (that is how sparse stores
-  work). Its `FSStore` does the same, by default, for `PermissionError` and any `OSError`, which
-  include timeouts and connection errors: a failed read would become NaN with no message, and a
-  later mean would skip it. This store raises those errors instead.
-
-  Args:
-    path: URL of the store, or its path on `fs`.
-    fs: The filesystem of `path`; by default, the one its URL names.
-    storage_options: Options of that filesystem (when `fs` is not given).
-  """
-  return zarr.storage.FSStore(
-    path, mode="r", fs=fs, exceptions=(KeyError,), **dict(storage_options or {})
-  )
-
-
-def reads_as_zarr(filename_or_obj: str, engine: str | None) -> bool:
-  """Whether `xarray.open_dataset(filename_or_obj, engine=engine)` uses the zarr engine.
-
-  Without an engine, xarray guesses one from the name (e.g. a `.zarr` suffix).
-  """
-  if engine is not None:
-    return engine == "zarr"
-  try:
-    return guess_engine(filename_or_obj) == "zarr"
-  except ValueError:
-    return False
-
-
 def open_input(filename_or_obj: Any, **kwargs: Any) -> xr.Dataset:
-  """`xarray.open_dataset`, raising read errors of Zarr stores given as fsspec URLs.
+  """`xarray.open_dataset`, the one way arco-make opens its inputs.
 
-  A URL (`gs://`, `s3://`, `https://`, chained `::` URLs...) read with the zarr engine, given or
-  guessed by xarray, is opened as a `strict_zarr_store`, with the `storage_options` given. Local
-  paths keep zarr's directory stores, which already raise read errors. Other engines are
-  not affected.
+  Read errors of Zarr stores raise (N8): zarr 3 reads only a missing object as the fill value
+  (sparse stores); timeouts and connection errors raise (`tests/test_read_errors.py`).
   """
-  is_url = isinstance(filename_or_obj, str) and (
-    "://" in filename_or_obj or "::" in filename_or_obj
-  )
-  if is_url and reads_as_zarr(filename_or_obj, kwargs.get("engine")):
-    kwargs["engine"] = "zarr"
-    storage_options = kwargs.pop("storage_options", None)
-    filename_or_obj = strict_zarr_store(filename_or_obj, storage_options=storage_options)
-  # xarray accepts zarr stores, but its type hints do not list them.
-  return xr.open_dataset(filename_or_obj, **kwargs)  # ty: ignore[invalid-argument-type]
+  return xr.open_dataset(filename_or_obj, **kwargs)
 
 
 class DatasetConfig(BaseModel):
@@ -361,6 +337,52 @@ def download_and_process(
   return dataset
 
 
+def _codecs(compressors: CompressorsConfig) -> list[dict[str, Any]]:
+  """The compressors of a recipe as zarr takes them (JSON metadata)."""
+  return [codec.model_dump() for codec in compressors]
+
+
+_ZARR3_CODECS = {
+  "compressors": BytesBytesCodec,
+  "filters": ArrayArrayCodec,
+  "serializer": ArrayBytesCodec,
+}
+
+
+def _without_zarr2_codecs(dataset: xr.Dataset) -> xr.Dataset:
+  """A shallow copy (own encodings, shared data) without the codecs read from Zarr v2 sources.
+
+  Variables read from a format 2 store carry numcodecs codecs in their encoding, which zarr 3
+  cannot write in format 3: they are dropped, so the recipe's codecs or zarr's defaults apply.
+  Codecs read from format 3 stores are kept.
+  """
+  dataset = dataset.copy(deep=False)
+  for variable in dataset.variables.values():
+    encoding = variable.encoding
+    encoding.pop("compressor", None)  # zarr 2's single compressor
+    for key, kind in _ZARR3_CODECS.items():
+      codecs = encoding.get(key)
+      if codecs is None:
+        continue
+      if not all(
+        isinstance(c, kind) for c in (codecs if isinstance(codecs, list | tuple) else [codecs])
+      ):
+        del encoding[key]
+  return dataset
+
+
+def _write_zarr(dataset: xr.Dataset, path: str, **kwargs: Any) -> xr.backends.ZarrStore | Delayed:
+  """`Dataset.to_zarr` in Zarr format 3. Consolidated metadata are written as asked (by default),
+  without zarr's warning that they are not part of the format 3 specification."""
+  with warnings.catch_warnings():
+    warnings.filterwarnings(
+      "ignore", message="Consolidated metadata is currently not part", category=ZarrUserWarning
+    )
+    written = dataset.to_zarr(path, zarr_format=3, **kwargs)
+  assert isinstance(written, xr.backends.ZarrStore | Delayed)
+  return written
+
+
 def maybe_checkpointing_download_and_process(
   configs: DatasetConfig,
   start_datetime: datetime.datetime,
@@ -370,9 +392,10 @@ def maybe_checkpointing_download_and_process(
 ) -> xr.Dataset:
   checkpointing_conf = configs.checkpointing
   checkpointing_step = checkpointing_conf.step if checkpointing_conf else None
-  compressor_conf = checkpointing_conf.compressor if checkpointing_conf else None
-  compressor = (
-    Blosc(**compressor_conf.model_dump(exclude_none=True)) if compressor_conf is not None else None
+  compressors = (
+    _codecs(checkpointing_conf.compressors)
+    if checkpointing_conf is not None and checkpointing_conf.compressors is not None
+    else None
   )
 
   if checkpointing_step is None:
@@ -390,31 +413,32 @@ def maybe_checkpointing_download_and_process(
     checkpoint_path = pathlib.Path(checkpoint.name)
 
   logger.info(f"Checkpointing to {checkpoint_path} every {parsed_step}")
-  checkpoint_store = DirectoryStore(str(checkpoint_path))
   date_intervals = IterableDateInterval(start_datetime, end_datetime, parsed_step)
   is_first_checkpoint = True
   for date_interval in date_intervals:
     with download_and_process(
       configs, date_interval.start, date_interval.end, time_dim=time_dim
     ) as downloaded:
-      # A shallow copy has its own encodings: the downloaded dataset is left unchanged.
-      dataset = downloaded.copy(deep=False)
-      if compressor is not None:
+      # A copy with its own encodings: the downloaded dataset is left unchanged.
+      dataset = _without_zarr2_codecs(downloaded)
+      if compressors is not None:
         for var in dataset.data_vars:
-          dataset[var].encoding["compressor"] = compressor
+          dataset[var].encoding["compressors"] = compressors
       logger.info(f"Saving checkpoint {date_interval}")
       progress_bar = nullcontext if not progress else ProgressBar
       with progress_bar():
         if is_first_checkpoint:
-          dataset.to_zarr(store=checkpoint_store, mode="w", compute=True)
+          _write_zarr(dataset, str(checkpoint_path), mode="w", consolidated=False)
           is_first_checkpoint = False
         else:
-          dataset.to_zarr(store=checkpoint_store, mode="a-", append_dim=time_dim, compute=True)
+          _write_zarr(
+            dataset, str(checkpoint_path), mode="a-", append_dim=time_dim, consolidated=False
+          )
     del dataset
 
   # Open the checkpointed dataset
   logger.info(f"Opening checkpointed dataset from {checkpoint_path}")
-  dataset = xr.open_zarr(store=checkpoint_store, overwrite_encoded_chunks=True)
+  dataset = xr.open_zarr(str(checkpoint_path), consolidated=False, overwrite_encoded_chunks=True)
   assert isinstance(dataset, xr.Dataset)
   if checkpoint is not None:
     dataset.set_close(checkpoint.cleanup)
@@ -430,28 +454,24 @@ def safe_to_zarr(
   mode: Literal["w", "w-", "a", "a-", "r+", "r"] | None = None,
   append_dim: str | None = None,
 ) -> xr.backends.ZarrStore | Delayed:
-  """Write a dataset to a Zarr store (a local directory or an fsspec URL) with the layout,
-  compression and encodings of `[save]`.
+  """Write a dataset to a Zarr store in format 3 (a local directory or an fsspec URL) with the
+  layout, compression and encodings of `[save]`.
 
-  With `compute=False`, returns the task that writes the data (the metadata are written now).
+  Codecs read from Zarr v2 sources are dropped (see `_without_zarr2_codecs`). With
+  `compute=False`, returns the task that writes the data (the metadata are written now).
   """
   if configs is None:
     configs = SaveConfig()
   mode = mode or "w"
-  # The stored layout is set through the variables' encodings. A shallow copy has its own
-  # encodings (data are shared), so the caller's dataset is left unchanged.
-  dataset = dataset.copy(deep=False)
+  # The stored layout is set through the variables' encodings, on a copy: the caller's dataset is
+  # left unchanged.
+  dataset = _without_zarr2_codecs(dataset)
 
   logger.info(f"Saving dataset to {destination} with {configs}")
   chunk_conf = configs.chunks
-  compressor = (
-    Blosc(**configs.compressor.model_dump(exclude_none=True))
-    if configs.compressor is not None
-    else None
-  )
   # by_alias: encodings use xarray's names (`_FillValue`).
   to_zarr_kwargs = configs.model_dump(
-    exclude_none=True, by_alias=True, exclude={"chunks", "compressor", "storage_options"}
+    exclude_none=True, by_alias=True, exclude={"chunks", "compressors", "storage_options"}
   )
 
   if chunk_conf is not None:
@@ -476,27 +496,18 @@ def safe_to_zarr(
         for dim, size in zip(dims, requested, strict=True)
       )
       dataset[var].encoding["chunks"] = chunk_sizes
-  if compressor is not None:
-    # Without `[save] compressor`, the variables keep their own (or zarr's default) compressor.
+  if configs.compressors is not None:
+    # Without `[save] compressors`, the variables keep their own (zarr 3) codecs or zarr's default.
     for var in dataset.data_vars:
-      dataset[var].encoding["compressor"] = compressor
+      dataset[var].encoding["compressors"] = _codecs(configs.compressors)
 
-  if "encoding" in to_zarr_kwargs and isinstance(to_zarr_kwargs["encoding"], dict):
-    for var_enc in to_zarr_kwargs["encoding"].values():
-      if isinstance(var_enc, dict) and isinstance(var_enc.get("compressor"), dict):
-        var_enc["compressor"] = Blosc(**var_enc["compressor"])
-
-  if isinstance(destination, str) and "://" in destination:
-    storage_options = configs.storage_options or {}
-    store = fsspec.get_mapper(destination, **storage_options)
-  else:
-    store = DirectoryStore(path=str(destination))
+  path = str(destination)
+  storage_options = (configs.storage_options or None) if "://" in path else None
 
   if mode in ("a", "a-", "r+") and "encoding" in to_zarr_kwargs and to_zarr_kwargs["encoding"]:
     try:
-      group = to_zarr_kwargs.get("group")
-      zg = (
-        zarr.open_group(store, mode="r", path=group) if group else zarr.open_group(store, mode="r")
+      zg = zarr.open_group(
+        path, mode="r", path=to_zarr_kwargs.get("group"), storage_options=storage_options
       )
       existing_keys = set(zg.keys())
       to_zarr_kwargs["encoding"] = {
@@ -504,10 +515,28 @@ def safe_to_zarr(
       }
       if not to_zarr_kwargs["encoding"]:
         to_zarr_kwargs.pop("encoding", None)
-    except zarr.errors.GroupNotFoundError:
+    except (FileNotFoundError, zarr.errors.GroupNotFoundError):
       # Nothing written yet (e.g. mode "a" on a new store): every encoding applies.
       pass
 
-  return dataset.to_zarr(
-    store=store, compute=compute, mode=mode, append_dim=append_dim, **to_zarr_kwargs
+  return _write_zarr(
+    dataset,
+    path,
+    compute=compute,
+    mode=mode,
+    append_dim=append_dim,
+    storage_options=storage_options,
+    **to_zarr_kwargs,
   )
+
+
+def consolidate_metadata(path: str, storage_options: Mapping[str, Any] | None = None) -> None:
+  """Write the consolidated metadata of a Zarr store (as `safe_to_zarr` does, without zarr's
+  warning about format 3)."""
+  path = str(path)
+  options = dict(storage_options or {}) or None if "://" in path else None
+  with warnings.catch_warnings():
+    warnings.filterwarnings(
+      "ignore", message="Consolidated metadata is currently not part", category=ZarrUserWarning
+    )
+    zarr.consolidate_metadata(zarr.open_group(path, mode="r+", storage_options=options).store)

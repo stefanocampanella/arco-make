@@ -108,7 +108,7 @@ variables = ["thetao"]
 
 [save]                         # the layout on disk
 chunks = {time = 1, depth = 1, lat = -1, lon = -1}
-compressor = {cname = "lz4", clevel = 1}
+compressors = [{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuffle = "shuffle"}}]
 ```
 
 Sources are read with xarray: any of its engines (e.g. `zarr`, `h5netcdf`), or one of the backends of

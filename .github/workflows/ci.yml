@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
         with:
-          # As in the Apptainer image: numcodecs <0.16 has no wheels for newer Pythons.
+          # As in the Apptainer image.
           python-version: "3.13"
       - name: Install system libraries
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenmpi-dev

@@ -50,10 +50,8 @@ from typing import Any, Literal, get_args
 import click
 import dask
 import dask.array
-import fsspec
 import numpy as np
 import xarray as xr
-import zarr
 from dask.graph_manipulation import bind
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -65,7 +63,13 @@ from arcomake.cli_utils import (
   set_default_logger,
 )
 from arcomake.dask_utils import DaskSetupType, get_client
-from arcomake.dataset_utils import ReadConfig, SaveConfig, open_input, safe_to_zarr
+from arcomake.dataset_utils import (
+  ReadConfig,
+  SaveConfig,
+  consolidate_metadata,
+  open_input,
+  safe_to_zarr,
+)
 from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
@@ -829,7 +833,7 @@ def _compute_by_series(
       pending.result()
   if configs.save.consolidated is not False:
     for path, _ in outputs:
-      zarr.consolidate_metadata(fsspec.get_mapper(str(path), **storage_options))
+      consolidate_metadata(path, storage_options)
 
 
 def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:
