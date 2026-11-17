@@ -136,6 +136,11 @@ records its interval and a fingerprint of the recipe; `--resume` refuses another
 started before `main` last moved. A plain rerun refuses to start beside a failed run it could continue;
 `--replace` starts over. Do not resume a run that is still going.
 
+`--blocks N` reads and processes N blocks at once (default 1), each in a thread of its own: a
+block's values are staged on local disk (`TMPDIR`) and the blocks are committed in order, so the output
+is the same as with one block at a time. Memory and disk use grow with N; the first block to fail, in
+order, stops the run (blocks before it are committed, `--resume` continues).
+
 Every output is an [Icechunk](https://icechunk.io) repository (Zarr format 3 with versions): a local
 directory, an `s3://` or a `gs://` URL. Every run writes on a branch of its own (`run/<command>-<start
 time>`), in commits: one per block for `download` (its message names the block's interval), one for

@@ -1,10 +1,18 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
+import collections
+import contextvars
+import dataclasses
 import functools
 import hashlib
 import logging
+import pathlib
+import shutil
+import threading
 import warnings
-from contextlib import ExitStack, nullcontext
+from collections.abc import Callable, Generator
+from concurrent.futures import Future
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timedelta
 from typing import Self, get_args
 
@@ -25,13 +33,15 @@ from arcomake.dask_utils import DaskSetupType, get_client
 from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
+  _write_zarr,
   maybe_checkpointing_download_and_process,
+  prepare_for_writing,
   write_output,
 )
 from arcomake.datetime_utils import DateInterval, IterableDateInterval, may_parse_timedelta
 from arcomake.processing_utils import ProcessingStepConfig
 from arcomake.retries import RetryConfig, with_retries
-from arcomake.temporary_utils import TempDirectoryRegistry
+from arcomake.temporary_utils import TempDirectoryRegistry, get_current_temp_registry
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +117,16 @@ class DownloadConfig(BaseModel):
   is_flag=True,
 )
 @click.option(
+  "--blocks",
+  "blocks_at_once",
+  default=1,
+  type=click.IntRange(min=1),
+  help=(
+    "Blocks read and processed at once (default 1). Above 1, each block is staged on local disk"
+    " (TMPDIR) and committed in order: memory and disk grow with it"
+  ),
+)
+@click.option(
   "--log-level",
   default="info",
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
@@ -134,6 +154,7 @@ def download(
   end_datetime: datetime | None = None,
   replace: bool = False,
   resume: bool = False,
+  blocks_at_once: int = 1,
   log_level: str = "info",
   dask_setup: DaskSetupType = "threads",
   progress: bool = False,
@@ -199,37 +220,36 @@ def download(
       )
     if done:
       logger.info(f"Resuming {run.branch}: {len(done)} of {len(blocks)} blocks are written")
-    # One block at a time, each committed on the run's branch; a block that fails with a
-    # transient error is redone (`retries`), others stop the run.
-    for number, date_interval in enumerate(blocks):
-      if block_key(date_interval) in done:
-        continue
-      what = f"Block [{date_interval.start:%Y-%m-%dT%H:%M}, {date_interval.end:%Y-%m-%dT%H:%M})"
-      logger.info(f"Downloading data from {date_interval.start} to {date_interval.end}")
-      try:
-        with_retries(
-          functools.partial(
-            _write_block,
-            configs,
-            date_interval,
-            run,
-            first=number == 0,
-            progress=progress and dask_setup in ("processes", "threads"),
-            metadata={
-              icechunk_utils.BLOCK_KEY: block_key(date_interval),
-              icechunk_utils.RECIPE_KEY: recipe,
-            },
-          ),
-          configs.retries,
-          what,
-        )
-      except click.ClickException:
-        raise
-      except Exception as exc:
-        raise click.ClickException(
-          f"An error occurred ({type(exc).__name__}). Aborting: the blocks written are on branch"
-          f" {run.branch}, `main` is unchanged; --resume continues from there."
-        ) from exc
+    # Each block is committed on the run's branch, in order; a block that fails with a transient
+    # error is redone (`retries`), others stop the run.
+    todo = [(n, b) for n, b in enumerate(blocks) if block_key(b) not in done]
+    progress = progress and dask_setup in ("processes", "threads") and blocks_at_once == 1
+    try:
+      if blocks_at_once == 1:
+        for number, date_interval in todo:
+          logger.info(f"Downloading data from {date_interval.start} to {date_interval.end}")
+          with_retries(
+            functools.partial(
+              _write_block,
+              configs,
+              date_interval,
+              run,
+              first=number == 0,
+              progress=progress,
+              recipe=recipe,
+            ),
+            configs.retries,
+            _describe(date_interval),
+          )
+      else:
+        _write_blocks_staged(configs, todo, run, blocks_at_once=blocks_at_once, recipe=recipe)
+    except click.ClickException:
+      raise
+    except Exception as exc:
+      raise click.ClickException(
+        f"An error occurred ({type(exc).__name__}). Aborting: the blocks written are on branch"
+        f" {run.branch}, `main` is unchanged; --resume continues from there."
+      ) from exc
     # Every block is written: `main` moves to them, then the recipe's retention applies.
     try:
       run.finish(configs.save.retention())
@@ -237,17 +257,16 @@ def download(
       raise click.ClickException(str(exc)) from exc
 
 
-def _write_block(
-  configs: DownloadConfig,
-  date_interval: DateInterval,
-  run: icechunk_utils.Run,
-  *,
-  first: bool,
-  progress: bool,
-  metadata: dict[str, str],
-) -> None:
-  """Read, process and merge the datasets of one block, and commit it to the run's branch
-  (written by the first block, appended along time by the others)."""
+def _describe(interval: DateInterval) -> str:
+  return f"Block [{interval.start:%Y-%m-%dT%H:%M}, {interval.end:%Y-%m-%dT%H:%M})"
+
+
+@contextmanager
+def _processed_block(
+  configs: DownloadConfig, date_interval: DateInterval, *, progress: bool
+) -> Generator[xr.Dataset]:
+  """The datasets of one block, read, processed and merged, with the global postprocessing
+  (lazy: computed when written)."""
   # Download and postprocess each dataset, possibly using checkpointing to disk.
   with ExitStack() as stack, warnings.catch_warnings():
     # During postprocessing computation, which may even happen while writing, if each operation
@@ -280,22 +299,153 @@ def _write_block(
     ) as dataset:
       if configs.postprocess:
         dataset = dataset.arcomake.process(steps=configs.postprocess)
-      # One commit per block, named by its interval: the repository's history tells which
-      # blocks are in.
-      block = f"download [{date_interval.start:%Y-%m-%dT%H:%M}, {date_interval.end:%Y-%m-%dT%H:%M})"
-      with ProgressBar() if progress else nullcontext():
-        if first:
-          write_output(dataset, run, configs.save, message=block, mode="w", metadata=metadata)
-        else:
-          write_output(
-            dataset,
-            run,
-            configs.save,
-            message=block,
-            mode="a-",
-            append_dim=configs.time_dim,
-            metadata=metadata,
-          )
+      assert isinstance(dataset, xr.Dataset)
+      yield dataset
+
+
+def _commit_message(interval: DateInterval) -> str:
+  """One commit per block, named by its interval: the repository's history tells which blocks
+  are in."""
+  return f"download [{interval.start:%Y-%m-%dT%H:%M}, {interval.end:%Y-%m-%dT%H:%M})"
+
+
+def _block_metadata(interval: DateInterval, recipe: str) -> dict[str, str]:
+  return {icechunk_utils.BLOCK_KEY: block_key(interval), icechunk_utils.RECIPE_KEY: recipe}
+
+
+def _write_block(
+  configs: DownloadConfig,
+  date_interval: DateInterval,
+  run: icechunk_utils.Run,
+  *,
+  first: bool,
+  progress: bool,
+  recipe: str,
+) -> None:
+  """Read, process and merge the datasets of one block, and commit it to the run's branch
+  (written by the first block, appended along time by the others)."""
+  with (
+    _processed_block(configs, date_interval, progress=progress) as dataset,
+    ProgressBar() if progress else nullcontext(),
+  ):
+    write_output(
+      dataset,
+      run,
+      configs.save,
+      message=_commit_message(date_interval),
+      mode="w" if first else "a-",
+      append_dim=None if first else configs.time_dim,
+      metadata=_block_metadata(date_interval, recipe),
+    )
+
+
+@dataclasses.dataclass
+class _Staged:
+  """A block computed into a local Zarr store, with what its direct write would have had: the
+  prepared dataset (encodings, attributes, coordinates) and its Dask chunks."""
+
+  path: pathlib.Path
+  prepared: xr.Dataset
+
+
+def _stage_block(configs: DownloadConfig, date_interval: DateInterval) -> _Staged:
+  """Read, process and merge one block, and compute its values into a local Zarr store (a
+  worker of `_write_blocks_staged`). Only values go there (no encoding but the chunks): the
+  output's encodings are those `prepare_for_writing` gives the block, kept in memory."""
+  registry = get_current_temp_registry()
+  assert registry is not None
+  with _processed_block(configs, date_interval, progress=False) as dataset:
+    prepared = prepare_for_writing(dataset, configs.save)
+    values = prepared.copy(deep=False)
+    for variable in values.variables.values():
+      chunks = variable.encoding.get("chunks")
+      variable.encoding = {} if chunks is None else {"chunks": chunks}
+    path = registry.create_temp_dir(suffix=".zarr")
+    logger.info(f"{_describe(date_interval)}: staging to {path}")
+    _write_zarr(values, str(path), mode="w", consolidated=False)
+  # The prepared dataset is kept for its metadata only: every lazy variable is replaced by the
+  # staged values before writing (`_from_stage`).
+  return _Staged(path, prepared)
+
+
+def _from_stage(staged: _Staged) -> xr.Dataset:
+  """The block as its direct write would see it: the prepared dataset with the staged values in
+  place of every lazy variable, in the same Dask chunks."""
+  values = xr.open_zarr(str(staged.path), consolidated=False)
+  dataset = staged.prepared.copy(deep=False)
+  for name, variable in dataset.variables.items():
+    chunks = variable.chunks
+    if chunks is None:  # in memory (index coordinates, loaded variables): kept as they are
+      continue
+    variable.data = values[name].data.rechunk(chunks)
+  return dataset
+
+
+def _start(action: Callable[[], _Staged], name: str) -> Future[_Staged]:
+  """Run `action` in a daemon thread, in a copy of the current context (the temporary registry
+  is a context variable). Daemon: a failed run exits without waiting for the blocks in progress,
+  whose work could not be committed anyway (blocks are appended in order)."""
+  future: Future[_Staged] = Future()
+  context = contextvars.copy_context()
+
+  def target() -> None:
+    if not future.set_running_or_notify_cancel():
+      return
+    try:
+      future.set_result(context.run(action))
+    except BaseException as error:
+      future.set_exception(error)
+
+  threading.Thread(target=target, name=name, daemon=True).start()
+  return future
+
+
+def _write_blocks_staged(
+  configs: DownloadConfig,
+  todo: list[tuple[int, DateInterval]],
+  run: icechunk_utils.Run,
+  *,
+  blocks_at_once: int,
+  recipe: str,
+) -> None:
+  """Read and process up to `blocks_at_once` blocks at once, each staged on local disk by a
+  worker thread, and commit them in order from this thread (appends along time need it). Each
+  stage is removed once committed. The first error, in block order, stops the run: blocks
+  before it are committed."""
+  pending: collections.deque[tuple[int, DateInterval, Future[_Staged]]] = collections.deque()
+  remaining = iter(todo)
+
+  def start_next() -> None:
+    item = next(remaining, None)
+    if item is None:
+      return
+    number, interval = item
+    logger.info(f"Downloading data from {interval.start} to {interval.end}")
+    stage = functools.partial(_stage_block, configs, interval)
+    action = functools.partial(with_retries, stage, configs.retries, _describe(interval))
+    pending.append((number, interval, _start(action, f"block-{block_key(interval)}")))
+
+  for _ in range(blocks_at_once):
+    start_next()
+  while pending:
+    number, interval, future = pending.popleft()
+    staged = future.result()
+    start_next()
+    first = number == 0
+    with_retries(
+      functools.partial(
+        run.write,
+        _from_stage(staged),
+        message=_commit_message(interval),
+        mode="w" if first else "a-",
+        append_dim=None if first else configs.time_dim,
+        group=configs.save.group,
+        metadata=_block_metadata(interval, recipe),
+      ),
+      configs.retries,
+      f"{_describe(interval)} (commit)",
+    )
+    shutil.rmtree(staged.path, ignore_errors=True)
 
 
 def block_key(interval: DateInterval) -> str:
