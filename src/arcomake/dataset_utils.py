@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal
 
 import fsspec
 import fsspec.utils
+import numpy as np
 import xarray as xr
 import zarr
 import zarr.errors
@@ -104,6 +105,24 @@ class CodecConfig(BaseModel):
 CompressorsConfig = list[CodecConfig]
 
 
+class PartTimeOffset(BaseModel):
+  """`time_offset` of a part: added to its time coordinate before each block's time selection.
+
+  For values stamped at the end of the period they describe, e.g. ERA5 hourly accumulations
+  (`time_offset = "-1h"`: the value stamped 00:00 covers 23:00-00:00 of the previous day), so
+  that each value is stamped with the start of its period and a day holds its own 24 hours. The
+  part is read over the block moved by the opposite amount (backends that take a time range get
+  it shifted).
+  """
+
+  time_offset: datetime.timedelta | None = None
+
+  @field_validator("time_offset", mode="before")
+  @classmethod
+  def _parse_time_offset(cls, value: Any) -> Any:
+    return may_parse_timedelta(value) if isinstance(value, str) else value
+
+
 def _engine_given_or_implied(data: Any, implied: Callable[[str], bool]) -> Any:
   """A part without `engine` matches a dedicated model only if its URL implies that engine.
 
@@ -120,7 +139,7 @@ def _has_scheme(url: str, *schemes: str) -> bool:
   return url.split("://", 1)[0].lower() in schemes if "://" in url else False
 
 
-class CopernicusMarinePartConfig(BaseModel):
+class CopernicusMarinePartConfig(PartTimeOffset):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
@@ -142,7 +161,7 @@ class CopernicusMarinePartConfig(BaseModel):
   storage_options: dict[str, Any] | None = None
 
 
-class NetCDFOverHTTPPartConfig(BaseModel):
+class NetCDFOverHTTPPartConfig(PartTimeOffset):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
@@ -158,7 +177,7 @@ class NetCDFOverHTTPPartConfig(BaseModel):
     )
 
 
-class EarlyWarningDataStorePartConfig(BaseModel):
+class EarlyWarningDataStorePartConfig(PartTimeOffset):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
@@ -182,7 +201,7 @@ class EarlyWarningDataStorePartConfig(BaseModel):
     return _engine_given_or_implied(data, lambda url: _has_scheme(url, "ewds"))
 
 
-class ZarrPartConfig(OpenDatasetArguments):
+class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset):
   """A Zarr part: the arguments of `xarray.open_dataset`, read through a strict store."""
 
   filename_or_obj: str
@@ -194,7 +213,7 @@ class ZarrPartConfig(OpenDatasetArguments):
     return _engine_given_or_implied(data, lambda url: url.rstrip("/").endswith(".zarr"))
 
 
-class GenericPartConfig(ReadConfig):
+class GenericPartConfig(ReadConfig, PartTimeOffset):
   """A part read by any other xarray engine, with the arguments of `xarray.open_dataset`."""
 
   filename_or_obj: str
@@ -392,6 +411,14 @@ class DatasetConfig(BaseModel):
   postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
 
 
+def _shift_time(part: xr.Dataset, offset: datetime.timedelta, time_dim: str) -> xr.Dataset:
+  """`part` with `offset` added to its time coordinate (attributes and encoding kept)."""
+  if time_dim not in part.coords:
+    raise ValueError(f"time_offset needs a {time_dim!r} coordinate, which the part lacks")
+  time = part[time_dim].variable
+  return part.assign_coords({time_dim: time.copy(data=time.values + np.timedelta64(offset))})
+
+
 def download_and_process(
   configs: DatasetConfig,
   start_datetime: datetime.datetime,
@@ -407,13 +434,16 @@ def download_and_process(
   # represents different pieces of the same dataset.
   parts = []
   for raw_part in configs.parts:
-    part_conf = raw_part.model_dump(exclude_unset=True)
+    offset = raw_part.time_offset or datetime.timedelta(0)
+    part_conf = raw_part.model_dump(exclude_unset=True, exclude={"time_offset"})
     engine = getattr(raw_part, "engine", None) or part_conf.get("engine")
     if engine is not None:
       part_conf["engine"] = engine
     if engine == "earlywarningdatastore" or engine == "copernicusmarine":
-      part_conf.update(start_datetime=start_datetime, end_datetime=end_datetime)
+      part_conf.update(start_datetime=start_datetime - offset, end_datetime=end_datetime - offset)
     part = open_input(**part_conf)
+    if offset:
+      part = _shift_time(part, offset, time_dim)
     part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
     parts.append(part)
   if not parts:

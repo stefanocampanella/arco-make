@@ -116,6 +116,12 @@ arco-make, `copernicusmarine` (Copernicus Marine, `cm://DATASET_ID`), `earlywarn
 `ewds://DATASET`) and `netcdfoverhttp` (a NetCDF file served over HTTP). Credentials come from the
 environment of each service's client, never from recipes.
 
+Day D is the interval from 00:00 of D to 00:00 of D+1, stamped D 00:00 (`resample` with `label` and
+`closed` "left"). Sources that stamp a value at the end of its period, such as ERA5 hourly
+accumulations (the value stamped 00:00 covers the last hour of the previous day), take a part option
+`time_offset = "-1h"`: the time coordinate is moved before each block is selected, and the part is
+read over the block moved the other way, so that every day holds its own hours.
+
 Outputs are written in Zarr format 3 (sources can be in either format), with consolidated metadata
 unless `[save] consolidated = false`. In `[save]`:
 - `chunks` set the stored chunks, per dimension (-1, or a dimension not listed: the whole dimension).
