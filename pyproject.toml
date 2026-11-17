@@ -11,7 +11,7 @@ dependencies = [
     # Upstream main after the merge of COPERNICUSMARINE_MAX_POOL_CONNECTIONS (#532), not yet in a
     # release; move to the first release that has it. The backend relies on chunk_size_limit=False
     # keeping the native chunks (undocumented): tests/live checks it.
-    "copernicusmarine @ git+https://github.com/mercator-ocean/copernicus-marine-toolbox.git@f66a8b8",
+    "copernicusmarine @ git+https://github.com/mercator-ocean/copernicus-marine-toolbox.git@f66a8b8c700654fec981b986fc79f6450298e96a",
     "dask",
     "dask_mpi",
     "eccodes",
