@@ -116,6 +116,17 @@ arco-make, `copernicusmarine` (Copernicus Marine, `cm://DATASET_ID`), `earlywarn
 `ewds://DATASET`) and `netcdfoverhttp` (a NetCDF file served over HTTP). Credentials come from the
 environment of each service's client, never from recipes.
 
+Outputs are written in Zarr format 3 (sources can be in either format), with consolidated metadata
+unless `[save] consolidated = false`. In `[save]`:
+- `chunks` set the stored chunks, per dimension (-1, or a dimension not listed: the whole dimension).
+- `shards`, in the same form, group whole chunks into one stored object each (Zarr v3 sharding):
+  fewer, larger objects, while readers still fetch single chunks. Without `shards`, every chunk is an
+  object. Dask chunks may not straddle shards when writing.
+- `compressors` is a list of Zarr v3 codecs, `{name, configuration}` as in Zarr's array metadata
+  (e.g. `blosc`, `zstd`, `gzip`); an empty list stores the data uncompressed, and without it zarr's
+  default (zstd) applies. `[save.encoding.VARIABLE]` can override chunks, shards and compressors per
+  variable.
+
 Each step is a table whose `name` is a step of arco-make or one of a few `xarray.Dataset` methods; the
 other keys are its arguments. See [docs/steps.md](docs/steps.md). The `process`, `validate` and
 `compute-climatology` recipes have the same `[read]`, step and `[save]` tables; see the other samples in

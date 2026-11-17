@@ -445,3 +445,55 @@ Corrects the toolbox bullets of 16 Nov.
 - The toolbox writes its version into the dataset attributes (`copernicusmarine_version`), now
   `2.5.0` (upstream main reports the version of the last release branch). Outputs of recipes that
   keep those attributes change; ARCO-OCEAN's do not (its recipes drop them).
+
+## 2026-11-17: Zarr v3 migration
+
+**Maintainer's decisions (17 Nov):** outputs in Zarr format 3 only, no compatibility with format 2
+outputs; `unpack` and zip outputs removed; shards set by the recipe, unsharded without `shards`;
+compressors as Zarr v3 codec metadata (a list of `{name, configuration}`), as flexible as zarr
+and free to adopt in the arco-ocean recipes; consolidated metadata kept.
+
+**Versions:** zarr 3.4.2, numcodecs 0.17.1 (no longer a direct dependency, so the `<0.16` pin and
+its Python 3.13 constraint are gone; CI and the image stay on 3.13).
+
+**Findings while porting:**
+- Variables read from format 2 stores (ERA5, GLORYS) carry numcodecs codecs (`Blosc`) in their
+  encodings, coordinates included; zarr 3 refuses them in format 3 ("Expected a BytesBytesCodec").
+  They are dropped before writing (the recipe's compressors or zarr's default, zstd, apply); codecs
+  of format 3 sources are kept. The synthetic test sources are now format 2 with Blosc.
+- zarr 3's fsspec store reads only `FileNotFoundError` (and directory errors) as missing chunks;
+  timeouts and connection errors raise. The N8 safeguard (`strict_zarr_store`) is no longer
+  needed; the read-error tests run on sources of both formats.
+- The toolbox, under zarr 3, uses its own zarr 3 store: only 403 and 404 answers become missing
+  chunks, other errors raise after its 9 retries (N9 narrower; code reading).
+- Consolidated metadata are not in the format 3 specification: zarr warns at every write (silenced
+  at arco-make's writes). Icechunk will not use them.
+- xarray keeps the CF `_FillValue` as an attribute (a float is stored base64-encoded) apart from
+  the array's own fill value (used for chunks never written).
+- Shards: xarray refuses Dask chunks straddling a shard; appending into a partial last shard works.
+  Blocks need not be multiples of the time shard, but each partial shard is rewritten on append.
+- Appending in format 3 to a format 2 store fails with an unclear xarray message ("append_dim ...
+  does not match any existing dataset dimensions {}"); no compatibility, by decision.
+
+**Copernicus Marine toolbox (PR #7) breaks the ARCO-OCEAN recipes.** Found by baseline window 2:
+upstream main refuses coordinates in `variables` ("The variable 'depth' is neither a variable or a
+standard name in the dataset"). Upstream #534 (`e34a30b`, 8 Oct, "standard names can also be used
+for sparse subset") checks requested names against the catalogue's variables, which exclude
+coordinates; before, against the dataset's variables. It precedes #532 on main, so every commit
+with the pool setting has it; 2.5.1 (cut from 2.5.0) and the fork accept `depth`. The GLORYS
+static parts of four arco-ocean recipes (0.25°, 0.5°, 1.0° levels-50, anfc levels-10) ask for
+`["deptho", "depth"]`: `depth` is needed by `get_sea_mask`. Workaround in the recipes: ask for
+`["deptho", "mask"]` (the 3D mask brings the same depth coordinate, checked on both static
+datasets) and drop `mask` as the first step, before anything reads it. The live checks did not
+catch it: their recipe asks for `thetao` only.
+
+**Baseline window 2** (2012-12-30 – 2013-01-02, code `5eb0587`, the 0.25° levels-50 recipe with
+`compressors` and the static workaround): all 37 variables equal the PR #1 output (`656503f`, format
+2) bit for bit, values, dtypes and attributes; same size on disk (1.3 GB). 3 min 58 s and 37.5 GB
+peak, against 2 min 48 s and 35.6 GB for `656503f` (one run each; not investigated, for the
+performance pass). New script `compare_values.py` (baseline scripts) compares across formats.
+
+**arco-ocean (fork stack):** the static workaround (for arco-make #7); `compressor` to `compressors`
+in every recipe (same Blosc lz4 settings, byte shuffle); the unpack recipes, `unpack.slurm` and
+the `--zip` options removed. The download scripts still write one store per piece, which nothing
+joins any more: they are to be reworked with group 7 (resumable blocks).
