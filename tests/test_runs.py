@@ -49,7 +49,7 @@ def test_a_failed_download_leaves_main_as_it_was(
   def failing_on_the_second_block(*a, **kw):
     calls.append(a[1])
     if len({str(c) for c in calls}) > 1:
-      raise TimeoutError("simulated read timeout")
+      raise RuntimeError("simulated failure")  # not transient: no retry
     return real(*a, **kw)
 
   monkeypatch.setattr(

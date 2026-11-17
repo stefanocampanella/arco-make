@@ -125,7 +125,10 @@ read over the block moved the other way, so that every day holds its own hours.
 
 Every request to a source times out: a part's `timeout` (seconds, default 120) applies to Zarr stores on
 Google Cloud Storage and S3, NetCDF files over HTTP and EWDS requests (Copernicus Marine parts rely on
-the toolbox's own timeouts and retries).
+the toolbox's own timeouts and retries). A block that fails with a transient error (a timeout, a dropped connection, a server
+or throttling answer) is redone, after a wait that doubles each time: `[retries] attempts = 5`, `wait =
+"1min"`, `max_wait = "30min"` by default. Other errors (a recipe or data error) stop the run at once; the
+log says which kind it was.
 
 Every output is an [Icechunk](https://icechunk.io) repository (Zarr format 3 with versions): a local
 directory, an `s3://` or a `gs://` URL. Every run writes on a branch of its own (`run/<command>-<start

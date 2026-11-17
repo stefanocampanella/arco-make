@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
+import functools
 import logging
 import warnings
 from contextlib import ExitStack, nullcontext
@@ -26,8 +27,9 @@ from arcomake.dataset_utils import (
   maybe_checkpointing_download_and_process,
   write_output,
 )
-from arcomake.datetime_utils import IterableDateInterval, may_parse_timedelta
+from arcomake.datetime_utils import DateInterval, IterableDateInterval, may_parse_timedelta
 from arcomake.processing_utils import ProcessingStepConfig
+from arcomake.retries import RetryConfig, with_retries
 from arcomake.temporary_utils import TempDirectoryRegistry
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,8 @@ class DownloadConfig(BaseModel):
   datasets: dict[str, DatasetConfig]
   postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
   save: SaveConfig
+  # How often a block is redone after a transient error (see `retries.RetryConfig`).
+  retries: RetryConfig = Field(default_factory=RetryConfig)
 
   @field_validator("step", mode="before")
   @classmethod
@@ -169,75 +173,29 @@ def download(
       )
     except Exception as exc:
       raise click.ClickException(f"Could not start writing {output_path}: {exc}") from exc
-    # Iterate over date intervals.
-    is_first_date_interval = True
-    for date_interval in IterableDateInterval(configs.start, configs.end, configs.step):
+    # One block at a time, each committed on the run's branch; a block that fails with a
+    # transient error is redone (`retries`), others stop the run.
+    for number, date_interval in enumerate(
+      IterableDateInterval(configs.start, configs.end, configs.step)
+    ):
+      what = f"Block [{date_interval.start:%Y-%m-%dT%H:%M}, {date_interval.end:%Y-%m-%dT%H:%M})"
       logger.info(f"Downloading data from {date_interval.start} to {date_interval.end}")
       try:
-        # Download and postprocess each dataset, possibly using checkpointing to disk.
-        with ExitStack() as stack, warnings.catch_warnings():
-          # During postprocessing computation, which may even happen during `save_to_zarr`, if each operation does not
-          # trigger dask computations (e.g., no calls to persist or compute) some RuntimeWarnings may be issued.
-          # This happens frequently with certain algorithms when regridding masked data (containing NaNs).
-          # We filter them to avoid cluttering the log.
-          warnings.filterwarnings(
-            "ignore",
-            message="invalid value encountered in divide",
-            category=RuntimeWarning,
-          )
-          datasets: list[xr.Dataset] = []
-          for dataset_name, dataset_conf in configs.datasets.items():
-            if dataset_conf.skip:
-              logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
-              continue
-            datasets.append(
-              stack.enter_context(
-                maybe_checkpointing_download_and_process(
-                  dataset_conf,
-                  date_interval.start,
-                  date_interval.end,
-                  time_dim=configs.time_dim,
-                  progress=progress,
-                )
-              )
-            )
-          # Merge the datasets
-          with (
-            xr.merge(
-              datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
-            ) as dataset,
-          ):
-            # Postprocess the merged dataset
-            if configs.postprocess:
-              dataset = dataset.arcomake.process(
-                steps=configs.postprocess,
-              )
-            # Save the dataset in a Zarr using sensible chunking and compression
-            progress_bar = (
-              ProgressBar if (progress and dask_setup in ["processes", "threads"]) else nullcontext
-            )
-            # One commit per block, named by its interval: the repository's history tells which
-            # blocks are in.
-            block = (
-              f"download [{date_interval.start:%Y-%m-%dT%H:%M}, {date_interval.end:%Y-%m-%dT%H:%M})"
-            )
-            with progress_bar():
-              if is_first_date_interval:
-                write_output(dataset, run, configs.save, message=block, mode="w")
-                is_first_date_interval = False
-              else:
-                write_output(
-                  dataset,
-                  run,
-                  configs.save,
-                  message=block,
-                  mode="a-",
-                  append_dim=configs.time_dim,
-                )
+        with_retries(
+          functools.partial(
+            _write_block,
+            configs,
+            date_interval,
+            run,
+            first=number == 0,
+            progress=progress and dask_setup in ("processes", "threads"),
+          ),
+          configs.retries,
+          what,
+        )
       except click.ClickException:
         raise
       except Exception as exc:
-        logger.exception("An error occurred during download")
         raise click.ClickException(
           f"An error occurred ({type(exc).__name__}). Aborting: the blocks written are on branch"
           f" {run.branch}, `main` is unchanged."
@@ -247,3 +205,57 @@ def download(
       run.finish(configs.save.retention())
     except icechunk_utils.PromotionError as exc:
       raise click.ClickException(str(exc)) from exc
+
+
+def _write_block(
+  configs: DownloadConfig,
+  date_interval: DateInterval,
+  run: icechunk_utils.Run,
+  *,
+  first: bool,
+  progress: bool,
+) -> None:
+  """Read, process and merge the datasets of one block, and commit it to the run's branch
+  (written by the first block, appended along time by the others)."""
+  # Download and postprocess each dataset, possibly using checkpointing to disk.
+  with ExitStack() as stack, warnings.catch_warnings():
+    # During postprocessing computation, which may even happen while writing, if each operation
+    # does not trigger dask computations (e.g., no calls to persist or compute) some
+    # RuntimeWarnings may be issued. This happens frequently with certain algorithms when
+    # regridding masked data (containing NaNs). We filter them to avoid cluttering the log.
+    warnings.filterwarnings(
+      "ignore",
+      message="invalid value encountered in divide",
+      category=RuntimeWarning,
+    )
+    datasets: list[xr.Dataset] = []
+    for dataset_name, dataset_conf in configs.datasets.items():
+      if dataset_conf.skip:
+        logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
+        continue
+      datasets.append(
+        stack.enter_context(
+          maybe_checkpointing_download_and_process(
+            dataset_conf,
+            date_interval.start,
+            date_interval.end,
+            time_dim=configs.time_dim,
+            progress=progress,
+          )
+        )
+      )
+    with xr.merge(
+      datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
+    ) as dataset:
+      if configs.postprocess:
+        dataset = dataset.arcomake.process(steps=configs.postprocess)
+      # One commit per block, named by its interval: the repository's history tells which
+      # blocks are in.
+      block = f"download [{date_interval.start:%Y-%m-%dT%H:%M}, {date_interval.end:%Y-%m-%dT%H:%M})"
+      with ProgressBar() if progress else nullcontext():
+        if first:
+          write_output(dataset, run, configs.save, message=block, mode="w")
+        else:
+          write_output(
+            dataset, run, configs.save, message=block, mode="a-", append_dim=configs.time_dim
+          )
