@@ -395,13 +395,15 @@ benchmark script: the NetCDF-over-HTTP backend needs the temp directory registry
 `COPERNICUSMARINE_MAX_POOL_CONNECTIONS`, default 10) is merged upstream (#532, 21 Oct) but in no
 release yet (2.5.1 of 3 Nov lacks it). arco-make now pins upstream main at `f66a8b8` (reports
 2.5.0); move to the first release that has it.
-- The backend passes `chunk_size_limit=False`, which upstream documents as -1 or a positive limit.
-  Upstream main, 2.5.1 and the fork (2.4.1) all treat a falsy limit as "no rechunking" and give
-  the store's native chunks (one day, 512 × 2048); the toolbox default doubles the time chunk. A
-  live check now fails if that changes. Offline suite and live checks pass on all three.
-- Upstream reads the pool size once, when the toolbox is imported (the fork, per client). arco-make
-  does not import the toolbox itself: xarray loads it at the first use of the engine, after the CLI
-  applied the settings file, where the pool size is now a setting.
+- (Wrong, corrected on 17 Nov.) The backend passes `chunk_size_limit=False`, which upstream
+  documents as -1 or a positive limit. Upstream main, 2.5.1 and the fork (2.4.1) all treat a falsy
+  limit as "no rechunking" and give the store's native chunks (one day, 512 × 2048); the toolbox
+  default doubles the time chunk. A live check now fails if that changes. Offline suite and live
+  checks pass on all three.
+- (Partly wrong, corrected on 17 Nov.) Upstream reads the pool size once, when the toolbox is
+  imported (the fork, per client). arco-make does not import the toolbox itself: xarray loads it
+  at the first use of the engine, after the CLI applied the settings file, where the pool size is
+  now a setting.
 - GLORYS on 4 days with 10, 32, 64 connections: 21.4, 16.6, 17.4 s/day reading; 21.9, 20.9, 20.6
   s/day reading and processing. Reading gains about 20 %; the processing graph is the limit.
   With 10 connections, urllib3 logs "Connection pool is full, discarding connection".
@@ -419,3 +421,27 @@ release yet (2.5.1 of 3 Nov lacks it). arco-make now pins upstream main at `f66a
 - **Maintainer's decision:** stay with Google's store; the timeouts are to be handled by the
   refactoring (group 7).
 
+
+## 2026-11-17: review of PR #7 (Copernicus Marine toolbox)
+
+Corrects the toolbox bullets of 16 Nov.
+- **`chunk_size_limit=False` does not give native chunks: it gives no Dask arrays.** A falsy
+  limit makes the toolbox call `open_zarr(chunks=None)`, so it returns lazily indexed arrays, and
+  xarray chunks them as the recipe's `chunks` say (the arco-ocean recipes set them, e.g. time 2,
+  depth 1, whole maps). Its default returns Dask arrays of its own chunking (time 2, all 50
+  depths), which the recipe's `chunks` then only rechunk. The live check of 16 Nov opened the data
+  with `chunks={}`, which makes xarray rechunk to the store's chunks whatever the toolbox returns:
+  it could not fail, and the comparison of 16 Nov had the same flaw. The check now calls the
+  backend directly, with the recipes' service and version, and requires unchunked arrays; it
+  fails when the backend's call loses `chunk_size_limit=False` (checked). Upstream main, 2.5.1
+  and the fork (2.4.1) all return unchunked arrays (checked again, the same way).
+- A recipe without `chunks` on a Copernicus Marine part reads each variable in one piece, without
+  Dask parallelism.
+- The toolbox was imported whenever xarray listed its backends (any `open_dataset`), which in
+  library use or tests can be before the settings file is applied, fixing the pool size at its
+  default. The backend now imports it at first use.
+- The pool size is checked as the toolbox reads it (`int()` of the text): `32.0` was accepted by
+  the check, then ignored by the toolbox, which falls back to 10 without a message.
+- The toolbox writes its version into the dataset attributes (`copernicusmarine_version`), now
+  `2.5.0` (upstream main reports the version of the last release branch). Outputs of recipes that
+  keep those attributes change; ARCO-OCEAN's do not (its recipes drop them).
