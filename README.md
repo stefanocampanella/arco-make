@@ -124,8 +124,9 @@ accumulations (the value stamped 00:00 covers the last hour of the previous day)
 read over the block moved the other way, so that every day holds its own hours.
 
 Every request to a source times out: a part's `timeout` (seconds, default 120) applies to Zarr stores on
-Google Cloud Storage and S3, NetCDF files over HTTP and EWDS requests (Copernicus Marine parts rely on
-the toolbox's own timeouts and retries). A block that fails with a transient error (a timeout, a dropped connection, a server
+Google Cloud Storage (gcsfs waits forever otherwise), NetCDF files over HTTP and EWDS requests, and to
+Zarr stores on S3 when given (botocore's default is 60 s). Copernicus Marine parts and Icechunk inputs
+rely on their own timeouts. A block that fails with a transient error (a timeout, a dropped connection, a server
 or throttling answer) is redone, after a wait that doubles each time: `[retries] attempts = 5`, `wait =
 "1min"`, `max_wait = "30min"` by default. Other errors (a recipe or data error) stop the run at once; the
 log says which kind it was.

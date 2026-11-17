@@ -17,6 +17,7 @@ from arcomake.dataset_utils import (
   CopernicusMarinePartConfig,
   DatasetConfig,
   EarlyWarningDataStorePartConfig,
+  GenericPartConfig,
   NetCDFOverHTTPPartConfig,
   ZarrPartConfig,
   download_and_process,
@@ -128,3 +129,19 @@ def test_ewds_requests_pass_the_timeout_to_cdsapi(monkeypatch: pytest.MonkeyPatc
       timeout=200,
     )
   assert seen == {"timeout": 200}
+
+
+def test_icechunk_inputs_are_left_alone(opened):
+  """Icechunk storages are not fsspec: gcsfs or botocore options would be refused."""
+  read(
+    GenericPartConfig.model_validate(
+      {"filename_or_obj": "gs://b/repo", "engine": "icechunk", "storage_options": {"token": "anon"}}
+    )
+  )
+  read(
+    GenericPartConfig.model_validate(
+      {"filename_or_obj": "s3://b/repo", "engine": "icechunk", "timeout": 30}
+    )
+  )
+  assert opened[0]["storage_options"] == {"token": "anon"}
+  assert "storage_options" not in opened[1]

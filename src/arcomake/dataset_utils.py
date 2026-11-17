@@ -132,9 +132,11 @@ DEFAULT_TIMEOUT = 120.0
 class PartTimeout(BaseModel):
   """`timeout` of a part: seconds a request to its source may take (default `DEFAULT_TIMEOUT`).
 
-  Applied to Zarr stores on Google Cloud Storage (gcsfs's `requests_timeout`) and on S3 (botocore's
-  connect and read timeouts), to NetCDF files over HTTP and to EWDS requests. Copernicus Marine
-  parts do not take it: the toolbox sets its own timeouts and retries.
+  Applied to Zarr stores on Google Cloud Storage (gcsfs's `requests_timeout`, which has none by
+  default), to NetCDF files over HTTP and to EWDS requests; on S3, only when given (botocore's
+  connect and read timeouts, 60 s by default otherwise). Copernicus Marine parts do not take it:
+  the toolbox sets its own timeouts and retries. Neither do Icechunk inputs, whose storage has
+  its own (`network_stream_timeout_seconds` on S3).
   """
 
   timeout: float | None = Field(default=None, gt=0)
@@ -143,6 +145,8 @@ class PartTimeout(BaseModel):
 def _with_timeout(part_conf: dict[str, Any], engine: str | None, timeout: float | None) -> None:
   """Give the part's source a request timeout (`PartTimeout`), unless its options set one."""
   seconds = timeout if timeout is not None else DEFAULT_TIMEOUT
+  if engine == "icechunk":  # not fsspec: its storage refuses gcsfs and botocore options
+    return
   if engine in ("netcdfoverhttp", "earlywarningdatastore"):
     part_conf.setdefault("timeout", seconds)
     return
