@@ -11,7 +11,7 @@ import xarray as xr
 
 from arcomake import cli_utils, climatology, icechunk_utils
 from arcomake.checks import ChecksConfig
-from arcomake.cli_utils import check_if_overwriting, read_configs
+from arcomake.cli_utils import check_destination, read_configs
 from arcomake.dataset_utils import (
   DatasetConfig,
   ReadConfig,
@@ -164,20 +164,20 @@ def test_climatology_honours_use_flox(tmp_path: pathlib.Path, sources: pathlib.P
   assert seen.get("use_flox") is True
 
 
-def test_check_if_overwriting(tmp_path: pathlib.Path):
-  """An existing destination needs `--overwrite`, which only replaces an Icechunk repository (in
-  a new commit); anything else at that path is left alone. A missing destination is fine."""
-  check_if_overwriting(str(tmp_path / "absent.zarr"))
+def test_check_destination(tmp_path: pathlib.Path):
+  """An existing destination needs `--replace`, which only writes a new version of an Icechunk
+  repository; anything else at that path is left alone. A missing destination is fine."""
+  check_destination(str(tmp_path / "absent.zarr"))
   with pytest.raises(click.ClickException, match="already exists"):
-    check_if_overwriting(str(tmp_path))
+    check_destination(str(tmp_path))
   with pytest.raises(click.ClickException, match="not an Icechunk repository"):
-    check_if_overwriting(str(tmp_path), overwrite=True)
+    check_destination(str(tmp_path), replace=True)
   repository = tmp_path / "out.zarr"
   write_output(xr.Dataset({"x": ("t", [1.0])}), repository, message="test")
-  check_if_overwriting(str(repository), overwrite=True)
+  check_destination(str(repository), replace=True)
 
 
-def test_check_if_overwriting_fails_when_destination_is_unreachable(
+def test_check_destination_fails_when_destination_is_unreachable(
   monkeypatch: pytest.MonkeyPatch,
 ):
   """If the destination cannot be checked (e.g. no access), the run stops before downloading."""
@@ -189,4 +189,4 @@ def test_check_if_overwriting_fails_when_destination_is_unreachable(
   monkeypatch.setattr(cli_utils.fsspec, "url_to_fs", lambda path, **kwargs: (Unreachable(), path))
   monkeypatch.setattr(icechunk_utils, "_bucket_region", lambda *args: "eu-south-1")  # no request
   with pytest.raises((click.ClickException, PermissionError)):
-    check_if_overwriting("s3://bucket/output.zarr")
+    check_destination("s3://bucket/output.zarr")

@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from arcomake.cli_utils import (
   check_aws_profile,
-  check_if_overwriting,
+  check_destination,
   check_path,
   read_configs,
   set_default_logger,
@@ -82,8 +82,11 @@ class DownloadConfig(BaseModel):
   type=click.DateTime(),
 )
 @click.option(
-  "--overwrite/--no-overwrite",
-  help="Whether to overwrite existing outputs",
+  "--replace/--no-replace",
+  help=(
+    "Write a new version of an existing output (an Icechunk repository); earlier versions stay in"
+    " its history"
+  ),
   default=False,
   is_flag=True,
 )
@@ -113,7 +116,7 @@ def download(
   output_path: str,
   start_datetime: datetime | None = None,
   end_datetime: datetime | None = None,
-  overwrite: bool = False,
+  replace: bool = False,
   log_level: str = "info",
   dask_setup: DaskSetupType = "threads",
   progress: bool = False,
@@ -125,8 +128,8 @@ def download(
   its [[postprocess]] steps (optionally in sub-blocks checkpointed to temporary Zarr, per
   `checkpointing.step`); the datasets are merged, the global [[postprocess]] steps run, and the
   block is written (first block) or appended along time, one commit per block. OUTPUT_PATH is an
-  Icechunk repository: a directory, an s3:// or a gs:// URL; it is never overwritten without
-  --overwrite (which replaces its content in a new commit; older versions stay in its history).
+  Icechunk repository: a directory, an s3:// or a gs:// URL; an existing one is only written with
+  --replace (a new version; older versions stay in its history).
   """
 
   # Set up logging.
@@ -154,7 +157,7 @@ def download(
       copernicus_marine=any(part.engine == "copernicusmarine" for part in parts),
     )
     # Check if the output destination exists.
-    check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
+    check_destination(output_path, replace=replace, save_configs=configs.save)
     # Iterate over date intervals.
     is_first_date_interval = True
     for date_interval in IterableDateInterval(configs.start, configs.end, configs.step):

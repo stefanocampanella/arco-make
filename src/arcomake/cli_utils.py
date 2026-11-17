@@ -64,9 +64,11 @@ def read_configs(
   return configs
 
 
-def check_if_overwriting(
-  path: str, overwrite: bool = False, save_configs: SaveConfig | None = None
+def check_destination(
+  path: str, replace: bool = False, save_configs: SaveConfig | None = None
 ) -> None:
+  """Check an output path before any work: usable by Icechunk, reachable, and either absent or
+  (with `replace`) an Icechunk repository, which the run writes a new version of."""
   if str(path).rstrip("/").lower().endswith(".zip"):
     # Zip outputs were removed with Zarr v3: a `.zip` name would silently become a directory.
     raise click.ClickException(f"{path}: zip outputs are not supported; write a directory or a URL")
@@ -81,9 +83,11 @@ def check_if_overwriting(
     raise click.ClickException(f"Could not check whether {path} exists: {exc}") from exc
 
   if exists:
-    if not overwrite:
-      raise click.ClickException(f"Output destination {path} already exists")
-    # Outputs are Icechunk repositories, overwritten in a new commit: anything else is left alone.
+    if not replace:
+      raise click.ClickException(
+        f"Output destination {path} already exists (--replace writes a new version of it)"
+      )
+    # Outputs are Icechunk repositories, replaced by a new version: anything else is left alone.
     try:
       repository = icechunk.Repository.exists(storage)
     except Exception as exc:
@@ -92,7 +96,7 @@ def check_if_overwriting(
       raise click.ClickException(
         f"Output destination {path} exists and is not an Icechunk repository: remove it first"
       )
-    logger.info(f"Overwriting {path} in a new commit (earlier versions stay in its history)")
+    logger.info(f"Writing a new version of {path} (the current one stays in its history)")
 
 
 def set_default_logger(log_level: str = "info"):

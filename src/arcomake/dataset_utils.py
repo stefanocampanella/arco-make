@@ -723,7 +723,7 @@ def write_outputs_together(
   written in turn, and what they share is computed again (logged).
 
   The commits are one per repository, not atomic across them: give them a common `message`, so a
-  run whose last commit failed shows (rerun it with --overwrite).
+  run whose last commit failed shows (rerun it with --replace).
   """
   if _distributed_client():
     logger.warning(

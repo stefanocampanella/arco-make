@@ -18,7 +18,8 @@ def cli():
   """Download, process, validate and summarize ARCO datasets, as described by TOML recipes.
 
   Every command takes a recipe (TOML) and input/output paths, which may be local or fsspec
-  URLs. Outputs are never overwritten without --overwrite.
+  URLs. Outputs are Icechunk repositories, written in new versions; an existing one only
+  with --replace.
 
   Settings missing from the environment (credentials, AWS_PROFILE, TMPDIR, DASK_*) are read
   from ~/.arcomakerc, or the file named by ARCOMAKE_RC: a dotenv file (`export KEY=VALUE`).

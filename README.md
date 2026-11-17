@@ -126,7 +126,7 @@ read over the block moved the other way, so that every day holds its own hours.
 Every output is an [Icechunk](https://icechunk.io) repository (Zarr format 3 with versions): a local
 directory, an `s3://` or a `gs://` URL. Each write is a commit on branch `main`: one per block for
 `download` (its message names the block's interval), one for `process` and for each output of
-`compute-climatology`. `--overwrite` replaces a repository's content in a new commit (earlier versions
+`compute-climatology`. `--replace` writes a new version of an existing repository (earlier versions
 stay in its history) and refuses anything at the path that is not a repository. Read outputs with
 `engine = "icechunk"`, or with Icechunk and xarray directly. `[save] storage_options` for an S3
 repository: `profile`, `region` (by default the bucket's, asked to S3, else the profile's),
@@ -156,7 +156,7 @@ other keys are its arguments. See [docs/steps.md](docs/steps.md). The `process`,
   lazy, and the data are computed once, when written.
 - **Time intervals are right-open**, `[start, end)`, for the recipe, the blocks of `download` and the time
   selection of each source, so consecutive pieces never overlap.
-- **An existing output is never replaced without `--overwrite`**, and a destination whose existence cannot
+- **An existing output is never replaced without `--replace`**, and a destination whose existence cannot
   be checked stops the command.
 - **Downloads proceed in blocks**, so that memory stays bounded: by `step` (and per source by
   `checkpointing.step`). Blocks appended to the output equal a single block.

@@ -56,14 +56,14 @@ def test_download_sample_recipe(downloaded: pathlib.Path):
   assert group["time"].dtype == np.int32
 
 
-def test_download_refuses_to_overwrite(downloaded: pathlib.Path, recipes):
-  """An existing output is never replaced without `--overwrite` (intent 6)."""
+def test_download_refuses_to_replace_without_the_flag(downloaded: pathlib.Path, recipes):
+  """An existing output is never replaced without `--replace` (intent 6)."""
   result = CliRunner().invoke(
     cli, ["download", *THREADS, str(recipes["download"]), str(downloaded)]
   )
   assert result.exit_code != 0
   assert "already exists" in result.output
-  result = run("download", *THREADS, "--overwrite", str(recipes["download"]), str(downloaded))
+  result = run("download", *THREADS, "--replace", str(recipes["download"]), str(downloaded))
   assert result.exit_code == 0, result.output
 
 

@@ -145,13 +145,13 @@ def test_unusable_destinations_fail_before_any_work(fake_s3):
   runs first, no traceback)."""
   import click
 
-  from arcomake.cli_utils import check_if_overwriting
+  from arcomake.cli_utils import check_destination
 
   bad = SaveConfig(storage_options={"client_kwargs": {"region_name": "x"}})
   with pytest.raises(click.ClickException, match="not understood"):
-    check_if_overwriting("s3://b/out.zarr", save_configs=bad)
+    check_destination("s3://b/out.zarr", save_configs=bad)
   with pytest.raises(click.ClickException, match="local paths, s3:// or gs://"):
-    check_if_overwriting("https://example.org/out.zarr")
+    check_destination("https://example.org/out.zarr")
 
 
 def test_gcs_tokens(tmp_path: pathlib.Path):

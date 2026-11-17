@@ -59,7 +59,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from arcomake import icechunk_utils
 from arcomake.cli_utils import (
   check_aws_profile,
-  check_if_overwriting,
+  check_destination,
   check_path,
   read_configs,
   set_default_logger,
@@ -175,8 +175,11 @@ class ClimatologyConfig(BaseModel):
   type=str,
 )
 @click.option(
-  "--overwrite/--no-overwrite",
-  help="Whether to overwrite existing outputs",
+  "--replace/--no-replace",
+  help=(
+    "Write a new version of an existing output (an Icechunk repository); earlier versions stay in"
+    " its history"
+  ),
   default=False,
   is_flag=True,
 )
@@ -207,7 +210,7 @@ def compute_climatology(
   input_path: str,
   climatology_output_path: str,
   anomaly_std_output_path: str,
-  overwrite: bool = False,
+  replace: bool = False,
   dask_setup: DaskSetupType = "mpi",
   use_frisky: bool = False,
   log_level: str = "info",
@@ -246,7 +249,7 @@ def compute_climatology(
       configs = read_configs(configs_path, schema=ClimatologyConfig)
       check_aws_profile(input_path, climatology_output_path, anomaly_std_output_path)
       for path in (climatology_output_path, anomaly_std_output_path):
-        check_if_overwriting(path, overwrite=overwrite, save_configs=configs.save)
+        check_destination(path, replace=replace, save_configs=configs.save)
       # The commit message of both outputs: their commits are not atomic together, equal
       # messages show that they come from the same run.
       message = f"compute-climatology {datetime.datetime.now(datetime.UTC):%Y-%m-%dT%H:%M:%SZ}"
