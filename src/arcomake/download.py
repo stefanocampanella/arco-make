@@ -86,7 +86,8 @@ class DownloadConfig(BaseModel):
   "--replace/--no-replace",
   help=(
     "Write a new version of an existing output (an Icechunk repository): it replaces what `main`"
-    " shows once the run succeeds; earlier versions stay in its history"
+    " shows once the run succeeds; earlier versions stay in its history until the recipe's"
+    " [save] keep_history or keep_versions expires them"
   ),
   default=False,
   is_flag=True,
@@ -132,7 +133,8 @@ def download(
   Icechunk repository: a directory, an s3:// or a gs:// URL. The blocks are committed on a branch
   of their own; `main` moves to them only when the last one is written, so a failed run leaves
   the repository's current version as it was. An existing repository is only written with
-  --replace; the version it replaces stays in the history.
+  --replace; the version it replaces stays in the history until the recipe's retention expires
+  it.
   """
 
   # Set up logging.
@@ -240,8 +242,8 @@ def download(
           f"An error occurred ({type(exc).__name__}). Aborting: the blocks written are on branch"
           f" {run.branch}, `main` is unchanged."
         ) from exc
-    # Every block is written: `main` moves to them.
+    # Every block is written: `main` moves to them, then the recipe's retention applies.
     try:
-      run.finish()
+      run.finish(configs.save.retention())
     except icechunk_utils.PromotionError as exc:
       raise click.ClickException(str(exc)) from exc

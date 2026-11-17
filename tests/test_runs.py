@@ -1,18 +1,21 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 """Runs write on a branch of their own; `main` moves only when a run succeeds (`--replace` writes
-a new version of an existing output)."""
+a new version of an existing output); the recipe's retention expires the versions replaced."""
 
+import datetime
 import pathlib
+from types import SimpleNamespace
 
 import icechunk
 import numpy as np
 import pytest
 import xarray as xr
 from click.testing import CliRunner
+from pydantic import ValidationError
 
-from arcomake import cli, icechunk_utils
-from arcomake.dataset_utils import write_output
+from arcomake import cli, dataset_utils, icechunk_utils
+from arcomake.dataset_utils import SaveConfig, write_output
 from tests.conftest import open_output, render_recipe
 
 
@@ -97,6 +100,142 @@ def run_labels(path) -> list[str]:
   return labels
 
 
+def test_keep_versions_expires_older_versions(tmp_path: pathlib.Path, no_grace):
+  """`keep_versions = 2`: after a third run, the first version is expired and its data deleted;
+  the two newest stay readable."""
+  path = tmp_path / "out.zarr"
+  save = SaveConfig(keep_versions=2)
+  snapshots = [write_output(dataset(v), path, save, message=f"v{v}") for v in (1, 2, 3)]
+  assert len(run_labels(path)) == 2
+  for snapshot, value in zip(snapshots[1:], (2, 3), strict=True):
+    store = icechunk_utils.readonly_store(path, snapshot_id=snapshot)
+    xr.testing.assert_identical(xr.open_zarr(store, consolidated=False).load(), dataset(value))
+  with pytest.raises(Exception):  # noqa: B017 (icechunk's error type for a deleted snapshot)
+    xr.open_zarr(icechunk_utils.readonly_store(path, snapshot_id=snapshots[0])).load()
+
+
+def test_without_retention_every_version_stays(tmp_path: pathlib.Path):
+  """Without keep_history or keep_versions nothing is expired."""
+  path = tmp_path / "out.zarr"
+  for value in (1, 2, 3):
+    write_output(dataset(value), path, message=f"v{value}")
+  assert len(run_labels(path)) == 3
+
+
+@pytest.mark.parametrize(
+  ("save", "message"),
+  [
+    ({"keep_history": "30D", "keep_versions": 2}, "not both"),
+    ({"keep_versions": 0}, "greater than or equal to 1"),
+    ({"keep_history": "-1D"}, "not negative"),
+  ],
+)
+def test_invalid_retention_fails_when_loaded(save: dict, message: str):
+  with pytest.raises(ValidationError, match=message):
+    SaveConfig.model_validate(save)
+
+
+def test_retention_from_the_recipe():
+  """`keep_history` takes durations as recipes write them; `retention()` is None without one."""
+  assert SaveConfig.model_validate({"keep_history": "30D"}).keep_history.days == 30  # type: ignore[union-attr]
+  assert SaveConfig().retention() is None
+  assert isinstance(SaveConfig(keep_versions=3).retention(), icechunk_utils.Retention)
+
+
+def test_retention_errors_do_not_fail_a_promoted_run(tmp_path, monkeypatch, caplog):
+  """The run is promoted before the retention applies: an error there is logged, not raised."""
+  path = tmp_path / "out.zarr"
+  write_output(dataset(1), path, message="v1")
+
+  def broken(*args, **kwargs):
+    raise OSError("store unavailable")
+
+  monkeypatch.setattr(icechunk.Repository, "expire_snapshots", broken)
+  write_output(dataset(2), path, SaveConfig(keep_versions=1), message="v2")
+  xr.testing.assert_identical(open_output(path).load(), dataset(2))
+  assert "retention could not be applied" in caplog.text
+  assert dataset_utils  # imported for the module under test
+
+
+@pytest.fixture
+def no_grace(monkeypatch: pytest.MonkeyPatch):
+  """Collect at once (the grace period protects other runs' uncommitted data for days)."""
+  monkeypatch.setattr(icechunk_utils, "GRACE", datetime.timedelta(0))
+
+
+def test_keep_history_expires_versions_replaced_before_the_limit(tmp_path, no_grace):
+  """`keep_history`: a version is kept while it was replaced less than that long ago (here a
+  limit of zero: only the current version stays); branches of failed runs older than the limit
+  and the grace period are deleted."""
+  path = tmp_path / "out.zarr"
+  write_output(dataset(1), path, message="v1")
+  failed = icechunk_utils.Run(path, None, icechunk_utils.run_label("failed"))
+  failed.write(dataset(9), message="never finished")
+  write_output(dataset(2), path, SaveConfig(keep_history="0s"), message="v2")
+  assert len(run_labels(path)) == 1
+  assert repository(path).list_branches() == {"main"}
+  xr.testing.assert_identical(open_output(path).load(), dataset(2))
+
+
+def snapshot(label: str, days_ago: float) -> SimpleNamespace:
+  written = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=days_ago)
+  return SimpleNamespace(metadata={icechunk_utils.RUN_KEY: label}, written_at=written)
+
+
+class FakeHistory:
+  """`main`'s history, newest first, counting the snapshots read."""
+
+  def __init__(self, snapshots):
+    self.snapshots, self.read = snapshots, 0
+
+  def ancestry(self, branch):
+    for item in self.snapshots:
+      self.read += 1
+      yield item
+
+
+def test_keep_history_counts_from_the_replacement():
+  """A version written long ago but replaced recently is kept: the age that counts is since it
+  was replaced (when the next version was written), not since it was written."""
+  retention = icechunk_utils.Retention(keep_history=datetime.timedelta(days=30))
+  recent_replacement = FakeHistory([snapshot("c", 0), snapshot("b", 60)])
+  assert retention.limit(recent_replacement) is None  # type: ignore[arg-type]
+  history = FakeHistory([snapshot("c", 0), snapshot("b", 60), snapshot("a", 90)])
+  b = history.snapshots[1]
+  assert retention.limit(history) == b.written_at  # type: ignore[arg-type]  # a: replaced 60 days ago
+
+
+def test_keep_versions_reads_only_the_history_it_needs():
+  """Finding the versions to keep reads `main`'s history only until one more run is found."""
+  blocks = [snapshot(label, i) for i, label in enumerate("ccccbbbbaaaa")]
+  history = FakeHistory(blocks)
+  limit = icechunk_utils.Retention(keep_versions=1).limit(history)  # type: ignore[arg-type]
+  assert limit == blocks[0].written_at and history.read == 5
+
+
+def test_another_run_in_progress_is_left_alone(tmp_path: pathlib.Path):
+  """Retention after one run keeps the branch, and the data, of another run still writing to the
+  same repository (younger than the grace period)."""
+  path = tmp_path / "out.zarr"
+  write_output(dataset(1), path, message="v1")
+  other = icechunk_utils.Run(path, None, icechunk_utils.run_label("other"))
+  other.write(dataset(7), message="still writing")
+  write_output(dataset(2), path, SaveConfig(keep_versions=1), message="v2")
+  assert other.branch in repository(path).list_branches()
+  store = repository(path).readonly_session(branch=other.branch).store
+  xr.testing.assert_identical(xr.open_zarr(store, consolidated=False).load(), dataset(7))
+
+
+def test_nothing_expired_means_no_collection(tmp_path, no_grace, monkeypatch):
+  """Garbage collection scans the whole repository: it runs only when snapshots were expired."""
+  calls = []
+  monkeypatch.setattr(icechunk.Repository, "garbage_collect", lambda *a, **kw: calls.append(a))
+  path = tmp_path / "out.zarr"
+  for value in (1, 2):
+    write_output(dataset(value), path, SaveConfig(keep_versions=5), message=f"v{value}")
+  assert calls == []
+
+
 def test_a_failed_first_run_needs_no_replace(tmp_path: pathlib.Path):
   """A repository whose `main` holds no version yet (a first run failed there) is written again
   without --replace."""
@@ -152,3 +291,10 @@ def test_process_runs_are_labelled_process(tmp_path: pathlib.Path):
   args = ["process", "--dask-setup", "threads", str(recipe), str(tmp_path / "in.zarr"), str(out)]
   assert CliRunner().invoke(cli, args).exit_code == 0
   assert run_labels(out)[0].startswith("process-")
+
+
+@pytest.mark.parametrize("value", ["30", 30])
+def test_keep_history_needs_a_unit(value):
+  """A bare number would be read as nanoseconds or seconds and expire nearly the whole history."""
+  with pytest.raises(ValidationError, match="with its unit"):
+    SaveConfig.model_validate({"keep_history": value})

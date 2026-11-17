@@ -3,6 +3,7 @@
 import datetime
 import logging
 import pathlib
+import re
 import tempfile
 import warnings
 from collections.abc import Callable, Generator, Hashable, Mapping
@@ -295,6 +296,34 @@ class SaveConfig(BaseModel):
   encoding: dict[str, VariableEncodingConfig] | None = None
   storage_options: dict[str, Any] | None = None
   group: str | None = None
+  # How long versions of the output replaced by later runs are kept (one of the two; without
+  # them, all are kept): by age (e.g. "30D"), or as the number of versions kept, the current
+  # one included. Applied after each successful run (see `icechunk_utils.Retention`).
+  keep_history: datetime.timedelta | None = None
+  keep_versions: Annotated[int, Field(ge=1)] | None = None
+
+  @field_validator("keep_history", mode="before")
+  @classmethod
+  def _parse_keep_history(cls, value: Any) -> Any:
+    # A duration with its unit ("30D", "12h", "0s"): a bare number would be read as nanoseconds
+    # (pandas) or seconds (pydantic), and expire nearly the whole history.
+    if not isinstance(value, str) or not re.search(r"[A-Za-z]", value):
+      raise ValueError('keep_history is a duration with its unit, e.g. "30D"')
+    return may_parse_timedelta(value)
+
+  @model_validator(mode="after")
+  def _one_retention(self) -> "SaveConfig":
+    if self.keep_history is not None and self.keep_versions is not None:
+      raise ValueError("give keep_history or keep_versions, not both")
+    if self.keep_history is not None and self.keep_history < datetime.timedelta(0):
+      raise ValueError("keep_history is a duration, not negative")
+    return self
+
+  def retention(self) -> "icechunk_utils.Retention | None":
+    """The retention of the output's versions, if the recipe sets one."""
+    if self.keep_history is None and self.keep_versions is None:
+      return None
+    return icechunk_utils.Retention(self.keep_history, self.keep_versions)
 
   @field_validator("chunks", "shards")
   @classmethod
@@ -656,7 +685,7 @@ def write_output(
 
   `destination` is a run (`icechunk_utils.Run`, which the caller finishes) or the path of a
   repository: then the write is a run of its own (labelled with `command`), finished at once
-  (`main` moves to it). Returns the commit.
+  (`main` moves to it, and the recipe's retention applies). Returns the commit.
 
   Raises:
     ValueError: for a `.zip` destination (zip outputs were removed with Zarr v3), or a layout
@@ -679,6 +708,7 @@ def write_output(
     mode=mode,
     append_dim=append_dim,
     group=configs.group,
+    retention=configs.retention(),
     command=command,
   )
 
@@ -761,4 +791,4 @@ def write_outputs_together(
     for run, session in zip(runs, sessions, strict=True):
       run.commit(session, label)
   # Every output is written: only now does `main` move, repository after repository.
-  return [run.finish() for run in runs]
+  return [run.finish(configs.retention()) for run in runs]

@@ -130,7 +130,11 @@ time>`), in commits: one per block for `download` (its message names the block's
 the version readers see, move to the run's output (if `main` changed meanwhile, the run stays on its
 branch); a failed run leaves `main` as it was. An existing output is written only with `--replace`,
 which keeps the version it replaces in the history and refuses anything at the path that is not a
-repository. Read outputs with
+repository. `[save] keep_history` (a duration with its unit, e.g. `"30D"`: a version is kept while it
+was replaced less than that long ago) or `keep_versions` (a number, the current version included)
+limits that history: after each successful run, older versions are expired and the data no version
+uses any more is deleted, once it is older than a week (another run may still be writing to the same
+repository); without them, every version is kept. Read outputs with
 `engine = "icechunk"`, or with Icechunk and xarray directly. `[save] storage_options` for an S3
 repository: `profile`, `region` (by default the bucket's, asked to S3, else the profile's),
 `endpoint_url`, `anon`, `network_stream_timeout_seconds` (default 20: a request without progress for

@@ -207,17 +207,18 @@ def write(
   mode: Literal["w", "w-", "a", "a-", "r+"] = "w",
   append_dim: Hashable | None = None,
   group: str | None = None,
+  retention: "Retention | None" = None,
   command: str = "write",
 ) -> str:
   """Write `dataset` in a run of `command` of a single commit (see `Run`); return the new tip of
   `main`.
 
   The repository is created if missing. Mode "w" replaces the content in the new version: earlier
-  versions stay in the repository's history.
+  versions stay in the repository's history until `retention` expires them.
   """
   run = Run(path, storage_options, run_label(command))
   run.write(dataset, message=message, mode=mode, append_dim=append_dim, group=group)
-  return run.finish()
+  return run.finish(retention)
 
 
 def readonly_store(
@@ -254,7 +255,7 @@ class Run:
 
   The branch (`run/<label>`) starts at the tip of `main`; every write of the run is a commit on
   it, with the run's label in the commit metadata. `finish` moves `main` to the run's last commit
-  if `main` has not changed meanwhile, then deletes the branch.
+  if `main` has not changed meanwhile, deletes the branch, then applies the recipe's retention.
   A run that fails before `finish` leaves `main` as it was (its branch stays, with what was
   written).
   """
@@ -292,12 +293,12 @@ class Run:
     to_icechunk(dataset, session, mode=mode, append_dim=append_dim, group=group)
     return self.commit(session, message)
 
-  def finish(self) -> str:
+  def finish(self, retention: "Retention | None" = None) -> str:
     """Move `main` to the run's last commit (if `main` is still where the run started), then
-    delete the run's branch; return the new tip of `main`.
+    delete the run's branch and apply `retention`; return the new tip of `main`.
 
-    Once `main` has moved the run has succeeded: an error deleting the branch is logged, not
-    raised.
+    Once `main` has moved the run has succeeded: errors deleting the branch or applying the
+    retention are logged, not raised.
 
     Raises:
       PromotionError: if `main` changed during the run; the run's branch is kept.
@@ -314,4 +315,94 @@ class Run:
       self.repo.delete_branch(self.branch)
     except Exception:
       logger.exception(f"{self.path}: branch {self.branch} could not be deleted (main is promoted)")
+    if retention is not None:
+      retention.apply(self.repo, self.path, current=self.label)
     return tip
+
+
+# Objects (chunks, manifests) younger than this are never collected, nor are the branches of
+# other runs whose tips are younger deleted: a run still writing to the same repository has
+# uncommitted chunks no snapshot references yet, and a branch it is still committing to.
+GRACE = datetime.timedelta(days=7)
+
+
+class Retention:
+  """How long the versions of `main` replaced by later runs are kept (`[save] keep_history` or
+  `keep_versions`), applied after each successful run.
+
+  `keep_history`: a version is kept while it was replaced less than that long ago (when the run
+  after it was written). `keep_versions`: the number of versions kept, the current one included.
+  Older snapshots are expired; then, if anything was, the objects no snapshot references and older
+  than `GRACE` are deleted, with the branches of other runs whose tips are older than both the
+  limit and `GRACE` (failed runs). The current version is never expired.
+  """
+
+  def __init__(
+    self, keep_history: datetime.timedelta | None = None, keep_versions: int | None = None
+  ) -> None:
+    if (keep_history is None) == (keep_versions is None):
+      raise ValueError("give exactly one of keep_history and keep_versions")
+    self.keep_history = keep_history
+    self.keep_versions = keep_versions
+
+  def limit(self, repo: icechunk.Repository) -> datetime.datetime | None:
+    """Snapshots written before this time are expired; `None`: nothing to expire."""
+    # The versions of `main`, newest first: the last commit of each run in its history. Only as
+    # many as needed are read (a download has a commit per block).
+    tips: list[Any] = []
+    seen: set[str] = set()
+    now = datetime.datetime.now(datetime.UTC)
+    for snapshot in repo.ancestry(branch=BRANCH):
+      run = (snapshot.metadata or {}).get(RUN_KEY)
+      if run is None or run in seen:
+        continue
+      seen.add(run)
+      tips.append(snapshot)
+      if self.keep_versions is not None and len(tips) > self.keep_versions:
+        break
+      # tips[-1] was replaced when tips[-2] was written: past the limit, so are the older ones.
+      if (
+        self.keep_history is not None
+        and len(tips) > 1
+        and now - tips[-2].written_at > self.keep_history
+      ):
+        break
+    if self.keep_versions is not None:
+      kept = tips[: self.keep_versions]
+    else:
+      kept = tips[:1] + [
+        older
+        for newer, older in zip(tips, tips[1:], strict=False)
+        if now - newer.written_at <= self.keep_history  # type: ignore[operator]
+      ]
+    if len(kept) == len(tips):
+      return None
+    oldest_kept = kept[-1].written_at
+    assert isinstance(oldest_kept, datetime.datetime)
+    return oldest_kept
+
+  def apply(self, repo: icechunk.Repository, path: str, *, current: str | None = None) -> None:
+    """Expire and collect; errors are logged, not raised (the run is already promoted)."""
+    try:
+      limit = self.limit(repo)
+      if limit is None:
+        return
+      safe = min(limit, datetime.datetime.now(datetime.UTC) - GRACE)
+      for branch in repo.list_branches():
+        if branch == BRANCH or branch == f"run/{current}":
+          continue
+        tip = next(iter(repo.ancestry(branch=branch)))
+        if tip.written_at < safe:
+          repo.delete_branch(branch)
+          logger.info(f"{path}: deleted branch {branch} (a run without commits since {safe:%F})")
+      expired = repo.expire_snapshots(limit)
+      if not expired:
+        return
+      summary = repo.garbage_collect(safe)
+      logger.info(
+        f"{path}: expired {len(expired)} snapshots older than {limit:%Y-%m-%dT%H:%M:%SZ};"
+        f" deleted {summary.chunks_deleted} chunks, {summary.manifests_deleted} manifests,"
+        f" {summary.snapshots_deleted} snapshots older than {safe:%Y-%m-%dT%H:%M:%SZ}"
+      )
+    except Exception:
+      logger.exception(f"{path}: the retention could not be applied; the output is complete")

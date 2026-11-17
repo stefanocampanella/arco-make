@@ -178,7 +178,8 @@ class ClimatologyConfig(BaseModel):
   "--replace/--no-replace",
   help=(
     "Write a new version of an existing output (an Icechunk repository): it replaces what `main`"
-    " shows once the run succeeds; earlier versions stay in its history"
+    " shows once the run succeeds; earlier versions stay in its history until the recipe's"
+    " [save] keep_history or keep_versions expires them"
   ),
   default=False,
   is_flag=True,
@@ -851,7 +852,7 @@ def _compute_by_series(
     run.commit(session, f"{label}: {len(series)} series")
   # Both outputs are written: only now does `main` move, in one repository after the other.
   for run in runs:
-    run.finish()
+    run.finish(configs.save.retention())
 
 
 def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:
