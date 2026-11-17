@@ -201,3 +201,34 @@ def test_climatology_outputs_share_their_commit_message(tmp_path: pathlib.Path, 
     for p in (clim, std)
   ]
   assert messages[0] == messages[1] and messages[0].startswith("compute-climatology ")
+
+
+def test_s3_credentials_are_resolved_once_while_valid(monkeypatch: pytest.MonkeyPatch):
+  """Resolving credentials again for every client or fork icechunk creates made S3 writes
+  several times slower: they are reused while more than a minute of validity is left."""
+  import botocore.session
+
+  sessions = []
+  original = botocore.session.Session.__init__
+
+  def counting_init(self, *args, **kwargs):
+    sessions.append(kwargs.get("profile"))
+    original(self, *args, **kwargs)
+
+  monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
+  monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-example")
+  monkeypatch.delenv("AWS_PROFILE", raising=False)
+  monkeypatch.delenv("AWS_DEFAULT_PROFILE", raising=False)
+  monkeypatch.setattr(icechunk_utils, "_CREDENTIALS", {})
+  monkeypatch.setattr(botocore.session.Session, "__init__", counting_init)
+  first = icechunk_utils._botocore_credentials(None)
+  assert icechunk_utils._botocore_credentials(None) is first
+  assert sessions == [None]
+
+
+def test_s3_stream_timeout_option(fake_s3):
+  """`network_stream_timeout_seconds` is accepted (default `STREAM_TIMEOUT`, shorter than
+  icechunk's 60 s: stalled requests are retried sooner)."""
+  options = {"region": "eu-south-1", "anon": True, "network_stream_timeout_seconds": 5}
+  assert isinstance(icechunk_utils.storage("s3://b/p", options), icechunk.Storage)
+  assert icechunk_utils.STREAM_TIMEOUT < 60

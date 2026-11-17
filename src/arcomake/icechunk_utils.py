@@ -6,7 +6,8 @@ A path names a repository on a local filesystem (a directory, or a `file://` URL
 (`s3://bucket/prefix`) or on Google Cloud Storage (`gs://bucket/prefix`). Recipes give its options
 in `storage_options`, as for fsspec, but only these are understood (others are an error):
 - S3: `profile` (else `AWS_PROFILE`), `region` (else the bucket's, asked to S3 at the endpoint;
-  else the profile's), `endpoint_url`, `anon`; credentials come from botocore, as for every other
+  else the profile's), `endpoint_url`, `anon`, `network_stream_timeout_seconds` (default 20, see
+  `STREAM_TIMEOUT`); credentials come from botocore, as for every other
   S3 access of arco-make (icechunk's own AWS client cannot use some profiles), refreshed before
   they expire.
 - GCS: `token = "anon"` for anonymous access, or the path of a service account file; otherwise
@@ -17,6 +18,7 @@ import datetime
 import functools
 import logging
 import pathlib
+import threading
 from collections.abc import Hashable, Mapping
 from typing import Any, Literal
 
@@ -28,27 +30,49 @@ from icechunk.xarray import to_icechunk
 logger = logging.getLogger(__name__)
 
 BRANCH = "main"
-S3_OPTIONS = {"profile", "region", "endpoint_url", "anon"}
+S3_OPTIONS = {"profile", "region", "endpoint_url", "anon", "network_stream_timeout_seconds"}
+# Seconds without progress before an S3 request is retried (icechunk's default: 60). Requests
+# stall now and then: on the project bucket, whole reads that take 6-7 s took up to 107 s with
+# 60 s, at most 22 s with 10 s. The timeout is reset by progress, so it only cuts stalls.
+STREAM_TIMEOUT = 20
 GCS_OPTIONS = {"token"}
+
+
+# Credentials resolved in this process, per profile: resolving them again for every client or
+# fork icechunk creates (a botocore session each, possibly an external credential process) made
+# writes to S3 several times slower.
+_CREDENTIALS: dict[str | None, icechunk.S3StaticCredentials] = {}
+_CREDENTIALS_LOCK = threading.Lock()
 
 
 def _botocore_credentials(profile: str | None) -> icechunk.S3StaticCredentials:
   """Credentials of `profile` (or the environment's), valid for at most 10 minutes: icechunk
-  asks again when they expire, and botocore refreshes temporary credentials as needed."""
-  import botocore.session
+  asks again when they expire, and botocore refreshes temporary credentials as needed. Reused
+  while more than a minute of validity is left."""
+  now = datetime.datetime.now(datetime.UTC)
+  with _CREDENTIALS_LOCK:
+    cached = _CREDENTIALS.get(profile)
+    if (
+      cached is not None
+      and cached.expires_after is not None
+      and cached.expires_after - now > datetime.timedelta(minutes=1)
+    ):
+      return cached
+    import botocore.session
 
-  credentials = botocore.session.Session(profile=profile).get_credentials()
-  if credentials is None:
-    raise ValueError(f"no AWS credentials for profile {profile or '(environment)'}")
-  frozen = credentials.get_frozen_credentials()
-  soon = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=10)
-  expiry = getattr(credentials, "_expiry_time", None)
-  return icechunk.S3StaticCredentials(
-    access_key_id=frozen.access_key,
-    secret_access_key=frozen.secret_key,
-    session_token=frozen.token,
-    expires_after=min(expiry, soon) if expiry is not None else soon,
-  )
+    credentials = botocore.session.Session(profile=profile).get_credentials()
+    if credentials is None:
+      raise ValueError(f"no AWS credentials for profile {profile or '(environment)'}")
+    frozen = credentials.get_frozen_credentials()
+    soon = now + datetime.timedelta(minutes=10)
+    expiry = getattr(credentials, "_expiry_time", None)
+    _CREDENTIALS[profile] = icechunk.S3StaticCredentials(
+      access_key_id=frozen.access_key,
+      secret_access_key=frozen.secret_key,
+      session_token=frozen.token,
+      expires_after=min(expiry, soon) if expiry is not None else soon,
+    )
+    return _CREDENTIALS[profile]
 
 
 @functools.cache
@@ -116,16 +140,26 @@ def storage(
     anonymous = bool(options.get("anon"))
     profile, endpoint_url = options.get("profile"), options.get("endpoint_url")
     region = options.get("region") or _bucket_region(bucket, profile, endpoint_url, anonymous)
+    timeout = int(options.get("network_stream_timeout_seconds", STREAM_TIMEOUT))
     if anonymous:
       return icechunk.s3_storage(
-        bucket=bucket, prefix=prefix, region=region, endpoint_url=endpoint_url, anonymous=True
+        bucket=bucket,
+        prefix=prefix,
+        region=region,
+        endpoint_url=endpoint_url,
+        anonymous=True,
+        network_stream_timeout_seconds=timeout,
       )
     return icechunk.s3_storage(
       bucket=bucket,
       prefix=prefix,
       region=region,
       endpoint_url=endpoint_url,
+      network_stream_timeout_seconds=timeout,
       get_credentials=functools.partial(_botocore_credentials, profile),
+      # The credentials travel with the storage to forks and workers, which ask again only when
+      # they expire.
+      scatter_initial_credentials=True,
     )
   _unknown(options, GCS_OPTIONS, "GCS repositories")
   token = options.get("token")

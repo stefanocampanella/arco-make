@@ -129,8 +129,11 @@ directory, an `s3://` or a `gs://` URL. Each write is a commit on branch `main`:
 `compute-climatology`. `--overwrite` replaces a repository's content in a new commit (earlier versions
 stay in its history) and refuses anything at the path that is not a repository. Read outputs with
 `engine = "icechunk"`, or with Icechunk and xarray directly. `[save] storage_options` for an S3
-repository: `profile`, `region` (by default the profile's, else the bucket's), `endpoint_url`, `anon`;
-credentials come from botocore, as for the rest of arco-make. For GCS: `token = "anon"`. In `[save]`:
+repository: `profile`, `region` (by default the bucket's, asked to S3, else the profile's),
+`endpoint_url`, `anon`, `network_stream_timeout_seconds` (default 20: a request without progress for
+that long is retried); credentials come from botocore, as for the rest of arco-make. For GCS: `token`
+is `"anon"` or a service account file (by default, the environment's credentials). Options Icechunk
+cannot honour are an error, before any download. In `[save]`:
 - `chunks` set the stored chunks, per dimension (-1, or a dimension not listed: the whole dimension).
 - `shards`, in the same form, group whole chunks into one stored object each (Zarr v3 sharding):
   fewer, larger objects, while readers still fetch single chunks. Without `shards`, every chunk is an
