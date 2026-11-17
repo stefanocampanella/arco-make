@@ -358,6 +358,14 @@ class Run:
     to_icechunk(dataset, session, mode=mode, append_dim=append_dim, group=group)
     return self.commit(session, message, metadata)
 
+  def last_block(self) -> str | None:
+    """The block (`BLOCK_KEY`) the tip of the run's branch commits, if it is one of this run's:
+    a commit whose answer was lost (a timeout after it landed) is not redone."""
+    tip = next(iter(self.repo.ancestry(branch=self.branch)))
+    metadata = tip.metadata or {}
+    block = metadata.get(BLOCK_KEY)
+    return str(block) if block is not None and metadata.get(RUN_KEY) == self.label else None
+
   def finish(self, retention: "Retention | None" = None) -> str:
     """Move `main` to the run's last commit (if `main` is still where the run started), then
     delete the run's branch and apply `retention`; return the new tip of `main`.

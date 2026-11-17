@@ -327,6 +327,8 @@ def _write_block(
 ) -> None:
   """Read, process and merge the datasets of one block, and commit it to the run's branch
   (written by the first block, appended along time by the others)."""
+  if _committed(run, date_interval):
+    return
   with (
     _processed_block(configs, date_interval, progress=progress) as dataset,
     ProgressBar() if progress else nullcontext(),
@@ -435,20 +437,30 @@ def _write_blocks_staged(
     staged = future.result()
     start_next()
     first = number == 0
-    with_retries(
-      functools.partial(
-        run.write,
+
+    def commit(staged: _Staged = staged, interval: DateInterval = interval, first: bool = first):
+      if _committed(run, interval):
+        return
+      run.write(
         _from_stage(staged),
         message=_commit_message(interval),
         mode="w" if first else "a-",
         append_dim=None if first else configs.time_dim,
         group=configs.save.group,
         metadata=_block_metadata(interval, recipe),
-      ),
-      configs.retries,
-      f"{_describe(interval)} (commit)",
-    )
+      )
+
+    with_retries(commit, configs.retries, f"{_describe(interval)} (commit)")
     shutil.rmtree(staged.path, ignore_errors=True)
+
+
+def _committed(run: icechunk_utils.Run, interval: DateInterval) -> bool:
+  """Whether the block is already the run's last commit: an attempt whose commit landed but
+  whose answer was lost (a transient error) must not append it again."""
+  if run.last_block() != block_key(interval):
+    return False
+  logger.warning(f"{_describe(interval)}: already committed by the previous attempt")
+  return True
 
 
 def block_key(interval: DateInterval) -> str:

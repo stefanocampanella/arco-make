@@ -13,7 +13,7 @@ import requests
 from click.testing import CliRunner
 from pydantic import ValidationError
 
-from arcomake import cli, retries
+from arcomake import cli, icechunk_utils, retries
 from arcomake.retries import RetryConfig, is_transient, with_retries
 from tests.conftest import open_output, render_recipe
 
@@ -150,3 +150,31 @@ def test_a_block_failing_once_is_redone(
   # The command's own log handler writes to its output.
   assert failures and "TimeoutError: simulated GCS read timeout (transient" in result.output
   assert open_output(output).sizes["time"] == 5
+
+
+@pytest.mark.parametrize("blocks_at_once", ["1", "2"])
+def test_a_commit_that_landed_is_not_redone(
+  tmp_path: pathlib.Path, sources: pathlib.Path, monkeypatch: pytest.MonkeyPatch, blocks_at_once
+):
+  """The second block's commit lands, then its answer times out: the retry must not append the
+  block again (duplicate times)."""
+  real_write = icechunk_utils.Run.write
+  lost = []
+
+  def write_then_time_out(self, dataset, **kwargs):
+    snapshot = real_write(self, dataset, **kwargs)
+    if kwargs["mode"] == "a-" and not lost:
+      lost.append(snapshot)
+      raise TimeoutError("answer lost after the commit")
+    return snapshot
+
+  monkeypatch.setattr(icechunk_utils.Run, "write", write_then_time_out)
+  monkeypatch.setattr(retries.time, "sleep", lambda seconds: None)
+  recipe = render_recipe("sample_download.toml", tmp_path, SOURCES=str(sources))
+  output = tmp_path / "out.zarr"
+  args = ["download", "--dask-setup", "threads", "--blocks", blocks_at_once]
+  result = CliRunner().invoke(cli, [*args, str(recipe), str(output)])
+  assert result.exit_code == 0, result.output
+  assert lost and "already committed by the previous attempt" in result.output
+  times = open_output(output).time.values
+  assert len(times) == 5 and len(set(times)) == 5
