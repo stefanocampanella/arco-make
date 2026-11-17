@@ -561,3 +561,34 @@ test that fails on the previous commit):
 - Still open: which IFS stream (HRES `oper` or ENS `enfo`, 51 members), runs other than 00 UTC
   (waves and IFS have 12 UTC), and whether 3-hourly fields (waves, IFS) stay 3-hourly or become
   daily means.
+
+## 2026-11-17: forecast design decisions; what "day D" means for every source
+
+**Maintainer's decisions (17 Nov):** IFS HRES (one member), 00 UTC runs only, daily resolution,
+`lat`/`lon` for the horizontal coordinates (dynamical.org's names for the time dimensions:
+`init_time`, `lead_time`, `valid_time`).
+
+**Day D in each source** (checked on the data and GRIB keys, 17 Nov; the convention to keep:
+day D is [D 00:00, D+1 00:00) UTC, stamped D 00:00):
+- GLORYS reanalysis and GLO12 forecast daily means: stamped 00:00, midnight to midnight (GLO12
+  product user manual). In sync.
+- WAVERYS and GLO12 waves: instantaneous every 3 h, 00:00 to 21:00; `resample` with
+  `label = closed = "left"` averages 00:00-21:00 of D. In sync.
+- ERA5 instantaneous variables: hourly 00:00-23:00 of D, averaged the same way. In sync.
+- **ERA5 accumulations (`tp`, `ssrd`, `strd`): one hour early.** ECMWF: an hourly accumulation
+  covers the hour ending at its stamp, so the value stamped 00:00 is the last hour of the previous
+  day. The recipe sums the stamps 00:00-23:00 of D: [D-1 23:00, D 23:00). **[Moby-Dick]** this
+  holds for the published data (C10 confirmed). A recipe-only fix (`closed = "right"`) would
+  break at block edges (the first stamp of a block forms a one-hour bin, the last day misses its
+  24:00 hour): it needs a part-level time offset applied before the block's time selection, or
+  reading one hour past the block (arco-make, group 9).
+- GloFAS historical (v5, `time_mean`): the request for day D is the mean over [D 00:00, D+1
+  00:00) (GRIB `dataDate` D, `stepRange` 0-24, `validityDate` D+1); arco-make stamps it D. In
+  sync: the feared one-day offset of `dis24` (C10, B9) does not exist for this variable.
+- GloFAS forecast: lead 24 h is the mean over the run day (`stepRange` 0-24), lead 48 h the next
+  day: lead day k = `leadtime_hour` 24(k+1), so a shift of -24 h gives lead days 0-29.
+- IFS HRES 00 UTC (to build): daily mean of lead day k from the instantaneous steps 24k to 24k+21
+  (3-hourly to 144 h, then 6-hourly: 8 then 4 samples, ERA5 has 24); accumulations as
+  differences, acc(24(k+1)) - acc(24k), exactly lead day k. Lead days 0-9.
+- GLO12 physics and waves forecast runs from the 00 UTC release of day R: lead day k is the
+  daily value of R + k; lead days 0-9 (negative leads, the hindcast part of a release, dropped).
