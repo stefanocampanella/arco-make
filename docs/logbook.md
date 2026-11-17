@@ -713,3 +713,43 @@ listing would count old versions, archived pieces and experiments):
 - Total: about 24 TB in steady state, about 31 TB at worst, of the 50 TB of the sponsorship.
   Until the production download replaces it, the data in use now (unpacked dataset, its archived
   pieces, an older version: about 15 TB) also stays.
+
+## 2026-11-17: group 7, resumable and fault-tolerant downloads
+
+Maintainer's decisions: retry defaults in arco-make, overridable per source; an explicit
+`--resume` (a plain rerun refuses and names the waiting branch); blocks at once through a CLI
+option, default 1. Five commits:
+- **Request timeouts.** Parts take `timeout` (seconds, default 120): gcsfs `requests_timeout`
+  (None by default: the N7 hangs), botocore's connect and read timeouts on S3 when given,
+  `requests` for NetCDF over HTTP (connect at most 30 s), cdsapi for EWDS. Not for Copernicus
+  Marine, which has its own.
+- **Block retries.** A block failing with a transient error (timeouts, connection errors, HTTP
+  408/425/429/5xx, also raised from or grouped in another error) is redone, waiting 1 min,
+  doubled up to 30 min, 5 attempts by default (`[retries]`). Others fail at once; the log says
+  which. Per block, not per source: a block reads all its sources in one computation. The
+  errors logged by the 0.25° download's six failed pieces (EWDS retries, DNS failures, connect
+  timeouts, Copernicus Marine resets) are of the transient kind; an ecCodes crash (N6) kills the
+  process and cannot be retried, but N6 is fixed.
+- **Fetched once per run.** The GloFAS static file was downloaded for every block; an outage of
+  its server (502, 16 Nov) failed the block it met. It is now fetched once per run.
+- **`--resume`.** Every block's commit records its interval and a fingerprint of the recipe
+  (start and end included; retries, request timeouts and checkpointing not, so a run that failed
+  on timeouts resumes with longer ones). `--resume` continues the newest failed download run on
+  its branch and writes only the missing blocks; it refuses another recipe, or a run that
+  started before `main` last moved. A plain rerun refuses beside a failed run that can still be
+  promoted; `--replace` starts over. The six manual reruns of the 0.25° download become one
+  command each, without rereading the blocks already written.
+- **`--blocks N`.** N blocks are read and processed at once, each staged on local disk by a
+  thread of its own and committed in order with the encodings and Dask chunks its direct write
+  would have had: the output is the same as with one block at a time (tested, array metadata
+  included). Memory and disk grow with N: the 0.25° levels-50 baseline windows (2-5 days)
+  peaked at 36-53 GB in one process. Not yet measured on real data: two processes each kept
+  their speed (logbook, 16 Nov), so about 2x is expected with N = 2.
+
+Review (high effort) of the five commits: ten findings, all fixed in six follow-up commits, each
+with a test that fails without it. The serious ones: gcsfs options were added to `engine =
+"icechunk"` inputs on GCS, which then failed to open; a commit that landed but whose answer was
+lost would be retried and append its block twice (each attempt now checks the branch tip's
+block first); `--blocks N` held N + 1 blocks. Found while fixing: checkpoints were removed only
+at the end of a run, harmless for 256-day pieces but filling the disk over a whole resumable
+download; they now go with their block.
