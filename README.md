@@ -69,8 +69,10 @@ command starts, from the environment or the file (`CDSAPI_URL` must be an HTTP U
 existing writable directory); errors name the variable, never its value. Keys that are not
 settings are ignored with a warning naming the key; a file other users can read, or a missing file
 named by `ARCOMAKE_RC`, is reported. Also accepted: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-`AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_ENDPOINT_URL` and the `ECCODES_*`
-paths. A recipe's `storage_options` (e.g. `profile`) override `AWS_PROFILE`. Runs with `s3://`
+`AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_ENDPOINT_URL`, the `ECCODES_*`
+paths, and `COPERNICUSMARINE_MAX_POOL_CONNECTIONS` (connections per Copernicus Marine client, a
+positive integer; the toolbox's default, 10, is fewer than Dask's threads on a large machine). A
+recipe's `storage_options` (e.g. `profile`) override `AWS_PROFILE`. Runs with `s3://`
 paths or Copernicus Marine parts (both use botocore) fail at once if the AWS profile does not
 exist.
 

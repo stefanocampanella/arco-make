@@ -21,6 +21,7 @@ import xarray as xr
 from click.testing import CliRunner, Result
 
 from arcomake import cli, settings
+from arcomake.backends import CopernicusMarine
 
 RECIPES = pathlib.Path(__file__).parent / "recipes"
 
@@ -131,3 +132,29 @@ def test_download_from_live_service(name: str, tmp_path: pathlib.Path):
   assert expected.low <= finite.min() and finite.max() <= expected.high, (
     f"values outside [{expected.low}, {expected.high}]: {finite.min()}..{finite.max()}"
   )
+
+
+def test_copernicusmarine_returns_lazy_arrays():
+  """The backend gets lazily indexed arrays from the toolbox, so a recipe's `chunks` decide the reads.
+
+  It passes `chunk_size_limit=False`, which the toolbox does not document (it accepts -1 or a
+  positive limit): today a falsy limit opens the store without Dask (`chunks=None`), and xarray
+  then chunks the variables as the recipe says. The toolbox's default returns Dask arrays of its
+  own chunking instead (time 2, all 50 depths for this dataset), which a recipe's `chunks` would
+  only rechunk. If a toolbox release changes that, this check fails. The backend is called
+  directly, with the recipes' service and version: `xarray.open_dataset` would wrap or rechunk
+  what it returns.
+  """
+  expected = CASES["copernicusmarine"]
+  settings.load()
+  if not credentials_available(expected):
+    pytest.fail(f"no credentials: set {', '.join(expected.credentials)}")
+  ds = CopernicusMarine().open_dataset(
+    "cm://cmems_mod_glo_phy_my_0.083deg_P1D-m",
+    variables=["thetao", "zos"],
+    start_datetime="2012-01-01",
+    end_datetime="2012-01-04",
+    service="arco-geo-series",
+    dataset_version="202311",
+  )
+  assert {name: ds[name].chunks for name in ("thetao", "zos")} == {"thetao": None, "zos": None}

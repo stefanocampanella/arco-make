@@ -3,7 +3,8 @@
 """User settings: credentials and machine settings from the environment and `~/.arcomakerc`.
 
 The settings are the environment variables that arco-make's libraries read (Copernicus Marine and
-CDS/EWDS credentials, AWS profile and credentials, ecCodes paths, `TMPDIR`, `DASK_*`).
+CDS/EWDS credentials, the Copernicus Marine pool size, AWS profile and credentials, ecCodes paths,
+`TMPDIR`, `DASK_*`).
 `ArcoMakeSettings` reads them from the environment and from a dotenv file, `~/.arcomakerc` (or the
 file named by `ARCOMAKE_RC`; an empty value disables it). `export KEY=VALUE` lines are allowed, so
 job scripts can `source` the same file::
@@ -81,6 +82,12 @@ class ArcoMakeSettings(BaseSettings):
   copernicusmarine_service_password: SecretStr | None = Field(
     default=None, validation_alias="COPERNICUSMARINE_SERVICE_PASSWORD"
   )
+  # Connections per Copernicus Marine S3 client (toolbox default 10, fewer than Dask's threads).
+  # Text, as the toolbox reads it with `int()`, which silently falls back to 10 on values pydantic
+  # would take as integers ("32.0"); a value from the environment is not rewritten.
+  copernicusmarine_max_pool_connections: str | None = Field(
+    default=None, pattern=r"^[1-9][0-9]*$", validation_alias="COPERNICUSMARINE_MAX_POOL_CONNECTIONS"
+  )
   cdsapi_url: str | None = Field(default=None, validation_alias="CDSAPI_URL", pattern=r"^https?://")
   cdsapi_key: SecretStr | None = Field(default=None, validation_alias="CDSAPI_KEY")
   eccodes_dir: str | None = Field(default=None, validation_alias="ECCODES_DIR")
@@ -137,7 +144,7 @@ def apply(settings: ArcoMakeSettings, environ: MutableMapping[str, str] | None =
     value = getattr(settings, name)
     if value is not None:
       alias = str(field.validation_alias)
-      values[alias] = value.get_secret_value() if isinstance(value, SecretStr) else value
+      values[alias] = value.get_secret_value() if isinstance(value, SecretStr) else str(value)
   dask_values: dict[str, str] = {}
   for key, value in (settings.model_extra or {}).items():
     if key.startswith("DASK_"):

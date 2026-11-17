@@ -339,3 +339,109 @@ size on S3: experiments that read less than a whole shard must still perform wel
   stored chunks when `reference_period` starts inside one); the per-series path uses local threads
   whatever `--dask-setup` says; numba is a declared dependency, compiled on first use.
 
+## 2026-11-16: download times, GloFAS outage, Copernicus Marine toolbox, ERA5 sources
+
+**Question (maintainer):** how long does a full download take per resolution, and how will the
+planned changes move it?
+
+**From the logs of past runs on the project VM** (code of the 30 Sep image, blocks of 256 days run
+one after another, written to S3):
+- 0.25°, 50 levels, 1993–2023 (11,322 days): 166 h of running time, 7.8 days of calendar time
+  (30 Sep – 8 Oct). Median 46.6 s per day of data. The 21 h difference is failed attempts and
+  waits before manual restarts (six blocks); stalled requests inside completed blocks cost another
+  ~19 h (one block lost 8.5 h).
+- 10 levels, 10,408 days, all three resolutions (Aug–Sep): 88.5 h (0.25°), 85.2 h (0.5°), 85.7 h
+  (1.0°): about 30 s per day each. The output resolution does not matter: the time goes into
+  reading the sources, the same for all three. 0.5° and 1.0° at 50 levels were never run here;
+  estimate: as 0.25°.
+
+**Per source** (4-day windows, PR stack code, values discarded, s per day of data): GLORYS 3D at
+50 levels 26–36 (18–27 reading alone), Waverys 3.8, ERA5 3.6, ERA5 accumulated 2.2, sea ice 1.6,
+GloFAS about 2.5 (from the logs), static datasets about 1: about 40–50 in total, as measured in
+production. GLORYS is about 75 %. A run keeps 2–6 of 32 cores busy; two GLORYS benchmarks run at
+the same time each kept their speed (1.4 GB/s decoded together): neither the CPU nor the network
+is the limit, but how the work of one process overlaps. Run-to-run noise is large (26–36 s/day
+for the same window). Single requests stall for 76–91 s now and then.
+
+**Expected effect of the planned changes** (±20 %):
+- Group 7 (blocks with timeouts, retries, restart): about 146 h per resolution, unattended (no
+  stalls or manual restarts).
+- Two blocks at once (independent blocks of group 7): about 3–3.5 days per resolution; memory
+  allows two (36–53 GB each), not three.
+- Downloading the whole series directly removes the unpack pass on the HPC cluster.
+- zarr v3 with shards: little effect on time (writing averages about 7 MB/s); the block length must
+  be a multiple of the shard's time length, or appends rewrite partial shards.
+- Group 8 (chunk planner): possible gain, not quantified.
+- Not planned, for the maintainer: computing 0.5° and 1.0° from the 0.25° product would take hours
+  instead of days, but the values would differ from regridding the native grids.
+- **Maintainer's decision:** the performance of the full download is revisited after all planned
+  changes, before a production download (the Dask graph of one block is the first lead).
+
+**GloFAS static file outage.** `confluence.ecmwf.int` answered 502 on 16 Nov from about 12:05 UTC;
+it worked at 12:04 and again at 19:28 (not checked in between). Every block reads that file again,
+so an outage fails the block it hits. (A benchmark error first read as the outage was a bug in the
+benchmark script: the NetCDF-over-HTTP backend needs the temp directory registry of `download`.)
+
+**Baseline windows 2 and 3 with PR #1 code** (600 s GCS timeout):
+- 2012-12-30 – 2013-01-02: the differences from `847b6f2` are the two ERA5 hours the old output
+  lost (N8: hour 09 of `2t` on 30 Dec, hour 05 of `msl` on 1 Jan); the new output equals the full
+  daily means recomputed from the source, bit for bit. 2 min 48 s, 36 GB.
+- 2020-02-26 – 2020-03-02: failed twice, each time after about 11 min, on a GCS read that received
+  nothing for 600 s (`TimeoutError`; the run stops, no partial data hidden). The same window ran in
+  3–5 min on 13 Nov with older code. Windows 1 and 2 pass. Not investigated (a blocked network
+  thread would look the same as a slow server); group 7's retries are the planned remedy.
+
+**Copernicus Marine toolbox.** The fork's only change (pool size from
+`COPERNICUSMARINE_MAX_POOL_CONNECTIONS`, default 10) is merged upstream (#532, 21 Oct) but in no
+release yet (2.5.1 of 3 Nov lacks it). arco-make now pins upstream main at `f66a8b8` (reports
+2.5.0); move to the first release that has it.
+- (Wrong, corrected on 17 Nov.) The backend passes `chunk_size_limit=False`, which upstream
+  documents as -1 or a positive limit. Upstream main, 2.5.1 and the fork (2.4.1) all treat a falsy
+  limit as "no rechunking" and give the store's native chunks (one day, 512 × 2048); the toolbox
+  default doubles the time chunk. A live check now fails if that changes. Offline suite and live
+  checks pass on all three.
+- (Partly wrong, corrected on 17 Nov.) Upstream reads the pool size once, when the toolbox is
+  imported (the fork, per client). arco-make does not import the toolbox itself: xarray loads it
+  at the first use of the engine, after the CLI applied the settings file, where the pool size is
+  now a setting.
+- GLORYS on 4 days with 10, 32, 64 connections: 21.4, 16.6, 17.4 s/day reading; 21.9, 20.9, 20.6
+  s/day reading and processing. Reading gains about 20 %; the processing graph is the limit.
+  With 10 connections, urllib3 logs "Connection pool is full, discarding connection".
+
+**ERA5 sources** (looked for an alternative to Google's GCS store because of the timeouts):
+- Earthmover's Icechunk ERA5 on AWS (`earthmover-icechunk-era5`, us-east-1, anonymous, zarr v3,
+  CC-BY 4.0, 1940 – June 2026, updated quarterly; one hour per global map, as Google's): has 7 of
+  the 8 hourly variables used (as `u10`, `v10`, `d2m`, `t2m`, `msl`, `ssrd`, `tp`) and the two
+  static ones (`z_sfc`, `lsm`), not `surface_thermal_radiation_downwards`; needs
+  `numcodecs[pcodec]`. Values match Google's within GRIB packing (t2m 0.0008 K, msl 0.08 Pa), not
+  bit for bit. One day of 7 variables from the VM: 10 s (Earthmover) against 15–20 s (Google),
+  but 79 s on a repeat of the same Earthmover read.
+- ECMWF's own ARCO Zarr (CDS, time-chunked and geo-chunked): a subset of variables, token access,
+  beta ("access may be closed at any time").
+- **Maintainer's decision:** stay with Google's store; the timeouts are to be handled by the
+  refactoring (group 7).
+
+
+## 2026-11-17: review of PR #7 (Copernicus Marine toolbox)
+
+Corrects the toolbox bullets of 16 Nov.
+- **`chunk_size_limit=False` does not give native chunks: it gives no Dask arrays.** A falsy
+  limit makes the toolbox call `open_zarr(chunks=None)`, so it returns lazily indexed arrays, and
+  xarray chunks them as the recipe's `chunks` say (the arco-ocean recipes set them, e.g. time 2,
+  depth 1, whole maps). Its default returns Dask arrays of its own chunking (time 2, all 50
+  depths), which the recipe's `chunks` then only rechunk. The live check of 16 Nov opened the data
+  with `chunks={}`, which makes xarray rechunk to the store's chunks whatever the toolbox returns:
+  it could not fail, and the comparison of 16 Nov had the same flaw. The check now calls the
+  backend directly, with the recipes' service and version, and requires unchunked arrays; it
+  fails when the backend's call loses `chunk_size_limit=False` (checked). Upstream main, 2.5.1
+  and the fork (2.4.1) all return unchunked arrays (checked again, the same way).
+- A recipe without `chunks` on a Copernicus Marine part reads each variable in one piece, without
+  Dask parallelism.
+- The toolbox was imported whenever xarray listed its backends (any `open_dataset`), which in
+  library use or tests can be before the settings file is applied, fixing the pool size at its
+  default. The backend now imports it at first use.
+- The pool size is checked as the toolbox reads it (`int()` of the text): `32.0` was accepted by
+  the check, then ignored by the toolbox, which falls back to 10 without a message.
+- The toolbox writes its version into the dataset attributes (`copernicusmarine_version`), now
+  `2.5.0` (upstream main reports the version of the last release branch). Outputs of recipes that
+  keep those attributes change; ARCO-OCEAN's do not (its recipes drop them).

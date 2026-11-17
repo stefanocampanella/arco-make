@@ -5,6 +5,8 @@
 import functools
 import http.server
 import pathlib
+import subprocess
+import sys
 import threading
 import time
 import zipfile
@@ -44,9 +46,19 @@ def test_cdsapi_client_receives_explicit_url(monkeypatch: pytest.MonkeyPatch):
 def test_copernicus_marine_drop_variables(monkeypatch: pytest.MonkeyPatch):
   """`drop_variables` removes variables, as for xarray's own backends."""
   fake = xr.Dataset({"a": ("x", np.zeros(2)), "b": ("x", np.ones(2))})
-  monkeypatch.setattr(backends.cm, "open_dataset", lambda **kwargs: fake)
+  monkeypatch.setattr("copernicusmarine.open_dataset", lambda **kwargs: fake)
   out = CopernicusMarine().open_dataset("cm://some-dataset", drop_variables=["b"])
   assert list(out.data_vars) == ["a"]
+
+
+def test_listing_the_backends_does_not_import_the_toolbox():
+  """The toolbox reads COPERNICUSMARINE_MAX_POOL_CONNECTIONS at import: xarray listing its
+  backends (any `open_dataset`) must not import it before the settings file is applied."""
+  code = (
+    "import sys, xarray, arcomake; xarray.backends.list_engines(); "
+    "sys.exit('copernicusmarine' in sys.modules)"
+  )
+  assert subprocess.run([sys.executable, "-c", code], check=False).returncode == 0
 
 
 def test_copernicus_marine_requires_dataset_id():

@@ -21,6 +21,7 @@ SETTINGS = [
   "CDSAPI_URL",
   "CDSAPI_KEY",
   "COPERNICUSMARINE_SERVICE_PASSWORD",
+  "COPERNICUSMARINE_MAX_POOL_CONNECTIONS",
   "DASK_ARCOMAKE_TEST",
 ]
 
@@ -78,6 +79,23 @@ def test_invalid_values_are_reported_without_the_value(rc):
   result = CliRunner().invoke(cli, ["steps"])
   assert result.exit_code != 0 and "CDSAPI_URL" in result.output
   assert "secret" not in result.output and "Traceback" not in result.output
+
+
+def test_copernicus_marine_pool_size_is_a_positive_integer(rc, monkeypatch: pytest.MonkeyPatch):
+  """The toolbox reads its pool size from the environment with `int()`, falling back to 10
+  without a message: only what `int()` reads as a positive integer is accepted."""
+  rc("COPERNICUSMARINE_MAX_POOL_CONNECTIONS=32\n")
+  assert settings.load() == ["COPERNICUSMARINE_MAX_POOL_CONNECTIONS"]
+  assert os.environ["COPERNICUSMARINE_MAX_POOL_CONNECTIONS"] == "32"
+  for bad in ("0", "many", "32.0", "-4"):
+    monkeypatch.delenv("COPERNICUSMARINE_MAX_POOL_CONNECTIONS", raising=False)
+    rc(f"COPERNICUSMARINE_MAX_POOL_CONNECTIONS={bad}\n")
+    with pytest.raises(settings.SettingsError, match="COPERNICUSMARINE_MAX_POOL_CONNECTIONS"):
+      settings.load()
+  rc("")
+  monkeypatch.setenv("COPERNICUSMARINE_MAX_POOL_CONNECTIONS", "32.0")  # from the environment
+  with pytest.raises(settings.SettingsError, match="COPERNICUSMARINE_MAX_POOL_CONNECTIONS"):
+    settings.load()
 
 
 def test_environment_values_are_checked_without_a_file(monkeypatch: pytest.MonkeyPatch, tmp_path):

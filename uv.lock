@@ -264,7 +264,7 @@ requires-dist = [
     { name = "cfgrib" },
     { name = "cftime" },
     { name = "click" },
-    { name = "copernicusmarine", git = "https://github.com/stefanocampanella/copernicus-marine-toolbox.git?rev=arco-make" },
+    { name = "copernicusmarine", git = "https://github.com/mercator-ocean/copernicus-marine-toolbox.git?rev=f66a8b8c700654fec981b986fc79f6450298e96a" },
     { name = "dask" },
     { name = "dask-mpi" },
     { name = "eccodes" },
@@ -898,8 +898,8 @@ wheels = [
 
 [[package]]
 name = "copernicusmarine"
-version = "2.4.1"
-source = { git = "https://github.com/stefanocampanella/copernicus-marine-toolbox.git?rev=arco-make#3009add7cd424a5517995f80dc8ca072f055154e" }
+version = "2.5.0"
+source = { git = "https://github.com/mercator-ocean/copernicus-marine-toolbox.git?rev=f66a8b8c700654fec981b986fc79f6450298e96a#f66a8b8c700654fec981b986fc79f6450298e96a" }
 dependencies = [
     { name = "arcosparse" },
     { name = "boto3" },
