@@ -55,6 +55,7 @@ def test_resume_writes_only_the_missing_blocks(recipe, reads, tmp_path: pathlib.
   reads["fail"] = SECOND_BLOCK
   failed = run(recipe, output)
   assert failed.exit_code != 0 and "--resume continues from there" in failed.output
+  assert "Traceback" in failed.output and "simulated failure" in failed.output  # logged
   # A plain rerun does not start beside the failed run.
   refused = run(recipe, output)
   assert refused.exit_code != 0 and "--resume continues it" in refused.output

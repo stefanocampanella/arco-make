@@ -183,7 +183,18 @@ def download(
       f"Using {dask_setup} scheduler, which is not compatible with remote arco-make xarray backends. "
       "Please use 'threads' or 'synchronous' instead."
     )
-  with get_client(dask_setup=dask_setup), TempDirectoryRegistry():
+  with get_client(dask_setup=dask_setup), TempDirectoryRegistry(), warnings.catch_warnings():
+    # During postprocessing computation, which may even happen while writing, if each operation
+    # does not trigger dask computations (e.g., no calls to persist or compute) some
+    # RuntimeWarnings may be issued. This happens frequently with certain algorithms when
+    # regridding masked data (containing NaNs). We filter them to avoid cluttering the log.
+    # Set once for the command: `catch_warnings` swaps the process-wide filters, and is not
+    # thread-safe (blocks run in threads with --blocks).
+    warnings.filterwarnings(
+      "ignore",
+      message="invalid value encountered in divide",
+      category=RuntimeWarning,
+    )
     # Read configs and inject start and end time.
     update_time_interval = {}
     if start_datetime is not None:
@@ -246,6 +257,7 @@ def download(
     except click.ClickException:
       raise
     except Exception as exc:
+      logger.exception("An error occurred during download")
       raise click.ClickException(
         f"An error occurred ({type(exc).__name__}). Aborting: the blocks written are on branch"
         f" {run.branch}, `main` is unchanged; --resume continues from there."
@@ -268,16 +280,7 @@ def _processed_block(
   """The datasets of one block, read, processed and merged, with the global postprocessing
   (lazy: computed when written)."""
   # Download and postprocess each dataset, possibly using checkpointing to disk.
-  with ExitStack() as stack, warnings.catch_warnings():
-    # During postprocessing computation, which may even happen while writing, if each operation
-    # does not trigger dask computations (e.g., no calls to persist or compute) some
-    # RuntimeWarnings may be issued. This happens frequently with certain algorithms when
-    # regridding masked data (containing NaNs). We filter them to avoid cluttering the log.
-    warnings.filterwarnings(
-      "ignore",
-      message="invalid value encountered in divide",
-      category=RuntimeWarning,
-    )
+  with ExitStack() as stack:
     datasets: list[xr.Dataset] = []
     for dataset_name, dataset_conf in configs.datasets.items():
       if dataset_conf.skip:
