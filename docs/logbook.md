@@ -497,3 +497,67 @@ performance pass). New script `compare_values.py` (baseline scripts) compares ac
 in every recipe (same Blosc lz4 settings, byte shuffle); the unpack recipes, `unpack.slurm` and
 the `--zip` options removed. The download scripts still write one store per piece, which nothing
 joins any more: they are to be reworked with group 7 (resumable blocks).
+
+## 2026-11-17: review of PR #8, Icechunk decisions, forecast time axes
+
+**Review of PR #8 (Zarr v3), high effort: 9 findings, all fixed** (one commit, each fix with a
+test that fails on the previous commit):
+- `[save.encoding.VAR]` went to xarray as `encoding=`, which replaces a variable's whole
+  encoding: a variable listed for its dtype lost the `[save]` chunks, shards and compressors
+  (also true before Zarr v3). Now merged key by key; appends reuse the stored encodings, so the
+  pruning of encodings in append mode (which read the existing store) is gone.
+- Shards read from a format 3 source survived new `[save] chunks`; an uncompressed source gave an
+  uncompressed output (N1 again); zarr 3 refuses `storage_options` for local stores (plain paths,
+  `file://`), which broke `open_input` and the one-series-at-a-time climatology on local
+  outputs; `.zip` outputs silently became directories; shard/chunk divisibility was checked at
+  load only when both were tables.
+- After the fixes: offline suite 261 passed, live checks 5 passed. Baseline window 2 (code
+  `9e9fa8c`) is still bit for bit equal to the PR #1 output in values and attributes, `time`
+  stored as before; 3 min 54 s, peak 44.5 GB (37.5 GB on `5eb0587`, 35.6 GB on `656503f`: single
+  runs, for the performance pass). A first attempt failed after 10 min on a GCS read timeout
+  (600 s) while opening the ERA5 store's consolidated metadata, before any download: the network
+  failures group 7 is to retry.
+
+**Maintainer's decisions (17 Nov):**
+- The upstream toolbox refusing coordinates in `variables`: keep the recipe workaround, with a
+  comment stating the issue (mercator-ocean/copernicus-marine-toolbox#534) for later.
+- Icechunk: every command writes Icechunk repositories; `process` and `compute-climatology`
+  should ideally read both Zarr v3 and Icechunk, weighed against code complexity; one commit per
+  block, its message naming the block's time range. Measure the effect of Icechunk on memory and
+  time.
+- Forecasts: the Icechunk code will have to handle forecast time series (initialization time
+  and lead time) as well as historical ones.
+
+**Forecast time axes** (investigation, nothing implemented):
+- Mercator GLO12 (GLOBAL_ANALYSISFORECAST_PHY_001_024): one `time` axis, the valid time (checked:
+  June 2022 to today + 9 days for the daily dataset), no run dimension or forecast metadata. Run
+  daily at 00 UTC, 10-day forecast, published by 12:00 UTC. The series is a best estimate
+  overwritten daily (product user manual): each validity date gets about 15 releases (forecast,
+  simulation, near-real-time analysis on Thursdays, best analysis), the last 11-15 days change
+  every day, and dates older than 15-21 days are final. Original files carry the run date
+  (`..._R<run date>.nc`) but are overwritten too: past forecasts are not archived. Daily means
+  run midnight to midnight, stamped 00:00.
+- ECMWF IFS: runs at 00/06/12/18 UTC (00 and 12 UTC to 240 h: 3-hourly to 144 h, then
+  6-hourly). GRIB through cfgrib gives `time` (initialization) x `step` and a 2D `valid_time`.
+  Open data keep the last ~12 runs; full history needs a service agreement. dynamical.org
+  archives IFS ENS (00 UTC since April 2024) as Icechunk, as `init_time` x `lead_time` x
+  `ensemble_member`, `valid_time` = init + lead.
+- **Maintainer's decisions (17 Nov):** forecast runs, not best-estimate series; GLO12 runs built
+  from the release date (an archive collected from now on); products: GLO12 physics
+  (GLOBAL_ANALYSISFORECAST_PHY_001_024), GLO12 waves (GLOBAL_ANALYSISFORECAST_WAV_001_027), ECMWF
+  IFS open data at 0.25° (0.1° possibly later) and the GloFAS river discharge forecast
+  (`cems-glofas-forecast`, EWDS); dynamical.org's names (`init_time`, `lead_time`,
+  `ensemble_member`, `valid_time`).
+- GLO12 waves (Météo-France MFWAM, 1/12°): one `time` axis, 3-hourly instantaneous (checked: Nov
+  2022 to today + 10 days, 19 variables). Two bulletins a day, 00 and 12 UTC: each releases a
+  10-day forecast and 24 h (00 UTC) or 12 h (12 UTC) of hindcast, overwriting the series; original
+  files are named `mfwamglocep_<field date>_R<bulletin date>_<00H|12H>.nc` (product user manual).
+- GloFAS forecast (EWDS `cems-glofas-forecast`, GloFAS v4, 0.05°, global without Antarctica):
+  river discharge in the last 24 hours, runoff, snow depth water equivalent, soil wetness; one
+  run a day since 5 Nov 2019; `leadtime_hour` 24 to 720 by 24; `product_type` control forecast or
+  perturbed ensemble members; GRIB2 or NetCDF (request form). The value at lead 24 h is the
+  discharge of the first day: aligned with daily means stamped at the start of the day, it is lead
+  day 0 (the C10 question, here for forecasts).
+- Still open: which IFS stream (HRES `oper` or ENS `enfo`, 51 members), runs other than 00 UTC
+  (waves and IFS have 12 UTC), and whether 3-hourly fields (waves, IFS) stay 3-hourly or become
+  daily means.
