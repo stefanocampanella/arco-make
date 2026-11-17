@@ -14,7 +14,8 @@ import xarray as xr
 import zarr
 from click.testing import CliRunner, Result
 
-from arcomake import cli, icechunk_utils
+from arcomake import cli, icechunk_utils, retries
+from arcomake.temporary_utils import get_current_temp_registry
 from tests.conftest import open_output, render_recipe
 
 download_module = importlib.import_module("arcomake.download")  # the module, not the command
@@ -60,6 +61,49 @@ def test_blocks_run_at_once(recipe, tmp_path: pathlib.Path, monkeypatch: pytest.
   monkeypatch.setattr(download_module, "maybe_checkpointing_download_and_process", meeting)
   result = run(recipe, tmp_path / "out.zarr", "--blocks", "2")
   assert result.exit_code == 0, result.output
+
+
+def temporary_stores() -> list[pathlib.Path]:
+  registry = get_current_temp_registry()
+  assert registry is not None
+  return list(registry.job_dir.rglob("*.zarr"))
+
+
+def test_checkpoints_go_with_their_block(
+  recipe, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+  """Checkpoints (the sample recipe checkpoints its ocean dataset daily) are removed at the end
+  of their block: a long run does not keep every block's checkpoints on disk until it ends."""
+  left: list[list[pathlib.Path]] = []
+  real_committed = download_module._committed
+
+  def committed(run, interval):  # called as each block starts: what did earlier blocks leave?
+    left.append(temporary_stores())
+    return real_committed(run, interval)
+
+  monkeypatch.setattr(download_module, "_committed", committed)
+  result = run(recipe, tmp_path / "out.zarr")
+  assert result.exit_code == 0, result.output
+  assert left == [[], [], []]
+
+
+def test_a_failed_stage_is_removed(recipe, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+  real = download_module._write_zarr
+  failed: list[pathlib.Path] = []
+
+  def time_out_once(dataset, path, **kwargs):
+    if not failed:
+      real(dataset, path, **kwargs)  # written, then the connection drops
+      failed.append(pathlib.Path(path))
+      raise TimeoutError("simulated")
+    assert not failed[0].exists()  # gone before the retry
+    return real(dataset, path, **kwargs)
+
+  monkeypatch.setattr(download_module, "_write_zarr", time_out_once)
+  monkeypatch.setattr(retries.time, "sleep", lambda seconds: None)
+  result = run(recipe, tmp_path / "out.zarr", "--blocks", "2")
+  assert result.exit_code == 0, result.output
+  assert failed
 
 
 def test_a_failed_block_keeps_those_before_it(

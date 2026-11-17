@@ -367,7 +367,11 @@ def _stage_block(configs: DownloadConfig, date_interval: DateInterval) -> _Stage
       variable.encoding = {} if chunks is None else {"chunks": chunks}
     path = registry.create_temp_dir(suffix=".zarr")
     logger.info(f"{_describe(date_interval)}: staging to {path}")
-    _write_zarr(values, str(path), mode="w", consolidated=False)
+    try:
+      _write_zarr(values, str(path), mode="w", consolidated=False)
+    except BaseException:
+      shutil.rmtree(path, ignore_errors=True)  # a retry stages again, elsewhere
+      raise
   # The prepared dataset is kept for its metadata only: every lazy variable is replaced by the
   # staged values before writing (`_from_stage`).
   return _Staged(path, prepared)

@@ -5,6 +5,7 @@ GloFAS static file was fetched again for every block, and an outage of its serve
 failed the block it met)."""
 
 import pathlib
+import threading
 
 import numpy as np
 import pytest
@@ -81,3 +82,23 @@ def test_netcdf_over_http_downloads_once_per_run(tmp_path, monkeypatch: pytest.M
       with NetCDFOverHTTP().open_dataset("https://example.org/static.nc", timeout=60) as ds:
         assert ds.uparea.values.tolist() == [0.0, 1.0, 2.0]
   assert requests_made == ["https://example.org/static.nc"]
+
+
+def test_fetches_of_other_keys_do_not_wait(tmp_path: pathlib.Path):
+  """A slow server holds up only the fetches of its own file."""
+  other_done = threading.Event()
+
+  def slow(path: pathlib.Path) -> None:
+    assert other_done.wait(timeout=10), "the other fetch waited for this one"
+    path.write_text("slow")
+
+  def fast(path: pathlib.Path) -> None:
+    path.write_text("fast")
+    other_done.set()
+
+  with TempDirectoryRegistry(base_dir=tmp_path) as registry:
+    slow_fetch = threading.Thread(target=registry.cached_file, args=("slow", "s.nc", slow))
+    slow_fetch.start()
+    registry.cached_file("fast", "f.nc", fast)
+    slow_fetch.join(timeout=10)
+    assert not slow_fetch.is_alive() and registry.cached_file("slow", "s.nc", slow).exists()

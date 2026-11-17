@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import datetime
+import functools
 import logging
 import pathlib
 import re
+import shutil
 import tempfile
 import warnings
 from collections.abc import Callable, Generator, Hashable, Mapping
@@ -629,8 +631,12 @@ def maybe_checkpointing_download_and_process(
   logger.info(f"Opening checkpointed dataset from {checkpoint_path}")
   dataset = xr.open_zarr(str(checkpoint_path), consolidated=False, overwrite_encoded_chunks=True)
   assert isinstance(dataset, xr.Dataset)
+  # Removed when the dataset is closed (at the end of its block): a run of many blocks would
+  # otherwise keep every block's checkpoints on disk until it ends.
   if checkpoint is not None:
     dataset.set_close(checkpoint.cleanup)
+  else:
+    dataset.set_close(functools.partial(shutil.rmtree, checkpoint_path, ignore_errors=True))
   return dataset
 
 

@@ -150,10 +150,10 @@ class TempDirectoryRegistry:
     self._token: contextvars.Token[TempDirectoryRegistry | None] | None = None
     self._pid = os.getpid()
     self._closed = False
-    # Files fetched once for the registry's lifetime (`cached_file`), and the lock that makes
-    # concurrent requests for the same key wait for one fetch.
+    # Files fetched once for the registry's lifetime (`cached_file`), and a lock per key, so that
+    # concurrent requests for the same key wait for one fetch, and other keys do not wait.
     self._files: dict[str, pathlib.Path] = {}
-    self._files_lock = threading.Lock()
+    self._file_locks: dict[str, threading.Lock] = {}
 
     parent_base = pathlib.Path(base_dir) if base_dir is not None else self.get_base_scratch_dir()
     parent_base.mkdir(parents=True, exist_ok=True)
@@ -194,7 +194,9 @@ class TempDirectoryRegistry:
     `fetch(path)` writes it the first time; a fetch that fails is not remembered (its directory
     is removed), so the next request tries again. The file is removed with the registry.
     """
-    with self._files_lock:
+    with self._lock:
+      key_lock = self._file_locks.setdefault(key, threading.Lock())
+    with key_lock:
       cached = self._files.get(key)
       if cached is not None and cached.exists():
         return cached
