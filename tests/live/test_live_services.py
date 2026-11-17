@@ -17,11 +17,11 @@ from dataclasses import dataclass
 
 import numpy as np
 import pytest
-import xarray as xr
 from click.testing import CliRunner, Result
 
 from arcomake import cli, settings
 from arcomake.backends import CopernicusMarine
+from tests.conftest import open_output
 
 RECIPES = pathlib.Path(__file__).parent / "recipes"
 
@@ -117,7 +117,7 @@ def test_download_from_live_service(name: str, tmp_path: pathlib.Path):
   )
   assert result.exit_code == 0, failure_report(result)
 
-  ds = xr.open_zarr(output)
+  ds = open_output(output)
   assert expected.variable in ds.data_vars
   da = ds[expected.variable]
   if expected.has_time:

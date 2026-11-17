@@ -608,3 +608,108 @@ day D is [D 00:00, D+1 00:00) UTC, stamped D 00:00):
   accumulations cover.
 - **[Moby-Dick]** The published ERA5 accumulations are the one-hour-early sums; the corrected ones
   come with the next download.
+
+## 2026-11-17: Icechunk outputs
+
+**Maintainer's decisions (17 Nov):** every command writes an Icechunk repository; `process` and
+`compute-climatology` read Zarr v3 and Icechunk inputs (weighed against code complexity: an
+explicit `engine = "icechunk"`); one commit per block, named by its interval; measure the effect
+on memory and time.
+
+**Design:** icechunk 2.3.1. `download` commits each block (`download [start, end)`), `process`
+once, `compute-climatology` once per output with the same message. `--overwrite` is a new commit
+(older versions stay) and refuses anything that is not a repository. Checkpoints stay plain Zarr
+v3; `[save] consolidated` is gone. On a distributed client the two climatology outputs are
+computed in turn (each repository's writes are merged by computing them; one shared computation
+would need icechunk's and xarray's private writers); with local schedulers once.
+
+**S3 access:** icechunk's own AWS client cannot use the project VM's profile ("credentials-login"
+feature missing) and needs a region the profile does not set: credentials come from botocore
+(as for every other S3 access), the region from S3 (`eu-south-1` for the project bucket).
+
+**Measurements** (window 2, 0.25° levels-50, 1.3 GB; the same in both formats, values and
+attributes bit for bit):
+- End to end on the VM, one successful run each (two other runs, one per format, failed on GCS
+  read timeouts of ERA5, 600 s): plain Zarr v3 4 min 09 s, 43.4 GB peak; Icechunk 5 min 40 s,
+  36.9 GB. The download dominates; the difference is within the run-to-run spread seen so far
+  (3:54-4:29 for the same code).
+- The format alone (`bench_formats.py`, writing and reading window 2's output, one process each):
+  - Local disk: write 5.1 s (Zarr) / 5.8 s (Icechunk); whole read 2.8 / 3.4 s; one point of
+    every variable 2.2 / 3.0 s; peak memory equal (0.67 GB writing, 4.5 GB reading).
+  - Project bucket: write 58 s / 266 s at first, 57.6 s once credentials were resolved once
+    (botocore session and credential process for every client or fork before); open 6.5 / 0.7
+    s, whole read 20 / 6-7 s, one point 14 / 6 s. Icechunk reads stalled now and then for about
+    its stream timeout (60 s; up to 107 s for a whole read): with 10 s at most 22 s. arco-make
+    uses 20 s (`network_stream_timeout_seconds`). **[Moby-Dick]** consumers reading from S3 with
+    icechunk's defaults may see such stalls: a shorter stream timeout avoids them.
+- Repositories of the measurements: `experiments/icechunk-probe-20261117/` and
+  `experiments/bench-formats-20261117/` in the project bucket (about 4 GB, may be deleted).
+
+**Review (high effort), 10 findings:** 9 fixed (bucket region over the profile's, asked at the
+endpoint and for anonymous access; unusable destinations fail before any download; GCS tokens;
+equal commit messages for the two climatology outputs; synchronous scheduler kept; one helper for
+writes into sessions); one not: the proposed shared computation for distributed clients relied
+on `write_lazy` returning lazily, which it does not (it computes).
+
+## 2026-11-17: runs on their own branch, --replace, retention
+
+**Maintainer's decisions (17 Nov):** a failed run must not hide the current version (gap 2 of
+`--overwrite`); the history of replaced versions is limited in the recipe (gap 3), by age or by
+count; `--overwrite` becomes `--replace` (nothing is deleted when it runs).
+
+- Every run writes on `run/<command>-<start time>` from the tip of `main`; `main` moves to the
+  run's last commit only when the run succeeds and only if `main` has not changed meanwhile
+  (conditional reset, `icechunk.ConflictError` otherwise). A failed run leaves `main` as it was,
+  its branch holding what it wrote; a repository whose `main` has no version yet is written again
+  without `--replace`. `compute-climatology` promotes its outputs once both are written.
+- `[save] keep_history` (counted from when a version was replaced) or `keep_versions`. Garbage
+  collection keeps objects younger than 7 days (`GRACE`): another run writing to the same
+  repository has uncommitted chunks no snapshot references, and the review showed that an
+  immediate collection would delete them, with its branch.
+- Measured: three versions of 8 MB take 22.5 MB, 7.5 MB with `keep_versions = 1` (grace 0);
+  the same cycle on the project bucket (`experiments/runs-probe-20261117/`) kept only the current
+  version and deleted the others' manifests (constant test data is inlined in manifests).
+- Review (high effort), 10 findings, all fixed: keep_history counted from writing (a version
+  replaced today could be deleted at once); unitless keep_history ("30" is 30 ns); retention could
+  delete another run's branch and uncommitted chunks; a failed first run left a repository that
+  needed `--replace`; any error at promotion was reported as a conflict; a branch deletion error
+  after promotion failed the run; keep_versions read the whole history (a commit per block);
+  garbage collection ran with nothing expired; process runs were labelled "write"; one commit had
+  three purposes (now three commits).
+- Still to decide (maintainer): the retention of the ARCO-OCEAN recipes (they keep everything).
+
+## 2026-11-17: forecast retention, storage budget
+
+**Maintainer's decisions (17 Nov):**
+- Forecasts keep a rolling window of runs (option B): each new run drops the oldest one from the
+  current version, so `init_time` keeps a fixed length. Window: 6 years (about 2,190 daily
+  00 UTC runs). Snapshot retention alone does not bound a forecast dataset: it only drops old
+  versions, and the current version would keep every run.
+- Every dataset is 50 levels; the 10-level recipes (e.g. anfc) are remnants, to be updated or
+  deleted.
+- Retention of the arco-ocean recipes: downloads `keep_versions = 2`, statistics
+  `keep_versions = 1` (fork stack).
+
+**How a rolling window can work** (prototype, not in arco-make yet): Icechunk's
+`Session.shift_array` moves the chunks of an array along a dimension by whole chunks, discarding
+those shifted out, without copying data (`init_time` chunked one run per chunk); the new run is
+written into the vacated slot, and the dropped chunks go with snapshot expiration and garbage
+collection. Tested on `init_time` x `lead_time` x `lat` with a 2D `valid_time`, keeping 3 runs
+over 8: coordinates and data right, size constant. xarray's region writes leave index
+coordinates out: the new `init_time` value has to be written explicitly. Others: dynamical.org
+keeps full, growing archives (GEFS 115 TB compressed in March 2025; costs about $100,000 a year,
+growing about 30 % a year); Earthmover's Arraylake schedules expiration and garbage collection.
+
+**Storage budget** (extrapolated from window 2 and the published metadata; the bucket's own
+listing would count old versions, archived pieces and experiments):
+- One day at 0.25°, 50 levels: 432 MB (388 MB 3D ocean, 44 MB all 2D fields), 47 % of its
+  uncompressed size. A year of statistics output (365 bins) at 0.25°: about 0.16 TB per output.
+- Historical datasets 1993-2025 (0.25°, 0.5°, 1.0°) and their statistics: 7.3 TB per version;
+  about 14 TB in steady state (2 versions of the datasets, 1 of the statistics), about 21 TB if
+  everything is replaced at once.
+- A forecast run (10 lead days of GLO12 physics and waves and IFS HRES at 0.25°, 50 levels, plus
+  30 days of GloFAS discharge): about 4.4 GB. Six years: about 9.6 TB, reached after six years
+  (about 1.6 TB a year).
+- Total: about 24 TB in steady state, about 31 TB at worst, of the 50 TB of the sponsorship.
+  Until the production download replaces it, the data in use now (unpacked dataset, its archived
+  pieces, an older version: about 15 TB) also stays.

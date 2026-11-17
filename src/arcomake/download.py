@@ -11,9 +11,10 @@ import xarray as xr
 from dask.diagnostics import ProgressBar
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from arcomake import icechunk_utils
 from arcomake.cli_utils import (
   check_aws_profile,
-  check_if_overwriting,
+  check_destination,
   check_path,
   read_configs,
   set_default_logger,
@@ -23,7 +24,7 @@ from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
   maybe_checkpointing_download_and_process,
-  safe_to_zarr,
+  write_output,
 )
 from arcomake.datetime_utils import IterableDateInterval, may_parse_timedelta
 from arcomake.processing_utils import ProcessingStepConfig
@@ -82,8 +83,12 @@ class DownloadConfig(BaseModel):
   type=click.DateTime(),
 )
 @click.option(
-  "--overwrite/--no-overwrite",
-  help="Whether to overwrite existing outputs",
+  "--replace/--no-replace",
+  help=(
+    "Write a new version of an existing output (an Icechunk repository): it replaces what `main`"
+    " shows once the run succeeds; earlier versions stay in its history until the recipe's"
+    " [save] keep_history or keep_versions expires them"
+  ),
   default=False,
   is_flag=True,
 )
@@ -113,7 +118,7 @@ def download(
   output_path: str,
   start_datetime: datetime | None = None,
   end_datetime: datetime | None = None,
-  overwrite: bool = False,
+  replace: bool = False,
   log_level: str = "info",
   dask_setup: DaskSetupType = "threads",
   progress: bool = False,
@@ -124,8 +129,12 @@ def download(
   `step`: for each block, every dataset is read from its parts, time-sliced and processed by
   its [[postprocess]] steps (optionally in sub-blocks checkpointed to temporary Zarr, per
   `checkpointing.step`); the datasets are merged, the global [[postprocess]] steps run, and the
-  block is written (first block) or appended along time. OUTPUT_PATH may be a directory or an
-  fsspec URL; it is never overwritten without --overwrite.
+  block is written (first block) or appended along time, one commit per block. OUTPUT_PATH is an
+  Icechunk repository: a directory, an s3:// or a gs:// URL. The blocks are committed on a branch
+  of their own; `main` moves to them only when the last one is written, so a failed run leaves
+  the repository's current version as it was. An existing repository is only written with
+  --replace; the version it replaces stays in the history until the recipe's retention expires
+  it.
   """
 
   # Set up logging.
@@ -152,8 +161,14 @@ def download(
       *(part.filename_or_obj for part in parts),
       copernicus_marine=any(part.engine == "copernicusmarine" for part in parts),
     )
-    # Check if the output destination exists.
-    check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
+    # Check the output destination, then start a run on a branch of its own.
+    check_destination(output_path, replace=replace, save_configs=configs.save)
+    try:
+      run = icechunk_utils.Run(
+        output_path, configs.save.storage_options, icechunk_utils.run_label("download")
+      )
+    except Exception as exc:
+      raise click.ClickException(f"Could not start writing {output_path}: {exc}") from exc
     # Iterate over date intervals.
     is_first_date_interval = True
     for date_interval in IterableDateInterval(configs.start, configs.end, configs.step):
@@ -201,27 +216,34 @@ def download(
             progress_bar = (
               ProgressBar if (progress and dask_setup in ["processes", "threads"]) else nullcontext
             )
+            # One commit per block, named by its interval: the repository's history tells which
+            # blocks are in.
+            block = (
+              f"download [{date_interval.start:%Y-%m-%dT%H:%M}, {date_interval.end:%Y-%m-%dT%H:%M})"
+            )
             with progress_bar():
               if is_first_date_interval:
-                safe_to_zarr(
-                  dataset=dataset,
-                  destination=output_path,
-                  configs=configs.save,
-                  mode="w",
-                  compute=True,
-                )
+                write_output(dataset, run, configs.save, message=block, mode="w")
                 is_first_date_interval = False
               else:
-                safe_to_zarr(
-                  dataset=dataset,
-                  destination=output_path,
-                  configs=configs.save,
+                write_output(
+                  dataset,
+                  run,
+                  configs.save,
+                  message=block,
                   mode="a-",
                   append_dim=configs.time_dim,
-                  compute=True,
                 )
       except click.ClickException:
         raise
       except Exception as exc:
         logger.exception("An error occurred during download")
-        raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
+        raise click.ClickException(
+          f"An error occurred ({type(exc).__name__}). Aborting: the blocks written are on branch"
+          f" {run.branch}, `main` is unchanged."
+        ) from exc
+    # Every block is written: `main` moves to them, then the recipe's retention applies.
+    try:
+      run.finish(configs.save.retention())
+    except icechunk_utils.PromotionError as exc:
+      raise click.ClickException(str(exc)) from exc

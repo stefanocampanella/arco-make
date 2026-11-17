@@ -5,7 +5,7 @@ window = 1
 weighting = "constant"
 
 [read]
-engine = "zarr"
+engine = "icechunk"  # the output of the sample download
 
 [[preprocess]]
 name = "isel"

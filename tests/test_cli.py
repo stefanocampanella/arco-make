@@ -8,11 +8,10 @@ import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
-import zarr
 from click.testing import CliRunner, Result
 
 from arcomake import cli
-from tests.conftest import render_recipe
+from tests.conftest import open_output, output_group, render_recipe
 
 THREADS = ["--dask-setup", "threads"]
 
@@ -42,7 +41,7 @@ def downloaded(tmp_path: pathlib.Path, recipes) -> pathlib.Path:
 
 def test_download_sample_recipe(downloaded: pathlib.Path):
   """The sample recipe gives a merged, regridded, filled dataset with the requested layout."""
-  ds = xr.open_zarr(downloaded)
+  ds = open_output(downloaded)
   assert ds.sizes == {"time": 5, "depth": 3, "lat": 4, "lon": 4}
   assert set(ds.data_vars) == {"t2m", "thetao", "thetao_bottom", "zos", "deptho", "sea_mask"}
   assert ds.attrs["title"] == "Synthetic sample dataset"
@@ -51,20 +50,20 @@ def test_download_sample_recipe(downloaded: pathlib.Path):
   )
   # Inside the sea mask there are no gaps left; outside it, the 3D field is missing.
   assert ds.thetao.where(ds.sea_mask).notnull().sum() == ds.sea_mask.sum() * ds.sizes["time"]
-  group = zarr.open_group(str(downloaded), mode="r")
+  group = output_group(downloaded)
   assert group["thetao"].chunks == (1, 1, 4, 4)
   assert group["thetao"].dtype == np.float32
   assert group["time"].dtype == np.int32
 
 
-def test_download_refuses_to_overwrite(downloaded: pathlib.Path, recipes):
-  """An existing output is never replaced without `--overwrite` (intent 6)."""
+def test_download_refuses_to_replace_without_the_flag(downloaded: pathlib.Path, recipes):
+  """An existing output is never replaced without `--replace` (intent 6)."""
   result = CliRunner().invoke(
     cli, ["download", *THREADS, str(recipes["download"]), str(downloaded)]
   )
   assert result.exit_code != 0
   assert "already exists" in result.output
-  result = run("download", *THREADS, "--overwrite", str(recipes["download"]), str(downloaded))
+  result = run("download", *THREADS, "--replace", str(recipes["download"]), str(downloaded))
   assert result.exit_code == 0, result.output
 
 
@@ -79,8 +78,8 @@ def test_blocks_equal_one_block(tmp_path: pathlib.Path, downloaded: pathlib.Path
   output = tmp_path / "one_block.zarr"
   result = run("download", *THREADS, str(whole), str(output))
   assert result.exit_code == 0, result.output
-  xr.testing.assert_identical(xr.open_zarr(output).load(), xr.open_zarr(downloaded).load())
-  assert "time" not in xr.open_zarr(downloaded).deptho.dims
+  xr.testing.assert_identical(open_output(output).load(), open_output(downloaded).load())
+  assert "time" not in open_output(downloaded).deptho.dims
 
 
 def test_validate_sample_dataset(downloaded: pathlib.Path, recipes):
@@ -94,8 +93,8 @@ def test_process_sample_dataset(tmp_path: pathlib.Path, downloaded: pathlib.Path
   output = tmp_path / "mean.zarr"
   result = run("process", *THREADS, str(recipes["process"]), str(downloaded), str(output))
   assert result.exit_code == 0, result.output
-  mean = xr.open_zarr(output)
-  expected = xr.open_zarr(downloaded).t2m.mean("time")
+  mean = open_output(output)
+  expected = open_output(downloaded).t2m.mean("time")
   xr.testing.assert_allclose(mean.t2m.load(), expected.load())
   assert "sea_mask" not in mean
 
@@ -112,10 +111,10 @@ def test_climatology_sample_dataset(tmp_path: pathlib.Path, downloaded: pathlib.
     str(std),
   )
   assert result.exit_code == 0, result.output
-  t2m = xr.open_zarr(downloaded).t2m.isel(time=slice(0, 4)).values
-  np.testing.assert_allclose(xr.open_zarr(clim).t2m.values[0], (t2m[0] + t2m[2]) / 2, rtol=1e-6)
+  t2m = open_output(downloaded).t2m.isel(time=slice(0, 4)).values
+  np.testing.assert_allclose(open_output(clim).t2m.values[0], (t2m[0] + t2m[2]) / 2, rtol=1e-6)
   np.testing.assert_allclose(
-    xr.open_zarr(std).t2m.values[1], np.abs(t2m[1] - t2m[3]) / np.sqrt(2), rtol=1e-5
+    open_output(std).t2m.values[1], np.abs(t2m[1] - t2m[3]) / np.sqrt(2), rtol=1e-5
   )
 
 
@@ -135,12 +134,12 @@ def test_climatology_reference_period_and_day_of_year(tmp_path: pathlib.Path):
   args = [str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)]
   result = run("compute-climatology", *THREADS, *args)
   assert result.exit_code == 0, result.output
-  out = xr.open_zarr(clim).x.values
+  out = open_output(clim).x.values
   in_2020 = values[time.year == 2020]
   np.testing.assert_array_equal(out[:58], in_2020[:58])  # Jan 1 to Feb 27 of 2020 only
   np.testing.assert_allclose(out[58], in_2020[58:60].mean(), rtol=1e-6)  # Feb 28 and 29
   np.testing.assert_array_equal(out[59:], in_2020[60:])
-  assert np.isnan(xr.open_zarr(std).x.values[0])  # one value: no variance
+  assert np.isnan(open_output(std).x.values[0])  # one value: no variance
 
 
 @pytest.mark.parametrize(
@@ -179,12 +178,12 @@ def test_climatology_one_series_at_a_time(tmp_path: pathlib.Path, save: str, chu
       "compute-climatology", *THREADS, str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)
     )
     assert result.exit_code == 0, result.output
-    outputs[label] = (xr.open_zarr(clim).load(), xr.open_zarr(std).load())
+    outputs[label] = (open_output(clim).load(), open_output(std).load())
   for graph, series in zip(outputs["graph"], outputs["series"], strict=True):
     xr.testing.assert_allclose(series, graph, rtol=1e-5)
     assert series.attrs == graph.attrs
   assert outputs["series"][0].attrs["title"] == "clim"
-  stored = xr.open_zarr(tmp_path / "series_clim.zarr").t3.encoding
+  stored = open_output(tmp_path / "series_clim.zarr").t3.encoding
   assert stored["chunks"] == chunks and stored["shards"] == shards
 
 
@@ -221,9 +220,9 @@ def test_one_series_at_a_time_without_coordinates_or_save_chunks(tmp_path: pathl
   assert graph.exit_code == 0 and series.exit_code == 0, series.output
   # Float32 rounding differs between the paths (one unit in the last place near zero).
   xr.testing.assert_allclose(
-    xr.open_zarr(series_clim).load(), xr.open_zarr(graph_clim).load(), atol=1e-6
+    open_output(series_clim).load(), open_output(graph_clim).load(), atol=1e-6
   )
-  assert xr.open_zarr(series_clim).t3.encoding["chunks"][1] == 1
+  assert open_output(series_clim).t3.encoding["chunks"][1] == 1
 
 
 @pytest.mark.parametrize(
@@ -249,7 +248,7 @@ def test_one_series_at_a_time_with_storage_options_on_a_local_output(tmp_path: p
   extra = 'split_dims = ["depth"]\n[save]\nstorage_options = {anon = true}\n'
   result, clim = run_climatology(tmp_path, source, "series", extra)
   assert result.exit_code == 0, result.output
-  assert xr.open_zarr(clim).t3.notnull().all()
+  assert open_output(clim).t3.notnull().all()
 
 
 def test_zip_outputs_are_refused_before_any_work(recipes, tmp_path: pathlib.Path):

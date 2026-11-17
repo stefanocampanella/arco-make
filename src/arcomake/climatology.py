@@ -53,11 +53,13 @@ import dask.array
 import numpy as np
 import xarray as xr
 from dask.graph_manipulation import bind
+from icechunk.xarray import to_icechunk
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from arcomake import icechunk_utils
 from arcomake.cli_utils import (
   check_aws_profile,
-  check_if_overwriting,
+  check_destination,
   check_path,
   read_configs,
   set_default_logger,
@@ -66,10 +68,9 @@ from arcomake.dask_utils import DaskSetupType, get_client
 from arcomake.dataset_utils import (
   ReadConfig,
   SaveConfig,
-  consolidate_metadata,
   open_input,
-  safe_to_zarr,
-  storage_options_for,
+  write_into_session,
+  write_outputs_together,
 )
 from arcomake.processing_utils import ProcessingStepConfig
 
@@ -174,8 +175,12 @@ class ClimatologyConfig(BaseModel):
   type=str,
 )
 @click.option(
-  "--overwrite/--no-overwrite",
-  help="Whether to overwrite existing outputs",
+  "--replace/--no-replace",
+  help=(
+    "Write a new version of an existing output (an Icechunk repository): it replaces what `main`"
+    " shows once the run succeeds; earlier versions stay in its history until the recipe's"
+    " [save] keep_history or keep_versions expires them"
+  ),
   default=False,
   is_flag=True,
 )
@@ -206,7 +211,7 @@ def compute_climatology(
   input_path: str,
   climatology_output_path: str,
   anomaly_std_output_path: str,
-  overwrite: bool = False,
+  replace: bool = False,
   dask_setup: DaskSetupType = "mpi",
   use_frisky: bool = False,
   log_level: str = "info",
@@ -245,7 +250,10 @@ def compute_climatology(
       configs = read_configs(configs_path, schema=ClimatologyConfig)
       check_aws_profile(input_path, climatology_output_path, anomaly_std_output_path)
       for path in (climatology_output_path, anomaly_std_output_path):
-        check_if_overwriting(path, overwrite=overwrite, save_configs=configs.save)
+        check_destination(path, replace=replace, save_configs=configs.save)
+      # Both outputs are written in runs with this label (branches, commit metadata, messages);
+      # `main` moves in each repository only once both are written.
+      label = icechunk_utils.run_label("compute-climatology")
       # Open input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
       with open_input(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
@@ -264,7 +272,9 @@ def compute_climatology(
         if not dataset.data_vars:
           raise ValueError("Input dataset contains no data variables.")
         if configs.split_dims is not None:
-          _compute_by_series(dataset, configs, climatology_output_path, anomaly_std_output_path)
+          _compute_by_series(
+            dataset, configs, climatology_output_path, anomaly_std_output_path, label=label
+          )
           logger.info("Climatology writes completed, one series at a time.")
           return
         climatology, anomaly_var = _compute_climatology(
@@ -284,19 +294,19 @@ def compute_climatology(
         assert isinstance(anomaly_std, xr.Dataset)
         if configs.postprocess_anomaly_std:
           anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
-        # Compute and save the climatology and anomaly std in parallel.
+        # Compute and save the climatology and anomaly std together (see write_outputs_together).
         logger.info("Processing climatology and anomaly standard deviation.")
-        _climatology_delayed_save = safe_to_zarr(
-          climatology, climatology_output_path, configs=configs.save, compute=False
+        write_outputs_together(
+          [(climatology, climatology_output_path), (anomaly_std, anomaly_std_output_path)],
+          configs.save,
+          label=label,
         )
-        _anomaly_std_delayed_save = safe_to_zarr(
-          anomaly_std, anomaly_std_output_path, configs=configs.save, compute=False
-        )
-        dask.compute(_climatology_delayed_save, _anomaly_std_delayed_save)
-        logger.info("Climatology writes completed; output stores closed.")
+        logger.info("Climatology and anomaly standard deviation committed.")
       logger.info("Input dataset closed; closing Dask client.")
     except click.ClickException:
       raise
+    except icechunk_utils.PromotionError as exc:
+      raise click.ClickException(str(exc)) from exc
     except Exception as exc:
       logger.exception("An error occurred while processing the climatology and anomaly std.")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
@@ -745,6 +755,8 @@ def _compute_by_series(
   configs: ClimatologyConfig,
   climatology_output_path: str,
   anomaly_std_output_path: str,
+  *,
+  label: str,
 ) -> None:
   """S1: one series (variable, index of `split_dims`) at a time, written into its region.
 
@@ -764,26 +776,23 @@ def _compute_by_series(
     raise ValueError(f"split_dims {unknown} are not dimensions of the input: {list(dataset.dims)}")
   save = _one_index_per_chunk(configs.save, configs.split_dims)
   template = _output_template(dataset, configs.period, configs.time_dim)
-  for path, steps in outputs:
+  # One run per output (its own branch) and one session on it, committed once every series is
+  # written: an interrupted run commits nothing, and `main` is untouched until both are written.
+  runs = [icechunk_utils.Run(path, save.storage_options, label) for path, _ in outputs]
+  sessions = [run.session() for run in runs]
+  for (_, steps), session in zip(outputs, sessions, strict=True):
     # Metadata only: the data of the template are never computed.
-    safe_to_zarr(
-      template.arcomake.process(steps=steps) if steps else template,
-      path,
-      configs=save,
-      compute=False,
+    write_into_session(
+      template.arcomake.process(steps=steps) if steps else template, session, save, compute=False
     )
   # Stored chunks (shards, if any: the units of writing) of every output variable: results are
   # chunked alike, so that Dask writes the chunks of a region in parallel.
   stored_chunks = [
     {
       name: var.encoding.get("shards") or var.encoding["chunks"]
-      for name, var in xr.open_zarr(
-        path,
-        storage_options=storage_options_for(path, configs.save.storage_options),
-        consolidated=False,
-      ).data_vars.items()
+      for name, var in xr.open_zarr(session.store, consolidated=False).data_vars.items()
     }
-    for path, _ in outputs
+    for session in sessions
   ]
 
   def write(results: tuple[xr.Dataset, xr.Dataset], index: dict[str, int], label: str) -> None:
@@ -792,7 +801,9 @@ def _compute_by_series(
     region = {configs.time_dim: slice(0, configs.period)} | {
       d: slice(i, i + 1) for d, i in index.items()
     }
-    for (path, steps), result, chunks in zip(outputs, results, stored_chunks, strict=True):
+    for (_, steps), result, chunks, session in zip(
+      outputs, results, stored_chunks, sessions, strict=True
+    ):
       if steps:
         result = result.arcomake.process(steps=steps)
       result = result.drop_attrs().chunk(
@@ -805,13 +816,7 @@ def _compute_by_series(
       result = result.drop_vars(
         [name for name, var in result.variables.items() if not set(var.dims) & set(region)]
       )
-      result.to_zarr(
-        path,
-        region=region,
-        mode="r+",
-        consolidated=False,
-        storage_options=storage_options_for(path, configs.save.storage_options),
-      )
+      to_icechunk(result, session, region=region, mode="r+")
     logger.info(f"{label} written in {time.monotonic() - writing:.0f} s")
 
   series = _series(dataset, configs.split_dims)
@@ -843,9 +848,11 @@ def _compute_by_series(
       )
     if pending is not None:
       pending.result()
-  if configs.save.consolidated is not False:
-    for path, _ in outputs:
-      consolidate_metadata(path, configs.save.storage_options)
+  for run, session in zip(runs, sessions, strict=True):
+    run.commit(session, f"{label}: {len(series)} series")
+  # Both outputs are written: only now does `main` move, in one repository after the other.
+  for run in runs:
+    run.finish(configs.save.retention())
 
 
 def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:

@@ -32,7 +32,7 @@ apptainer exec oras://ghcr.io/stefanocampanella/arco-make:latest arco-make downl
 
 | Command | What it does |
 |---|---|
-| `arco-make download RECIPE OUTPUT` | Downloads, processes and merges the datasets of a recipe into one Zarr store |
+| `arco-make download RECIPE OUTPUT` | Downloads, processes and merges the datasets of a recipe into one Icechunk repository |
 | `arco-make validate RECIPE INPUT` | Checks a dataset: time axis, grid, missing values inside masks |
 | `arco-make process RECIPE INPUT OUTPUT` | Applies recipe steps to a dataset (e.g. a time mean) |
 | `arco-make compute-climatology RECIPE INPUT CLIMATOLOGY ANOMALY_STD` | Computes a periodic climatology and the standard deviation of the anomalies |
@@ -113,8 +113,9 @@ compressors = [{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuf
 
 Sources are read with xarray: any of its engines (e.g. `zarr`, `h5netcdf`), or one of the backends of
 arco-make, `copernicusmarine` (Copernicus Marine, `cm://DATASET_ID`), `earlywarningdatastore` (EWDS,
-`ewds://DATASET`) and `netcdfoverhttp` (a NetCDF file served over HTTP). Credentials come from the
-environment of each service's client, never from recipes.
+`ewds://DATASET`), `netcdfoverhttp` (a NetCDF file served over HTTP) and `icechunk` (an Icechunk
+repository, such as an output of arco-make: the tip of `main`, or the version named by `branch`, `tag`
+or `snapshot_id`). Credentials come from the environment of each service's client, never from recipes.
 
 Day D is the interval from 00:00 of D to 00:00 of D+1, stamped D 00:00 (`resample` with `label` and
 `closed` "left"). Sources that stamp a value at the end of its period, such as ERA5 hourly
@@ -122,8 +123,24 @@ accumulations (the value stamped 00:00 covers the last hour of the previous day)
 `time_offset = "-1h"`: the time coordinate is moved before each block is selected, and the part is
 read over the block moved the other way, so that every day holds its own hours.
 
-Outputs are written in Zarr format 3 (sources can be in either format), with consolidated metadata
-unless `[save] consolidated = false`. In `[save]`:
+Every output is an [Icechunk](https://icechunk.io) repository (Zarr format 3 with versions): a local
+directory, an `s3://` or a `gs://` URL. Every run writes on a branch of its own (`run/<command>-<start
+time>`), in commits: one per block for `download` (its message names the block's interval), one for
+`process` and for each output of `compute-climatology`. Only when the run succeeds does branch `main`,
+the version readers see, move to the run's output (if `main` changed meanwhile, the run stays on its
+branch); a failed run leaves `main` as it was. An existing output is written only with `--replace`,
+which keeps the version it replaces in the history and refuses anything at the path that is not a
+repository. `[save] keep_history` (a duration with its unit, e.g. `"30D"`: a version is kept while it
+was replaced less than that long ago) or `keep_versions` (a number, the current version included)
+limits that history: after each successful run, older versions are expired and the data no version
+uses any more is deleted, once it is older than a week (another run may still be writing to the same
+repository); without them, every version is kept. Read outputs with
+`engine = "icechunk"`, or with Icechunk and xarray directly. `[save] storage_options` for an S3
+repository: `profile`, `region` (by default the bucket's, asked to S3, else the profile's),
+`endpoint_url`, `anon`, `network_stream_timeout_seconds` (default 20: a request without progress for
+that long is retried); credentials come from botocore, as for the rest of arco-make. For GCS: `token`
+is `"anon"` or a service account file (by default, the environment's credentials). Options Icechunk
+cannot honour are an error, before any download. In `[save]`:
 - `chunks` set the stored chunks, per dimension (-1, or a dimension not listed: the whole dimension).
 - `shards`, in the same form, group whole chunks into one stored object each (Zarr v3 sharding):
   fewer, larger objects, while readers still fetch single chunks. Without `shards`, every chunk is an
@@ -146,8 +163,8 @@ other keys are its arguments. See [docs/steps.md](docs/steps.md). The `process`,
   lazy, and the data are computed once, when written.
 - **Time intervals are right-open**, `[start, end)`, for the recipe, the blocks of `download` and the time
   selection of each source, so consecutive pieces never overlap.
-- **An existing output is never replaced without `--overwrite`**, and a destination whose existence cannot
-  be checked stops the command.
+- **An existing output is never replaced without `--replace`**, a run that fails leaves the current
+  version as it was, and a destination whose existence cannot be checked stops the command.
 - **Downloads proceed in blocks**, so that memory stays bounded: by `step` (and per source by
   `checkpointing.step`). Blocks appended to the output equal a single block.
 - **Static variables** (without the time dimension) are written once, with the first block.

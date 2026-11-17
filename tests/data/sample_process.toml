@@ -1,6 +1,6 @@
 # Time mean of the dynamic variables of the sample dataset.
 [read]
-engine = "zarr"
+engine = "icechunk"  # the output of the sample download
 
 [[process]]
 name = "drop_static_vars"

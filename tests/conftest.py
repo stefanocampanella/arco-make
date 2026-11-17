@@ -155,3 +155,19 @@ def isolated_tempdir(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch) ->
   directory.mkdir()
   monkeypatch.setattr(tempfile, "tempdir", str(directory))
   return directory
+
+
+def open_output(path) -> xr.Dataset:
+  """An output of arco-make (an Icechunk repository), as xarray opens it: the tip of `main`."""
+  from arcomake import icechunk_utils
+
+  return xr.open_zarr(icechunk_utils.readonly_store(path), consolidated=False)
+
+
+def output_group(path):
+  """The Zarr group of an output of arco-make (an Icechunk repository), read-only."""
+  import zarr
+
+  from arcomake import icechunk_utils
+
+  return zarr.open_group(icechunk_utils.readonly_store(path), mode="r")

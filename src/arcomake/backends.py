@@ -402,3 +402,61 @@ class EarlyWarningDataStore(BackendEntrypoint):
     else:
       url = urlparse(filename_or_obj)
       return url.scheme == "ewds"
+
+
+class Icechunk(BackendEntrypoint):
+  """Icechunk repositories (the outputs of arco-make): `engine = "icechunk"`.
+
+  The path is a local directory, an `s3://` or a `gs://` URL; `storage_options` as in
+  `icechunk_utils`. Reads the tip of branch `main`, or the version named by `branch`, `tag` or
+  `snapshot_id`. Decoding options are those of xarray's zarr backend; `consolidated` is accepted
+  and ignored (Icechunk lists metadata without it).
+  """
+
+  description = "Open an Icechunk repository (a version of it) with xarray's zarr backend"
+  url = "https://icechunk.io"
+
+  @override
+  def open_dataset(
+    self,
+    filename_or_obj,
+    *,
+    drop_variables: str | Iterable[str] | None = None,
+    storage_options: dict[str, Any] | None = None,
+    branch: str | None = None,
+    tag: str | None = None,
+    snapshot_id: str | None = None,
+    group: str | None = None,
+    consolidated: bool | None = None,
+    mask_and_scale: bool = True,
+    decode_times: Any = True,
+    concat_characters: bool = True,
+    decode_coords: Any = True,
+    use_cftime: bool | None = None,
+    decode_timedelta: Any = None,
+  ) -> xr.Dataset:
+    from xarray.backends.zarr import ZarrBackendEntrypoint
+
+    from arcomake import icechunk_utils
+
+    store = icechunk_utils.readonly_store(
+      filename_or_obj, storage_options, branch=branch, tag=tag, snapshot_id=snapshot_id
+    )
+    # xarray reads zarr stores; its type hints do not list them.
+    return ZarrBackendEntrypoint().open_dataset(
+      store,  # ty: ignore[invalid-argument-type]
+      drop_variables=drop_variables,
+      group=group,
+      consolidated=False,
+      zarr_format=3,
+      mask_and_scale=mask_and_scale,
+      decode_times=decode_times,
+      concat_characters=concat_characters,
+      decode_coords=decode_coords,
+      use_cftime=use_cftime,
+      decode_timedelta=decode_timedelta,
+    )
+
+  @override
+  def guess_can_open(self, filename_or_obj) -> bool:
+    return False  # explicit `engine = "icechunk"` only: no request to find out

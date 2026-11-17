@@ -6,15 +6,16 @@ from typing import get_args
 import click
 from pydantic import BaseModel, ConfigDict, Field
 
+from arcomake import icechunk_utils
 from arcomake.cli_utils import (
   check_aws_profile,
-  check_if_overwriting,
+  check_destination,
   check_path,
   read_configs,
   set_default_logger,
 )
 from arcomake.dask_utils import DaskSetupType, get_client
-from arcomake.dataset_utils import ReadConfig, SaveConfig, open_input, safe_to_zarr
+from arcomake.dataset_utils import ReadConfig, SaveConfig, open_input, write_output
 from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
@@ -47,8 +48,12 @@ class ProcessConfig(BaseModel):
   type=str,
 )
 @click.option(
-  "--overwrite/--no-overwrite",
-  help="Whether to overwrite existing outputs",
+  "--replace/--no-replace",
+  help=(
+    "Write a new version of an existing output (an Icechunk repository): it replaces what `main`"
+    " shows once the run succeeds; earlier versions stay in its history until the recipe's"
+    " [save] keep_history or keep_versions expires them"
+  ),
   default=False,
   is_flag=True,
 )
@@ -78,7 +83,7 @@ def process(
   configs_path: str,
   input_path: str,
   output_path: str,
-  overwrite: bool = False,
+  replace: bool = False,
   dask_setup: DaskSetupType = "mpi",
   use_frisky: bool = False,
   log_level: str = "info",
@@ -99,7 +104,7 @@ def process(
       # Read configs, then check the output path (with the recipe's storage options).
       configs = read_configs(configs_path, schema=ProcessConfig)
       check_aws_profile(input_path, output_path)
-      check_if_overwriting(output_path, overwrite=overwrite, save_configs=configs.save)
+      check_destination(output_path, replace=replace, save_configs=configs.save)
       # Read input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
       with open_input(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
@@ -107,14 +112,13 @@ def process(
         if configs.process:
           dataset = dataset.arcomake.process(steps=configs.process)
         # Save stats
-        safe_to_zarr(
-          dataset=dataset,
-          destination=output_path,
-          configs=configs.save,
-          compute=True,
+        write_output(
+          dataset, output_path, configs.save, message=f"process {input_path}", command="process"
         )
     except click.ClickException:
       raise
+    except icechunk_utils.PromotionError as exc:
+      raise click.ClickException(str(exc)) from exc
     except Exception as exc:
       logger.exception("An error occurred while processing dataset")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
