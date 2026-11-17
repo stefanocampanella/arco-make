@@ -133,8 +133,8 @@ log says which kind it was.
 
 A download that fails leaves `main` as it was and its committed blocks on its branch: rerun it with
 `--resume` (same recipe, `--start` and `--end`) to write only the missing blocks. Each block's commit
-records its interval and a fingerprint of the recipe; `--resume` refuses another recipe, or a run that
-started before `main` last moved. A plain rerun refuses to start beside a failed run it could continue;
+records its interval and a fingerprint of the recipe; `--resume` refuses another recipe (request timeouts,
+checkpointing and `[retries]` may change), or a run that started before `main` last moved. A plain rerun refuses to start beside a failed run it could continue;
 `--replace` starts over. Do not resume a run that is still going.
 
 `--blocks N` reads and processes N blocks at once (default 1), each in a thread of its own: a

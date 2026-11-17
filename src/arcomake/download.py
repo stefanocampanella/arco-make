@@ -5,6 +5,7 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
+import json
 import logging
 import pathlib
 import shutil
@@ -477,9 +478,16 @@ def block_key(interval: DateInterval) -> str:
 
 
 def recipe_fingerprint(configs: DownloadConfig) -> str:
-  """A fingerprint of everything that decides what a download writes (the recipe, its start and
-  end; not the retries): a run is resumed only with the same."""
-  text = configs.model_dump_json(exclude={"retries"})
+  """A fingerprint of what decides what a download writes (the recipe, its start and end): a run
+  is resumed only with the same. Settings that only change how blocks are read are left out
+  (`[retries]`, parts' `timeout`, `checkpointing`): a run that failed on timeouts can resume with
+  longer ones."""
+  recipe = configs.model_dump(mode="json", exclude={"retries"})
+  for dataset in recipe["datasets"].values():
+    dataset.pop("checkpointing", None)
+    for part in dataset["parts"]:
+      part.pop("timeout", None)
+  text = json.dumps(recipe, sort_keys=True)
   return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 

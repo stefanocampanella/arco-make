@@ -78,6 +78,23 @@ def test_resume_needs_the_same_recipe(recipe, reads, tmp_path: pathlib.Path):
   assert other.exit_code != 0 and "another recipe" in other.output
 
 
+def test_resume_with_other_read_settings(recipe, reads, tmp_path: pathlib.Path):
+  """Request timeouts, checkpointing and retries change how blocks are read, not what is
+  written: a run that failed on timeouts resumes with longer ones."""
+  output = tmp_path / "out.zarr"
+  reads["fail"] = SECOND_BLOCK
+  assert run(recipe, output).exit_code != 0
+  reads["fail"] = None
+  text = recipe.read_text()
+  edited = text.replace(
+    '[datasets.ocean.checkpointing]\nstep = "1D"', '[datasets.ocean.checkpointing]\nstep = "2D"'
+  ).replace("[[datasets.ocean.parts]]\n", "[[datasets.ocean.parts]]\ntimeout = 600\n")
+  assert edited.count("timeout = 600") >= 1 and 'step = "2D"\n\n[[datasets.ocean.parts]]' in edited
+  recipe.write_text(edited + "\n[retries]\nattempts = 2\n")
+  resumed = run(recipe, output, "--resume")
+  assert resumed.exit_code == 0, resumed.output
+
+
 def test_nothing_to_resume(recipe, tmp_path: pathlib.Path):
   result = run(recipe, tmp_path / "out.zarr", "--resume")
   assert result.exit_code != 0 and "Nothing to resume" in result.output
