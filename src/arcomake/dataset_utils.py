@@ -26,7 +26,7 @@ from zarr.abc.codec import ArrayArrayCodec, ArrayBytesCodec, BytesBytesCodec
 from zarr.errors import ZarrUserWarning
 from zarr.registry import get_codec_class
 
-from arcomake import icechunk_utils
+from arcomake import hdf5_lock, icechunk_utils
 from arcomake.datetime_utils import (
   IterableDateInterval,
   may_parse_timedelta,
@@ -466,13 +466,14 @@ def open_input(filename_or_obj: Any, **kwargs: Any) -> xr.Dataset:
 
   Read errors of Zarr stores raise (N8): zarr 3 reads only a missing object as the fill value
   (sparse stores); timeouts and connection errors raise (`tests/test_read_errors.py`).
-  `storage_options` are dropped for local paths.
+  `storage_options` are dropped for local paths. netCDF4 and HDF5 files are opened and read
+  under one lock (`hdf5_lock`): those libraries are not thread-safe, and blocks run in threads.
   """
   if "storage_options" in kwargs:
     options = storage_options_for(filename_or_obj, kwargs.pop("storage_options"))
     if options is not None:
       kwargs["storage_options"] = options
-  return xr.open_dataset(filename_or_obj, **kwargs)
+  return hdf5_lock.open_dataset(filename_or_obj, **kwargs)
 
 
 class DatasetConfig(BaseModel):

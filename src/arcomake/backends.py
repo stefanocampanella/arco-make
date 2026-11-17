@@ -17,6 +17,7 @@ import xarray as xr
 from xarray.backends import AbstractDataStore, BackendEntrypoint
 from xarray.core.types import ReadBuffer
 
+from arcomake import hdf5_lock
 from arcomake.datetime_utils import DateInterval
 from arcomake.temporary_utils import get_current_temp_registry, set_current_temp_registry
 
@@ -145,9 +146,9 @@ class NetCDFOverHTTP(BackendEntrypoint):
     # server outage after the first block no longer fails the others (as on 16 Nov for GloFAS).
     temp_path = registry.cached_file(filename_or_obj, "downloaded.nc", fetch)
 
-    # Open the downloaded file as xarray Dataset
-    dataset = xr.open_dataset(temp_path, engine="netcdf4", drop_variables=drop_variables)
-    return dataset
+    # Under arco-make's HDF5 lock: blocks run at once (`download --blocks`) open this file at the
+    # same moment, and netCDF4 is not thread-safe.
+    return hdf5_lock.open_dataset(temp_path, engine="netcdf4", drop_variables=drop_variables)
 
   @override
   def guess_can_open(

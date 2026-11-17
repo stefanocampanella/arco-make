@@ -14,6 +14,7 @@ import xarray as xr
 from arcomake import backends
 from arcomake.backends import NetCDFOverHTTP
 from arcomake.temporary_utils import TempDirectoryRegistry
+from tests.conftest import FakeResponse
 
 
 def test_a_file_is_fetched_once_per_registry(tmp_path: pathlib.Path):
@@ -45,24 +46,6 @@ def test_a_failed_fetch_is_tried_again(tmp_path: pathlib.Path):
     assert not attempts[0].exists()  # the partial file is not kept
     path = registry.cached_file("key", "f.nc", flaky)
     assert path.read_text() == "partial" and len(attempts) == 2
-
-
-class FakeResponse:
-  def __init__(self, payload: bytes):
-    self.payload = payload
-
-  def __enter__(self):
-    return self
-
-  def __exit__(self, *args):
-    return False
-
-  def raise_for_status(self):
-    pass
-
-  def iter_content(self, chunk_size: int):
-    for start in range(0, len(self.payload), chunk_size):
-      yield self.payload[start : start + chunk_size]
 
 
 def test_netcdf_over_http_downloads_once_per_run(tmp_path, monkeypatch: pytest.MonkeyPatch):
