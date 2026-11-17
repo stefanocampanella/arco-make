@@ -650,3 +650,30 @@ endpoint and for anonymous access; unusable destinations fail before any downloa
 equal commit messages for the two climatology outputs; synchronous scheduler kept; one helper for
 writes into sessions); one not: the proposed shared computation for distributed clients relied
 on `write_lazy` returning lazily, which it does not (it computes).
+
+## 2026-11-17: runs on their own branch, --replace, retention
+
+**Maintainer's decisions (17 Nov):** a failed run must not hide the current version (gap 2 of
+`--overwrite`); the history of replaced versions is limited in the recipe (gap 3), by age or by
+count; `--overwrite` becomes `--replace` (nothing is deleted when it runs).
+
+- Every run writes on `run/<command>-<start time>` from the tip of `main`; `main` moves to the
+  run's last commit only when the run succeeds and only if `main` has not changed meanwhile
+  (conditional reset, `icechunk.ConflictError` otherwise). A failed run leaves `main` as it was,
+  its branch holding what it wrote; a repository whose `main` has no version yet is written again
+  without `--replace`. `compute-climatology` promotes its outputs once both are written.
+- `[save] keep_history` (counted from when a version was replaced) or `keep_versions`. Garbage
+  collection keeps objects younger than 7 days (`GRACE`): another run writing to the same
+  repository has uncommitted chunks no snapshot references, and the review showed that an
+  immediate collection would delete them, with its branch.
+- Measured: three versions of 8 MB take 22.5 MB, 7.5 MB with `keep_versions = 1` (grace 0);
+  the same cycle on the project bucket (`experiments/runs-probe-20261117/`) kept only the current
+  version and deleted the others' manifests (constant test data is inlined in manifests).
+- Review (high effort), 10 findings, all fixed: keep_history counted from writing (a version
+  replaced today could be deleted at once); unitless keep_history ("30" is 30 ns); retention could
+  delete another run's branch and uncommitted chunks; a failed first run left a repository that
+  needed `--replace`; any error at promotion was reported as a conflict; a branch deletion error
+  after promotion failed the run; keep_versions read the whole history (a commit per block);
+  garbage collection ran with nothing expired; process runs were labelled "write"; one commit had
+  three purposes (now three commits).
+- Still to decide (maintainer): the retention of the ARCO-OCEAN recipes (they keep everything).
