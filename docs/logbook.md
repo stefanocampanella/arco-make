@@ -677,3 +677,39 @@ count; `--overwrite` becomes `--replace` (nothing is deleted when it runs).
   garbage collection ran with nothing expired; process runs were labelled "write"; one commit had
   three purposes (now three commits).
 - Still to decide (maintainer): the retention of the ARCO-OCEAN recipes (they keep everything).
+
+## 2026-11-17: forecast retention, storage budget
+
+**Maintainer's decisions (17 Nov):**
+- Forecasts keep a rolling window of runs (option B): each new run drops the oldest one from the
+  current version, so `init_time` keeps a fixed length. Window: 6 years (about 2,190 daily
+  00 UTC runs). Snapshot retention alone does not bound a forecast dataset: it only drops old
+  versions, and the current version would keep every run.
+- Every dataset is 50 levels; the 10-level recipes (e.g. anfc) are remnants, to be updated or
+  deleted.
+- Retention of the arco-ocean recipes: downloads `keep_versions = 2`, statistics
+  `keep_versions = 1` (fork stack).
+
+**How a rolling window can work** (prototype, not in arco-make yet): Icechunk's
+`Session.shift_array` moves the chunks of an array along a dimension by whole chunks, discarding
+those shifted out, without copying data (`init_time` chunked one run per chunk); the new run is
+written into the vacated slot, and the dropped chunks go with snapshot expiration and garbage
+collection. Tested on `init_time` x `lead_time` x `lat` with a 2D `valid_time`, keeping 3 runs
+over 8: coordinates and data right, size constant. xarray's region writes leave index
+coordinates out: the new `init_time` value has to be written explicitly. Others: dynamical.org
+keeps full, growing archives (GEFS 115 TB compressed in March 2025; costs about $100,000 a year,
+growing about 30 % a year); Earthmover's Arraylake schedules expiration and garbage collection.
+
+**Storage budget** (extrapolated from window 2 and the published metadata; the bucket's own
+listing would count old versions, archived pieces and experiments):
+- One day at 0.25°, 50 levels: 432 MB (388 MB 3D ocean, 44 MB all 2D fields), 47 % of its
+  uncompressed size. A year of statistics output (365 bins) at 0.25°: about 0.16 TB per output.
+- Historical datasets 1993-2025 (0.25°, 0.5°, 1.0°) and their statistics: 7.3 TB per version;
+  about 14 TB in steady state (2 versions of the datasets, 1 of the statistics), about 21 TB if
+  everything is replaced at once.
+- A forecast run (10 lead days of GLO12 physics and waves and IFS HRES at 0.25°, 50 levels, plus
+  30 days of GloFAS discharge): about 4.4 GB. Six years: about 9.6 TB, reached after six years
+  (about 1.6 TB a year).
+- Total: about 24 TB in steady state, about 31 TB at worst, of the 50 TB of the sponsorship.
+  Until the production download replaces it, the data in use now (unpacked dataset, its archived
+  pieces, an older version: about 15 TB) also stays.
