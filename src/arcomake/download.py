@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import functools
+import hashlib
 import logging
 import warnings
 from contextlib import ExitStack, nullcontext
@@ -97,6 +98,15 @@ class DownloadConfig(BaseModel):
   is_flag=True,
 )
 @click.option(
+  "--resume/--no-resume",
+  help=(
+    "Continue a download that failed on this output: its committed blocks are kept, the others"
+    " written (same recipe, --start and --end)"
+  ),
+  default=False,
+  is_flag=True,
+)
+@click.option(
   "--log-level",
   default="info",
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
@@ -123,6 +133,7 @@ def download(
   start_datetime: datetime | None = None,
   end_datetime: datetime | None = None,
   replace: bool = False,
+  resume: bool = False,
   log_level: str = "info",
   dask_setup: DaskSetupType = "threads",
   progress: bool = False,
@@ -165,19 +176,34 @@ def download(
       *(part.filename_or_obj for part in parts),
       copernicus_marine=any(part.engine == "copernicusmarine" for part in parts),
     )
-    # Check the output destination, then start a run on a branch of its own.
-    check_destination(output_path, replace=replace, save_configs=configs.save)
+    # Check the output destination (a failed run waiting there, or an existing version), then
+    # start a run on a branch of its own, or continue the failed one.
+    recipe = recipe_fingerprint(configs)
+    waiting = _waiting_run(output_path, configs, resume=resume, replace=replace, recipe=recipe)
+    check_destination(output_path, replace=replace or resume, save_configs=configs.save)
     try:
       run = icechunk_utils.Run(
-        output_path, configs.save.storage_options, icechunk_utils.run_label("download")
+        output_path,
+        configs.save.storage_options,
+        icechunk_utils.run_label("download"),
+        waiting=waiting if resume else None,
       )
     except Exception as exc:
       raise click.ClickException(f"Could not start writing {output_path}: {exc}") from exc
+    blocks = list(IterableDateInterval(configs.start, configs.end, configs.step))
+    written = list(waiting.blocks) if resume and waiting is not None else []
+    done = set(written)
+    if written != [block_key(b) for b in blocks[: len(written)]]:
+      raise click.ClickException(
+        f"The blocks on {run.branch} are not the first ones of this recipe: start over with --replace"
+      )
+    if done:
+      logger.info(f"Resuming {run.branch}: {len(done)} of {len(blocks)} blocks are written")
     # One block at a time, each committed on the run's branch; a block that fails with a
     # transient error is redone (`retries`), others stop the run.
-    for number, date_interval in enumerate(
-      IterableDateInterval(configs.start, configs.end, configs.step)
-    ):
+    for number, date_interval in enumerate(blocks):
+      if block_key(date_interval) in done:
+        continue
       what = f"Block [{date_interval.start:%Y-%m-%dT%H:%M}, {date_interval.end:%Y-%m-%dT%H:%M})"
       logger.info(f"Downloading data from {date_interval.start} to {date_interval.end}")
       try:
@@ -189,6 +215,10 @@ def download(
             run,
             first=number == 0,
             progress=progress and dask_setup in ("processes", "threads"),
+            metadata={
+              icechunk_utils.BLOCK_KEY: block_key(date_interval),
+              icechunk_utils.RECIPE_KEY: recipe,
+            },
           ),
           configs.retries,
           what,
@@ -198,7 +228,7 @@ def download(
       except Exception as exc:
         raise click.ClickException(
           f"An error occurred ({type(exc).__name__}). Aborting: the blocks written are on branch"
-          f" {run.branch}, `main` is unchanged."
+          f" {run.branch}, `main` is unchanged; --resume continues from there."
         ) from exc
     # Every block is written: `main` moves to them, then the recipe's retention applies.
     try:
@@ -214,6 +244,7 @@ def _write_block(
   *,
   first: bool,
   progress: bool,
+  metadata: dict[str, str],
 ) -> None:
   """Read, process and merge the datasets of one block, and commit it to the run's branch
   (written by the first block, appended along time by the others)."""
@@ -254,8 +285,56 @@ def _write_block(
       block = f"download [{date_interval.start:%Y-%m-%dT%H:%M}, {date_interval.end:%Y-%m-%dT%H:%M})"
       with ProgressBar() if progress else nullcontext():
         if first:
-          write_output(dataset, run, configs.save, message=block, mode="w")
+          write_output(dataset, run, configs.save, message=block, mode="w", metadata=metadata)
         else:
           write_output(
-            dataset, run, configs.save, message=block, mode="a-", append_dim=configs.time_dim
+            dataset,
+            run,
+            configs.save,
+            message=block,
+            mode="a-",
+            append_dim=configs.time_dim,
+            metadata=metadata,
           )
+
+
+def block_key(interval: DateInterval) -> str:
+  """How a block is named in the commit metadata (`icechunk_utils.BLOCK_KEY`)."""
+  return f"{interval.start:%Y-%m-%dT%H:%M}/{interval.end:%Y-%m-%dT%H:%M}"
+
+
+def recipe_fingerprint(configs: DownloadConfig) -> str:
+  """A fingerprint of everything that decides what a download writes (the recipe, its start and
+  end; not the retries): a run is resumed only with the same."""
+  text = configs.model_dump_json(exclude={"retries"})
+  return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def _waiting_run(
+  output_path: str, configs: DownloadConfig, *, resume: bool, replace: bool, recipe: str
+) -> icechunk_utils.WaitingRun | None:
+  """The failed download run at `output_path`, checked against the options: --resume needs one
+  that can continue with this recipe, a plain run refuses to start beside one."""
+  try:
+    waiting = icechunk_utils.waiting_run(output_path, configs.save.storage_options, "download")
+  except Exception as exc:
+    raise click.ClickException(f"Could not check {output_path} for a failed run: {exc}") from exc
+  if resume:
+    if waiting is None:
+      raise click.ClickException(f"Nothing to resume: no failed download run at {output_path}")
+    if not waiting.current:
+      raise click.ClickException(
+        f"main changed since {waiting.branch} started, which can no longer be promoted: start"
+        " over with --replace"
+      )
+    if waiting.recipe is not None and waiting.recipe != recipe:
+      raise click.ClickException(
+        f"{waiting.branch} was written with another recipe (or --start/--end): resume it with"
+        " the same, or start over with --replace"
+      )
+  elif waiting is not None and waiting.current and not replace:
+    raise click.ClickException(
+      f"A download run failed at {output_path} ({waiting.branch}, {len(waiting.blocks)} blocks"
+      " written): --resume continues it, --replace starts over"
+    )
+  return waiting

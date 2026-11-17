@@ -14,6 +14,7 @@ in `storage_options`, as for fsspec, but only these are understood (others are a
   the environment's credentials.
 """
 
+import dataclasses
 import datetime
 import functools
 import logging
@@ -246,6 +247,54 @@ def fsspec_options(
   return options
 
 
+# Commit metadata of the blocks of a download (see `WaitingRun`): the block's interval, and a
+# fingerprint of the recipe it was written with.
+BLOCK_KEY = "arcomake_block"
+RECIPE_KEY = "arcomake_recipe"
+
+
+@dataclasses.dataclass(frozen=True)
+class WaitingRun:
+  """A run that failed before `main` moved to it: its branch holds the blocks it committed."""
+
+  label: str
+  branch: str
+  base: str  # the tip of `main` when it started
+  blocks: tuple[str, ...]  # the intervals committed, oldest first (`BLOCK_KEY`)
+  recipe: str | None  # the fingerprint of the recipe its blocks were written with
+  current: bool  # whether `main` is still where the run started (it can still be promoted)
+
+
+def waiting_run(
+  path: str | pathlib.Path, storage_options: Mapping[str, Any] | None, command: str
+) -> WaitingRun | None:
+  """The newest run of `command` whose branch is still in the repository at `path` (a run that
+  failed), or `None`; also `None` if there is no repository."""
+  repository_storage = storage(path, storage_options)
+  if not icechunk.Repository.exists(repository_storage):
+    return None
+  repo = icechunk.Repository.open(repository_storage)
+  branches = sorted(b for b in repo.list_branches() if b.startswith(f"run/{command}-"))
+  if not branches:
+    return None
+  branch = branches[-1]
+  label = branch.removeprefix("run/")
+  blocks: list[str] = []
+  recipe = None
+  base = None
+  for snapshot in repo.ancestry(branch=branch):
+    metadata = snapshot.metadata or {}
+    if metadata.get(RUN_KEY) != label:
+      base = snapshot.id
+      break
+    if metadata.get(BLOCK_KEY) is not None:
+      blocks.append(metadata[BLOCK_KEY])
+    recipe = recipe or metadata.get(RECIPE_KEY)
+  assert base is not None  # a run's branch starts from a snapshot of `main`
+  current = repo.lookup_branch(BRANCH) == base
+  return WaitingRun(label, branch, base, tuple(reversed(blocks)), recipe, current)
+
+
 class PromotionError(RuntimeError):
   """`main` changed during a run: its output was not promoted (it stays on the run's branch)."""
 
@@ -261,12 +310,23 @@ class Run:
   """
 
   def __init__(
-    self, path: str | pathlib.Path, storage_options: Mapping[str, Any] | None, label: str
+    self,
+    path: str | pathlib.Path,
+    storage_options: Mapping[str, Any] | None,
+    label: str,
+    *,
+    waiting: "WaitingRun | None" = None,
   ) -> None:
+    """Start a run labelled `label`, or continue `waiting` (a run that failed, see
+    `waiting_run`) on its branch."""
     self.path = str(path)
+    self.repo = icechunk.Repository.open_or_create(storage(path, storage_options))
+    if waiting is not None:
+      self.label, self.branch, self.base = waiting.label, waiting.branch, waiting.base
+      logger.info(f"Continuing {self.path} on branch {self.branch} (from {self.base})")
+      return
     self.label = label
     self.branch = f"run/{label}"
-    self.repo = icechunk.Repository.open_or_create(storage(path, storage_options))
     self.base = self.repo.lookup_branch(BRANCH)
     self.repo.create_branch(self.branch, self.base)
     logger.info(f"Writing {self.path} on branch {self.branch} (from {self.base})")
@@ -274,8 +334,12 @@ class Run:
   def session(self) -> icechunk.Session:
     return self.repo.writable_session(self.branch)
 
-  def commit(self, session: icechunk.Session, message: str) -> str:
-    snapshot = str(session.commit(message, metadata={RUN_KEY: self.label}))
+  def commit(
+    self, session: icechunk.Session, message: str, metadata: Mapping[str, Any] | None = None
+  ) -> str:
+    """Commit `session` on the run's branch; the run's label (and `metadata`) go in the commit's
+    metadata."""
+    snapshot = str(session.commit(message, metadata={**(metadata or {}), RUN_KEY: self.label}))
     logger.info(f"Committed {snapshot} to {self.path} ({self.branch}): {message}")
     return snapshot
 
@@ -287,11 +351,12 @@ class Run:
     mode: Literal["w", "w-", "a", "a-", "r+"] = "w",
     append_dim: Hashable | None = None,
     group: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
   ) -> str:
     """Write `dataset` (its variables' encodings set the layout) in one commit of the run."""
     session = self.session()
     to_icechunk(dataset, session, mode=mode, append_dim=append_dim, group=group)
-    return self.commit(session, message)
+    return self.commit(session, message, metadata)
 
   def finish(self, retention: "Retention | None" = None) -> str:
     """Move `main` to the run's last commit (if `main` is still where the run started), then

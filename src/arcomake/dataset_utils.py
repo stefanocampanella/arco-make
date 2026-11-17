@@ -721,6 +721,7 @@ def write_output(
   mode: Literal["w", "w-", "a", "a-", "r+"] = "w",
   append_dim: str | None = None,
   command: str = "write",
+  metadata: Mapping[str, Any] | None = None,
 ) -> str:
   """Write a dataset with the layout of `[save]` (see `prepare_for_writing`) in one commit.
 
@@ -737,7 +738,12 @@ def write_output(
   if isinstance(destination, icechunk_utils.Run):
     logger.info(f"Writing to {destination.path} ({message}) with {configs}")
     return destination.write(
-      prepared, message=message, mode=mode, append_dim=append_dim, group=configs.group
+      prepared,
+      message=message,
+      mode=mode,
+      append_dim=append_dim,
+      group=configs.group,
+      metadata=metadata,
     )
   path = _check_output_path(destination)
   logger.info(f"Writing to {path} ({message}) with {configs}")

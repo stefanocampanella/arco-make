@@ -130,6 +130,12 @@ or throttling answer) is redone, after a wait that doubles each time: `[retries]
 "1min"`, `max_wait = "30min"` by default. Other errors (a recipe or data error) stop the run at once; the
 log says which kind it was.
 
+A download that fails leaves `main` as it was and its committed blocks on its branch: rerun it with
+`--resume` (same recipe, `--start` and `--end`) to write only the missing blocks. Each block's commit
+records its interval and a fingerprint of the recipe; `--resume` refuses another recipe, or a run that
+started before `main` last moved. A plain rerun refuses to start beside a failed run it could continue;
+`--replace` starts over. Do not resume a run that is still going.
+
 Every output is an [Icechunk](https://icechunk.io) repository (Zarr format 3 with versions): a local
 directory, an `s3://` or a `gs://` URL. Every run writes on a branch of its own (`run/<command>-<start
 time>`), in commits: one per block for `download` (its message names the block's interval), one for
