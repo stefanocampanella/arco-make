@@ -139,3 +139,25 @@ def test_needs_merge():
 def test_shapes_of_a_dataset():
   ds = xr.Dataset({"v": (("time", "x"), np.zeros((3, 4), dtype=np.float32))})
   assert shapes(ds) == {"v": Shape(("time", "x"), (3, 4), 4)}
+
+
+def test_gathered_tasks_split_the_other_dimensions_first():
+  """`get_bottom` without regrid: its tasks hold the 50 levels, so splitting depth would not bound
+  them; latitude is split until a column task fits a task's share, then depth for the target."""
+  variables = {"thetao": Shape(("time", "depth", "latitude", "longitude"), (8, 50, 2041, 4320), 4)}
+  result = plan(variables, VM, Needs(gathered=frozenset({"depth"})))
+  assert result.chunks["latitude"] < 2041
+  assert result.gathered is not None and result.gathered[0] <= VM.per_task
+  assert result.largest[0] <= VM.target
+  assert result.warnings == ()
+
+
+def test_splits_prefer_multiples_of_the_source_chunks():
+  """16 levels fit the target; with source chunks of 5 levels, 15 (each read by one task); with
+  source chunks larger than what fits, or on another dimension, the plain fit."""
+  variables = {"v": Shape(("time", "depth", "x"), (4, 50, 10**6), 8)}
+  budget = Budget(memory_limit=10**9, threads=1)
+  assert plan(variables, budget).chunks["depth"] == 16
+  assert plan(variables, budget, preferred={"depth": 5}).chunks["depth"] == 15
+  assert plan(variables, budget, preferred={"depth": 20}).chunks["depth"] == 16
+  assert plan(variables, budget, preferred={"elevation": 5}).chunks["depth"] == 16

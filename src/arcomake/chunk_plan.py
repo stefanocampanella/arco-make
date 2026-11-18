@@ -188,11 +188,20 @@ def _fit(
   variables: Mapping[Hashable, Shape],
   unit: int,
   size: int,
+  whole: Iterable[Hashable] = (),
+  preferred: int | None = None,
 ) -> int:
   """The largest multiple of `unit` along `dim` (at least `unit`, at most `size`) whose chunks,
-  the other dimensions as in `chunks`, hold at most `limit` bytes."""
-  per_step = _bytes({**chunks, dim: 1}, {n: v for n, v in variables.items() if dim in v.dims})
-  steps = size if per_step[0] == 0 else limit // per_step[0]
+  the other dimensions as in `chunks` (`whole` ones whole), hold at most `limit` bytes; a
+  multiple of `preferred` too (the source's chunk, read once by one task) if one fits."""
+  per_step = _bytes(
+    {**chunks, dim: 1}, {n: v for n, v in variables.items() if dim in v.dims}, whole
+  )[0]
+  steps = size if per_step == 0 else limit // per_step
+  if preferred is not None:
+    aligned = min(size, math.lcm(unit, preferred))
+    if aligned <= steps:
+      return min(size, steps // aligned * aligned)
   return max(unit, min(size, steps // unit * unit))
 
 
@@ -201,14 +210,18 @@ def plan(
   budget: Budget,
   needs: Needs | None = None,
   grow_dim: Hashable | None = "time",
+  preferred: Mapping[Hashable, int] | None = None,
 ) -> Plan:
   """Chunk sizes for `variables`, about `budget.target` bytes each.
 
   Every dimension starts whole, except `grow_dim`, which starts at its unit (the multiple its
-  steps need, 1 without). If a chunk is still above the target, the dimensions that need not be
-  whole are split, outermost first, to multiples of their unit. Then `grow_dim` grows, in
-  multiples of its unit, up to the target or its length. Chunks, and the tasks of steps that
-  gather dimensions (those dimensions whole), above `budget.per_task` are reported as warnings.
+  steps need, 1 without). Steps that gather dimensions hold them whole in each task: while such
+  tasks are above `budget.per_task`, the other dimensions that need not be whole are split,
+  outermost first. Then, while a chunk is above the target, so are the gathered ones. Then
+  `grow_dim` grows, in multiples of its unit, up to the target (gathered tasks up to
+  `budget.per_task`) or its length. Splits prefer multiples of the source's chunks
+  (`preferred`), when they fit. Chunks, and gathering tasks, above `budget.per_task` are
+  reported as warnings.
 
   Raises:
     PlanError: if even chunks of one unit along every dimension that may be split leave no room
@@ -222,20 +235,36 @@ def plan(
       if dim not in order:
         order.append(dim)
   needs = (needs or Needs()).restricted_to(sizes)
+  source: dict[Hashable, int] = {
+    dim: int(size) for dim, size in (preferred or {}).items() if dim in sizes and size > 0
+  }
   units = {dim: min(max(sizes[dim], 1), needs.multiple.get(dim, 1)) for dim in sizes}
   chunks = dict(sizes)
   grow = grow_dim if grow_dim in sizes and grow_dim not in needs.whole else None
   if grow is not None:
     chunks[grow] = units[grow]
   target = budget.target
-  for dim in order:
-    if _bytes(chunks, variables)[0] <= target:
-      break
-    if dim == grow or dim in needs.whole:
-      continue
-    chunks[dim] = _fit(dim, target, chunks, variables, units[dim], sizes[dim])
+
+  def split(dims: Iterable[Hashable], limit: int, whole: frozenset[Hashable]) -> None:
+    for dim in dims:
+      if _bytes(chunks, variables, whole)[0] <= limit:
+        return
+      chunks[dim] = _fit(
+        dim, limit, chunks, variables, units[dim], sizes[dim], whole, source.get(dim)
+      )
+
+  free = [dim for dim in order if dim != grow and dim not in needs.whole]
+  if needs.gathered:
+    split([dim for dim in free if dim not in needs.gathered], budget.per_task, needs.gathered)
+  split(free, target, frozenset())
   if grow is not None and _bytes(chunks, variables)[0] <= target:
-    chunks[grow] = _fit(grow, target, chunks, variables, units[grow], sizes[grow])
+    size = _fit(grow, target, chunks, variables, units[grow], sizes[grow], (), source.get(grow))
+    if needs.gathered:
+      size = min(
+        size,
+        _fit(grow, budget.per_task, chunks, variables, units[grow], sizes[grow], needs.gathered),
+      )
+    chunks[grow] = size
   gathered = _bytes(chunks, variables, needs.gathered) if needs.gathered else None
   largest = _bytes(chunks, variables)
   warnings = []
