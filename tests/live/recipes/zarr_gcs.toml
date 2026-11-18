@@ -8,8 +8,10 @@ step = "1D"
 filename_or_obj = "gs://gcp-public-data-arco-era5/ar/full_37-1h-0p25deg-chunk-1.zarr-v3"
 engine = "zarr"
 consolidated = true
-# A timeout per request: gcsfs sends none by default, and a read can hang forever.
-storage_options = {token = "anon", requests_timeout = 120}
+# gcsfs sends no timeout by default, and a read can hang forever: the part's `timeout` (seconds
+# of silence) reaches gcsfs as a timeout that it retries (not `requests_timeout`, a total).
+timeout = 120
+storage_options = {token = "anon"}
 chunks = {time = 24, latitude = -1, longitude = -1}
 
 [[datasets.era5.postprocess]]

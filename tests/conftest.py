@@ -171,3 +171,23 @@ def output_group(path):
   from arcomake import icechunk_utils
 
   return zarr.open_group(icechunk_utils.readonly_store(path), mode="r")
+
+
+class FakeResponse:
+  """A streamed `requests` response with `payload` as content."""
+
+  def __init__(self, payload: bytes):
+    self.payload = payload
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, *args):
+    return False
+
+  def raise_for_status(self):
+    pass
+
+  def iter_content(self, chunk_size: int):
+    for start in range(0, len(self.payload), chunk_size):
+      yield self.payload[start : start + chunk_size]

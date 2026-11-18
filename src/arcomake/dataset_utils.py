@@ -1,15 +1,18 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import datetime
+import functools
 import logging
 import pathlib
 import re
+import shutil
 import tempfile
 import warnings
 from collections.abc import Callable, Generator, Hashable, Mapping
 from contextlib import contextmanager, nullcontext
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
+import aiohttp
 import dask
 import fsspec
 import fsspec.utils
@@ -24,7 +27,7 @@ from zarr.abc.codec import ArrayArrayCodec, ArrayBytesCodec, BytesBytesCodec
 from zarr.errors import ZarrUserWarning
 from zarr.registry import get_codec_class
 
-from arcomake import icechunk_utils
+from arcomake import hdf5_lock, icechunk_utils
 from arcomake.datetime_utils import (
   IterableDateInterval,
   may_parse_timedelta,
@@ -65,7 +68,8 @@ class OpenDatasetArguments(BaseModel):
   chunked_array_type: str | None = None
   from_array_kwargs: dict[str, Any] | None = None
   backend_kwargs: dict[str, Any] | None = None
-  # Options of the fsspec filesystem of a remote input (credentials, `requests_timeout`...).
+  # Options of the fsspec filesystem of a remote input (credentials...). Download parts take their
+  # request timeouts from `timeout` (`PartTimeout`); `[read]` tables get none from arco-make.
   storage_options: dict[str, Any] | None = None
   # Zarr inputs: whether to read consolidated metadata.
   consolidated: bool | None = None
@@ -124,6 +128,87 @@ class PartTimeOffset(BaseModel):
     return may_parse_timedelta(value) if isinstance(value, str) else value
 
 
+# Seconds a source may stay silent (no connection, no data) before the request fails. gcsfs
+# waits forever by default (N7): two downloads hung on a read from Google Cloud Storage.
+DEFAULT_TIMEOUT = 120.0
+
+
+class PartTimeout(BaseModel):
+  """`timeout` of a part: seconds a source may stay silent before a request to it fails
+  (default `DEFAULT_TIMEOUT`).
+
+  Applied to Zarr stores on Google Cloud Storage (gcsfs's `requests_timeout`, which has none by
+  default), to NetCDF files over HTTP (connection at most 30 s, then each wait for data) and to
+  EWDS requests; on S3, only when given (botocore's connect and read timeouts, 60 s by default
+  otherwise). Copernicus Marine parts do not take it: the toolbox sets its own timeouts and
+  retries. Neither do Icechunk inputs, whose storage has its own
+  (`network_stream_timeout_seconds` on S3).
+
+  On GCS (`gcs_timeout`) it bounds the connection (at most 30 s) and each wait for data, not
+  the whole request: a stalled answer fails with aiohttp's `SocketTimeoutError`, which gcsfs
+  requests again (6 attempts in all, waits of about 1, 2, 4, 8 and 16 s between them), so one
+  stalled chunk costs about the timeout, not the block. GCS answers stall now and then (one ERA5
+  chunk took 212 s on 17 Nov, four at once past 600 s, each block waiting for them alone). When
+  GCS does not answer at all, a chunk fails after 6 attempts (about 3.5 minutes if no connection
+  can be made, 12.6 if connections are made but nothing comes, at the default), then its block
+  is retried. gcsfs's own `requests_timeout` is refused in a part's storage options: as a
+  number it bounds a whole request, and gcsfs does not retry the plain `TimeoutError` it raises.
+
+  No timeout bounds a whole request: large chunks over slow links are not cut, and waits for a
+  pooled connection end as the requests holding them do. An answer that trickles in more often
+  than once per `timeout` would not be cut either; none was seen.
+  """
+
+  timeout: float | None = Field(default=None, gt=0)
+
+  @model_validator(mode="after")
+  def _no_gcsfs_timeout(self) -> Self:
+    options = getattr(self, "storage_options", None) or {}
+    if _is_gcs(getattr(self, "filename_or_obj", None)) and "requests_timeout" in options:
+      raise ValueError(
+        "storage_options.requests_timeout: set the part's `timeout` instead (seconds of silence,"
+        " retried by gcsfs; requests_timeout is a total, which gcsfs does not retry)"
+      )
+    return self
+
+
+def _is_gcs(url: Any) -> bool:
+  """Whether `url` names a Google Cloud Storage object (chained URLs such as `simplecache::gs://`
+  are not: their storage options are per protocol)."""
+  return isinstance(url, str) and fsspec.utils.get_protocol(url) in ("gs", "gcs")
+
+
+def gcs_timeout(seconds: float) -> aiohttp.ClientTimeout:
+  """gcsfs's `requests_timeout` for a part's `timeout`: the connection and each wait for data,
+  no total (see `PartTimeout`)."""
+  return aiohttp.ClientTimeout(total=None, sock_connect=min(30.0, seconds), sock_read=seconds)
+
+
+def _with_timeout(part_conf: dict[str, Any], engine: str | None, timeout: float | None) -> None:
+  """Give the part's source a request timeout (`PartTimeout`), unless its options set one."""
+  seconds = timeout if timeout is not None else DEFAULT_TIMEOUT
+  if engine == "icechunk":  # not fsspec: its storage refuses gcsfs and botocore options
+    return
+  if engine in ("netcdfoverhttp", "earlywarningdatastore"):
+    part_conf.setdefault("timeout", seconds)
+    return
+  url = part_conf.get("filename_or_obj")
+  if not isinstance(url, str):
+    return
+  protocol = fsspec.utils.get_protocol(url)
+  options = dict(part_conf.get("storage_options") or {})
+  if _is_gcs(url):  # a recipe cannot set requests_timeout here (`PartTimeout`)
+    options.setdefault("requests_timeout", gcs_timeout(seconds))
+  elif protocol in ("s3", "s3a") and timeout is not None:
+    config = dict(options.get("config_kwargs") or {})
+    config.setdefault("connect_timeout", timeout)
+    config.setdefault("read_timeout", timeout)
+    options["config_kwargs"] = config
+  else:
+    return
+  part_conf["storage_options"] = options
+
+
 def _engine_given_or_implied(data: Any, implied: Callable[[str], bool]) -> Any:
   """A part without `engine` matches a dedicated model only if its URL implies that engine.
 
@@ -162,7 +247,7 @@ class CopernicusMarinePartConfig(PartTimeOffset):
   storage_options: dict[str, Any] | None = None
 
 
-class NetCDFOverHTTPPartConfig(PartTimeOffset):
+class NetCDFOverHTTPPartConfig(PartTimeOffset, PartTimeout):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
@@ -178,7 +263,7 @@ class NetCDFOverHTTPPartConfig(PartTimeOffset):
     )
 
 
-class EarlyWarningDataStorePartConfig(PartTimeOffset):
+class EarlyWarningDataStorePartConfig(PartTimeOffset, PartTimeout):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
@@ -202,7 +287,7 @@ class EarlyWarningDataStorePartConfig(PartTimeOffset):
     return _engine_given_or_implied(data, lambda url: _has_scheme(url, "ewds"))
 
 
-class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset):
+class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout):
   """A Zarr part: the arguments of `xarray.open_dataset`, read through a strict store."""
 
   filename_or_obj: str
@@ -214,7 +299,7 @@ class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset):
     return _engine_given_or_implied(data, lambda url: url.rstrip("/").endswith(".zarr"))
 
 
-class GenericPartConfig(ReadConfig, PartTimeOffset):
+class GenericPartConfig(ReadConfig, PartTimeOffset, PartTimeout):
   """A part read by any other xarray engine, with the arguments of `xarray.open_dataset`."""
 
   filename_or_obj: str
@@ -421,13 +506,14 @@ def open_input(filename_or_obj: Any, **kwargs: Any) -> xr.Dataset:
 
   Read errors of Zarr stores raise (N8): zarr 3 reads only a missing object as the fill value
   (sparse stores); timeouts and connection errors raise (`tests/test_read_errors.py`).
-  `storage_options` are dropped for local paths.
+  `storage_options` are dropped for local paths. netCDF4 and HDF5 files are opened and read
+  under one lock (`hdf5_lock`): those libraries are not thread-safe, and blocks run in threads.
   """
   if "storage_options" in kwargs:
     options = storage_options_for(filename_or_obj, kwargs.pop("storage_options"))
     if options is not None:
       kwargs["storage_options"] = options
-  return xr.open_dataset(filename_or_obj, **kwargs)
+  return hdf5_lock.open_dataset(filename_or_obj, **kwargs)
 
 
 class DatasetConfig(BaseModel):
@@ -463,10 +549,12 @@ def download_and_process(
   parts = []
   for raw_part in configs.parts:
     offset = raw_part.time_offset or datetime.timedelta(0)
-    part_conf = raw_part.model_dump(exclude_unset=True, exclude={"time_offset"})
+    part_conf = raw_part.model_dump(exclude_unset=True, exclude={"time_offset", "timeout"})
     engine = getattr(raw_part, "engine", None) or part_conf.get("engine")
     if engine is not None:
       part_conf["engine"] = engine
+    if engine != "copernicusmarine":
+      _with_timeout(part_conf, engine, getattr(raw_part, "timeout", None))
     if engine == "earlywarningdatastore" or engine == "copernicusmarine":
       part_conf.update(start_datetime=start_datetime - offset, end_datetime=end_datetime - offset)
     part = open_input(**part_conf)
@@ -584,8 +672,12 @@ def maybe_checkpointing_download_and_process(
   logger.info(f"Opening checkpointed dataset from {checkpoint_path}")
   dataset = xr.open_zarr(str(checkpoint_path), consolidated=False, overwrite_encoded_chunks=True)
   assert isinstance(dataset, xr.Dataset)
+  # Removed when the dataset is closed (at the end of its block): a run of many blocks would
+  # otherwise keep every block's checkpoints on disk until it ends.
   if checkpoint is not None:
     dataset.set_close(checkpoint.cleanup)
+  else:
+    dataset.set_close(functools.partial(shutil.rmtree, checkpoint_path, ignore_errors=True))
   return dataset
 
 
@@ -680,6 +772,7 @@ def write_output(
   mode: Literal["w", "w-", "a", "a-", "r+"] = "w",
   append_dim: str | None = None,
   command: str = "write",
+  metadata: Mapping[str, Any] | None = None,
 ) -> str:
   """Write a dataset with the layout of `[save]` (see `prepare_for_writing`) in one commit.
 
@@ -696,7 +789,12 @@ def write_output(
   if isinstance(destination, icechunk_utils.Run):
     logger.info(f"Writing to {destination.path} ({message}) with {configs}")
     return destination.write(
-      prepared, message=message, mode=mode, append_dim=append_dim, group=configs.group
+      prepared,
+      message=message,
+      mode=mode,
+      append_dim=append_dim,
+      group=configs.group,
+      metadata=metadata,
     )
   path = _check_output_path(destination)
   logger.info(f"Writing to {path} ({message}) with {configs}")

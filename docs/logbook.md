@@ -713,3 +713,150 @@ listing would count old versions, archived pieces and experiments):
 - Total: about 24 TB in steady state, about 31 TB at worst, of the 50 TB of the sponsorship.
   Until the production download replaces it, the data in use now (unpacked dataset, its archived
   pieces, an older version: about 15 TB) also stays.
+
+## 2026-11-17: group 7, resumable and fault-tolerant downloads
+
+Maintainer's decisions: retry defaults in arco-make, overridable per source; an explicit
+`--resume` (a plain rerun refuses and names the waiting branch); blocks at once through a CLI
+option, default 1. Five commits:
+- **Request timeouts.** Parts take `timeout` (seconds, default 120): gcsfs `requests_timeout`
+  (None by default: the N7 hangs), botocore's connect and read timeouts on S3 when given,
+  `requests` for NetCDF over HTTP (connect at most 30 s), cdsapi for EWDS. Not for Copernicus
+  Marine, which has its own.
+- **Block retries.** A block failing with a transient error (timeouts, connection errors, HTTP
+  408/425/429/5xx, also raised from or grouped in another error) is redone, waiting 1 min,
+  doubled up to 30 min, 5 attempts by default (`[retries]`). Others fail at once; the log says
+  which. Per block, not per source: a block reads all its sources in one computation. The
+  errors logged by the 0.25° download's six failed pieces (EWDS retries, DNS failures, connect
+  timeouts, Copernicus Marine resets) are of the transient kind; an ecCodes crash (N6) kills the
+  process and cannot be retried, but N6 is fixed.
+- **Fetched once per run.** The GloFAS static file was downloaded for every block; an outage of
+  its server (502, 16 Nov) failed the block it met. It is now fetched once per run.
+- **`--resume`.** Every block's commit records its interval and a fingerprint of the recipe
+  (start and end included; retries, request timeouts and checkpointing not, so a run that failed
+  on timeouts resumes with longer ones). `--resume` continues the newest failed download run on
+  its branch and writes only the missing blocks; it refuses another recipe, or a run that
+  started before `main` last moved. A plain rerun refuses beside a failed run that can still be
+  promoted; `--replace` starts over. The six manual reruns of the 0.25° download become one
+  command each, without rereading the blocks already written.
+- **`--blocks N`.** N blocks are read and processed at once, each staged on local disk by a
+  thread of its own and committed in order with the encodings and Dask chunks its direct write
+  would have had: the output is the same as with one block at a time (tested, array metadata
+  included). Memory and disk grow with N: the 0.25° levels-50 baseline windows (2-5 days)
+  peaked at 36-53 GB in one process. Not yet measured on real data: two processes each kept
+  their speed (logbook, 16 Nov), so about 2x is expected with N = 2 (measured: about 1.2×,
+  18 Nov).
+
+Review (high effort) of the five commits: ten findings, all fixed in six follow-up commits, each
+with a test that fails without it. The serious ones: gcsfs options were added to `engine =
+"icechunk"` inputs on GCS, which then failed to open; a commit that landed but whose answer was
+lost would be retried and append its block twice (each attempt now checks the branch tip's
+block first); `--blocks N` held N + 1 blocks. Found while fixing: checkpoints were removed only
+at the end of a run, harmless for 256-day pieces but filling the disk over a whole resumable
+download; they now go with their block.
+
+## 2026-11-17: ARCO-OCEAN path scheme; Icechunk repositories can be moved
+
+Maintainer's decisions for the new version of ARCO-OCEAN:
+- One repository per product type and resolution, hive-style, levels left out (every dataset has
+  50): `historical/res=0p25` (every product that is not a forecast, GloFAS's hindcast included),
+  `forecast/res=0p25` (one recipe, all products homogenized; GloFAS keeps 10 lead days like the
+  others), `climatology/res=0p25`, `anomaly-std/res=0p25`, later `observations/res=0p25`; the
+  same for `0p5` and `1p0`. Downloads write there directly: no pieces, no `archive/` (the
+  download scripts of the fork are reworked accordingly, recipes renamed after the scheme, e.g.
+  `historical_res-0p25.toml`).
+- `anomaly-std` takes a hyphen (the published path is `anomaly_std`), so only the published
+  climatology occupies a new path. The published statistics may be deleted or overwritten once
+  the historical dataset is downloaded (Moby-Dick keeps a local copy).
+
+**An Icechunk repository can be moved by copying its objects** (icechunk 2.3.1, checked locally
+and on S3 with server-side copies): no object names the repository's location, so a copy opens
+at its new path with its branches, tags and history, reads identical data at `main` and at a
+tag, takes new commits, and expires and garbage-collects there; the original is unaffected.
+Conditions: copy while nothing writes to it (a reference copied before the snapshot it names
+would be dangling), and only native chunks move (virtual references, which arco-make does not
+write, keep their absolute URLs).
+
+
+## 2026-11-17: --blocks 2 on real data; one lock for netCDF4 and HDF5
+
+Baseline window 2 (30 Dec 2012 – 2 Jan 2013, 0.25°, 50 levels, one-day blocks, 600 s GCS
+timeout), without GloFAS (EWDS queued requests for hours that day), on the project VM, one run
+at a time:
+
+| Run | Code | Wall time | Peak RSS | 600 s read timeouts (each retried once, successfully) |
+|---|---|---|---|---|
+| `--blocks 1` | `083d8a4` | 38:22 | 22.0 GiB | 2 (days 2, 3) |
+| `--blocks 1`, again | `083d8a4` | 33:37 | 20.9 GiB | 2 (day 2, twice) |
+| `--blocks 2` | `083d8a4` | failed after 36 s | | |
+| `--blocks 2` | first fix (static file read whole) | 19:27 | 28.6 GiB | 1 (day 1) |
+| `--blocks 2` | second fix | 20:37 | 23.7 GiB | 2 (days 2, 3) |
+| `--blocks 2` | final fix (`hdf5_lock`) | 8:34 | 23.8 GiB | none |
+
+All five complete outputs are identical bit for bit (36 variables: values, attributes, array
+metadata). Reads that sent nothing until the 600 s timeout (empty `TimeoutError`, so GCS:
+ERA5) dominate the wall times: each costs about 11 minutes (timeout, wait, redone block). The
+one run without them did three days in 8.5 minutes with two blocks at once; the one-block runs
+less their stalls took about 15 minutes, consistent with the expected factor of about 2 (wrong:
+about 1.2× measured, 18 Nov). The
+stalls are not explained: they hit any day, also day 1 at the start of a process, so idle
+connections cannot explain all of them. To investigate before the production download (a
+shorter GCS timeout would bound their cost).
+
+**`--blocks 2` failed at once**: two blocks opened the GloFAS static file (`netcdfoverhttp`) at
+the same moment and netCDF4 raised "NetCDF: Can't open HDF5 attribute". netCDF-C and HDF5 are
+not thread-safe, and xarray locks reads of array values only, not what it reads while opening a
+file; eight threads opening files at once crash the interpreter (tests, for the backend and for
+generic NetCDF parts and `[read]` tables, also when xarray guesses the engine). Every netCDF4 or
+h5netcdf file is now opened through `hdf5_lock.open_dataset`, which holds one reentrant
+process-wide lock during the open and gives it to xarray for the later reads; a test fails if
+other code opens datasets with xarray directly. Two reviews shaped it: a first fix read the
+static file whole under xarray's own lock and covered one backend only; a version that also took
+xarray's two locks inside ours could deadlock (xarray combines locks in arbitrary order). GRIB
+opens were already serialized by one module lock (N6); 240 GRIB opens overlapping reads of
+other files ran without error on ecCodes 2.48 and 2.49, so they are left as they are.
+
+## 2026-11-18: GCS stalls traced; timeouts gcsfs retries; --blocks 2 over eight days
+
+**The stalls.** Window 2 was run again with every GCS request traced (a wrapper around gcsfs's
+request method, outside the repository: requests over 5 s or failed, requests in flight and the
+connection pool every 15 s). Now and then one GET gets no answer for minutes (212 s once, for a
+2 MB chunk; 183 s, 201 s; four at once past 600 s) while every other chunk of the block is done,
+then answers 200 if still waiting. The pool was never full (at most 81 of 100 connections, nobody
+waiting), so the stalls are GCS's or the network's, not ours. gcsfs passed the part's timeout to
+aiohttp as a number, a total for the request: past it aiohttp raises a plain `TimeoutError`,
+which gcsfs does not retry, so the whole block failed and was redone after the retry wait.
+
+**The change.** A GCS part's `timeout` (default 120 s) now reaches gcsfs as an aiohttp
+`ClientTimeout` bounding the connection (at most 30 s) and each wait for data, with no total: a
+stalled answer raises a socket timeout, which gcsfs requests again (6 attempts in all), so a
+stall costs about the timeout, not the block, and large chunks over slow links are not cut.
+`requests_timeout` in a GCS part's storage options is refused at load (a total, not retried).
+Tested against a local GCS endpoint whose first answer stalls. Not covered: `[read]` tables
+(`process`, `compute-climatology`, `validate`) get no GCS timeout from arco-make; recipes that set
+`requests_timeout` on GCS parts must drop it (the baseline's `timeout600` copies are refused).
+
+**Eight days.** 30 Dec 2012 – 7 Jan 2013, 0.25°, 50 levels, GloFAS included, one-day blocks, on
+the project VM, one run at a time, traced:
+
+| Run | Code | GCS timeout | Wall time | Peak RSS | GCS stalls | Blocks redone |
+|---|---|---|---|---|---|---|
+| `--blocks 1` | `99ebb11` | 600 s total | 1:27:52 | 23.0 GiB | 6 requests at 600 s | 3 |
+| `--blocks 1` | `526b465` | 120 s of silence | 30:49 | 22.4 GiB | 5, retried by gcsfs | 0 |
+| `--blocks 2` | `526b465` | 120 s of silence | 25:40 | 32.2 GiB | 2, retried by gcsfs | 1 (Copernicus Marine S3 read timeout) |
+
+The three outputs are identical bit for bit (37 variables). In the new runs gcsfs also retried
+connections refused for a moment ("Network is unreachable", three in the one-block run), and no
+GCS stall reached the block level. The old run's three redone blocks cost at least 33 minutes
+(600 s, the retry wait, the block again); the rest of its extra hour is not attributed (EWDS
+queues and Copernicus Marine timeouts vary between runs).
+
+**Correction: `--blocks 2` is about 1.2× as fast, not 2×.** Over eight days, two blocks at once
+took 25:40 against 30:49 (1.2×; one redone block included, so at most about 1.3× without it),
+for 44 % more peak memory. GloFAS window 2 (three days, `99ebb11`) gave the same: 11:03 against
+9:11. The 17 Nov entry's "consistent with the expected factor of about 2" compared one clean run
+with an estimate of the one-block runs less their stalls; on three days two blocks cannot be
+more than 1.5× faster anyway (two rounds instead of three). Two processes each kept their speed
+(16 Nov), but two blocks in one process do not: they share its Dask thread pool, the GIL, the
+HDF5 lock and the Copernicus Marine connection pool. Which of these limits it is for the
+performance pass; until then, expect about 5 days per resolution with `--blocks 2`, not 3–3.5.

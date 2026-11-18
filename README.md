@@ -123,6 +123,29 @@ accumulations (the value stamped 00:00 covers the last hour of the previous day)
 `time_offset = "-1h"`: the time coordinate is moved before each block is selected, and the part is
 read over the block moved the other way, so that every day holds its own hours.
 
+Every request to a source times out: a part's `timeout` (seconds a source may stay silent, default 120)
+applies to Zarr stores on Google Cloud Storage (gcsfs waits forever otherwise), NetCDF files over HTTP
+and EWDS requests, and to Zarr stores on S3 when given (botocore's default is 60 s). Connecting takes
+at most 30 s of it; no timeout bounds a whole request, so large chunks over slow links are not cut.
+On GCS, a stalled answer is requested again by gcsfs (6 attempts): GCS answers stall now and then for
+minutes. gcsfs's own `requests_timeout` is refused in a part's storage options (it bounds a whole
+request and gcsfs does not retry it): set `timeout`. Copernicus Marine parts and Icechunk inputs rely
+on their own timeouts. A block that fails with a transient error (a timeout, a dropped connection, a server
+or throttling answer) is redone, after a wait that doubles each time: `[retries] attempts = 5`, `wait =
+"1min"`, `max_wait = "30min"` by default. Other errors (a recipe or data error) stop the run at once; the
+log says which kind it was.
+
+A download that fails leaves `main` as it was and its committed blocks on its branch: rerun it with
+`--resume` (same recipe, `--start` and `--end`) to write only the missing blocks. Each block's commit
+records its interval and a fingerprint of the recipe; `--resume` refuses another recipe (request timeouts,
+checkpointing and `[retries]` may change), or a run that started before `main` last moved. A plain rerun refuses to start beside a failed run it could continue;
+`--replace` starts over. Do not resume a run that is still going.
+
+`--blocks N` reads and processes N blocks at once (default 1), each in a thread of its own: a
+block's values are staged on local disk (`TMPDIR`) and the blocks are committed in order, so the output
+is the same as with one block at a time. Memory and disk use grow with N; the first block to fail, in
+order, stops the run (blocks before it are committed, `--resume` continues).
+
 Every output is an [Icechunk](https://icechunk.io) repository (Zarr format 3 with versions): a local
 directory, an `s3://` or a `gs://` URL. Every run writes on a branch of its own (`run/<command>-<start
 time>`), in commits: one per block for `download` (its message names the block's interval), one for
