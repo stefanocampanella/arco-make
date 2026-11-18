@@ -53,16 +53,17 @@ def ocean(days: int, start: str = "2020-01-01") -> xr.Dataset:
 @pytest.mark.parametrize("order", ["lexicographic", "colexicographic"])
 def test_shards_of_created_and_appended_arrays_follow_the_order(tmp_path: pathlib.Path, order):
   """As in a download: the first block creates the arrays, the next ones are appended (zarr
-  builds their codec from the metadata, where the order is not stored). Values and metadata are
-  those of zarr's default order."""
-  first, then = ocean(8), ocean(8, "2020-01-09")
+  builds their codec from the metadata, where the order is not stored), and Dask chunks that
+  straddle shards are aligned to them (the planner's chunks need not fit the stored layout).
+  Values and metadata are those of zarr's default order."""
+  first, then = ocean(8).chunk(time=3), ocean(8, "2020-01-09").chunk(time=3)
   outputs = {}
   for chosen in ("morton", order):
     configs = SaveConfig.model_validate({**LAYOUT, "shard_order": chosen})
     path = tmp_path / f"{chosen}.zarr"
     run = icechunk_utils.Run(path, None, "test")
-    write_output(first, run, configs, message="first")
-    write_output(then, run, configs, message="then", mode="a", append_dim="time")
+    write_output(first, run, configs, message="first", align_chunks=True)
+    write_output(then, run, configs, message="then", mode="a", append_dim="time", align_chunks=True)
     run.finish()
     outputs[chosen] = path
   for shard in range(4):  # two shards per block

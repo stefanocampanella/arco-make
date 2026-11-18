@@ -1007,8 +1007,7 @@ def write_into_session(
   options: dict[str, Any] = {"consolidated": False, "zarr_format": 3, "group": configs.group}
   with sharding.write_order(configs.shard_order):
     if sharding.creates_arrays(configs.shard_order, "w"):
-      # Metadata first: values written into arrays zarr opens follow the order.
-      prepared.to_zarr(session.store, mode="w", compute=False, **options)
+      sharding.create_arrays(prepared, session.store, mode="w", group=configs.group)
       written = prepared.to_zarr(session.store, mode="r+", compute=compute, **options)
     else:
       written = prepared.to_zarr(session.store, mode="w", compute=compute, **options)

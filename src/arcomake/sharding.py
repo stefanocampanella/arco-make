@@ -13,9 +13,9 @@ Because the order is not stored, every write would use the default: zarr builds 
 existing array from its metadata (appends, regions), and builds it itself when xarray creates an
 array. `write_order` selects, through zarr's codec registry (`codecs.sharding_indexed` in
 `zarr.config`), a subclass whose default is the order asked, for every array opened meanwhile;
-arrays created in a write need their metadata written first and the values written into them
-afterwards (`creates_arrays`, done by the writers in `icechunk_utils` and `dataset_utils`). The
-setting is process-wide while active, and reaches Dask's threads, not the workers of a
+arrays created in a write need their metadata written first (`create_arrays`) and the values
+written into them afterwards (mode "r+", by the writers in `icechunk_utils` and `dataset_utils`).
+The setting is process-wide while active, and reaches Dask's threads, not the workers of a
 distributed client.
 """
 
@@ -23,6 +23,7 @@ import contextlib
 from collections.abc import Generator
 from typing import Any, Literal
 
+import xarray as xr
 import zarr
 from zarr.codecs import ShardingCodec
 from zarr.registry import register_codec
@@ -56,6 +57,26 @@ for _codec in _CODECS.values():
 def creates_arrays(order: ShardOrder, mode: str) -> bool:
   """Whether a write in `mode` with this order must write the metadata first (see the module)."""
   return order != DEFAULT and mode in ("w", "w-")
+
+
+def create_arrays(
+  dataset: xr.Dataset, store: Any, *, mode: Literal["w", "w-", "a", "a-", "r+"], group: str | None
+) -> None:
+  """Write the metadata of `dataset`'s arrays (and the values of those not in Dask) into
+  `store`, for values written afterwards in mode "r+" into the arrays zarr opens.
+
+  No Dask values are written here, so xarray's check that Dask chunks do not straddle stored
+  ones is left to the write of the values, which may align them (`align_chunks`).
+  """
+  dataset.to_zarr(
+    store,
+    mode=mode,
+    group=group,
+    compute=False,
+    safe_chunks=False,
+    consolidated=False,
+    zarr_format=3,
+  )
 
 
 @contextlib.contextmanager

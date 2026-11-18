@@ -377,10 +377,7 @@ class Run:
     session = self.session()
     with sharding.write_order(shard_order):
       if sharding.creates_arrays(shard_order, mode):
-        # Metadata first: values written into arrays zarr opens follow the order.
-        dataset.to_zarr(
-          session.store, mode=mode, group=group, compute=False, consolidated=False, zarr_format=3
-        )
+        sharding.create_arrays(dataset, session.store, mode=mode, group=group)
         mode = "r+"
       to_icechunk(
         dataset, session, mode=mode, append_dim=append_dim, group=group, align_chunks=align_chunks
