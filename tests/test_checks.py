@@ -5,6 +5,7 @@
 import warnings
 from datetime import datetime
 
+import dask
 import numpy as np
 import pytest
 import xarray as xr
@@ -109,6 +110,40 @@ def test_ensure_no_nans_respects_masks(ocean_ds: xr.Dataset, static_ds: xr.Datas
   broken = ds.assign(zos=ds.zos.where(ds.time != ds.time[2]))
   with pytest.raises(ValidationError, match="2020-02-28"):
     checks.ensure_no_nans(broken[["zos", "m"]], m=["zos"])
+
+
+def test_ensure_no_nans_computes_once(ocean_ds: xr.Dataset, static_ds: xr.Dataset):
+  """One computation for every variable and day, not two per day and variable (11,322 days in
+  the published dataset); the report is the same: per day, the variables with NaN inside
+  their mask (a 3D mask's first level for 2D variables), and the static variables once."""
+  ds = xr.merge([ocean_ds, static_ds])
+  ds["m"] = ds.deptho.notnull()
+  ds["m3"] = ds.thetao.isel(time=0, drop=True).notnull()
+  ds = ds.assign(
+    zos=ds.zos.fillna(0.0).where(ds.m).where(ds.time != ds.time[1]),
+    thetao=ds.thetao.where(ds.time != ds.time[3]),
+    deptho=ds.deptho.fillna(1.0).where(ds.latitude != ds.latitude[0]),
+  ).chunk(time=1)
+  calls = []
+
+  def counting(dsk, keys, **kwargs):
+    calls.append(1)
+    return dask.get(dsk, keys, **kwargs)
+
+  with dask.config.set(scheduler=counting), pytest.raises(ValidationError) as raised:
+    checks.ensure_no_nans(ds[["zos", "thetao", "deptho", "m", "m3"]], m=["zos"], m3=["thetao"])
+  assert len(calls) == 1
+  lines = str(raised.value).splitlines()
+  n_lat = ds.sizes["longitude"]
+  assert lines[0] == f"1 errors found without time: {n_lat} NaN values found for variable deptho"
+  times = ds.time.to_index()
+  in_mask = int(ds.m.sum())
+  assert lines[1] == (
+    f"1 errors found for time {times[1]}: {in_mask} NaN values found for variable zos"
+  )
+  assert lines[2].startswith(f"1 errors found for time {times[3]}: ")
+  assert lines[2].endswith(f"{int(ds.m3.sum())} NaN values found for variable thetao")
+  assert len(lines) == 3
 
 
 def test_validate_accessor_warns_or_raises(ocean_ds: xr.Dataset):
