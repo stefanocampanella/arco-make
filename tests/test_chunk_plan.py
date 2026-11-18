@@ -4,6 +4,7 @@
 memory budget. The planner is a pure function, tested here on the shapes of real sources."""
 
 import dask
+import dask.array
 import numpy as np
 import pytest
 import xarray as xr
@@ -17,6 +18,7 @@ from arcomake.chunk_plan import (
   Shape,
   plan,
   shapes,
+  stored_warnings,
 )
 
 GB = 10**9
@@ -139,6 +141,20 @@ def test_needs_merge():
 def test_shapes_of_a_dataset():
   ds = xr.Dataset({"v": (("time", "x"), np.zeros((3, 4), dtype=np.float32))})
   assert shapes(ds) == {"v": Shape(("time", "x"), (3, 4), 4)}
+
+
+def test_stored_chunks_above_a_task_share_are_reported():
+  """Writing a stored chunk (or shard) needs it whole in one task, whatever the planned chunks:
+  whole-depth stored chunks of a 1/12 deg variable (1.76 GB) are above 687 MB a task."""
+  data = dask.array.zeros((2, 50, 2041, 4320), chunks=(1, 3, 2041, 4320), dtype=np.float32)
+  ds = xr.Dataset({"thetao": (("time", "depth", "lat", "lon"), data)})
+  ds["thetao"].encoding["chunks"] = (1, 50, 2041, 4320)
+  [warning] = stored_warnings(ds, VM)
+  assert warning.startswith("thetao: stored chunks of 1.64 GiB, above")
+  ds["thetao"].encoding["chunks"] = (1, 1, 2041, 4320)
+  assert stored_warnings(ds, VM) == []
+  ds["thetao"].encoding["shards"] = (1, 25, 2041, 4320)
+  assert "thetao: stored shards of" in stored_warnings(ds, VM)[0]
 
 
 def test_gathered_tasks_split_the_other_dimensions_first():

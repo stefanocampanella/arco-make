@@ -25,7 +25,7 @@ from dask.utils import format_bytes, parse_bytes
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from arcomake import icechunk_utils
-from arcomake.chunk_plan import Budget, detect_budget
+from arcomake.chunk_plan import Budget, PlanError, detect_budget, stored_warnings
 from arcomake.cli_utils import (
   check_aws_profile,
   check_destination,
@@ -38,6 +38,7 @@ from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
   _write_zarr,
+  download_and_process,
   maybe_checkpointing_download_and_process,
   prepare_for_writing,
   refuse_chunk_steps,
@@ -317,6 +318,11 @@ def download(
         )
     except click.ClickException:
       raise
+    except PlanError as exc:
+      raise click.ClickException(
+        f"{exc}. The blocks written are on branch {run.branch}, `main` is unchanged;"
+        " --resume continues from there."
+      ) from exc
     except Exception as exc:
       logger.exception("An error occurred during download")
       raise click.ClickException(
@@ -331,21 +337,58 @@ def download(
 
 
 def _print_plan(configs: DownloadConfig, interval: DateInterval, budget: Budget) -> None:
-  """Print the chunks of the first block's merged dataset, as it would be written (the plan of
-  each part is logged as it is opened); nothing is computed."""
+  """Print the chunks of the first block's merged dataset, as it would be written, with the
+  stored chunks (the plan of each dataset is logged as it is opened). Nothing is computed:
+  checkpointed datasets are planned over the whole block (a run plans each sub-block, so its
+  time chunks may be shorter).
+
+  Raises:
+    click.ClickException: if the budget leaves no room for a task (`PlanError`).
+  """
   click.echo(f"{_describe(interval)}, budget: {budget.describe()}")
-  with _processed_block(configs, interval, progress=False, budget=budget) as dataset:
-    for name, var in sorted(dataset.data_vars.items(), key=lambda item: str(item[0])):
-      dims = ", ".join(map(str, var.dims))
-      if var.chunks is None:
-        click.echo(f"  {name} ({dims}) {var.dtype}: in memory, {format_bytes(var.nbytes)}")
-        continue
-      shape = tuple(max(sizes) for sizes in var.chunks)
-      size = math.prod(shape) * var.dtype.itemsize
-      count = math.prod(len(sizes) for sizes in var.chunks)
-      click.echo(
-        f"  {name} ({dims}) {var.dtype}: chunks {shape}, {format_bytes(size)} each, {count} chunks"
-      )
+  try:
+    with ExitStack() as stack:
+      datasets = []
+      for name, conf in configs.datasets.items():
+        if conf.skip:
+          continue
+        if conf.checkpointing is not None:
+          click.echo(f"  ({name} is checkpointed: a run plans each sub-block of it)")
+        datasets.append(
+          stack.enter_context(
+            download_and_process(
+              conf,
+              interval.start,
+              interval.end,
+              time_dim=configs.time_dim,
+              budget=budget,
+              name=name,
+              later_steps=configs.postprocess,
+            )
+          )
+        )
+      dataset = xr.merge(datasets, join="exact", compat="no_conflicts", combine_attrs="identical")
+      if configs.postprocess:
+        dataset = dataset.arcomake.process(steps=configs.postprocess)
+      prepared = prepare_for_writing(dataset, configs.save)
+  except PlanError as error:
+    raise click.ClickException(str(error)) from error
+  for name, var in sorted(prepared.data_vars.items(), key=lambda item: str(item[0])):
+    dims = ", ".join(map(str, var.dims))
+    stored = var.encoding.get("shards") or var.encoding.get("chunks")
+    where = f"; stored {tuple(stored)}" if stored is not None else ""
+    if var.chunks is None:
+      click.echo(f"  {name} ({dims}) {var.dtype}: in memory, {format_bytes(var.nbytes)}{where}")
+      continue
+    shape = tuple(max(sizes) for sizes in var.chunks)
+    size = math.prod(shape) * var.dtype.itemsize
+    count = math.prod(len(sizes) for sizes in var.chunks)
+    click.echo(
+      f"  {name} ({dims}) {var.dtype}: chunks {shape}, {format_bytes(size)} each, {count} chunks"
+      f"{where}"
+    )
+  for warning in stored_warnings(prepared, budget):
+    click.echo(f"  warning: {warning}")
 
 
 def _describe(interval: DateInterval) -> str:
@@ -385,6 +428,9 @@ def _processed_block(
       if configs.postprocess:
         dataset = dataset.arcomake.process(steps=configs.postprocess)
       assert isinstance(dataset, xr.Dataset)
+      if budget is not None:
+        for warning in stored_warnings(prepare_for_writing(dataset, configs.save), budget):
+          logger.warning(warning)
       yield dataset
 
 

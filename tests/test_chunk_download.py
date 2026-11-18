@@ -15,7 +15,7 @@ import zarr
 from click.testing import CliRunner, Result
 from pydantic import ValidationError
 
-from arcomake import cli, icechunk_utils
+from arcomake import cli, dataset_utils, icechunk_utils
 from arcomake.chunk_plan import Budget
 from arcomake.dataset_utils import (
   DatasetConfig,
@@ -77,10 +77,11 @@ def test_the_plan_does_not_change_the_output(recipe, tmp_path: pathlib.Path, log
 
 
 def test_a_budget_too_small_for_one_task_fails(recipe, tmp_path: pathlib.Path, logs):
+  """The run stops with the planner's message (no traceback), its committed blocks kept."""
   result = run(recipe, tmp_path / "out.zarr", "--memory-limit", "20kB")
-  assert result.exit_code != 0
-  assert "PlanError" in result.output
-  assert "give more memory (--memory-limit)" in logs.text
+  assert result.exit_code == 1
+  assert "give more memory (--memory-limit)" in result.output
+  assert "--resume continues" in result.output
 
 
 @pytest.mark.parametrize("blocks", ["1", "2"])
@@ -152,19 +153,35 @@ def test_download_recipes_set_no_chunk_sizes(recipe: dict, message: str):
   download_config.model_validate(recipe_with(postprocess=[REGRID]) | {"save": {"chunks": 1}})
 
 
-def test_plan_prints_the_chunks_and_writes_nothing(recipe, tmp_path: pathlib.Path):
-  """`--plan`: the first block's variables with their chunks; no output, no data read."""
+def test_plan_prints_the_chunks_and_writes_nothing(
+  recipe, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+  """`--plan`: the first block's variables with their chunks and stored chunks; no output, and
+  nothing computed: not even the checkpoints of the checkpointed ocean."""
+
+  def no_writes(*args, **kwargs):
+    raise AssertionError("--plan wrote a checkpoint")
+
+  monkeypatch.setattr(dataset_utils, "_write_zarr", no_writes)
   output = tmp_path / "out.zarr"
   result = run(recipe, output, "--plan", "--memory-limit", "100kB")
   assert result.exit_code == 0, result.output
   assert "Block [2020-02-26T00:00, 2020-02-28T00:00), budget: target" in result.output
-  assert re.search(
-    r"  thetao \(time, depth, lat, lon\) float32: chunks \(1, 3, 4, 4\), ", result.output
-  )
-  assert re.search(
-    r"  t2m \(time, lat, lon\) float64: chunks \(1, 4, 4\), 128 B each, 2 chunks", result.output
-  )
+  assert "(ocean is checkpointed: a run plans each sub-block of it)" in result.output
+  thetao = r"  thetao \(time, depth, lat, lon\) float32: chunks \(\d+, 3, 4, 4\), .*; stored \(1, 1, 4, 4\)"
+  assert re.search(thetao, result.output)
+  t2m = r"  t2m \(time, lat, lon\) float64: chunks \(1, 4, 4\), 128 B each, 2 chunks; stored"
+  assert re.search(t2m, result.output)
+  assert "warning" not in result.output
   assert not output.exists()
+
+
+def test_plan_reports_a_budget_too_small(recipe, tmp_path: pathlib.Path):
+  """A budget too small for one task: the planner's message, no traceback."""
+  result = run(recipe, tmp_path / "out.zarr", "--plan", "--memory-limit", "20kB")
+  assert result.exit_code == 1
+  assert "give more memory (--memory-limit)" in result.output
+  assert "Traceback" not in result.output
 
 
 ATMOSPHERE_DAYS = (datetime.datetime(2020, 2, 26), datetime.datetime(2020, 2, 28))

@@ -284,3 +284,22 @@ def plan(
         f" ({budget.describe()}): give more memory (--memory-limit), or fewer blocks at once"
       )
   return Plan(chunks, largest, gathered, tuple(warnings))
+
+
+def stored_warnings(prepared: xr.Dataset, budget: Budget) -> list[str]:
+  """What the stored layout of `prepared` (encodings set for writing) costs beyond the budget:
+  writing a stored chunk (or shard) needs it whole in one task, whatever the planned chunks."""
+  warnings = []
+  for name, var in prepared.data_vars.items():
+    stored = var.encoding.get("shards") or var.encoding.get("chunks")
+    if stored is None:
+      continue
+    size = math.prod(min(int(s), n) for s, n in zip(stored, var.shape, strict=True))
+    size *= var.dtype.itemsize
+    if size > budget.per_task:
+      kind = "shards" if var.encoding.get("shards") else "chunks"
+      warnings.append(
+        f"{name}: stored {kind} of {format_bytes(size)}, above {format_bytes(budget.per_task)} per"
+        " task: each is written whole by one task"
+      )
+  return warnings

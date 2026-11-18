@@ -157,8 +157,10 @@ and chunks aim at Dask's `array.chunk-size` (128 MiB) at most. Space stays whole
 is above that; then outer dimensions (depth) are split, and time grows in whole bins. The plan of each
 part is logged, with what does not fit; a task that cannot fit the budget fails the block. Writes
 rechunk what straddles the stored chunks of `[save]`. `download --plan` prints the chunks of the first
-block and exits, without reading data or writing the output (sources are opened: EWDS parts download
-their files to do so).
+block and its stored chunks, and exits, without reading data or writing the output (sources are
+opened: EWDS parts download their files to do so; checkpointed datasets are planned over the whole
+block, a run plans each sub-block). Stored chunks (or shards) above a task's share are reported: each
+is written whole by one task.
 
 Every output is an [Icechunk](https://icechunk.io) repository (Zarr format 3 with versions): a local
 directory, an `s3://` or a `gs://` URL. Every run writes on a branch of its own (`run/<command>-<start
