@@ -191,21 +191,21 @@ def test_listing_the_backends_does_not_import_the_toolbox():
 def test_copernicus_marine_pool_follows_dask_threads(given, threads, pool):
   """Unless set, the toolbox's connection pool is as large as Dask's thread count, never below
   its own default of 10: with 10 connections for 32 threads, connections were dropped and opened
-  again all the time, and reading took much longer."""
+  again all the time, and reading took much longer. A default is set only for the import."""
   code = (
     "import dask, os, sys\n"
     "from arcomake import backends\n"
     f"dask.config.set(scheduler='threads', num_workers={threads})\n"
     "backends._copernicusmarine()\n"
     "from copernicusmarine.core_functions import sessions\n"
-    "print(sessions.MAX_POOL_CONNECTIONS)\n"
+    "print(sessions.MAX_POOL_CONNECTIONS, os.environ.get(backends.POOL_VARIABLE))\n"
   )
   env = {k: v for k, v in os.environ.items() if k != backends.POOL_VARIABLE}
   if given is not None:
     env[backends.POOL_VARIABLE] = given
   out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
   assert out.returncode == 0, out.stderr
-  assert out.stdout.split()[-1] == str(pool)
+  assert out.stdout.split()[-2:] == [str(pool), str(given)]
 
 
 def test_copernicus_marine_requires_dataset_id():

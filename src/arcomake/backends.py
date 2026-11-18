@@ -49,10 +49,17 @@ def _copernicusmarine() -> Any:
   Unless set, the pool is as large as Dask's thread count (at least the toolbox's 10): with 10
   connections for 32 threads, connections were discarded and opened again all the time (TLS
   handshakes were 29 % of the reading time), and an 8-day block took 37 % longer to compute,
-  with 13 GiB more memory (logbook, 18 Nov 2026).
+  with 13 GiB more memory (logbook, 18 Nov 2026). The variable is set only for the import: the
+  toolbox has read it then, and child processes or later code do not inherit it.
   """
-  os.environ.setdefault(POOL_VARIABLE, str(max(10, chunk_plan.dask_threads())))
-  import copernicusmarine
+  given = POOL_VARIABLE in os.environ
+  if not given:
+    os.environ[POOL_VARIABLE] = str(max(10, chunk_plan.dask_threads()))
+  try:
+    import copernicusmarine
+  finally:
+    if not given:
+      del os.environ[POOL_VARIABLE]
 
   # Avoid annoying copernicusmarine log handling (its handlers are installed at import).
   cm_logger = logging.getLogger("copernicus_marine_root_logger")
