@@ -180,7 +180,8 @@ repository: `profile`, `region` (by default the bucket's, asked to S3, else the 
 that long is retried); credentials come from botocore, as for the rest of arco-make. For GCS: `token`
 is `"anon"` or a service account file (by default, the environment's credentials). Options Icechunk
 cannot honour are an error, before any download. In `[save]`:
-- `chunks` set the stored chunks, per dimension (-1, or a dimension not listed: the whole dimension).
+- `chunks` set the stored chunks, per dimension (-1, or a dimension not listed: the whole dimension);
+  required in download recipes, whose chunks for reading are planned for each machine.
 - `shards`, in the same form, group whole chunks into one stored object each (Zarr v3 sharding):
   fewer, larger objects, while readers still fetch single chunks. Without `shards`, every chunk is an
   object. Dask chunks may not straddle shards when writing (`download` rechunks them; `process` and

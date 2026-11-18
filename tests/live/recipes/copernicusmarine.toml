@@ -23,4 +23,5 @@ latitude = {start = 40.0, stop = 46.0}
 longitude = {start = 12.0, stop = 20.0}
 
 [save]
+chunks = {time = 1}
 compressors = [{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuffle = "shuffle"}}]

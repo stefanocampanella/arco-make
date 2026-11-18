@@ -99,6 +99,17 @@ class DownloadConfig(BaseModel):
       raise ValueError("start datetime must be before or equal to end datetime")
     return self
 
+  @model_validator(mode="after")
+  def _stored_layout(self) -> Self:
+    # Without it, the stored chunks would be the chunks planned for reading: they depend on the
+    # machine's memory, its threads and --blocks, and so would the output.
+    if self.save.chunks is None:
+      raise ValueError(
+        "[save] chunks: give the stored layout (e.g. {time = 1}; dimensions not listed are"
+        " whole): chunks for reading are planned for each machine"
+      )
+    return self
+
 
 @click.command()
 @click.argument(

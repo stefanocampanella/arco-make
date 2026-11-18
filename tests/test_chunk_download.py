@@ -153,6 +153,14 @@ def test_download_recipes_set_no_chunk_sizes(recipe: dict, message: str):
   download_config.model_validate(recipe_with(postprocess=[REGRID]) | {"save": {"chunks": 1}})
 
 
+def test_download_recipes_give_the_stored_layout():
+  """Without `[save] chunks`, the stored chunks would be those planned for reading, which depend
+  on the machine: refused at load."""
+  download_config = importlib.import_module("arcomake.download").DownloadConfig
+  with pytest.raises(ValidationError, match=r"\[save\] chunks: give the stored layout"):
+    download_config.model_validate(recipe_with())
+
+
 def test_plan_prints_the_chunks_and_writes_nothing(
   recipe, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ):
