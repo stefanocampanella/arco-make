@@ -146,8 +146,8 @@ class NetCDFOverHTTP(BackendEntrypoint):
     # server outage after the first block no longer fails the others (as on 16 Nov for GloFAS).
     temp_path = registry.cached_file(filename_or_obj, "downloaded.nc", fetch)
 
-    # Under arco-make's HDF5 lock: blocks run at once (`download --blocks`) open this file at the
-    # same moment, and netCDF4 is not thread-safe.
+    # Under arco-make's HDF5 lock: netCDF4 is not thread-safe, and Dask's threads read other
+    # netCDF files meanwhile.
     return hdf5_lock.open_dataset(temp_path, engine="netcdf4", drop_variables=drop_variables)
 
   @override

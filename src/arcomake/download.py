@@ -1,19 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
-import collections
-import contextvars
-import dataclasses
 import functools
 import hashlib
 import json
 import logging
 import math
-import pathlib
-import shutil
-import threading
 import warnings
-from collections.abc import Callable, Generator
-from concurrent.futures import Future
+from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timedelta
 from typing import Self, get_args, override
@@ -37,7 +30,6 @@ from arcomake.dask_utils import DaskSetupType, get_client
 from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
-  _write_zarr,
   download_and_process,
   maybe_checkpointing_download_and_process,
   prepare_for_writing,
@@ -48,7 +40,7 @@ from arcomake.datetime_utils import DateInterval, IterableDateInterval, may_pars
 from arcomake.processing_utils import ProcessingStepConfig
 from arcomake.retries import RetryConfig, with_retries
 from arcomake.settings import parse_memory
-from arcomake.temporary_utils import TempDirectoryRegistry, get_current_temp_registry
+from arcomake.temporary_utils import TempDirectoryRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +92,7 @@ class DownloadConfig(BaseModel):
   @model_validator(mode="after")
   def _stored_layout(self) -> Self:
     # Without it, the stored chunks would be the chunks planned for reading: they depend on the
-    # machine's memory, its threads and --blocks, and so would the output.
+    # machine's memory and its threads, and so would the output.
     if self.save.chunks is None:
       raise ValueError(
         "[save] chunks: give the stored layout (e.g. {time = 1}; dimensions not listed are"
@@ -155,16 +147,6 @@ class DownloadConfig(BaseModel):
   is_flag=True,
 )
 @click.option(
-  "--blocks",
-  "blocks_at_once",
-  default=1,
-  type=click.IntRange(min=1),
-  help=(
-    "Blocks read and processed at once (default 1). Above 1, each block is staged on local disk"
-    " (TMPDIR) and committed in order: memory and disk grow with it"
-  ),
-)
-@click.option(
   "--memory-limit",
   type=Memory(),
   default=None,
@@ -173,7 +155,6 @@ class DownloadConfig(BaseModel):
   help=(
     "Memory the chunks of each block are planned for, e.g. 100GB (default: what this process may"
     " use: physical memory, or its cgroup's or Slurm job's limit), shared among Dask's threads"
-    " and the blocks at once"
   ),
 )
 @click.option(
@@ -214,7 +195,6 @@ def download(
   end_datetime: datetime | None = None,
   replace: bool = False,
   resume: bool = False,
-  blocks_at_once: int = 1,
   memory_limit: int | None = None,
   log_level: str = "info",
   dask_setup: DaskSetupType = "threads",
@@ -251,7 +231,7 @@ def download(
     # RuntimeWarnings may be issued. This happens frequently with certain algorithms when
     # regridding masked data (containing NaNs). We filter them to avoid cluttering the log.
     # Set once for the command: `catch_warnings` swaps the process-wide filters, and is not
-    # thread-safe (blocks run in threads with --blocks).
+    # thread-safe (Dask computes in threads).
     warnings.filterwarnings(
       "ignore",
       message="invalid value encountered in divide",
@@ -264,7 +244,7 @@ def download(
     if end_datetime is not None:
       update_time_interval["end"] = end_datetime
     configs = read_configs(configs_path, inject=update_time_interval, schema=DownloadConfig)
-    budget = detect_budget(memory_limit, blocks_at_once)
+    budget = detect_budget(memory_limit)
     logger.info(f"Chunks planned for a budget of {budget.describe()}")
     parts = [part for dataset in configs.datasets.values() for part in dataset.parts]
     check_aws_profile(
@@ -302,28 +282,23 @@ def download(
     # Each block is committed on the run's branch, in order; a block that fails with a transient
     # error is redone (`retries`), others stop the run.
     todo = [(n, b) for n, b in enumerate(blocks) if block_key(b) not in done]
-    progress = progress and dask_setup in ("processes", "threads") and blocks_at_once == 1
+    progress = progress and dask_setup in ("processes", "threads")
     try:
-      if blocks_at_once == 1:
-        for number, date_interval in todo:
-          logger.info(f"Downloading data from {date_interval.start} to {date_interval.end}")
-          with_retries(
-            functools.partial(
-              _write_block,
-              configs,
-              date_interval,
-              run,
-              first=number == 0,
-              progress=progress,
-              recipe=recipe,
-              budget=budget,
-            ),
-            configs.retries,
-            _describe(date_interval),
-          )
-      else:
-        _write_blocks_staged(
-          configs, todo, run, blocks_at_once=blocks_at_once, recipe=recipe, budget=budget
+      for number, date_interval in todo:
+        logger.info(f"Downloading data from {date_interval.start} to {date_interval.end}")
+        with_retries(
+          functools.partial(
+            _write_block,
+            configs,
+            date_interval,
+            run,
+            first=number == 0,
+            progress=progress,
+            recipe=recipe,
+            budget=budget,
+          ),
+          configs.retries,
+          _describe(date_interval),
         )
     except click.ClickException:
       raise
@@ -482,128 +457,6 @@ def _write_block(
       # Chunks are planned for reading; the stored layout is the recipe's.
       align_chunks=True,
     )
-
-
-@dataclasses.dataclass
-class _Staged:
-  """A block computed into a local Zarr store, with what its direct write would have had: the
-  prepared dataset (encodings, attributes, coordinates) and its Dask chunks."""
-
-  path: pathlib.Path
-  prepared: xr.Dataset
-
-
-def _stage_block(
-  configs: DownloadConfig, date_interval: DateInterval, budget: Budget | None = None
-) -> _Staged:
-  """Read, process and merge one block, and compute its values into a local Zarr store (a
-  worker of `_write_blocks_staged`). Only values go there (no encoding but the chunks): the
-  output's encodings are those `prepare_for_writing` gives the block, kept in memory."""
-  registry = get_current_temp_registry()
-  assert registry is not None
-  with _processed_block(configs, date_interval, progress=False, budget=budget) as dataset:
-    prepared = prepare_for_writing(dataset, configs.save)
-    values = prepared.copy(deep=False)
-    for variable in values.variables.values():
-      chunks = variable.encoding.get("chunks")
-      variable.encoding = {} if chunks is None else {"chunks": chunks}
-    path = registry.create_temp_dir(suffix=".zarr")
-    logger.info(f"{_describe(date_interval)}: staging to {path}")
-    try:
-      _write_zarr(values, str(path), mode="w", consolidated=False, align_chunks=True)
-    except BaseException:
-      shutil.rmtree(path, ignore_errors=True)  # a retry stages again, elsewhere
-      raise
-  # The prepared dataset is kept for its metadata only: every lazy variable is replaced by the
-  # staged values before writing (`_from_stage`).
-  return _Staged(path, prepared)
-
-
-def _from_stage(staged: _Staged) -> xr.Dataset:
-  """The block as its direct write would see it: the prepared dataset with the staged values in
-  place of every variable not in memory: Dask arrays in the same chunks, lazily indexed arrays
-  (variables not chunked) loaded, as their direct write would. The block's sources are
-  closed by then: nothing may read them again."""
-  values = xr.open_zarr(str(staged.path), consolidated=False)
-  dataset = staged.prepared.copy(deep=False)
-  for name, variable in dataset.variables.items():
-    if variable._in_memory:  # index coordinates, loaded variables: kept as they are
-      continue
-    stored = values[name].variable
-    chunks = variable.chunks
-    variable.data = stored.values if chunks is None else stored.data.rechunk(chunks)
-  return dataset
-
-
-def _start(action: Callable[[], _Staged], name: str) -> Future[_Staged]:
-  """Run `action` in a daemon thread, in a copy of the current context (the temporary registry
-  is a context variable). Daemon: a failed run exits without waiting for the blocks in progress,
-  whose work could not be committed anyway (blocks are appended in order)."""
-  future: Future[_Staged] = Future()
-  context = contextvars.copy_context()
-
-  def target() -> None:
-    if not future.set_running_or_notify_cancel():
-      return
-    try:
-      future.set_result(context.run(action))
-    except BaseException as error:
-      future.set_exception(error)
-
-  threading.Thread(target=target, name=name, daemon=True).start()
-  return future
-
-
-def _write_blocks_staged(
-  configs: DownloadConfig,
-  todo: list[tuple[int, DateInterval]],
-  run: icechunk_utils.Run,
-  *,
-  blocks_at_once: int,
-  recipe: str,
-  budget: Budget | None = None,
-) -> None:
-  """Read and process up to `blocks_at_once` blocks at once, each staged on local disk by a
-  worker thread, and commit them in order from this thread (appends along time need it). Each
-  stage is removed once committed. The first error, in block order, stops the run: blocks
-  before it are committed."""
-  pending: collections.deque[tuple[int, DateInterval, Future[_Staged]]] = collections.deque()
-  remaining = iter(todo)
-
-  def start_next() -> None:
-    item = next(remaining, None)
-    if item is None:
-      return
-    number, interval = item
-    logger.info(f"Downloading data from {interval.start} to {interval.end}")
-    stage = functools.partial(_stage_block, configs, interval, budget)
-    action = functools.partial(with_retries, stage, configs.retries, _describe(interval))
-    pending.append((number, interval, _start(action, f"block-{block_key(interval)}")))
-
-  for _ in range(blocks_at_once):
-    start_next()
-  while pending:
-    number, interval, future = pending.popleft()
-    staged = future.result()
-    first = number == 0
-
-    def commit(staged: _Staged = staged, interval: DateInterval = interval, first: bool = first):
-      if _committed(run, interval):
-        return
-      run.write(
-        _from_stage(staged),
-        message=_commit_message(interval),
-        mode="w" if first else "a-",
-        append_dim=None if first else configs.time_dim,
-        group=configs.save.group,
-        metadata=_block_metadata(interval, recipe),
-        align_chunks=True,
-      )
-
-    with_retries(commit, configs.retries, f"{_describe(interval)} (commit)")
-    shutil.rmtree(staged.path, ignore_errors=True)
-    # Only now: at most `blocks_at_once` blocks are staging or staged at any time.
-    start_next()
 
 
 def _committed(run: icechunk_utils.Run, interval: DateInterval) -> bool:

@@ -3,10 +3,11 @@
 """One lock for arco-make's uses of netCDF4 and HDF5.
 
 The netCDF-C and HDF5 libraries are not thread-safe. xarray locks the reads of array values,
-not what it reads while opening a file (dimensions, variables, attributes): `download --blocks
-2` opened the GloFAS static file in two blocks at once and failed ("NetCDF: Can't open HDF5
-attribute"), and eight threads opening files at once crash the interpreter
-(`tests/test_native_locks.py`).
+not what it reads while opening a file (dimensions, variables, attributes): two download
+blocks run at once (a `--blocks` option, since removed) opened the GloFAS static file at the
+same moment and failed ("NetCDF: Can't open HDF5 attribute"), and eight threads opening files at
+once crash the interpreter (`tests/test_native_locks.py`). Opens and Dask's reads in threads
+still meet.
 
 `open_dataset` holds `HDF5_LOCK` while it opens a file with an HDF5 engine and gives the same
 lock to xarray for the reads that follow, so opens and reads never overlap. The lock is

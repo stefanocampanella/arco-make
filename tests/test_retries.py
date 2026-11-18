@@ -152,9 +152,8 @@ def test_a_block_failing_once_is_redone(
   assert open_output(output).sizes["time"] == 5
 
 
-@pytest.mark.parametrize("blocks_at_once", ["1", "2"])
 def test_a_commit_that_landed_is_not_redone(
-  tmp_path: pathlib.Path, sources: pathlib.Path, monkeypatch: pytest.MonkeyPatch, blocks_at_once
+  tmp_path: pathlib.Path, sources: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ):
   """The second block's commit lands, then its answer times out: the retry must not append the
   block again (duplicate times)."""
@@ -172,7 +171,7 @@ def test_a_commit_that_landed_is_not_redone(
   monkeypatch.setattr(retries.time, "sleep", lambda seconds: None)
   recipe = render_recipe("sample_download.toml", tmp_path, SOURCES=str(sources))
   output = tmp_path / "out.zarr"
-  args = ["download", "--dask-setup", "threads", "--blocks", blocks_at_once]
+  args = ["download", "--dask-setup", "threads"]
   result = CliRunner().invoke(cli, [*args, str(recipe), str(output)])
   assert result.exit_code == 0, result.output
   assert lost and "already committed by the previous attempt" in result.output
