@@ -581,6 +581,24 @@ def _source_chunks(dataset: xr.Dataset) -> dict[Hashable, int]:
   return chunks
 
 
+def _kept_variables(steps: Sequence[ProcessingStepConfig], dataset: xr.Dataset) -> set[Hashable]:
+  """The data variables of `dataset` that its leading selection steps (`select_variables`,
+  `drop_vars`) keep: the others are dropped before any computation, so they are not planned
+  for (an ERA5 store's pressure-level variables, say)."""
+  kept = set(dataset.data_vars)
+  for config in steps:
+    arguments = config.model_dump(exclude_unset=True)
+    name = arguments.pop("name")
+    if name == "select_variables":
+      kept &= set(arguments["variables"])
+    elif name == "drop_vars":
+      names = arguments.get("names", ())
+      kept -= {names} if isinstance(names, str) else set(names)
+    else:
+      break
+  return kept
+
+
 def _planned(
   parts: list[tuple[str, xr.Dataset]],
   steps: Sequence[ProcessingStepConfig],
@@ -592,16 +610,17 @@ def _planned(
   """The parts of a dataset (their block's slices, not yet chunked), each with a token naming
   its Dask arrays (lazily indexed source arrays are not tokenized), in the chunks
   `chunk_plan.plan` gives them together, so that merged variables share their chunks: for
-  `budget`, the needs of the `steps` that will process them, and the sources' chunks. The plan
-  is logged."""
+  `budget`, the needs of the `steps` that will process them, and the sources' chunks, over the
+  variables the leading selection steps keep. The plan is logged."""
   needs = chunk_plan.Needs()
   variables: dict[Hashable, chunk_plan.Shape] = {}
   preferred: dict[Hashable, int] = {}
   for number, (_, part) in enumerate(parts, start=1):
     needs = needs.merge(needs_for(steps, part))
-    for name, shape in chunk_plan.shapes(part).items():
+    used = part[sorted(_kept_variables(steps, part), key=str)]
+    for name, shape in chunk_plan.shapes(used).items():
       variables[name if name not in variables else f"{name} (part {number})"] = shape
-    for dim, size in _source_chunks(part).items():
+    for dim, size in _source_chunks(used).items():
       preferred[dim] = math.lcm(preferred.get(dim, 1), size)
   planned = chunk_plan.plan(variables, budget, needs, grow_dim=time_dim, preferred=preferred)
   logger.info(f"{label}: {planned.describe()}")

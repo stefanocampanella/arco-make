@@ -243,3 +243,22 @@ def test_parts_of_a_dataset_share_their_chunks(tmp_path: pathlib.Path, sources: 
   budget = Budget(memory_limit=30_000, threads=1)
   dataset = download_and_process(config, *ATMOSPHERE_DAYS, budget=budget)
   assert dataset["t2"].chunks == dataset["t2m"].chunks == dataset["tp"].chunks
+
+
+def test_variables_dropped_first_are_not_planned_for(tmp_path: pathlib.Path, sources: pathlib.Path):
+  """A store with pressure-level variables the recipe drops at once (ERA5's): the plan is for
+  the variables kept, so time grows as if they were alone (39 hours at 20 kB a task), instead
+  of being held at one hour by 37 levels."""
+  source = xr.open_zarr(sources / "atmosphere.zarr").drop_encoding()
+  levels = source["t2m"].expand_dims(level=37, axis=1).rename("t")
+  xr.merge([source, levels]).to_zarr(tmp_path / "levels.zarr")
+  part = {"filename_or_obj": str(tmp_path / "levels.zarr"), "engine": "zarr"}
+  budget = Budget(memory_limit=100_000, threads=1)
+  for first, expected in [
+    ({"name": "select_variables", "variables": ["t2m", "tp"]}, (39, 9)),
+    ({"name": "drop_vars", "names": "t"}, (39, 9)),
+    ({"name": "flip", "dim": "latitude"}, (1,) * 48),  # not a selection: all are planned
+  ]:
+    config = DatasetConfig.model_validate({"parts": [part], "postprocess": [first]})
+    dataset = download_and_process(config, *ATMOSPHERE_DAYS, budget=budget)
+    assert dataset["t2m"].chunks[0] == expected, first
