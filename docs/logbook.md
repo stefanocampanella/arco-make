@@ -1031,3 +1031,18 @@ and find chunks through each shard's index.
 Next (maintainer, 18 Nov): the stack is merged before the production run, which uses the
 updated image; group 9 and the Moby-Dick findings PR come before it. One commit per run
 (Icechunk's `Session.amend`) is dropped from the plan: a TODO at `icechunk_utils.Run.write`.
+
+A high-effort review of the branch found five issues, fixed in five commits with tests (two
+checked to fail before): with `shard_order`, the first block's metadata write checked unaligned
+Dask chunks against the shards, so a download whose planned chunks straddle shards (ERA5's
+2-day chunks in 8-day shards) failed; the recipe fingerprint counted options at their default,
+so any new option blocked `--resume` across an upgrade; per-year EWDS requests could exceed the
+500-field limit (it counts days x variables: a year of two variables costs 730) or name months
+not published yet (refused whole; a request mixing published and unpublished months is accepted
+and the latter left out): the service's cost estimate is now asked first, with per-month
+requests as before when it refuses, and a block missing days fails naming them; the pool
+default stayed in the environment; a name from `--blocks`. Its claim that distributed workers
+keep the shard order was right: zarr pickles the order with the codec, so the warning saying
+otherwise was removed. On real data (8-day block without GloFAS, shards of 8 days x 50 levels,
+lexicographic): values identical to the unsharded run, the 400 chunks of each 3D shard in
+lexicographic order.
