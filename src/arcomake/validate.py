@@ -5,7 +5,6 @@ import logging
 
 import click
 from pydantic import BaseModel, ConfigDict
-from pydantic import ValidationError as ModelError
 
 from arcomake.checks import ChecksConfig, ValidationError
 from arcomake.cli_utils import (
@@ -75,15 +74,14 @@ def validate(
   set_default_logger(log_level)
 
   # Read configs; --start and --end set the bounds of the time check.
-  raw = read_configs(configs_path)
   bounds = {"start": start_datetime, "end": end_datetime}
+  inject = None
   if any(value is not None for value in bounds.values()):
-    check = raw.setdefault("checks", {}).setdefault("valid_time_coordinate", {})
-    check.update({key: value for key, value in bounds.items() if value is not None})
-  try:
-    configs = ValidateConfig.model_validate(raw)
-  except ModelError as exc:
-    raise click.ClickException(f"Invalid config at {configs_path}:\n{exc}") from exc
+    checks = read_configs(configs_path).get("checks", {})
+    time_check = {**checks.get("valid_time_coordinate", {})}
+    time_check.update({key: value for key, value in bounds.items() if value is not None})
+    inject = {"checks": {**checks, "valid_time_coordinate": time_check}}
+  configs = read_configs(configs_path, schema=ValidateConfig, inject=inject)
   check_aws_profile(input_path)
 
   # Validate the dataset
