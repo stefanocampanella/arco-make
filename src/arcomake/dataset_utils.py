@@ -601,6 +601,8 @@ def inline_grids(data: Any) -> Any:
   if not isinstance(data, Mapping):
     return data
   grids = data.get("grids") or {}
+  if not isinstance(grids, Mapping):
+    raise ValueError("[grids] is a table of grids, each a table of xarray_regrid.Grid arguments")
 
   def inlined(steps: Any, where: str) -> Any:
     if not isinstance(steps, list):
@@ -612,7 +614,9 @@ def inline_grids(data: Any) -> Any:
         if step["grid"] not in grids:
           known = ", ".join(sorted(grids)) or "none"
           raise ValueError(f"{where} step {number}: no grid {step['grid']!r} in [grids] ({known})")
-        step = {**step, "grid": dict(grids[step["grid"]])}
+        if not isinstance(grid := grids[step["grid"]], Mapping):
+          raise ValueError(f"grids.{step['grid']} is not a table of xarray_regrid.Grid arguments")
+        step = {**step, "grid": dict(grid)}
       result.append(step)
     return result
 

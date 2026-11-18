@@ -111,6 +111,29 @@ def test_a_new_option_at_its_default_keeps_the_fingerprint(recipe):
   assert recipe_fingerprint(now) == recipe_fingerprint(later)
 
 
+def test_grids_named_or_written_have_one_fingerprint(recipe):
+  """Moving a grid into `[grids]` changes nothing written: a failed run still resumes."""
+  from arcomake.cli_utils import read_configs
+  from arcomake.download import DownloadConfig, recipe_fingerprint
+
+  text = recipe.read_text()
+  inline = (
+    "grid = {south = -1.5, north = 1.5, west = 0.5, east = 3.5,"
+    " resolution_lat = 1.0, resolution_lon = 1.0}"
+  )
+  written = recipe.with_name("inline.toml")
+  table = (
+    "[grids.one_degree]\nsouth = -1.5\nnorth = 1.5\nwest = 0.5\neast = 3.5\n"
+    "resolution_lat = 1.0\nresolution_lon = 1.0\n"
+  )
+  assert table in text
+  written.write_text(text.replace(table, "").replace('grid = "one_degree"', inline))
+  fingerprints = {
+    recipe_fingerprint(read_configs(str(path), schema=DownloadConfig)) for path in (recipe, written)
+  }
+  assert len(fingerprints) == 1
+
+
 def test_nothing_to_resume(recipe, tmp_path: pathlib.Path):
   result = run(recipe, tmp_path / "out.zarr", "--resume")
   assert result.exit_code != 0 and "Nothing to resume" in result.output

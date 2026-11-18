@@ -508,8 +508,9 @@ def recipe_fingerprint(configs: DownloadConfig) -> str:
   is resumed only with the same. Settings that only change how blocks are read are left out
   (`[retries]`, parts' `timeout`, `checkpointing`): a run that failed on timeouts can resume with
   longer ones. Options at their default are left out too: an option a later version adds, with a
-  default keeping the earlier behaviour, does not change the fingerprint of recipes without it."""
-  recipe = configs.model_dump(mode="json", exclude={"retries"}, exclude_defaults=True)
+  default keeping the earlier behaviour, does not change the fingerprint of recipes without it.
+  `[grids]` is left out: the regrid steps carry the grids they name."""
+  recipe = configs.model_dump(mode="json", exclude={"retries", "grids"}, exclude_defaults=True)
   for dataset in recipe["datasets"].values():
     dataset.pop("checkpointing", None)
     for part in dataset["parts"]:

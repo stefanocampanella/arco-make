@@ -58,6 +58,14 @@ def test_grids_are_named_once(tmp_path: pathlib.Path, sources: pathlib.Path):
       "process": [{"name": "regrid", "grid": "g"}],
     }
   )
+  not_a_table = path.with_name("not_a_table.toml")
+  not_a_table.write_text(
+    text.replace('grid = "one_degree"', 'grid = "quarter"', 1)
+    .replace("[grids.one_degree]", "[unused]")
+    .replace('step = "2D"\n', 'step = "2D"\ngrids = {quarter = 0.25}\n', 1)
+  )
+  with pytest.raises(click.ClickException, match="grids.quarter is not a table"):
+    read_configs(str(not_a_table), schema=DownloadConfig)
   assert process.process[0].model_dump()["grid"] == {
     "south": 0.0,
     "north": 1.0,
