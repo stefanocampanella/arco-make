@@ -210,6 +210,7 @@ def write(
   group: str | None = None,
   retention: "Retention | None" = None,
   command: str = "write",
+  align_chunks: bool = False,
 ) -> str:
   """Write `dataset` in a run of `command` of a single commit (see `Run`); return the new tip of
   `main`.
@@ -218,7 +219,14 @@ def write(
   versions stay in the repository's history until `retention` expires them.
   """
   run = Run(path, storage_options, run_label(command))
-  run.write(dataset, message=message, mode=mode, append_dim=append_dim, group=group)
+  run.write(
+    dataset,
+    message=message,
+    mode=mode,
+    append_dim=append_dim,
+    group=group,
+    align_chunks=align_chunks,
+  )
   return run.finish(retention)
 
 
@@ -352,10 +360,15 @@ class Run:
     append_dim: Hashable | None = None,
     group: str | None = None,
     metadata: Mapping[str, Any] | None = None,
+    align_chunks: bool = False,
   ) -> str:
-    """Write `dataset` (its variables' encodings set the layout) in one commit of the run."""
+    """Write `dataset` (its variables' encodings set the layout) in one commit of the run. With
+    `align_chunks`, Dask chunks that straddle stored chunks are rechunked to fit them (xarray's,
+    region-aware: an append may start inside a chunk); else such chunks fail the write."""
     session = self.session()
-    to_icechunk(dataset, session, mode=mode, append_dim=append_dim, group=group)
+    to_icechunk(
+      dataset, session, mode=mode, append_dim=append_dim, group=group, align_chunks=align_chunks
+    )
     return self.commit(session, message, metadata)
 
   def last_block(self) -> str | None:

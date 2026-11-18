@@ -383,6 +383,8 @@ def _write_block(
       mode="w" if first else "a-",
       append_dim=None if first else configs.time_dim,
       metadata=_block_metadata(date_interval, recipe),
+      # Chunks are planned for reading; the stored layout is the recipe's.
+      align_chunks=True,
     )
 
 
@@ -412,7 +414,7 @@ def _stage_block(
     path = registry.create_temp_dir(suffix=".zarr")
     logger.info(f"{_describe(date_interval)}: staging to {path}")
     try:
-      _write_zarr(values, str(path), mode="w", consolidated=False)
+      _write_zarr(values, str(path), mode="w", consolidated=False, align_chunks=True)
     except BaseException:
       shutil.rmtree(path, ignore_errors=True)  # a retry stages again, elsewhere
       raise
@@ -499,6 +501,7 @@ def _write_blocks_staged(
         append_dim=None if first else configs.time_dim,
         group=configs.save.group,
         metadata=_block_metadata(interval, recipe),
+        align_chunks=True,
       )
 
     with_retries(commit, configs.retries, f"{_describe(interval)} (commit)")

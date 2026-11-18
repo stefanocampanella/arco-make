@@ -824,8 +824,12 @@ def write_output(
   append_dim: str | None = None,
   command: str = "write",
   metadata: Mapping[str, Any] | None = None,
+  align_chunks: bool = False,
 ) -> str:
   """Write a dataset with the layout of `[save]` (see `prepare_for_writing`) in one commit.
+
+  With `align_chunks`, Dask chunks that straddle the stored chunks (or shards) are rechunked to
+  fit them (see `icechunk_utils.Run.write`); else such a layout is refused.
 
   `destination` is a run (`icechunk_utils.Run`, which the caller finishes) or the path of a
   repository: then the write is a run of its own (labelled with `command`), finished at once
@@ -846,6 +850,7 @@ def write_output(
       append_dim=append_dim,
       group=configs.group,
       metadata=metadata,
+      align_chunks=align_chunks,
     )
   path = _check_output_path(destination)
   logger.info(f"Writing to {path} ({message}) with {configs}")
@@ -859,6 +864,7 @@ def write_output(
     group=configs.group,
     retention=configs.retention(),
     command=command,
+    align_chunks=align_chunks,
   )
 
 

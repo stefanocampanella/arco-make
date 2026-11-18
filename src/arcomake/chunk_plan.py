@@ -4,9 +4,9 @@
 
 Download recipes give no chunk sizes: each part of a block is chunked by `plan`, from the shapes
 and dtypes of its variables in the block, what the dataset's steps need along each dimension
-(`Needs`, declared by the steps) and the memory each task may use (`Budget`). Before writing,
-`align_to_stored` rechunks the dimensions whose Dask chunks straddle the stored chunks (or
-shards). Everything here is a pure function of its arguments.
+(`Needs`, declared by the steps) and the memory each task may use (`Budget`). Writes align the
+planned chunks to the stored layout (xarray's `align_chunks`). Everything here is a pure function
+of its arguments, except `detect_budget`.
 """
 
 import dataclasses
@@ -255,35 +255,3 @@ def plan(
         f" ({budget.describe()}): give more memory (--memory-limit), or fewer blocks at once"
       )
   return Plan(chunks, largest, gathered, tuple(warnings))
-
-
-def _straddles(chunks: tuple[int, ...], unit: int) -> bool:
-  """Whether Dask `chunks` along a dimension split stored chunks of `unit` (all but the last
-  must be multiples of it)."""
-  return any(size % unit for size in chunks[:-1])
-
-
-def align_to_stored(dataset: xr.Dataset, budget: Budget) -> xr.Dataset:
-  """`dataset` with its variables rechunked where their Dask chunks straddle the stored chunks
-  (or shards) their encodings give, as Zarr writes require; other dimensions keep their chunks.
-
-  Along such a dimension a variable gets the largest multiple of its stored size within
-  `budget.target`, its other dimensions as they are. Variables are aligned one by one: merged
-  datasets may chunk a dimension differently.
-  """
-  updates = {}
-  for name, var in dataset.data_vars.items():
-    stored = var.encoding.get("shards") or var.encoding.get("chunks")
-    if var.chunks is None or stored is None:
-      continue
-    chunks = {dim: max(sizes) for dim, sizes in zip(var.dims, var.chunks, strict=True)}
-    shape = {name: Shape(tuple(var.dims), tuple(var.shape), var.dtype.itemsize)}
-    rechunk: dict[Hashable, int] = {}
-    for dim, unit, sizes in zip(var.dims, stored, var.chunks, strict=True):
-      unit = min(int(unit), var.sizes[dim])
-      if _straddles(tuple(sizes), unit):
-        rechunk[dim] = _fit(dim, budget.target, chunks, shape, unit, var.sizes[dim])
-        chunks[dim] = rechunk[dim]
-    if rechunk:
-      updates[name] = var.chunk(rechunk)
-  return dataset.assign(updates) if updates else dataset

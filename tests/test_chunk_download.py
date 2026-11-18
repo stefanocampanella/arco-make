@@ -94,3 +94,21 @@ def test_a_budget_too_small_for_one_task_fails(recipe, tmp_path: pathlib.Path, l
   assert result.exit_code != 0
   assert "PlanError" in result.output
   assert "give more memory (--memory-limit)" in logs.text
+
+
+@pytest.mark.parametrize("blocks", ["1", "2"])
+def test_chunks_are_aligned_to_the_stored_chunks(recipe, tmp_path: pathlib.Path, blocks: str):
+  """Stored chunks of two days over the ocean's daily checkpoints (Dask chunks of one day):
+  rechunked before writing, as a `chunk` step did by hand; the values are those of daily
+  stored chunks."""
+  assert run(recipe, tmp_path / "daily.zarr").exit_code == 0
+  text = recipe.read_text()
+  layout = "chunks = {time = 1, depth = 1, lat = -1, lon = -1}\n"
+  assert text.count(layout) == 1
+  two_days = recipe.with_name("two_days.toml")
+  two_days.write_text(text.replace(layout, layout.replace("time = 1", "time = 2")))
+  result = run(two_days, tmp_path / "out.zarr", "--blocks", blocks)
+  assert result.exit_code == 0, result.output
+  out = open_output(tmp_path / "out.zarr")
+  assert out["thetao"].encoding["chunks"][0] == 2
+  xr.testing.assert_identical(out.load(), open_output(tmp_path / "daily.zarr").load())

@@ -4,7 +4,6 @@
 memory budget. The planner is a pure function, tested here on the shapes of real sources."""
 
 import dask
-import dask.array
 import numpy as np
 import pytest
 import xarray as xr
@@ -16,7 +15,6 @@ from arcomake.chunk_plan import (
   Needs,
   PlanError,
   Shape,
-  align_to_stored,
   plan,
   shapes,
 )
@@ -141,52 +139,3 @@ def test_needs_merge():
 def test_shapes_of_a_dataset():
   ds = xr.Dataset({"v": (("time", "x"), np.zeros((3, 4), dtype=np.float32))})
   assert shapes(ds) == {"v": Shape(("time", "x"), (3, 4), 4)}
-
-
-def _dataset(chunks: dict, stored: tuple[int, ...] | None, shards=None) -> xr.Dataset:
-  data = dask.array.zeros((8, 6), chunks=(chunks["time"], chunks["x"]), dtype=np.float32)
-  ds = xr.Dataset({"v": (("time", "x"), data)})
-  if stored is not None:
-    ds["v"].encoding["chunks"] = stored
-  if shards is not None:
-    ds["v"].encoding["shards"] = shards
-  return ds
-
-
-def test_aligned_chunks_are_kept():
-  ds = _dataset({"time": 2, "x": 6}, (2, 6))
-  assert align_to_stored(ds, VM) is ds
-
-
-def test_straddling_chunks_are_aligned_to_the_stored_chunks():
-  """Daily chunks of 3 over stored chunks of 2 (a resample's output, say): rechunked to whole
-  multiples of 2 within the target; the other dimension keeps its chunks."""
-  ds = _dataset({"time": 3, "x": 3}, (2, 3))
-  aligned = align_to_stored(ds, VM)
-  assert all(size % 2 == 0 for size in aligned["v"].chunks[0][:-1])
-  assert aligned["v"].chunks[1] == (3, 3)
-  assert aligned["v"].encoding == ds["v"].encoding
-  small = align_to_stored(ds, Budget(memory_limit=3 * 2 * 4 * 32 * COPIES * 10, threads=32))
-  assert small["v"].chunks[0][:-1] == (2,) * (len(small["v"].chunks[0]) - 1)
-
-
-def test_shards_are_the_unit_of_writing():
-  ds = _dataset({"time": 2, "x": 6}, (2, 6), shards=(4, 6))
-  aligned = align_to_stored(ds, VM)
-  assert all(size % 4 == 0 for size in aligned["v"].chunks[0][:-1])
-
-
-def test_a_whole_stored_dimension_becomes_one_chunk():
-  """Dask chunks writing into one stored chunk at once would lose values (N10)."""
-  ds = _dataset({"time": 8, "x": 2}, (8, 6))
-  assert align_to_stored(ds, VM)["v"].chunks[1] == (6,)
-
-
-def test_variables_are_aligned_one_by_one():
-  """Merged datasets may chunk a dimension differently: each variable is aligned on its own."""
-  ds = _dataset({"time": 3, "x": 6}, (2, 6))
-  other = xr.Dataset({"w": (("time",), dask.array.zeros(8, chunks=1))})
-  merged = xr.merge([ds, other])
-  aligned = align_to_stored(merged, VM)
-  assert aligned["w"].chunks == ((1,) * 8,)
-  assert all(size % 2 == 0 for size in aligned["v"].chunks[0][:-1])
