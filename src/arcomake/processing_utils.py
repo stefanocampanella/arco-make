@@ -361,7 +361,8 @@ def regrid(
       `resolution_lat`, `resolution_lon`).
     latitude_dim, longitude_dim: Names of the horizontal dimensions.
     method: The xarray-regrid method (default "nearest").
-    kwargs: Further arguments of that method (e.g. `skipna`, `nan_threshold`, `output_chunks`).
+    kwargs: Further arguments of that method (e.g. `skipna`, `nan_threshold`; `output_chunks`
+      only outside download recipes, whose chunks are planned).
   """
   new_grid = xarray_regrid.Grid(**grid)
   target_dataset = new_grid.create_regridding_dataset(lat_name=latitude_dim, lon_name=longitude_dim)

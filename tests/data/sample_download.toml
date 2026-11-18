@@ -14,7 +14,6 @@ step = "2D"
 [[datasets.atmosphere.parts]]
 filename_or_obj = "@SOURCES@/atmosphere.zarr"
 engine = "zarr"
-chunks = {time = 24, latitude = -1, longitude = -1}
 
 [[datasets.atmosphere.postprocess]]
 name = "select_variables"
@@ -40,7 +39,6 @@ step = "1D"
 [[datasets.ocean.parts]]
 filename_or_obj = "@SOURCES@/ocean.zarr"
 engine = "zarr"
-chunks = {time = 1, depth = 1, latitude = -1, longitude = -1}
 
 [[datasets.ocean.postprocess]]
 name = "get_bottom"

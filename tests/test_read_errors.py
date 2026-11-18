@@ -24,6 +24,7 @@ from click.testing import CliRunner
 from fsspec.implementations.memory import MemoryFileSystem
 
 from arcomake import cli
+from arcomake.chunk_plan import Budget
 from arcomake.dataset_utils import DatasetConfig, ZarrPartConfig, download_and_process
 
 TIMES = pd.date_range("2020-01-01", periods=24, freq="1h")
@@ -72,9 +73,12 @@ def fail_reads_of_hour_3() -> None:
 
 
 def read_part(url: str) -> xr.Dataset:
-  part = ZarrPartConfig(filename_or_obj=url, consolidated=True, chunks={})
+  part = ZarrPartConfig(filename_or_obj=url, consolidated=True)
   return download_and_process(
-    DatasetConfig(parts=[part]), datetime(2020, 1, 1), datetime(2020, 1, 2)
+    DatasetConfig(parts=[part]),
+    datetime(2020, 1, 1),
+    datetime(2020, 1, 2),
+    budget=Budget(memory_limit=10**9, threads=1),  # parts chunked as download plans them
   ).load()
 
 

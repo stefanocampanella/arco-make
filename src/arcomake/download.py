@@ -39,6 +39,7 @@ from arcomake.dataset_utils import (
   _write_zarr,
   maybe_checkpointing_download_and_process,
   prepare_for_writing,
+  refuse_chunk_steps,
   write_output,
 )
 from arcomake.datetime_utils import DateInterval, IterableDateInterval, may_parse_timedelta
@@ -84,6 +85,11 @@ class DownloadConfig(BaseModel):
   @classmethod
   def parse_step(cls, value: str | timedelta) -> timedelta:
     return may_parse_timedelta(value)
+
+  @field_validator("postprocess")
+  @classmethod
+  def _no_chunk_steps(cls, steps: list[ProcessingStepConfig]) -> list[ProcessingStepConfig]:
+    return refuse_chunk_steps(steps)
 
   @model_validator(mode="after")
   def validate_date_range(self) -> Self:
@@ -426,7 +432,7 @@ def _stage_block(
 def _from_stage(staged: _Staged) -> xr.Dataset:
   """The block as its direct write would see it: the prepared dataset with the staged values in
   place of every variable not in memory: Dask arrays in the same chunks, lazily indexed arrays
-  (parts opened without `chunks`) loaded, as their direct write would. The block's sources are
+  (variables not chunked) loaded, as their direct write would. The block's sources are
   closed by then: nothing may read them again."""
   values = xr.open_zarr(str(staged.path), consolidated=False)
   dataset = staged.prepared.copy(deep=False)

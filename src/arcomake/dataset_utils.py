@@ -51,11 +51,11 @@ ChunksConfig = (
 
 
 class OpenDatasetArguments(BaseModel):
-  """Arguments of `xarray.open_dataset`, except `engine`."""
+  """Arguments of `xarray.open_dataset`, except `engine` and `chunks` (download parts are
+  chunked as planned: `chunk_plan`)."""
 
   model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
-  chunks: ChunksConfig | None = None
   cache: bool | None = None
   decode_cf: bool | None = None
   mask_and_scale: bool | Mapping[str, bool] | None = None
@@ -81,6 +81,7 @@ class ReadConfig(OpenDatasetArguments):
   """Arguments of `xarray.open_dataset` (the `[read]` table of a recipe)."""
 
   engine: EngineType | None = None
+  chunks: ChunksConfig | None = None
 
 
 class CodecConfig(BaseModel):
@@ -245,7 +246,6 @@ class CopernicusMarinePartConfig(PartTimeOffset):
   service: str | None = None
   start_datetime: datetime.datetime | str | None = None
   end_datetime: datetime.datetime | str | None = None
-  chunks: ChunksConfig | None = None
   storage_options: dict[str, Any] | None = None
 
 
@@ -255,7 +255,6 @@ class NetCDFOverHTTPPartConfig(PartTimeOffset, PartTimeout):
   filename_or_obj: str
   engine: Literal["netcdfoverhttp"] | None = "netcdfoverhttp"
   drop_variables: str | list[str] | None = None
-  chunks: ChunksConfig | None = None
 
   @model_validator(mode="before")
   @classmethod
@@ -281,7 +280,6 @@ class EarlyWarningDataStorePartConfig(PartTimeOffset, PartTimeout):
   time_dim: str | None = None
   latitude_dim: str | None = None
   longitude_dim: str | None = None
-  chunks: ChunksConfig | None = None
 
   @model_validator(mode="before")
   @classmethod
@@ -301,10 +299,11 @@ class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout):
     return _engine_given_or_implied(data, lambda url: url.rstrip("/").endswith(".zarr"))
 
 
-class GenericPartConfig(ReadConfig, PartTimeOffset, PartTimeout):
+class GenericPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout):
   """A part read by any other xarray engine, with the arguments of `xarray.open_dataset`."""
 
   filename_or_obj: str
+  engine: EngineType | None = None
 
   @field_validator("engine")
   @classmethod
@@ -518,6 +517,26 @@ def open_input(filename_or_obj: Any, **kwargs: Any) -> xr.Dataset:
   return hdf5_lock.open_dataset(filename_or_obj, **kwargs)
 
 
+# Download recipes give no chunk sizes: they are planned for each block (`chunk_plan`).
+PLANNED_CHUNKS = "chunks are planned for each block (download --memory-limit)"
+
+
+def refuse_chunk_steps(steps: list[ProcessingStepConfig]) -> list[ProcessingStepConfig]:
+  """`steps` of a download recipe, which may not set chunk sizes: no `chunk` step, no regrid
+  `output_chunks` (they are planned).
+
+  Raises:
+    ValueError: naming the step.
+  """
+  for number, config in enumerate(steps, start=1):
+    if config.name == "chunk":
+      raise ValueError(f"step {number} (chunk): {PLANNED_CHUNKS}: remove the step")
+    kwargs = (config.model_extra or {}).get("kwargs") or {}
+    if config.name == "regrid" and isinstance(kwargs, Mapping) and "output_chunks" in kwargs:
+      raise ValueError(f"step {number} (regrid): {PLANNED_CHUNKS}: remove `output_chunks`")
+  return steps
+
+
 class DatasetConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
@@ -525,6 +544,21 @@ class DatasetConfig(BaseModel):
   checkpointing: CheckpointingConfig | None = None
   parts: list[DatasetPartConfig] = Field(default_factory=list)
   postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
+
+  @model_validator(mode="before")
+  @classmethod
+  def _no_part_chunks(cls, data: Any) -> Any:
+    # Before the parts are parsed: one message, not one per model of the union.
+    if isinstance(data, Mapping):
+      for number, part in enumerate(data.get("parts") or [], start=1):
+        if isinstance(part, Mapping) and "chunks" in part:
+          raise ValueError(f"part {number}: {PLANNED_CHUNKS}: remove `chunks`")
+    return data
+
+  @field_validator("postprocess")
+  @classmethod
+  def _no_chunk_steps(cls, steps: list[ProcessingStepConfig]) -> list[ProcessingStepConfig]:
+    return refuse_chunk_steps(steps)
 
 
 def _shift_time(part: xr.Dataset, offset: datetime.timedelta, time_dim: str) -> xr.Dataset:
@@ -568,8 +602,8 @@ def download_and_process(
   """The dataset of `configs` over [start, end): its parts read, time-sliced and merged, then its
   steps applied (lazily: computed when written).
 
-  With a `budget`, a part without `chunks` is chunked by `chunk_plan.plan` for its slice of the
-  block and the needs of the dataset's steps; without, it is read as its backend returns it.
+  With a `budget`, each part is chunked by `chunk_plan.plan` for its slice of the block and the
+  needs of the dataset's steps; without, it is read as its backend returns it.
   """
   # When downloading from Copernicus Marine Data Store or Climate Data Store, the typical case is a large dataset,
   # spanning a long time period, with several sets of variables in different datasets (bio, phys, etc.),
@@ -586,13 +620,11 @@ def download_and_process(
       _with_timeout(part_conf, engine, getattr(raw_part, "timeout", None))
     if engine == "earlywarningdatastore" or engine == "copernicusmarine":
       part_conf.update(start_datetime=start_datetime - offset, end_datetime=end_datetime - offset)
-    plan = budget is not None and part_conf.get("chunks") is None
     part = open_input(**part_conf)
     if offset:
       part = _shift_time(part, offset, time_dim)
     part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
-    if plan:
-      assert budget is not None
+    if budget is not None:
       part = _planned(
         part,
         configs.postprocess,

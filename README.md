@@ -94,7 +94,6 @@ step = "1D"
 [[datasets.ocean.parts]]       # one or more parts, merged into the dataset
 filename_or_obj = "gs://bucket/ocean.zarr"
 engine = "zarr"
-chunks = {time = 1, depth = 1, latitude = -1, longitude = -1}
 
 [[datasets.ocean.postprocess]] # steps applied to this dataset, in order
 name = "regrid"
@@ -148,6 +147,17 @@ block's values are staged on local disk (`TMPDIR`) and the blocks are committed 
 is the same as with one block at a time. Memory and disk use grow with N; the first block to fail, in
 order, stops the run (blocks before it are committed, `--resume` continues).
 
+Download recipes give no chunk sizes (part `chunks`, `chunk` steps and regrid `output_chunks` are
+refused): each part of each block is chunked as planned from the shapes and dtypes of its variables,
+what the dataset's steps need (whole latitude and longitude for `regrid`, whole bins for `resample`,
+whole columns for `get_bottom`) and a memory budget. The budget is `--memory-limit` (or
+`ARCOMAKE_MEMORY_LIMIT`), by default the memory the process may use (its cgroup's or Slurm job's
+limit included), shared among Dask's threads and the blocks at once: a task holds about four chunks,
+and chunks aim at Dask's `array.chunk-size` (128 MiB) at most. Space stays whole unless one time step
+is above that; then outer dimensions (depth) are split, and time grows in whole bins. The plan of each
+part is logged, with what does not fit; a task that cannot fit the budget fails the block. Writes
+rechunk what straddles the stored chunks of `[save]`.
+
 Every output is an [Icechunk](https://icechunk.io) repository (Zarr format 3 with versions): a local
 directory, an `s3://` or a `gs://` URL. Every run writes on a branch of its own (`run/<command>-<start
 time>`), in commits: one per block for `download` (its message names the block's interval), one for
@@ -169,7 +179,8 @@ cannot honour are an error, before any download. In `[save]`:
 - `chunks` set the stored chunks, per dimension (-1, or a dimension not listed: the whole dimension).
 - `shards`, in the same form, group whole chunks into one stored object each (Zarr v3 sharding):
   fewer, larger objects, while readers still fetch single chunks. Without `shards`, every chunk is an
-  object. Dask chunks may not straddle shards when writing.
+  object. Dask chunks may not straddle shards when writing (`download` rechunks them; `process` and
+  `compute-climatology` refuse them).
 - `compressors` is a list of Zarr v3 codecs, `{name, configuration}` as in Zarr's array metadata
   (e.g. `blosc`, `zstd`, `gzip`); an empty list stores the data uncompressed, and without it zarr's
   default (zstd) applies. `[save.encoding.VARIABLE]` can override chunks, shards and compressors per
