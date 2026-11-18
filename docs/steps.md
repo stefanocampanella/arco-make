@@ -74,9 +74,9 @@ Set the ACDD attributes of the dataset's extent from its coordinates.
 `geospatial_lat_*` and `geospatial_lon_*` (min, max, units, and resolution if the spacing is
 regular), `geospatial_vertical_*` (min, max, and the coordinate's `units` and `positive`) if
 `vertical_dim` is given, and `time_coverage_start`, `_end` (the first and last stamps) and
-`_resolution` (an ISO 8601 duration). Attributes typed by hand drift from the data: the
-arco-ocean recipes said longitudes -180 to 180 over coordinates 0 to 359.75. `download` keeps
-the first block's `time_coverage_start` when it appends the others:
+`_resolution` (an ISO 8601 duration). Attributes typed by hand drift from the data, e.g.
+longitudes -180 to 180 over coordinates 0 to 359.75. In `download`, the time coverage is that
+of the whole output (the stored stamps and the block's), not of the block:
 
 ```toml
 name = "coverage_attrs"

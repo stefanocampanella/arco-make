@@ -12,8 +12,8 @@ from datetime import datetime, timedelta
 from typing import Any, Self, get_args, override
 
 import click
+import numpy as np
 import xarray as xr
-import zarr
 from dask.diagnostics import ProgressBar
 from dask.utils import format_bytes
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -39,7 +39,7 @@ from arcomake.dataset_utils import (
   write_output,
 )
 from arcomake.datetime_utils import DateInterval, IterableDateInterval, may_parse_timedelta
-from arcomake.processing_utils import ProcessingStepConfig
+from arcomake.processing_utils import ProcessingStepConfig, time_coverage
 from arcomake.retries import RetryConfig, with_retries
 from arcomake.settings import parse_memory
 from arcomake.temporary_utils import TempDirectoryRegistry
@@ -455,8 +455,7 @@ def _write_block(
     _processed_block(configs, date_interval, progress=progress, budget=budget) as dataset,
     ProgressBar() if progress else nullcontext(),
   ):
-    if not first:
-      dataset = _with_first_block_attrs(dataset, run, configs.save.group)
+    dataset = _with_output_coverage(dataset, run, configs.save.group, configs.time_dim, first)
     write_output(
       dataset,
       run,
@@ -470,19 +469,24 @@ def _write_block(
     )
 
 
-# Global attributes saying where the output starts: xarray replaces a store's attributes with
-# each appended block's, so an appended block takes them from the output (first block's).
-FROM_FIRST_BLOCK = ("time_coverage_start",)
+def _with_output_coverage(
+  dataset: xr.Dataset, run: icechunk_utils.Run, group: str | None, time_dim: str, first: bool
+) -> xr.Dataset:
+  """`dataset` with the time coverage of the whole output, if it has one (`coverage_attrs`).
 
-
-def _with_first_block_attrs(dataset: xr.Dataset, run: icechunk_utils.Run, group: str | None):
-  """`dataset` with the `FROM_FIRST_BLOCK` attributes it has set to those of the run's output."""
-  if not any(key in dataset.attrs for key in FROM_FIRST_BLOCK):
+  xarray replaces a store's attributes with each appended block's, and a checkpointed dataset
+  carries its last sub-block's: the coverage is computed here from the output's stamps (those
+  stored on the run's branch, then the block's), for every block.
+  """
+  if "time_coverage_start" not in dataset.attrs:
     return dataset
-  store = run.repo.readonly_session(branch=run.branch).store
-  stored = zarr.open_group(store, path=group or "", mode="r").attrs
-  kept = {key: stored[key] for key in FROM_FIRST_BLOCK if key in dataset.attrs and key in stored}
-  return dataset.assign_attrs(kept)
+  stamps = dataset[time_dim].values
+  if not first:
+    store = run.repo.readonly_session(branch=run.branch).store
+    stored = xr.open_zarr(store, group=group, consolidated=False)[time_dim].values
+    stamps = np.concatenate([stored, stamps])
+  attrs = {k: v for k, v in dataset.attrs.items() if not k.startswith("time_coverage_")}
+  return dataset.drop_attrs(deep=False).assign_attrs(attrs | time_coverage(stamps))
 
 
 def _committed(run: icechunk_utils.Run, interval: DateInterval) -> bool:

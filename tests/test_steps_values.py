@@ -114,3 +114,19 @@ def test_coverage_attrs_come_from_the_coordinates(ocean_ds: xr.Dataset):
   assert attrs["time_coverage_start"] == f"{times[0]:%Y-%m-%dT%H:%M:%S}Z"
   assert attrs["time_coverage_end"] == f"{times[-1]:%Y-%m-%dT%H:%M:%S}Z"
   assert attrs["time_coverage_resolution"] == "P1D"
+
+
+@pytest.mark.parametrize(
+  ("lon", "resolution"),
+  [
+    (np.arange(0.0, 10.0, 0.1), "0.1 degree"),
+    (np.arange(0.0, 360.0, 1 / 12).astype("float32"), "0.0833333 degree"),
+    (np.array([0.0, 1.0, 3.0]), None),
+  ],
+  ids=["tenth", "twelfth-float32", "irregular"],
+)
+def test_coverage_resolution_of_inexact_grids(lon: np.ndarray, resolution):
+  """Spacings not exact in binary (0.1, a float32 1/12 degree) are regular; uneven ones are not."""
+  ds = xr.Dataset(coords={"lat": [0.0, 1.0], "lon": lon})
+  attrs = pu.coverage_attrs(ds, time_dim=None).attrs
+  assert attrs.get("geospatial_lon_resolution") == resolution

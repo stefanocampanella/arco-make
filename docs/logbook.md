@@ -1064,8 +1064,8 @@ the output of an unchanged recipe:
   `lsm` once instead of 24 times a day, and without the glitches of a few days.
 - **`[grids]`** (A4): a target grid written once per recipe and named by its regrid steps.
 - **`coverage_attrs`** (C13, finding 15): ACDD extent attributes from the coordinates. xarray
-  replaces a store's attributes with each appended block's, so `download` keeps the output's
-  `time_coverage_start` when it appends.
+  replaces a store's attributes with each appended block's, so `download` sets the time coverage
+  of the whole output (stored stamps and the block's) for each block.
 
 Masking after regridding needs nothing new: `apply_mask` does it; the arco-ocean recipes will use
 it in the Moby-Dick findings PR (NaN outside the masks).

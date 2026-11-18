@@ -79,16 +79,20 @@ def test_a_failed_block_keeps_those_before_it(
   xr.testing.assert_identical(open_output(output).load(), open_output(clean).load())
 
 
-def test_appended_blocks_keep_the_start_of_the_coverage(recipe, tmp_path: pathlib.Path):
-  """xarray replaces a store's attributes with each appended block's: the output still starts
-  where the first block did (`time_coverage_start`), and ends where the last does."""
-  recipe.write_text(recipe.read_text() + '\n[[postprocess]]\nname = "coverage_attrs"\n')
+@pytest.mark.parametrize("step", ["2D", "1D"])
+def test_the_time_coverage_is_the_outputs(recipe, tmp_path: pathlib.Path, step: str):
+  """xarray replaces a store's attributes with each appended block's: the time coverage is still
+  the whole output's, from the first block's start to the last's end, with its resolution even
+  when a block has one day (2-day blocks over 5 days end with one; 1-day blocks always do)."""
+  text = recipe.read_text().replace('step = "2D"', f'step = "{step}"', 1)
+  recipe.write_text(text + '\n[[postprocess]]\nname = "coverage_attrs"\n')
   output = tmp_path / "out.zarr"
   result = run(recipe, output)
   assert result.exit_code == 0, result.output
   attrs = open_output(output).attrs
   assert attrs["time_coverage_start"] == "2020-02-26T00:00:00Z"
   assert attrs["time_coverage_end"] == "2020-03-01T00:00:00Z"
+  assert attrs["time_coverage_resolution"] == "P1D"
 
 
 def test_blocks_option_is_gone(recipe, tmp_path: pathlib.Path):

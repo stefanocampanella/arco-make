@@ -141,11 +141,30 @@ def clip_negative(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
 
 
 def _regular_step(values: np.ndarray) -> Any:
-  """The spacing of sorted coordinate values if it is constant, else None."""
+  """The spacing of coordinate values if it is constant, else None: exactly for times, within a
+  relative 1e-3 for numbers (a 0.1 or float32 1/12 degree grid is not exact in binary)."""
   if values.size < 2:
     return None
-  steps = np.unique(np.diff(np.sort(values)))
-  return steps[0] if steps.size == 1 else None
+  ordered = np.sort(values)
+  diffs = np.diff(ordered)
+  if not np.issubdtype(diffs.dtype, np.floating):
+    steps = np.unique(diffs)
+    return steps[0] if steps.size == 1 else None
+  step = (ordered[-1] - ordered[0]) / (values.size - 1)
+  return step if step > 0 and np.allclose(diffs, step, rtol=1e-3, atol=0.0) else None
+
+
+def time_coverage(stamps: Any) -> dict[str, str]:
+  """ACDD `time_coverage_start`, `_end` (first and last stamps) and `_resolution` (an ISO 8601
+  duration, if the stamps are regular)."""
+  index = pd.DatetimeIndex(np.asarray(stamps))
+  attrs = {
+    "time_coverage_start": f"{index.min():%Y-%m-%dT%H:%M:%SZ}",
+    "time_coverage_end": f"{index.max():%Y-%m-%dT%H:%M:%SZ}",
+  }
+  if (spacing := _regular_step(index.values)) is not None:
+    attrs["time_coverage_resolution"] = _iso_duration(spacing)
+  return attrs
 
 
 def _iso_duration(step: np.timedelta64) -> str:
@@ -171,9 +190,9 @@ def coverage_attrs(
   `geospatial_lat_*` and `geospatial_lon_*` (min, max, units, and resolution if the spacing is
   regular), `geospatial_vertical_*` (min, max, and the coordinate's `units` and `positive`) if
   `vertical_dim` is given, and `time_coverage_start`, `_end` (the first and last stamps) and
-  `_resolution` (an ISO 8601 duration). Attributes typed by hand drift from the data: the
-  arco-ocean recipes said longitudes -180 to 180 over coordinates 0 to 359.75. `download` keeps
-  the first block's `time_coverage_start` when it appends the others::
+  `_resolution` (an ISO 8601 duration). Attributes typed by hand drift from the data, e.g.
+  longitudes -180 to 180 over coordinates 0 to 359.75. In `download`, the time coverage is that
+  of the whole output (the stored stamps and the block's), not of the block::
 
     name = "coverage_attrs"
     vertical_dim = "depth"
@@ -187,8 +206,8 @@ def coverage_attrs(
     attrs[f"geospatial_{axis}_min"] = round(float(values.min()), 6)
     attrs[f"geospatial_{axis}_max"] = round(float(values.max()), 6)
     attrs[f"geospatial_{axis}_units"] = units
-    if (spacing := _regular_step(np.round(values, 6))) is not None:
-      attrs[f"geospatial_{axis}_resolution"] = f"{float(spacing):g} degree"
+    if (spacing := _regular_step(values)) is not None:
+      attrs[f"geospatial_{axis}_resolution"] = f"{float(spacing):.6g} degree"
   if vertical_dim is not None:
     vertical = ds[vertical_dim]
     values = np.asarray(vertical.values, dtype=np.float64)
@@ -198,11 +217,7 @@ def coverage_attrs(
       if key in vertical.attrs:
         attrs[f"geospatial_vertical_{key}"] = vertical.attrs[key]
   if time_dim is not None:
-    stamps = pd.DatetimeIndex(ds[time_dim].values)
-    attrs["time_coverage_start"] = f"{stamps.min():%Y-%m-%dT%H:%M:%SZ}"
-    attrs["time_coverage_end"] = f"{stamps.max():%Y-%m-%dT%H:%M:%SZ}"
-    if (spacing := _regular_step(stamps.values)) is not None:
-      attrs["time_coverage_resolution"] = _iso_duration(spacing)
+    attrs |= time_coverage(ds[time_dim].values)
   return ds.assign_attrs(attrs)
 
 
