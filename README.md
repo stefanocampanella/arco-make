@@ -190,9 +190,7 @@ cannot honour are an error, before any download. In `[save]`:
   `"lexicographic"` (C order over the chunk grid: with chunks of one time step and one level,
   a time step's levels lie next to each other, so a whole depth profile is read in few requests)
   or `"colexicographic"` (Fortran order). It is not part of the array metadata: readers need no
-  setting, and find chunks through each shard's index whatever the order. The workers of a
-  distributed client (`process`, `compute-climatology` with `mpi` or `localcluster`) write in
-  zarr's default order.
+  setting, and find chunks through each shard's index whatever the order.
 - `compressors` is a list of Zarr v3 codecs, `{name, configuration}` as in Zarr's array metadata
   (e.g. `blosc`, `zstd`, `gzip`); an empty list stores the data uncompressed, and without it zarr's
   default (zstd) applies. `[save.encoding.VARIABLE]` can override chunks, shards and compressors per

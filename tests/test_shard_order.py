@@ -6,6 +6,9 @@ written region by region (the climatology's series)."""
 
 import asyncio
 import pathlib
+import pickle
+import subprocess
+import sys
 
 import dask
 import icechunk
@@ -18,7 +21,7 @@ import zarr
 from click.testing import CliRunner
 from zarr.core.buffer import default_buffer_prototype
 
-from arcomake import cli, icechunk_utils
+from arcomake import cli, icechunk_utils, sharding
 from arcomake.dataset_utils import SaveConfig, write_into_session, write_output
 
 LAYOUT = {"chunks": {"time": 1, "depth": 1}, "shards": {"time": 4, "depth": -1}}
@@ -130,6 +133,23 @@ def test_climatology_shards_follow_the_order(tmp_path: pathlib.Path, split: str)
     assert np.array_equal(
       physical_order(path, "x", (0, 0, 0)), expected("lexicographic", (5, 1, 2))
     )
+
+
+def test_the_order_travels_to_other_processes(tmp_path: pathlib.Path):
+  """Distributed workers get the arrays pickled: they write in the order without zarr's
+  configuration (a fresh process has only the default)."""
+  path = tmp_path / "a.zarr"
+  zarr.create_array(path, shape=(8, 4), chunks=(1, 1), shards=(8, 4), dtype="f4")
+  with sharding.write_order("lexicographic"):
+    array = zarr.open_array(path, mode="r+")
+  code = (
+    "import pickle, sys; c = pickle.loads(sys.stdin.buffer.read()).metadata.codecs[0]; "
+    "print(c.subchunk_write_order)"
+  )
+  out = subprocess.run(
+    [sys.executable, "-c", code], input=pickle.dumps(array), capture_output=True, check=True
+  )
+  assert out.stdout.decode().split() == ["lexicographic"]
 
 
 def test_an_order_needs_shards():

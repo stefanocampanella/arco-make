@@ -945,7 +945,6 @@ def write_output(
   """
   configs = configs or SaveConfig()
   prepared = prepare_for_writing(dataset, configs)
-  _warn_distributed_order(configs)
   if isinstance(destination, icechunk_utils.Run):
     logger.info(f"Writing to {destination.path} ({message}) with {configs}")
     return destination.write(
@@ -984,16 +983,6 @@ def _distributed_client() -> bool:
   except (ImportError, ValueError):
     return False
   return True
-
-
-def _warn_distributed_order(configs: SaveConfig) -> None:
-  """`[save] shard_order` is set in this process (zarr's configuration): a distributed client's
-  workers write in zarr's default order."""
-  if configs.shard_order != sharding.DEFAULT and _distributed_client():
-    logger.warning(
-      f"shard_order {configs.shard_order!r} applies to writes in this process: the workers of a"
-      f" distributed client write shards in zarr's default order ({sharding.DEFAULT})"
-    )
 
 
 def write_into_session(

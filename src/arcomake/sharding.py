@@ -15,8 +15,8 @@ array. `write_order` selects, through zarr's codec registry (`codecs.sharding_in
 `zarr.config`), a subclass whose default is the order asked, for every array opened meanwhile;
 arrays created in a write need their metadata written first (`create_arrays`) and the values
 written into them afterwards (mode "r+", by the writers in `icechunk_utils` and `dataset_utils`).
-The setting is process-wide while active, and reaches Dask's threads, not the workers of a
-distributed client.
+The setting is process-wide while active. Arrays opened under it keep their codec when pickled,
+order included (zarr carries it): the workers of a distributed client write in that order too.
 """
 
 import contextlib
