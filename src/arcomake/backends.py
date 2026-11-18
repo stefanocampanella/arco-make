@@ -1,17 +1,19 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import datetime
+import itertools
 import logging
 import os
 import threading
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, override
 from urllib.parse import urlparse
 from zipfile import ZipFile
 
 import cdsapi
+import numpy as np
 import requests
 import xarray as xr
 from xarray.backends import AbstractDataStore, BackendEntrypoint
@@ -217,7 +219,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
     registry = get_current_temp_registry()
     if registry is None:
       raise ValueError("No temporary directory registry available.")
-    consecutive_dates = self._consecutive_dates_by_month(start_datetime, end_datetime)
+    dates_by_year = self._dates_by_year(start_datetime, end_datetime)
 
     requests = [
       {
@@ -226,13 +228,11 @@ class EarlyWarningDataStore(BackendEntrypoint):
         "product_type": [product_type],
         "timespan": [timespan],
         "variable": [variable] if isinstance(variable, str) else variable,
-        "year": f"{dates[0].year}",
-        "month": [f"{dates[0].month:02}"],
-        "day": [f"{date.day:02}" for date in dates],
+        **self._year_request(dates),
         "data_format": "grib2",
         "download_format": "zip",
       }
-      for dates in consecutive_dates
+      for dates in dates_by_year
     ]
 
     client_options = {} if timeout is None else {"timeout": timeout}
@@ -241,7 +241,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
     )
 
     datasets: list[xr.Dataset] = []
-    for dates, dataset in zip(consecutive_dates, raw_datasets, strict=True):
+    for dates, dataset in zip(dates_by_year, raw_datasets, strict=True):
       # TODO:
       #  Unfortunately, it was impossible to get documentation on `valid_time` for historical GLOFAS data, hence
       #  the provider documentation should clarify the difference between the two, e.g., if renaming the time
@@ -251,40 +251,49 @@ class EarlyWarningDataStore(BackendEntrypoint):
         name for name in dataset.coords if name not in [latitude_dim, longitude_dim, time_dim]
       ]:
         dataset = dataset.drop_vars(extra_coords)
-      # _process_request drops the time dimension if of length one
+      # A one-day request (one month, one day) gives no time dimension.
       if len(dates) == 1:
         dataset = dataset.expand_dims(dim=time_dim, axis=0)
         dataset = dataset.assign_coords({time_dim: dates})
+      else:  # the request's months x days: keep only the interval's days
+        wanted = np.isin(
+          dataset[time_dim].values.astype("datetime64[D]"),
+          np.array([date.date() for date in dates], dtype="datetime64[D]"),
+        )
+        dataset = dataset.isel({time_dim: wanted})
       datasets.append(dataset)
 
     return _drop_variables(xr.concat(datasets, dim=time_dim), drop_variables)
 
   @staticmethod
-  def _consecutive_dates_by_month(
+  def _dates_by_year(
     start_datetime: datetime.datetime,
     end_datetime: datetime.datetime,
   ) -> list[list[datetime.datetime]]:
-    date_interval = DateInterval(start=start_datetime, end=end_datetime)
-    days = date_interval.to_list(freq=datetime.timedelta(days=1))
+    """The interval's days, grouped by year: one request each.
 
-    def partition[T](f: Callable[[T, T], bool], sequence: Iterable[T]) -> list[list[T]]:
-      part: list[list[T]] = []
-      subseq: list[T] = []
-      last: T | None = None
-      for current in sequence:
-        if (last is None) or (not subseq) or f(last, current):
-          subseq.append(current)
-        else:
-          part.append(subseq)
-          subseq = [current]
-        last = current
-      part.append(subseq)
-      return part
+    The EWDS runs one request of a user at a time, about two minutes apart (measured 18 Nov
+    2026): a request per month cost a 32-day block, usually spanning two months, an extra wait.
+    A request of up to a year stays within the service's limit of 500 days of GloFAS.
+    """
+    days = DateInterval(start=start_datetime, end=end_datetime).to_list(
+      freq=datetime.timedelta(days=1)
+    )
+    return [list(group) for _, group in itertools.groupby(days, key=lambda day: day.year)]
 
-    def same_month_and_year(x: datetime.datetime, y: datetime.datetime) -> bool:
-      return x.month == y.month and x.year == y.year
+  @staticmethod
+  def _year_request(dates: list[datetime.datetime]) -> dict[str, Any]:
+    """The `year`, `month` and `day` of a request for the given days of one year.
 
-    return partition(same_month_and_year, days)
+    The service gives every valid date of months x days, so days spanning two months partly also
+    bring days outside them (at most about a month's worth for a 32-day block); `open_dataset`
+    drops them.
+    """
+    return {
+      "year": f"{dates[0].year}",
+      "month": sorted({f"{date.month:02}" for date in dates}),
+      "day": sorted({f"{date.day:02}" for date in dates}),
+    }
 
   def _process_requests(
     self,
