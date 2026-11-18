@@ -1070,7 +1070,7 @@ the output of an unchanged recipe:
 Masking after regridding needs nothing new: `apply_mask` does it; the arco-ocean recipes will use
 it in the Moby-Dick findings PR (NaN outside the masks).
 
-A high-effort review found nine issues, fixed in six commits (tests checked to fail before where
+A high-effort review found nine issues, fixed in five commits (tests checked to fail before where
 the fix changes behaviour): the time coverage was per block (no resolution with one-stamp blocks,
 removed by a short last block; a checkpointed dataset's start), now the whole output's; grid
 resolutions of 0.1 and float32 1/12 degree were missing; `[grids]` changed the resume
@@ -1078,3 +1078,15 @@ fingerprint, and a grid that is not a table raised a traceback; a zoned `static_
 converted; two comments named one dataset's data; `validate` repeated `read_configs`. Its claim
 that `ensure_no_nans` lost an exact join was checked and dropped: variables of one Dataset share
 its indexes, so a variable and its mask cannot be misaligned.
+
+A second high-effort review, of the fixes, found six more, fixed in three commits (tests checked
+to fail before): `coverage_attrs` in a dataset's steps fails the merge of the datasets (they need
+identical attributes), so it is refused there; fine float32 grids far from zero (0.01 degree to
+360) still lacked a resolution (the tolerance now follows the type's rounding); download dropped
+every `time_coverage_*` attribute, not only those it computes; `validate` read its recipe twice
+(`read_configs` now merges injected tables); a UTC `static_time` was refused; this entry counted
+six fix commits. The earlier fix had said the whole-output coverage also fixed a checkpointed
+dataset: it did not need to, the recipe's steps run on the reopened block. Left as they are: no
+`output:` prefix (no recipe could use `coverage_attrs` before this branch), the fingerprint
+change for runs of older code (unreleased), and reading the output's time coordinate for each
+block (about 380 blocks in production).
