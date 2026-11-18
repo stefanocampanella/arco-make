@@ -1046,3 +1046,26 @@ keep the shard order was right: zarr pickles the order with the codec, so the wa
 otherwise was removed. On real data (8-day block without GloFAS, shards of 8 days x 50 levels,
 lexicographic): values identical to the unsharded run, the 400 chunks of each 3D shard in
 lexicographic order.
+
+## 2026-11-18: group 9, general capabilities for the recipes
+
+Six capabilities the arco-ocean recipes need, each general, with a synthetic test; none changes
+the output of an unchanged recipe:
+- **`ensure_no_nans` in one computation** (S3): it looped over every day (11,322 in the published
+  dataset) and variable, two computations each. Now one Dask computation counts the missing
+  values inside each mask per day; the report is the same, static variables once. On the 32-day
+  output (hyperfine, 2 runs each): 0.5 min against 1.4-3.9 min; both found no missing value.
+- **`validate --start/--end`** (C11): the time check's bounds as given to `download`; the
+  arco-ocean validate recipe ended years before the data.
+- **`sin_cos`** (C1, 5.3): an angle replaced by its sine and cosine before regridding and daily
+  means (350 and 10 degrees averaged to 180 as numbers). The maintainer chose the names `mwd_sin`
+  and `mwd_cos` for the wave direction.
+- **`static_time`** (C5, findings 3 and 4): a part read at one stamp, without time: ERA5's `z` and
+  `lsm` once instead of 24 times a day, and without the glitches of a few days.
+- **`[grids]`** (A4): a target grid written once per recipe and named by its regrid steps.
+- **`coverage_attrs`** (C13, finding 15): ACDD extent attributes from the coordinates. xarray
+  replaces a store's attributes with each appended block's, so `download` keeps the output's
+  `time_coverage_start` when it appends.
+
+Masking after regridding needs nothing new: `apply_mask` does it; the arco-ocean recipes will use
+it in the Moby-Dick findings PR (NaN outside the masks).
