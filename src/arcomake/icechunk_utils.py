@@ -371,6 +371,9 @@ class Run:
     `align_chunks`, Dask chunks that straddle stored chunks are rechunked to fit them (xarray's,
     region-aware: an append may start inside a chunk); else such chunks fail the write.
     `shard_order`: the order of the chunks inside shards (see `sharding`)."""
+    # TODO (idea, not planned): one commit per run instead of one per block, amending the run's
+    # last commit (`Session.amend`, icechunk 2.3) with the blocks written so far in its metadata
+    # for `waiting_run`; amended snapshots are garbage-collected after `GRACE` (logbook, 18 Nov).
     session = self.session()
     with sharding.write_order(shard_order):
       if sharding.creates_arrays(shard_order, mode):
