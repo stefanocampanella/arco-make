@@ -78,14 +78,14 @@ class Budget:
   source: str = "given"
 
   @property
-  def per_block(self) -> int:
-    """Bytes for the tasks of one block."""
+  def usable(self) -> int:
+    """Bytes the tasks may use, all threads together (`USABLE` of the limit)."""
     return int(self.memory_limit * USABLE)
 
   @property
   def per_task(self) -> int:
     """Bytes of input chunk a task may hold (`COPIES` of it are held while it runs)."""
-    return self.per_block // (self.threads * COPIES)
+    return self.usable // (self.threads * COPIES)
 
   @property
   def target(self) -> int:
@@ -275,10 +275,10 @@ def plan(
       warnings.append(
         f"{name}: {what} of {format_bytes(size)}, above {format_bytes(budget.per_task)} per task"
       )
-    if size * COPIES > budget.per_block:
+    if size * COPIES > budget.usable:
       raise PlanError(
         f"{name}: a {what} of {format_bytes(size)} needs about {format_bytes(size * COPIES)}"
-        f" ({COPIES} copies), more than the {format_bytes(budget.per_block)} a block may use"
+        f" ({COPIES} copies), more than the {format_bytes(budget.usable)} the tasks may use"
         f" ({budget.describe()}): give more memory (--memory-limit)"
       )
   return Plan(chunks, largest, gathered, tuple(warnings))
