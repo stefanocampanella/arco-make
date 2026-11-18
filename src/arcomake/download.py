@@ -15,14 +15,16 @@ from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timedelta
-from typing import Self, get_args
+from typing import Self, get_args, override
 
 import click
 import xarray as xr
 from dask.diagnostics import ProgressBar
+from dask.utils import parse_bytes
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from arcomake import icechunk_utils
+from arcomake.chunk_plan import detect_budget
 from arcomake.cli_utils import (
   check_aws_profile,
   check_destination,
@@ -45,6 +47,24 @@ from arcomake.retries import RetryConfig, with_retries
 from arcomake.temporary_utils import TempDirectoryRegistry, get_current_temp_registry
 
 logger = logging.getLogger(__name__)
+
+
+class Memory(click.ParamType[int]):
+  """An amount of memory, as Dask writes them: "100GB", "80GiB", "2e9"."""
+
+  name = "memory"
+
+  @override
+  def convert(self, value, param, ctx) -> int:
+    if isinstance(value, int):
+      return value
+    try:
+      amount = parse_bytes(value)
+    except (ValueError, TypeError):
+      amount = 0
+    if amount <= 0:
+      self.fail(f"{value!r} is not an amount of memory (e.g. 100GB, 80GiB)", param, ctx)
+    return amount
 
 
 class DownloadConfig(BaseModel):
@@ -128,6 +148,18 @@ class DownloadConfig(BaseModel):
   ),
 )
 @click.option(
+  "--memory-limit",
+  type=Memory(),
+  default=None,
+  envvar="ARCOMAKE_MEMORY_LIMIT",
+  show_envvar=True,
+  help=(
+    "Memory the chunks of each block are planned for, e.g. 100GB (default: what this process may"
+    " use: physical memory, or its cgroup's or Slurm job's limit), shared among Dask's threads"
+    " and the blocks at once"
+  ),
+)
+@click.option(
   "--log-level",
   default="info",
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
@@ -156,6 +188,7 @@ def download(
   replace: bool = False,
   resume: bool = False,
   blocks_at_once: int = 1,
+  memory_limit: int | None = None,
   log_level: str = "info",
   dask_setup: DaskSetupType = "threads",
   progress: bool = False,
@@ -203,6 +236,8 @@ def download(
     if end_datetime is not None:
       update_time_interval["end"] = end_datetime
     configs = read_configs(configs_path, inject=update_time_interval, schema=DownloadConfig)
+    budget = detect_budget(memory_limit, blocks_at_once)
+    logger.info(f"Chunks planned for a budget of {budget.describe()}")
     parts = [part for dataset in configs.datasets.values() for part in dataset.parts]
     check_aws_profile(
       output_path,

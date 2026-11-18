@@ -14,6 +14,7 @@ import math
 from collections.abc import Hashable, Iterable, Mapping
 
 import dask
+import dask.system
 import xarray as xr
 from dask.utils import format_bytes, parse_bytes
 
@@ -100,6 +101,25 @@ class Budget:
       f" task: {format_bytes(self.memory_limit)} ({self.source}) x {USABLE} /"
       f" ({self.threads} threads x {self.blocks} block(s) x {COPIES})"
     )
+
+
+def _threads() -> int:
+  """Threads of Dask's local scheduler: one for the synchronous one, else `num_workers` or the
+  CPUs this process may use."""
+  if dask.config.get("scheduler", None) in ("synchronous", "sync", "single-threaded"):
+    return 1
+  return int(dask.config.get("num_workers", None) or dask.system.CPU_COUNT)
+
+
+def detect_budget(memory_limit: int | None = None, blocks: int = 1) -> Budget:
+  """The budget of this process: `memory_limit` if given, else the memory it may use (the least
+  of physical memory, its cgroup's limit, so a Slurm job's, and its RLIMIT_RSS), shared among
+  the threads of Dask's local scheduler and `blocks` blocks at once."""
+  if memory_limit is not None:
+    return Budget(memory_limit, _threads(), blocks, "given")
+  from distributed.system import MEMORY_LIMIT
+
+  return Budget(MEMORY_LIMIT, _threads(), blocks, "detected")
 
 
 @dataclasses.dataclass(frozen=True)

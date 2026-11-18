@@ -14,6 +14,7 @@ dependencies = [
     "copernicusmarine @ git+https://github.com/mercator-ocean/copernicus-marine-toolbox.git@f66a8b8c700654fec981b986fc79f6450298e96a",
     "dask",
     "dask_mpi",
+    "distributed",
     "eccodes",
     "etils",
     "gcsfs",

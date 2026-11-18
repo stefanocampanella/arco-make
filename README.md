@@ -69,7 +69,9 @@ settings are ignored with a warning naming the key; a file other users can read,
 named by `ARCOMAKE_RC`, is reported. Also accepted: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_ENDPOINT_URL`, the `ECCODES_*`
 paths, and `COPERNICUSMARINE_MAX_POOL_CONNECTIONS` (connections per Copernicus Marine client, a
-positive integer; the toolbox's default, 10, is fewer than Dask's threads on a large machine). A
+positive integer; the toolbox's default, 10, is fewer than Dask's threads on a large machine), and
+`ARCOMAKE_MEMORY_LIMIT` (the memory `download` plans its chunks for, e.g. `100GB`: see
+`--memory-limit`). A
 recipe's `storage_options` (e.g. `profile`) override `AWS_PROFILE`. Runs with `s3://`
 paths or Copernicus Marine parts (both use botocore) fail at once if the AWS profile does not
 exist.

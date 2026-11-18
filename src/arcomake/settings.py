@@ -30,6 +30,7 @@ import tempfile
 import warnings
 from collections.abc import Iterable, MutableMapping
 
+from dask.utils import parse_bytes
 from pydantic import Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -95,6 +96,19 @@ class ArcoMakeSettings(BaseSettings):
     default=None, validation_alias="ECCODES_DEFINITION_PATH"
   )
   eccodes_samples_path: str | None = Field(default=None, validation_alias="ECCODES_SAMPLES_PATH")
+  # Memory `download` plans its chunks for (`--memory-limit`, which reads it), e.g. "100GB".
+  arcomake_memory_limit: str | None = Field(default=None, validation_alias="ARCOMAKE_MEMORY_LIMIT")
+
+  @field_validator("arcomake_memory_limit")
+  @classmethod
+  def _bytes(cls, value: str | None) -> str | None:
+    if value is not None:
+      try:
+        if parse_bytes(value) <= 0:
+          raise ValueError
+      except (ValueError, TypeError):
+        raise ValueError("not an amount of memory (e.g. 100GB, 80GiB)") from None
+    return value
 
   @field_validator("tmpdir")
   @classmethod
