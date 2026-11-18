@@ -123,3 +123,31 @@ def test_a_dataset_resampled_to_days_is_chunked_in_days():
   chunks = plan(shapes(ds), budget, needs).chunks
   assert chunks["time"] % 24 == 0
   assert chunks["time"] == 24 * (budget.target // (24 * 3 * 4 * 4))
+
+
+@pytest.mark.parametrize(
+  ("extra", "times", "multiple"),
+  [
+    ({"closed": "left"}, HOURS, {"time": 24}),
+    ({"closed": "right"}, HOURS, {}),  # (D-1 00:00, D 00:00]: bins end where chunks start
+    ({"offset": "12h"}, HOURS, {}),
+    ({"origin": "epoch"}, HOURS, {}),
+    ({}, HOURS[1:], {}),  # a block starting at 01:00: chunks from there straddle the days
+    (
+      {},
+      xr.date_range("2013-01-01T01:00", periods=47, freq="h", calendar="noleap", use_cftime=True),
+      {},
+    ),
+  ],
+)
+def test_resampling_needs_bins_starting_at_the_first_stamp(extra, times, multiple):
+  """Chunks start at the block's first stamp: whole bins only if a bin starts there too."""
+  table = {"name": "resample", "time": "1D", "reduce": "mean", **extra}
+  assert needs_for(steps(table), hourly(times)) == Needs(multiple=multiple)
+
+
+def test_sub_daily_bins_may_start_inside_the_day():
+  """Six-hour bins from midnight: a block starting at 06:00 starts on a bin edge, at 01:00 not."""
+  table = {"name": "resample", "time": "6h", "reduce": "mean"}
+  assert needs_for(steps(table), hourly(HOURS[6:])).multiple == {"time": 6}
+  assert needs_for(steps(table), hourly(HOURS[1:])).multiple == {}

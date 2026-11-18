@@ -436,19 +436,39 @@ def _regular_spacing(index: pd.Index) -> pd.Timedelta | None:
   return pd.Timedelta(steps[0]) if len(steps) == 1 else None
 
 
+def _since_midnight(stamp: Any) -> pd.Timedelta:
+  """Time from the midnight of its day to `stamp` (numpy or cftime)."""
+  if isinstance(stamp, np.datetime64):
+    timestamp = pd.Timestamp(stamp)
+    return timestamp - timestamp.normalize()
+  return pd.Timedelta(stamp - stamp.replace(hour=0, minute=0, second=0, microsecond=0))
+
+
+# Arguments of `Dataset.resample` that move the bins away from the day's midnight.
+_SHIFTED_BINS = ("offset", "origin", "base", "loffset")
+
+
 def _resample_needs(
   ds: xr.Dataset, indexer: Mapping[Hashable, Any] | None = None, **kwargs: Any
 ) -> Needs:
   """Chunks of whole bins: a fixed frequency over evenly spaced stamps is a number of steps per
-  bin, and chunk sizes along the dimension are multiples of it (no bin straddles chunks)."""
+  bin, and chunk sizes along the dimension are multiples of it, so that no bin straddles chunks.
+  Only for bins starting at the first stamp (chunks start there): left-closed, from midnight
+  (no offset or origin), the first stamp on a bin edge."""
+  if kwargs.get("closed") == "right" or any(key in kwargs for key in _SHIFTED_BINS):
+    return Needs()
   multiple: dict[Hashable, int] = {}
   for dim, frequency in {**(indexer or {}), **kwargs}.items():
     if dim not in ds.indexes:  # `reduce`, `label`, `closed`...
       continue
+    index = ds.indexes[dim]
     period = _fixed_period(frequency)
-    spacing = _regular_spacing(ds.indexes[dim])
+    spacing = _regular_spacing(index)
     if period is None or spacing is None or spacing <= pd.Timedelta(0):
       logger.debug(f"resample along {dim!r}: bins of no fixed number of steps")
+      continue
+    if _since_midnight(np.asarray(index)[0]) % period != pd.Timedelta(0):
+      logger.debug(f"resample along {dim!r}: the first stamp is not on a bin edge")
       continue
     if period % spacing == pd.Timedelta(0) and period >= spacing:
       multiple[dim] = int(period // spacing)
