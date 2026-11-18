@@ -97,3 +97,20 @@ def test_sin_cos_averages_directions(unit: str):
   assert float(out.mwd_sin[0, 1]) == pytest.approx(1.0) and np.isnan(out.mwd_cos[1, 1])
   assert out.mwd_sin.attrs == {"units": "1", "long_name": "sine of mean wave direction"}
   assert "VMDR" in pu.sin_cos(ds, "VMDR", "s", "c", unit=unit, keep=True)
+
+
+def test_coverage_attrs_come_from_the_coordinates(ocean_ds: xr.Dataset):
+  """The extent attributes follow the coordinates, not what a recipe typed (it said longitudes
+  -180 to 180 over coordinates 0 to 359.75, finding 15)."""
+  ds = ocean_ds.assign_coords(depth=ocean_ds.depth.assign_attrs(units="m", positive="down"))
+  attrs = pu.coverage_attrs(ds, "latitude", "longitude", vertical_dim="depth").attrs
+  assert attrs["geospatial_lat_min"] == -1.75 and attrs["geospatial_lat_max"] == 1.75
+  assert attrs["geospatial_lon_min"] == 0.25 and attrs["geospatial_lon_max"] == 3.75
+  assert attrs["geospatial_lat_resolution"] == "0.5 degree"
+  assert attrs["geospatial_lon_units"] == "degrees_east"
+  assert (attrs["geospatial_vertical_min"], attrs["geospatial_vertical_max"]) == (0.5, 5.0)
+  assert attrs["geospatial_vertical_positive"] == "down"
+  times = ds.time.to_index()
+  assert attrs["time_coverage_start"] == f"{times[0]:%Y-%m-%dT%H:%M:%S}Z"
+  assert attrs["time_coverage_end"] == f"{times[-1]:%Y-%m-%dT%H:%M:%S}Z"
+  assert attrs["time_coverage_resolution"] == "P1D"

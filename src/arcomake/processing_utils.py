@@ -140,6 +140,72 @@ def clip_negative(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
   return ds
 
 
+def _regular_step(values: np.ndarray) -> Any:
+  """The spacing of sorted coordinate values if it is constant, else None."""
+  if values.size < 2:
+    return None
+  steps = np.unique(np.diff(np.sort(values)))
+  return steps[0] if steps.size == 1 else None
+
+
+def _iso_duration(step: np.timedelta64) -> str:
+  """An ISO 8601 duration: P1D, PT3H, or pandas' form for others."""
+  delta = pd.Timedelta(step)
+  if delta % pd.Timedelta("1D") == pd.Timedelta(0):
+    return f"P{delta // pd.Timedelta('1D')}D"
+  if delta % pd.Timedelta("1h") == pd.Timedelta(0):
+    return f"PT{delta // pd.Timedelta('1h')}H"
+  return delta.isoformat()
+
+
+@step
+def coverage_attrs(
+  ds: xr.Dataset,
+  latitude_dim: Hashable = "lat",
+  longitude_dim: Hashable = "lon",
+  vertical_dim: Hashable | None = None,
+  time_dim: Hashable | None = "time",
+) -> xr.Dataset:
+  """Set the ACDD attributes of the dataset's extent from its coordinates.
+
+  `geospatial_lat_*` and `geospatial_lon_*` (min, max, units, and resolution if the spacing is
+  regular), `geospatial_vertical_*` (min, max, and the coordinate's `units` and `positive`) if
+  `vertical_dim` is given, and `time_coverage_start`, `_end` (the first and last stamps) and
+  `_resolution` (an ISO 8601 duration). Attributes typed by hand drift from the data: the
+  arco-ocean recipes said longitudes -180 to 180 over coordinates 0 to 359.75. `download` keeps
+  the first block's `time_coverage_start` when it appends the others::
+
+    name = "coverage_attrs"
+    vertical_dim = "depth"
+  """
+  attrs: dict[str, Any] = {}
+  for dim, axis, units in (
+    (latitude_dim, "lat", "degrees_north"),
+    (longitude_dim, "lon", "degrees_east"),
+  ):
+    values = np.asarray(ds[dim].values, dtype=np.float64)
+    attrs[f"geospatial_{axis}_min"] = round(float(values.min()), 6)
+    attrs[f"geospatial_{axis}_max"] = round(float(values.max()), 6)
+    attrs[f"geospatial_{axis}_units"] = units
+    if (spacing := _regular_step(np.round(values, 6))) is not None:
+      attrs[f"geospatial_{axis}_resolution"] = f"{float(spacing):g} degree"
+  if vertical_dim is not None:
+    vertical = ds[vertical_dim]
+    values = np.asarray(vertical.values, dtype=np.float64)
+    attrs["geospatial_vertical_min"] = round(float(values.min()), 6)
+    attrs["geospatial_vertical_max"] = round(float(values.max()), 6)
+    for key in ("units", "positive"):
+      if key in vertical.attrs:
+        attrs[f"geospatial_vertical_{key}"] = vertical.attrs[key]
+  if time_dim is not None:
+    stamps = pd.DatetimeIndex(ds[time_dim].values)
+    attrs["time_coverage_start"] = f"{stamps.min():%Y-%m-%dT%H:%M:%SZ}"
+    attrs["time_coverage_end"] = f"{stamps.max():%Y-%m-%dT%H:%M:%SZ}"
+    if (spacing := _regular_step(stamps.values)) is not None:
+      attrs["time_coverage_resolution"] = _iso_duration(spacing)
+  return ds.assign_attrs(attrs)
+
+
 @step
 def drop_static_vars(ds: xr.Dataset, time_dim: str = "time") -> xr.Dataset:
   """Drop the data variables without the time dimension (masks, bathymetry...)."""

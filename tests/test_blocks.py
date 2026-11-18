@@ -79,6 +79,18 @@ def test_a_failed_block_keeps_those_before_it(
   xr.testing.assert_identical(open_output(output).load(), open_output(clean).load())
 
 
+def test_appended_blocks_keep_the_start_of_the_coverage(recipe, tmp_path: pathlib.Path):
+  """xarray replaces a store's attributes with each appended block's: the output still starts
+  where the first block did (`time_coverage_start`), and ends where the last does."""
+  recipe.write_text(recipe.read_text() + '\n[[postprocess]]\nname = "coverage_attrs"\n')
+  output = tmp_path / "out.zarr"
+  result = run(recipe, output)
+  assert result.exit_code == 0, result.output
+  attrs = open_output(output).attrs
+  assert attrs["time_coverage_start"] == "2020-02-26T00:00:00Z"
+  assert attrs["time_coverage_end"] == "2020-03-01T00:00:00Z"
+
+
 def test_blocks_option_is_gone(recipe, tmp_path: pathlib.Path):
   """`--blocks N` was removed: a block twice as long is faster, with less memory."""
   result = run(recipe, tmp_path / "out.zarr", "--blocks", "2")

@@ -13,6 +13,7 @@ from typing import Any, Self, get_args, override
 
 import click
 import xarray as xr
+import zarr
 from dask.diagnostics import ProgressBar
 from dask.utils import format_bytes
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -454,6 +455,8 @@ def _write_block(
     _processed_block(configs, date_interval, progress=progress, budget=budget) as dataset,
     ProgressBar() if progress else nullcontext(),
   ):
+    if not first:
+      dataset = _with_first_block_attrs(dataset, run, configs.save.group)
     write_output(
       dataset,
       run,
@@ -465,6 +468,21 @@ def _write_block(
       # Chunks are planned for reading; the stored layout is the recipe's.
       align_chunks=True,
     )
+
+
+# Global attributes saying where the output starts: xarray replaces a store's attributes with
+# each appended block's, so an appended block takes them from the output (first block's).
+FROM_FIRST_BLOCK = ("time_coverage_start",)
+
+
+def _with_first_block_attrs(dataset: xr.Dataset, run: icechunk_utils.Run, group: str | None):
+  """`dataset` with the `FROM_FIRST_BLOCK` attributes it has set to those of the run's output."""
+  if not any(key in dataset.attrs for key in FROM_FIRST_BLOCK):
+    return dataset
+  store = run.repo.readonly_session(branch=run.branch).store
+  stored = zarr.open_group(store, path=group or "", mode="r").attrs
+  kept = {key: stored[key] for key in FROM_FIRST_BLOCK if key in dataset.attrs and key in stored}
+  return dataset.assign_attrs(kept)
 
 
 def _committed(run: icechunk_utils.Run, interval: DateInterval) -> bool:
