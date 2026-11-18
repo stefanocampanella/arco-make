@@ -860,3 +860,71 @@ more than 1.5× faster anyway (two rounds instead of three). Two processes each 
 (16 Nov), but two blocks in one process do not: they share its Dask thread pool, the GIL, the
 HDF5 lock and the Copernicus Marine connection pool. Which of these limits it is for the
 performance pass; until then, expect about 5 days per resolution with `--blocks 2`, not 3–3.5.
+
+## 2026-11-18: group 8, chunks planned instead of set by recipes
+
+Download recipes set 21 chunk sizes by hand (part `chunks`, regrid `output_chunks`, `chunk`
+steps), tuned by trial and error for one machine. They are now refused at load, and each dataset
+of each block (or checkpointed sub-block) is chunked by `chunk_plan.plan`:
+- **Shapes.** The plan uses the shapes and dtypes of the variables the dataset's first selection
+  steps keep.
+- **What the steps need (`Needs`).** Whole latitude and longitude for `regrid`. Whole bins for
+  `resample`, when its bins start at the block's start. For `get_bottom`, the whole depth: it
+  counts when sizing that step's tasks.
+- **Source chunks.** The plan prefers multiples of the sources' stored chunks.
+- **A memory budget.** `--memory-limit`, `ARCOMAKE_MEMORY_LIMIT`, or what the process may use,
+  shared among threads and blocks. Each task holds about 4 chunks, and chunks aim at Dask's
+  `array.chunk-size` at most.
+
+Space stays whole unless one step is above the target; then outer dimensions are split, and time
+grows in whole bins. Writes (output and checkpoints) align Dask chunks to the stored ones
+(xarray's `align_chunks`). `download --plan` prints the plan without computing. Download recipes
+must give `[save] chunks`: otherwise the stored chunks would follow the plan, which depends on
+the machine. The recipes' `output_chunks` had no effect: xarray-regrid reads only the entries of
+the regridded dimensions. A high-effort review found ten issues, fixed in six commits, each with
+a test (three checked to fail on the code before).
+
+On the shapes of the 0.25 deg sources, the plan gives the sizes set by hand:
+- ERA5: one day of hourly data;
+- GLORYS: one day and one level (decoded to float64, two levels exceed 128 MiB);
+- WAVERYS: one day of 3-hourly data.
+
+GLORYS `get_bottom` tasks hold a whole column (3.3 GiB, above the 705 MiB per task the budget
+allows on the VM), which is reported as a warning.
+
+Window 30 Dec 2012 – 7 Jan 2013, GloFAS included, one run at a time:
+
+| Run | Code | Blocks | Chunks | Wall time | Peak RSS |
+|---|---|---|---|---|---|
+| t8-b1 (18 Nov, above) | before | 8 x 1 day | by hand | 30:49 | 22.4 GiB |
+| p8-b1 | planner | 8 x 1 day | planned | 35:53 (one block redone) | 23.4 GiB |
+| p8-b2 | planner | 8 x 1 day, `--blocks 2` | planned | 19:00 | 35.1 GiB |
+| o8d-b1 | before | 1 x 8 days | by hand | 7:21 | 101.8 GiB |
+| p8d-b1 | planner | 1 x 8 days | planned | 8:42 | 43.7 GiB |
+| c128-8d | final | 1 x 8 days | planned, 128 MiB | 7:59 | 45.2 GiB |
+| c256-8d | final | 1 x 8 days | planned, 256 MiB | 4:42 | 46.5 GiB |
+| c512-8d | final | 1 x 8 days | planned, 512 MiB | 8:10 | 60.5 GiB |
+| ck1d-8d | final | 1 x 8 days, GLORYS checkpointed daily | planned, 128 MiB | 27:35 | 19.0 GiB |
+
+All data variables are identical bit for bit across the runs. One difference: the `time`
+coordinate is stored in chunks as long as the first block (8, not 1). That depends on the block
+length, not on the planner, and happens with the old code too.
+
+What the figures say (single runs, network noise included):
+- **Block length.** Long blocks are fast. One-day blocks pay fixed costs in each block: 20 s to
+  5 min opening sources, mostly EWDS queueing, and the static masks recomputed for
+  `masked_fill`. They also compute at 100–270 s per day, against about 40 s per day in an 8-day
+  block.
+- **Memory.** It grows with block length. With hand-set chunks, the 8-day block came within a few
+  GB of the VM's 110 GB: GLORYS chunks of 2 days make each `get_bottom` task gather 2 days x 50
+  levels. Planned chunks halve that.
+- **Chunk size.** 256 MiB was the fastest at the same memory; 512 MiB was slower, with more memory.
+- **Checkpointing.** Checkpointing GLORYS per day halves memory but is 3.5x slower: it computes
+  the sub-blocks one after another, and GLORYS no longer overlaps the other sources. The
+  maintainer's direction is to avoid it in production.
+
+Next:
+- a 32-day window with blocks of 8, 16 and 32 days and `--blocks 2`, to choose the production
+  block length (128 days now) and decide whether `--blocks` stays;
+- profiling one 8-day block;
+- one commit per run (Icechunk's `Session.amend`).
