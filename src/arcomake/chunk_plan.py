@@ -101,7 +101,7 @@ class Budget:
     )
 
 
-def _threads() -> int:
+def dask_threads() -> int:
   """Threads of Dask's local scheduler: one for the synchronous one, else `num_workers` or the
   CPUs this process may use."""
   if dask.config.get("scheduler", None) in ("synchronous", "sync", "single-threaded"):
@@ -114,10 +114,10 @@ def detect_budget(memory_limit: int | None = None) -> Budget:
   of physical memory, its cgroup's limit, so a Slurm job's, and its RLIMIT_RSS), shared among
   the threads of Dask's local scheduler."""
   if memory_limit is not None:
-    return Budget(memory_limit, _threads(), "given")
+    return Budget(memory_limit, dask_threads(), "given")
   from distributed.system import MEMORY_LIMIT
 
-  return Budget(MEMORY_LIMIT, _threads(), "detected")
+  return Budget(MEMORY_LIMIT, dask_threads(), "detected")
 
 
 @dataclasses.dataclass(frozen=True)

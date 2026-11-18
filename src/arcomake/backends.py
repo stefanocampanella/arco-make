@@ -19,7 +19,7 @@ import xarray as xr
 from xarray.backends import AbstractDataStore, BackendEntrypoint
 from xarray.core.types import ReadBuffer
 
-from arcomake import hdf5_lock
+from arcomake import chunk_plan, hdf5_lock
 from arcomake.datetime_utils import DateInterval
 from arcomake.temporary_utils import get_current_temp_registry, set_current_temp_registry
 
@@ -36,13 +36,22 @@ def _drop_variables(dataset: xr.Dataset, names: str | Iterable[str] | None) -> x
   return dataset.drop_vars([names] if isinstance(names, str) else list(names), errors="ignore")
 
 
+POOL_VARIABLE = "COPERNICUSMARINE_MAX_POOL_CONNECTIONS"
+
+
 def _copernicusmarine() -> Any:
   """The toolbox, imported at first use, with its log handlers removed.
 
   The toolbox reads some settings (COPERNICUSMARINE_MAX_POOL_CONNECTIONS) when it is imported.
   xarray imports this module whenever it lists its backends, possibly before the settings file
   is applied (library use, tests): importing the toolbox here would fix those settings early.
+
+  Unless set, the pool is as large as Dask's thread count (at least the toolbox's 10): with 10
+  connections for 32 threads, connections were discarded and opened again all the time (TLS
+  handshakes were 29 % of the reading time), and an 8-day block took 37 % longer to compute,
+  with 13 GiB more memory (logbook, 18 Nov 2026).
   """
+  os.environ.setdefault(POOL_VARIABLE, str(max(10, chunk_plan.dask_threads())))
   import copernicusmarine
 
   # Avoid annoying copernicusmarine log handling (its handlers are installed at import).

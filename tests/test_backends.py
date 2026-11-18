@@ -5,6 +5,7 @@
 import calendar
 import functools
 import http.server
+import os
 import pathlib
 import subprocess
 import sys
@@ -114,6 +115,31 @@ def test_listing_the_backends_does_not_import_the_toolbox():
     "sys.exit('copernicusmarine' in sys.modules)"
   )
   assert subprocess.run([sys.executable, "-c", code], check=False).returncode == 0
+
+
+@pytest.mark.parametrize(
+  ("given", "threads", "pool"),
+  [(None, 32, 32), (None, 4, 10), ("12", 32, 12)],
+  ids=["threads", "at-least-the-default", "given-wins"],
+)
+def test_copernicus_marine_pool_follows_dask_threads(given, threads, pool):
+  """Unless set, the toolbox's connection pool is as large as Dask's thread count, never below
+  its own default of 10: with 10 connections for 32 threads, connections were dropped and opened
+  again all the time, and reading took much longer."""
+  code = (
+    "import dask, os, sys\n"
+    "from arcomake import backends\n"
+    f"dask.config.set(scheduler='threads', num_workers={threads})\n"
+    "backends._copernicusmarine()\n"
+    "from copernicusmarine.core_functions import sessions\n"
+    "print(sessions.MAX_POOL_CONNECTIONS)\n"
+  )
+  env = {k: v for k, v in os.environ.items() if k != backends.POOL_VARIABLE}
+  if given is not None:
+    env[backends.POOL_VARIABLE] = given
+  out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+  assert out.returncode == 0, out.stderr
+  assert out.stdout.split()[-1] == str(pool)
 
 
 def test_copernicus_marine_requires_dataset_id():
