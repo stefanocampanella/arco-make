@@ -375,6 +375,7 @@ def _processed_block(
             progress=progress,
             budget=budget,
             name=dataset_name,
+            later_steps=configs.postprocess,
           )
         )
       )

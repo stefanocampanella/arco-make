@@ -3,12 +3,13 @@
 import datetime
 import functools
 import logging
+import math
 import pathlib
 import re
 import shutil
 import tempfile
 import warnings
-from collections.abc import Callable, Generator, Hashable, Mapping
+from collections.abc import Callable, Generator, Hashable, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from typing import Annotated, Any, Literal, Self
 
@@ -569,26 +570,47 @@ def _shift_time(part: xr.Dataset, offset: datetime.timedelta, time_dim: str) -> 
   return part.assign_coords({time_dim: time.copy(data=time.values + np.timedelta64(offset))})
 
 
+def _source_chunks(dataset: xr.Dataset) -> dict[Hashable, int]:
+  """The chunks of the source's storage along each dimension (the least common multiple over the
+  variables), as the backend reports them (`preferred_chunks`)."""
+  chunks: dict[Hashable, int] = {}
+  for var in dataset.data_vars.values():
+    for dim, size in (var.encoding.get("preferred_chunks") or {}).items():
+      if dim in var.dims and isinstance(size, int) and size > 0:
+        chunks[dim] = math.lcm(chunks.get(dim, 1), size)
+  return chunks
+
+
 def _planned(
-  part: xr.Dataset,
-  steps: list[ProcessingStepConfig],
+  parts: list[tuple[str, xr.Dataset]],
+  steps: Sequence[ProcessingStepConfig],
   budget: chunk_plan.Budget,
   *,
   time_dim: str,
-  token: str,
   label: str,
-) -> xr.Dataset:
-  """`part` (the block's slice, not yet chunked) in the chunks `chunk_plan.plan` gives it for
-  `budget` and the needs of the dataset's `steps`. The plan is logged.
-
-  `token` names the Dask arrays: the lazily indexed arrays of a source are not tokenized.
-  """
-  needs = needs_for(steps, part)
-  planned = chunk_plan.plan(chunk_plan.shapes(part), budget, needs, grow_dim=time_dim)
+) -> list[xr.Dataset]:
+  """The parts of a dataset (their block's slices, not yet chunked), each with a token naming
+  its Dask arrays (lazily indexed source arrays are not tokenized), in the chunks
+  `chunk_plan.plan` gives them together, so that merged variables share their chunks: for
+  `budget`, the needs of the `steps` that will process them, and the sources' chunks. The plan
+  is logged."""
+  needs = chunk_plan.Needs()
+  variables: dict[Hashable, chunk_plan.Shape] = {}
+  preferred: dict[Hashable, int] = {}
+  for number, (_, part) in enumerate(parts, start=1):
+    needs = needs.merge(needs_for(steps, part))
+    for name, shape in chunk_plan.shapes(part).items():
+      variables[name if name not in variables else f"{name} (part {number})"] = shape
+    for dim, size in _source_chunks(part).items():
+      preferred[dim] = math.lcm(preferred.get(dim, 1), size)
+  planned = chunk_plan.plan(variables, budget, needs, grow_dim=time_dim, preferred=preferred)
   logger.info(f"{label}: {planned.describe()}")
   for warning in planned.warnings:
     logger.warning(f"{label}: {warning}")
-  return part.chunk(planned.chunks, token=token)
+  return [
+    part.chunk({dim: size for dim, size in planned.chunks.items() if dim in part.dims}, token=token)
+    for token, part in parts
+  ]
 
 
 def download_and_process(
@@ -598,19 +620,21 @@ def download_and_process(
   time_dim: str = "time",
   budget: chunk_plan.Budget | None = None,
   name: str = "dataset",
+  later_steps: Sequence[ProcessingStepConfig] = (),
 ) -> xr.Dataset:
   """The dataset of `configs` over [start, end): its parts read, time-sliced and merged, then its
   steps applied (lazily: computed when written).
 
-  With a `budget`, each part is chunked by `chunk_plan.plan` for its slice of the block and the
-  needs of the dataset's steps; without, it is read as its backend returns it.
+  With a `budget`, the parts are chunked by `chunk_plan.plan` for their slices of the block and
+  the needs of the dataset's steps and of the `later_steps` (the recipe's steps after merging);
+  without, they are read as their backends return them.
   """
   # When downloading from Copernicus Marine Data Store or Climate Data Store, the typical case is a large dataset,
   # spanning a long time period, with several sets of variables in different datasets (bio, phys, etc.),
   # which needs to be downloaded one piece at a time. Hence, `parts` list in the TOML configuration file
   # represents different pieces of the same dataset.
-  parts = []
-  for number, raw_part in enumerate(configs.parts):
+  opened: list[tuple[str, xr.Dataset]] = []
+  for raw_part in configs.parts:
     offset = raw_part.time_offset or datetime.timedelta(0)
     part_conf = raw_part.model_dump(exclude_unset=True, exclude={"time_offset", "timeout"})
     engine = getattr(raw_part, "engine", None) or part_conf.get("engine")
@@ -624,18 +648,14 @@ def download_and_process(
     if offset:
       part = _shift_time(part, offset, time_dim)
     part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
-    if budget is not None:
-      part = _planned(
-        part,
-        configs.postprocess,
-        budget,
-        time_dim=time_dim,
-        token=tokenize(repr(raw_part), start_datetime, end_datetime),
-        label=f"{name}, part {number + 1}",
-      )
-    parts.append(part)
-  if not parts:
+    opened.append((tokenize(repr(raw_part), start_datetime, end_datetime), part))
+  if not opened:
     raise ValueError("No parts found in the dataset configuration")
+  if budget is not None:
+    steps = [*configs.postprocess, *later_steps]
+    parts = _planned(opened, steps, budget, time_dim=time_dim, label=name)
+  else:
+    parts = [part for _, part in opened]
   dataset = xr.merge(parts, join="exact")
   assert isinstance(dataset, xr.Dataset)
   if configs.postprocess:
@@ -695,6 +715,7 @@ def maybe_checkpointing_download_and_process(
   progress: bool = True,
   budget: chunk_plan.Budget | None = None,
   name: str = "dataset",
+  later_steps: Sequence[ProcessingStepConfig] = (),
 ) -> xr.Dataset:
   checkpointing_conf = configs.checkpointing
   checkpointing_step = checkpointing_conf.step if checkpointing_conf else None
@@ -706,12 +727,24 @@ def maybe_checkpointing_download_and_process(
 
   if checkpointing_step is None:
     return download_and_process(
-      configs, start_datetime, end_datetime, time_dim=time_dim, budget=budget, name=name
+      configs,
+      start_datetime,
+      end_datetime,
+      time_dim=time_dim,
+      budget=budget,
+      name=name,
+      later_steps=later_steps,
     )
   parsed_step = may_parse_timedelta(checkpointing_step)
   if parsed_step >= end_datetime - start_datetime:
     return download_and_process(
-      configs, start_datetime, end_datetime, time_dim=time_dim, budget=budget, name=name
+      configs,
+      start_datetime,
+      end_datetime,
+      time_dim=time_dim,
+      budget=budget,
+      name=name,
+      later_steps=later_steps,
     )
 
   registry = get_current_temp_registry()
@@ -733,6 +766,7 @@ def maybe_checkpointing_download_and_process(
       time_dim=time_dim,
       budget=budget,
       name=name,
+      later_steps=later_steps,
     ) as downloaded:
       # A copy with its own encodings: the downloaded dataset is left unchanged.
       dataset = _without_zarr2_codecs(downloaded)
@@ -743,11 +777,19 @@ def maybe_checkpointing_download_and_process(
       progress_bar = nullcontext if not progress else ProgressBar
       with progress_bar():
         if is_first_checkpoint:
-          _write_zarr(dataset, str(checkpoint_path), mode="w", consolidated=False)
+          # Planned chunks may straddle the checkpoint's (those of its first write).
+          _write_zarr(
+            dataset, str(checkpoint_path), mode="w", consolidated=False, align_chunks=True
+          )
           is_first_checkpoint = False
         else:
           _write_zarr(
-            dataset, str(checkpoint_path), mode="a-", append_dim=time_dim, consolidated=False
+            dataset,
+            str(checkpoint_path),
+            mode="a-",
+            append_dim=time_dim,
+            consolidated=False,
+            align_chunks=True,
           )
     del dataset
 

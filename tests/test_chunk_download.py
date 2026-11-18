@@ -3,6 +3,7 @@
 """`download` chunks the parts of each block as planned (6.1): without chunk settings, a recipe
 writes the same output as with the sizes set by hand, and the plan follows the memory budget."""
 
+import datetime
 import importlib
 import logging
 import pathlib
@@ -15,6 +16,13 @@ from click.testing import CliRunner, Result
 from pydantic import ValidationError
 
 from arcomake import cli, icechunk_utils
+from arcomake.chunk_plan import Budget
+from arcomake.dataset_utils import (
+  DatasetConfig,
+  download_and_process,
+  maybe_checkpointing_download_and_process,
+)
+from arcomake.processing_utils import ProcessingStepConfig
 from tests.conftest import open_output, render_recipe
 
 
@@ -43,25 +51,25 @@ def array_metadata(path: pathlib.Path) -> dict[str, dict]:
 
 
 def planned_chunks(text: str) -> dict[str, str]:
-  """The chunks logged for each part in its first block: label -> chunks."""
+  """The chunks logged for each dataset in its first block: name -> chunks."""
   plans: dict[str, str] = {}
-  for label, chunks in re.findall(r"(\w+, part \d+): chunks (\{[^}]*\})", text):
+  for label, chunks in re.findall(r"(\w+): chunks (\{[^}]*\})", text):
     plans.setdefault(label, chunks)
   return plans
 
 
 def test_the_plan_does_not_change_the_output(recipe, tmp_path: pathlib.Path, logs):
   """The sample recipe (no chunk sizes) planned for a large and a small budget: same values,
-  attributes and array metadata; each part of each block is planned, and logged."""
+  attributes and array metadata; each dataset of each block is planned, and logged."""
   result = run(recipe, tmp_path / "large.zarr")
   assert result.exit_code == 0, result.output
   plans = planned_chunks(logs.text)
-  assert set(plans) == {"atmosphere, part 1", "ocean, part 1", "ocean_static, part 1"}
-  assert plans["atmosphere, part 1"] == "{time: 48, latitude: 8, longitude: 8}"  # a whole block
+  assert set(plans) == {"atmosphere", "ocean", "ocean_static"}
+  assert plans["atmosphere"] == "{time: 48, latitude: 8, longitude: 8}"  # a whole block
   logs.clear()
   result = run(recipe, tmp_path / "small.zarr", "--memory-limit", "100kB")
   assert result.exit_code == 0, result.output
-  assert planned_chunks(logs.text)["atmosphere, part 1"].startswith("{time: 24,")
+  assert planned_chunks(logs.text)["atmosphere"].startswith("{time: 24,")
   xr.testing.assert_identical(
     open_output(tmp_path / "small.zarr").load(), open_output(tmp_path / "large.zarr").load()
   )
@@ -157,3 +165,56 @@ def test_plan_prints_the_chunks_and_writes_nothing(recipe, tmp_path: pathlib.Pat
     r"  t2m \(time, lat, lon\) float64: chunks \(1, 4, 4\), 128 B each, 2 chunks", result.output
   )
   assert not output.exists()
+
+
+ATMOSPHERE_DAYS = (datetime.datetime(2020, 2, 26), datetime.datetime(2020, 2, 28))
+
+
+def atmosphere(sources: pathlib.Path, **dataset) -> DatasetConfig:
+  part = {"filename_or_obj": str(sources / "atmosphere.zarr"), "engine": "zarr"}
+  return DatasetConfig.model_validate({"parts": [part], **dataset})
+
+
+def test_checkpoints_take_planned_chunks(sources: pathlib.Path):
+  """Daily checkpoints of hourly data planned in chunks of 11 hours (6 kB a task): the second day
+  is appended at hour 24, inside a stored chunk of the first; it is aligned, not refused."""
+  budget = Budget(memory_limit=30_000, threads=1)
+  config = atmosphere(sources, checkpointing={"step": "1D"})
+  with maybe_checkpointing_download_and_process(
+    config, *ATMOSPHERE_DAYS, budget=budget, progress=False
+  ) as dataset:
+    expected = xr.open_zarr(sources / "atmosphere.zarr").sel(time=slice("2020-02-26", "2020-02-27"))
+    xr.testing.assert_equal(dataset.load(), expected.load())
+
+
+def test_steps_after_merging_are_planned_for(sources: pathlib.Path):
+  """A resample in the recipe's steps after merging: the parts are read in whole days (20 kB a
+  task: 39 hours would fit, 24 are a day)."""
+  budget = Budget(memory_limit=100_000, threads=1)
+  resample = ProcessingStepConfig.model_validate(
+    {"name": "resample", "time": "1D", "reduce": "mean"}
+  )
+  alone = download_and_process(atmosphere(sources), *ATMOSPHERE_DAYS, budget=budget)
+  assert alone["t2m"].chunks[0] == (39, 9)
+  dataset = download_and_process(
+    atmosphere(sources), *ATMOSPHERE_DAYS, budget=budget, later_steps=[resample]
+  )
+  assert dataset["t2m"].chunks[0] == (24, 24)
+
+
+def test_parts_of_a_dataset_share_their_chunks(tmp_path: pathlib.Path, sources: pathlib.Path):
+  """A float32 part beside a float64 one on the same axes: planned together, so merged variables
+  have the same chunks (steps combining them would otherwise rechunk)."""
+  source = xr.open_zarr(sources / "atmosphere.zarr")[["t2m"]].astype("float32").rename(t2m="t2")
+  source.drop_encoding().to_zarr(tmp_path / "single.zarr")
+  config = DatasetConfig.model_validate(
+    {
+      "parts": [
+        {"filename_or_obj": str(sources / "atmosphere.zarr"), "engine": "zarr"},
+        {"filename_or_obj": str(tmp_path / "single.zarr"), "engine": "zarr"},
+      ]
+    }
+  )
+  budget = Budget(memory_limit=30_000, threads=1)
+  dataset = download_and_process(config, *ATMOSPHERE_DAYS, budget=budget)
+  assert dataset["t2"].chunks == dataset["t2m"].chunks == dataset["tp"].chunks
