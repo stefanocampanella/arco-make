@@ -72,3 +72,28 @@ def test_assign_and_drop_var_attrs(ocean_ds: xr.Dataset):
   out = pu.drop_var_attrs(ocean_ds, ["thetao"])
   assert out.thetao.attrs == {}
   assert ocean_ds.thetao.attrs == {"units": "degC"}
+
+
+@pytest.mark.parametrize("unit", ["degrees", "radians"])
+def test_sin_cos_averages_directions(unit: str):
+  """Directions of 350 and 10 degrees average to 0 (north) through sine and cosine, where the
+  angles average to 180; missing angles stay missing, and the angle is replaced."""
+  degrees = np.array([[350.0, 10.0], [90.0, np.nan]])
+  angles = degrees if unit == "degrees" else np.deg2rad(degrees)
+  ds = xr.Dataset(
+    {"VMDR": (("time", "x"), angles.T, {"long_name": "mean wave direction"})},
+    coords={"time": [0, 1], "x": [0, 1]},
+  )
+  out = pu.sin_cos(ds, "VMDR", "mwd_sin", "mwd_cos", unit=unit)
+  assert set(out.data_vars) == {"mwd_sin", "mwd_cos"}
+  mean = np.rad2deg(np.arctan2(out.mwd_sin.mean("time"), out.mwd_cos.mean("time")))
+  assert float(mean[0]) == pytest.approx(0.0, abs=1e-9)
+  naive = (
+    float(np.rad2deg(ds.VMDR.isel(x=0).mean()))
+    if unit == "radians"
+    else float(ds.VMDR.isel(x=0).mean())
+  )
+  assert naive == pytest.approx(180.0)  # what averaging the angles gives
+  assert float(out.mwd_sin[0, 1]) == pytest.approx(1.0) and np.isnan(out.mwd_cos[1, 1])
+  assert out.mwd_sin.attrs == {"units": "1", "long_name": "sine of mean wave direction"}
+  assert "VMDR" in pu.sin_cos(ds, "VMDR", "s", "c", unit=unit, keep=True)

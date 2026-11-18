@@ -283,6 +283,36 @@ Keep only the listed data variables (and the coordinates of their dimensions).
 |---|---|---|
 | `variables` | `Iterable[Hashable]` | required |
 
+## `sin_cos`
+
+Replace an angle by its sine and cosine, two ordinary fields to regrid and average.
+
+An angle cannot be averaged as a number: 350 and 10 degrees give 180. Its sine and cosine can,
+and the averaged pair gives the mean direction (`atan2(sin, cos)`) and, by its length (0 to
+1), how steady the direction was. Apply it before any regridding or time mean, e.g. to a mean
+wave direction:
+
+```toml
+name = "sin_cos"
+variable = "VMDR"
+sin_name = "mwd_sin"
+cos_name = "mwd_cos"
+```
+
+Arguments:
+  variable: The angle, in `unit`.
+  sin_name, cos_name: Names of the new variables (units "1"); missing values stay missing.
+  unit: "degrees" or "radians".
+  keep: Keep the angle too (dropped by default).
+
+| Argument | Type | Default |
+|---|---|---|
+| `variable` | `Hashable` | required |
+| `sin_name` | `Hashable` | required |
+| `cos_name` | `Hashable` | required |
+| `unit` | `Literal['degrees', 'radians']` | `'degrees'` |
+| `keep` | `bool` | `False` |
+
 ## `transpose`
 
 Reorder dimensions; other arguments go to `Dataset.transpose` (e.g. `missing_dims`).

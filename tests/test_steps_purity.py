@@ -44,6 +44,7 @@ STEPS = {
   "rescale": {"zos": 2.0},
   "sel": {"latitude": {"start": 0.0, "stop": 1.0}},
   "select_variables": {"variables": ["zos"]},
+  "sin_cos": {"variable": "zos", "sin_name": "zs", "cos_name": "zc"},
   "transpose": {"dims": ["longitude", "latitude", "depth", "time"]},
 }
 

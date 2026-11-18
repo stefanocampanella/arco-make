@@ -528,6 +528,49 @@ def select_variables(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Datase
 
 
 @step
+def sin_cos(
+  ds: xr.Dataset,
+  variable: Hashable,
+  sin_name: Hashable,
+  cos_name: Hashable,
+  unit: Literal["degrees", "radians"] = "degrees",
+  keep: bool = False,
+) -> xr.Dataset:
+  """Replace an angle by its sine and cosine, two ordinary fields to regrid and average.
+
+  An angle cannot be averaged as a number: 350 and 10 degrees give 180. Its sine and cosine can,
+  and the averaged pair gives the mean direction (`atan2(sin, cos)`) and, by its length (0 to
+  1), how steady the direction was. Apply it before any regridding or time mean, e.g. to a mean
+  wave direction::
+
+    name = "sin_cos"
+    variable = "VMDR"
+    sin_name = "mwd_sin"
+    cos_name = "mwd_cos"
+
+  Arguments:
+    variable: The angle, in `unit`.
+    sin_name, cos_name: Names of the new variables (units "1"); missing values stay missing.
+    unit: "degrees" or "radians".
+    keep: Keep the angle too (dropped by default).
+  """
+  angle = ds[variable]
+  radians = angle * (np.pi / 180.0) if unit == "degrees" else angle
+  described = angle.attrs.get("long_name", str(variable))
+  components = {
+    sin_name: xr.apply_ufunc(np.sin, radians, dask="allowed").assign_attrs(
+      units="1", long_name=f"sine of {described}"
+    ),
+    cos_name: xr.apply_ufunc(np.cos, radians, dask="allowed").assign_attrs(
+      units="1", long_name=f"cosine of {described}"
+    ),
+  }
+  for component in components.values():
+    component.encoding = {}
+  return (ds if keep else ds.drop_vars([variable])).assign(components)
+
+
+@step
 def transpose(ds: xr.Dataset, dims: Iterable[Hashable], **kwargs: Any) -> xr.Dataset:
   """Reorder dimensions; other arguments go to `Dataset.transpose` (e.g. `missing_dims`)."""
   return ds.transpose(*dims, **kwargs)
