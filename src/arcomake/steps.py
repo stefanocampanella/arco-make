@@ -9,21 +9,33 @@ A step is either a function of `arcomake.processing_utils` registered with `@ste
 
 Recipes are checked when they are loaded: an unknown step, an unknown argument, a missing
 argument or an argument of the wrong type is an error before any data is read.
+
+A step may declare what it needs from the chunks of its input (`@step(needs=...)`, a function of
+the dataset and the step's arguments returning `chunk_plan.Needs`): `download` plans the chunks
+of each dataset's parts to meet the needs of its steps (`needs_for`).
 """
 
 import difflib
 import inspect
+import logging
 import types
-from collections.abc import Callable, Hashable, Mapping
-from typing import Any, Literal, Union, get_args, get_origin
+from collections.abc import Callable, Hashable, Iterable, Mapping
+from typing import Any, Literal, Union, get_args, get_origin, overload
 
 import xarray as xr
-from pydantic import ConfigDict, TypeAdapter
+from pydantic import BaseModel, ConfigDict, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
+from arcomake.chunk_plan import Needs
+
+logger = logging.getLogger(__name__)
+
 StepFunction = Callable[..., xr.Dataset]
+# What a step needs from the chunks of its input: `needs(dataset, **arguments)`.
+NeedsFunction = Callable[..., Needs]
 
 _REGISTRY: dict[str, StepFunction] = {}
+_NEEDS: dict[str, NeedsFunction] = {}
 
 # `xarray.Dataset` methods usable as steps. Extend deliberately: each name is part of the recipe
 # language.
@@ -44,15 +56,51 @@ DATASET_METHODS: frozenset[str] = frozenset(
 _TYPE_CONFIG = ConfigDict(arbitrary_types_allowed=True)
 
 
-def step[F: StepFunction](function: F) -> F:
-  """Register a function of `processing_utils` as a recipe step, under its own name."""
-  name = getattr(function, "__name__", None)
-  if not isinstance(name, str):
-    raise TypeError(f"Steps must be named functions, got {function!r}")
-  if name in _REGISTRY:
-    raise ValueError(f"Step {name!r} is already registered")
-  _REGISTRY[name] = function
-  return function
+@overload
+def step[F: StepFunction](function: F, /) -> F: ...
+@overload
+def step[F: StepFunction](*, needs: NeedsFunction) -> Callable[[F], F]: ...
+def step[F: StepFunction](
+  function: F | None = None, /, *, needs: NeedsFunction | None = None
+) -> F | Callable[[F], F]:
+  """Register a function of `processing_utils` as a recipe step, under its own name:
+  `@step`, or `@step(needs=...)` for a step that declares what it needs from its input's chunks.
+  """
+
+  def register(function: F) -> F:
+    name = getattr(function, "__name__", None)
+    if not isinstance(name, str):
+      raise TypeError(f"Steps must be named functions, got {function!r}")
+    if name in _REGISTRY:
+      raise ValueError(f"Step {name!r} is already registered")
+    _REGISTRY[name] = function
+    if needs is not None:
+      _NEEDS[name] = needs
+    return function
+
+  return register(function) if function is not None else register
+
+
+def needs_for(steps: Iterable[BaseModel], dataset: xr.Dataset) -> Needs:
+  """What `steps` (recipe steps, `ProcessingStepConfig`) need from the chunks of `dataset`, the
+  input of the first: the needs of every step that declares some, evaluated on `dataset`.
+
+  A hint for planning chunks, not a requirement: steps work on any chunks. Needs on dimensions
+  `dataset` lacks (renamed by an earlier step, say) are left to the planner, which ignores them;
+  a step whose needs cannot be evaluated on `dataset` is skipped (logged).
+  """
+  needs = Needs()
+  for config in steps:
+    arguments = config.model_dump(exclude_unset=True)
+    name = arguments.pop("name")
+    function = _NEEDS.get(name)
+    if function is None:
+      continue
+    try:
+      needs = needs.merge(function(dataset, **arguments))
+    except (KeyError, ValueError, TypeError) as error:
+      logger.debug(f"Needs of step {name!r} not evaluated on the opened data: {error!r}")
+  return needs
 
 
 def registered_steps() -> dict[str, StepFunction]:
