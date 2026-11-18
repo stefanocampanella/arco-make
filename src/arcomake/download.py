@@ -21,7 +21,7 @@ from typing import Self, get_args, override
 import click
 import xarray as xr
 from dask.diagnostics import ProgressBar
-from dask.utils import format_bytes, parse_bytes
+from dask.utils import format_bytes
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from arcomake import icechunk_utils
@@ -47,6 +47,7 @@ from arcomake.dataset_utils import (
 from arcomake.datetime_utils import DateInterval, IterableDateInterval, may_parse_timedelta
 from arcomake.processing_utils import ProcessingStepConfig
 from arcomake.retries import RetryConfig, with_retries
+from arcomake.settings import parse_memory
 from arcomake.temporary_utils import TempDirectoryRegistry, get_current_temp_registry
 
 logger = logging.getLogger(__name__)
@@ -62,12 +63,9 @@ class Memory(click.ParamType[int]):
     if isinstance(value, int):
       return value
     try:
-      amount = parse_bytes(value)
-    except (ValueError, TypeError):
-      amount = 0
-    if amount <= 0:
-      self.fail(f"{value!r} is not an amount of memory (e.g. 100GB, 80GiB)", param, ctx)
-    return amount
+      return parse_memory(value)
+    except ValueError as error:
+      self.fail(f"{value!r} is {error}", param, ctx)
 
 
 class DownloadConfig(BaseModel):

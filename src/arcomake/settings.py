@@ -40,6 +40,21 @@ DEFAULT_PATH = pathlib.Path("~/.arcomakerc")
 ENV_VAR = "ARCOMAKE_RC"
 
 
+def parse_memory(value: str) -> int:
+  """An amount of memory as Dask writes them ("100GB", "80GiB", "2e9"), in bytes.
+
+  Raises:
+    ValueError: if `value` is not a positive amount.
+  """
+  try:
+    amount = parse_bytes(value)
+  except (ValueError, TypeError):
+    amount = 0
+  if amount <= 0:
+    raise ValueError("not an amount of memory (e.g. 100GB, 80GiB)")
+  return amount
+
+
 class SettingsError(Exception):
   """Invalid settings; the message names the variables, never their values."""
 
@@ -103,11 +118,7 @@ class ArcoMakeSettings(BaseSettings):
   @classmethod
   def _bytes(cls, value: str | None) -> str | None:
     if value is not None:
-      try:
-        if parse_bytes(value) <= 0:
-          raise ValueError
-      except (ValueError, TypeError):
-        raise ValueError("not an amount of memory (e.g. 100GB, 80GiB)") from None
+      parse_memory(value)
     return value
 
   @field_validator("tmpdir")
