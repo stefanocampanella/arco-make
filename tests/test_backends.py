@@ -58,11 +58,13 @@ def _ewds_answers(requests: list[dict]) -> list[xr.Dataset]:
   return answers
 
 
-def test_ewds_days_outside_the_interval_are_dropped(
-  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("accepted", [True, False], ids=["one-request", "refused-per-month"])
+def test_ewds_requests_spanning_months(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, accepted: bool
 ):
   """Days 20 Jan to 21 Feb are requested as January and February x days 1-31, which brings all
-  of both months: only the interval's days are returned, from one request."""
+  of both months: only the interval's days are returned. If the service's cost estimate refuses
+  that request (unpublished dates, too many fields), one exact request per month is made."""
   made: list[dict] = []
 
   def answer(self, name, requests, **kwargs):
@@ -70,6 +72,10 @@ def test_ewds_days_outside_the_interval_are_dropped(
     return _ewds_answers(list(requests))
 
   monkeypatch.setattr(EarlyWarningDataStore, "_process_requests", answer)
+  monkeypatch.setattr(EarlyWarningDataStore, "_accepted", staticmethod(lambda *a: accepted))
+  monkeypatch.setattr(
+    EarlyWarningDataStore, "get_cdsapi_client", staticmethod(lambda **kwargs: object())
+  )
   with TempDirectoryRegistry(base_dir=tmp_path):
     out = EarlyWarningDataStore().open_dataset(
       "ewds://cems-glofas-historical",
@@ -81,9 +87,69 @@ def test_ewds_days_outside_the_interval_are_dropped(
       timespan="t",
       variable="dis",
     )
-  assert len(made) == 1
+  if accepted:
+    assert [(r["month"], len(r["day"])) for r in made] == [(["01", "02"], 31)]
+  else:
+    assert [(r["month"], r["day"][0], r["day"][-1]) for r in made] == [
+      (["01"], "20", "31"),
+      (["02"], "01", "21"),
+    ]
   days = out["time"].values.astype("datetime64[D]")
   assert days.tolist() == np.arange("2020-01-20", "2020-02-22", dtype="datetime64[D]").tolist()
+
+
+def test_ewds_days_left_out_fail_the_block(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+  """A request mixing published and unpublished months is valid (checked on 18 Nov 2026), and
+  the service leaves the unpublished days out: the block fails, naming them."""
+
+  def answer(self, name, requests, **kwargs):
+    return [a.isel(time=slice(0, -3)) for a in _ewds_answers(list(requests))]
+
+  monkeypatch.setattr(EarlyWarningDataStore, "_process_requests", answer)
+  monkeypatch.setattr(EarlyWarningDataStore, "_accepted", staticmethod(lambda *a: True))
+  monkeypatch.setattr(
+    EarlyWarningDataStore, "get_cdsapi_client", staticmethod(lambda **kwargs: object())
+  )
+  with TempDirectoryRegistry(base_dir=tmp_path), pytest.raises(ValueError, match="2020-02-2"):
+    EarlyWarningDataStore().open_dataset(
+      "ewds://cems-glofas-historical",
+      start_datetime=datetime(2020, 1, 20),
+      end_datetime=datetime(2020, 2, 29),
+      system_version="v",
+      hydrological_model="m",
+      product_type="p",
+      timespan="t",
+      variable="dis",
+    )
+
+
+@pytest.mark.parametrize(
+  ("costs", "accepted"),
+  [
+    ({"id": "size", "cost": 59.0, "limit": 500.0}, True),
+    ({"cost": 730.0, "limit": 500.0}, False),
+    ({"cost": 30.0, "limit": 500.0, "request_is_valid": False, "invalid_reason": "no data"}, False),
+    (RuntimeError("unreachable"), False),
+    (None, False),  # an older cdsapi client: no cost estimates
+  ],
+  ids=["valid", "above-the-limit", "unpublished-dates", "estimate-fails", "no-estimates"],
+)
+def test_ewds_cost_estimate_decides(costs, accepted):
+  """The answers of the service's cost estimate, as measured on 18 Nov 2026 (a year of two
+  variables costs 730 of 500; a month not published yet is not a valid combination)."""
+
+  class Datastores:
+    def estimate_costs(self, name, request):
+      if isinstance(costs, Exception):
+        raise costs
+      return costs
+
+  class Legacy:
+    client = Datastores()
+
+  client = object() if costs is None else Legacy()
+  request = {"year": "2020", "month": ["01", "02"], "day": ["01"]}
+  assert EarlyWarningDataStore._accepted(client, "cems-glofas-historical", request) is accepted
 
 
 def test_cdsapi_client_receives_explicit_url(monkeypatch: pytest.MonkeyPatch):

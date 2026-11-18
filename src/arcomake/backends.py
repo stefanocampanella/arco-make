@@ -228,29 +228,24 @@ class EarlyWarningDataStore(BackendEntrypoint):
     registry = get_current_temp_registry()
     if registry is None:
       raise ValueError("No temporary directory registry available.")
-    dates_by_year = self._dates_by_year(start_datetime, end_datetime)
-
-    requests = [
-      {
-        "system_version": [system_version],
-        "hydrological_model": [hydrological_model],
-        "product_type": [product_type],
-        "timespan": [timespan],
-        "variable": [variable] if isinstance(variable, str) else variable,
-        **self._year_request(dates),
-        "data_format": "grib2",
-        "download_format": "zip",
-      }
-      for dates in dates_by_year
-    ]
-
+    base = {
+      "system_version": [system_version],
+      "hydrological_model": [hydrological_model],
+      "product_type": [product_type],
+      "timespan": [timespan],
+      "variable": [variable] if isinstance(variable, str) else variable,
+      "data_format": "grib2",
+      "download_format": "zip",
+    }
     client_options = {} if timeout is None else {"timeout": timeout}
+    groups = self._request_groups(dataset_name, base, start_datetime, end_datetime, client_options)
+    requests = [base | self._year_request(dates) for dates in groups]
     raw_datasets = self._process_requests(
       dataset_name, requests, max_workers=max_workers, **client_options
     )
 
     datasets: list[xr.Dataset] = []
-    for dates, dataset in zip(dates_by_year, raw_datasets, strict=True):
+    for dates, dataset in zip(groups, raw_datasets, strict=True):
       # TODO:
       #  Unfortunately, it was impossible to get documentation on `valid_time` for historical GLOFAS data, hence
       #  the provider documentation should clarify the difference between the two, e.g., if renaming the time
@@ -265,14 +260,69 @@ class EarlyWarningDataStore(BackendEntrypoint):
         dataset = dataset.expand_dims(dim=time_dim, axis=0)
         dataset = dataset.assign_coords({time_dim: dates})
       else:  # the request's months x days: keep only the interval's days
-        wanted = np.isin(
-          dataset[time_dim].values.astype("datetime64[D]"),
-          np.array([date.date() for date in dates], dtype="datetime64[D]"),
-        )
-        dataset = dataset.isel({time_dim: wanted})
+        given = dataset[time_dim].values.astype("datetime64[D]")
+        wanted = np.array([date.date() for date in dates], dtype="datetime64[D]")
+        if missing := sorted(set(wanted.tolist()) - set(given.tolist())):
+          # The service leaves out dates not published yet, if others of the request are.
+          raise ValueError(
+            f"EWDS gave no data for {len(missing)} day(s) of {dataset_name}, from {missing[0]}"
+            f" to {missing[-1]}: not published yet?"
+          )
+        dataset = dataset.isel({time_dim: np.isin(given, wanted)})
       datasets.append(dataset)
 
     return _drop_variables(xr.concat(datasets, dim=time_dim), drop_variables)
+
+  def _request_groups(
+    self,
+    dataset_name: str,
+    base: dict[str, Any],
+    start_datetime: datetime.datetime,
+    end_datetime: datetime.datetime,
+    client_options: dict[str, Any],
+  ) -> list[list[datetime.datetime]]:
+    """The interval's days, one group per request: per year (see `_dates_by_year`) where the
+    service accepts the request, else per month, as exact as before.
+
+    A request over several months asks for every date of its months x days: the service refuses
+    it whole if some are not published yet (near the end of the record), and refuses requests
+    above its limit (500 fields: days x variables, so a year of two variables). Its cost
+    estimate tells, before any wait in the queue.
+    """
+    groups: list[list[datetime.datetime]] = []
+    client = None
+    for dates in self._dates_by_year(start_datetime, end_datetime):
+      months = [list(g) for _, g in itertools.groupby(dates, key=lambda day: day.month)]
+      if len(months) > 1:
+        client = client or self.get_cdsapi_client(
+          progress=False, client_logger=self.client_logger, **client_options
+        )
+        if not self._accepted(client, dataset_name, base | self._year_request(dates)):
+          groups.extend(months)
+          continue
+      groups.append(dates)
+    return groups
+
+  @staticmethod
+  def _accepted(client: Any, dataset_name: str, request: dict[str, Any]) -> bool:
+    """Whether the service's cost estimate accepts `request` (valid, within the limit). False if
+    the estimate is unavailable (an older client, an error): requests per month then, as before."""
+    datastores = getattr(client, "client", None)  # the legacy cdsapi client's datastores client
+    if datastores is None:
+      return False
+    try:
+      costs = datastores.estimate_costs(dataset_name, request)
+    except Exception as error:
+      logger.warning(f"EWDS cost estimate failed ({error}): one request per month")
+      return False
+    accepted = costs.get("request_is_valid", True) and costs["cost"] <= costs["limit"]
+    if not accepted:
+      reason = str(costs.get("invalid_reason") or f"cost {costs['cost']} > {costs['limit']}")
+      logger.info(
+        f"EWDS refuses {request['year']} in one request ({reason.splitlines()[0]}):"
+        " one request per month"
+      )
+    return bool(accepted)
 
   @staticmethod
   def _dates_by_year(
@@ -283,7 +333,6 @@ class EarlyWarningDataStore(BackendEntrypoint):
 
     The EWDS runs one request of a user at a time, about two minutes apart (measured 18 Nov
     2026): a request per month cost a 32-day block, usually spanning two months, an extra wait.
-    A request of up to a year stays within the service's limit of 500 days of GloFAS.
     """
     days = DateInterval(start=start_datetime, end=end_datetime).to_list(
       freq=datetime.timedelta(days=1)
