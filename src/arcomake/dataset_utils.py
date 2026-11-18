@@ -138,7 +138,7 @@ class PartStaticTime(BaseModel):
 
   For fields constant in time that a source stores as a time series, e.g. ERA5's geopotential at
   the surface and land-sea mask: one field instead of every step of every block, the same in
-  every block, and none of the glitches some steps have (finding 4). Give such variables a part
+  every block, and none of the glitches some steps have. Give such variables a part
   of their own (the time-varying ones of the same source in another part). The instant must be a
   stamp of the source (after `time_offset`, if any).
   """

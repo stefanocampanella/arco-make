@@ -87,7 +87,7 @@ def ensure_no_nans(
         warnings.warn(f"Variable {variable_name} not found in dataset")
 
   # Missing values inside the masks, counted per time step in one computation, not two per day
-  # and variable (11,322 days in the published dataset, S3).
+  # and variable: a check over decades looped over thousands of days.
   counts: dict[Hashable, xr.DataArray] = {}
   for variable_name, da in dataset.data_vars.items():
     invalid = da.isnull()
