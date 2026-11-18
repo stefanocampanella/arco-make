@@ -56,7 +56,7 @@ from dask.graph_manipulation import bind
 from icechunk.xarray import to_icechunk
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from arcomake import icechunk_utils
+from arcomake import icechunk_utils, sharding
 from arcomake.cli_utils import (
   check_aws_profile,
   check_destination,
@@ -816,7 +816,8 @@ def _compute_by_series(
       result = result.drop_vars(
         [name for name, var in result.variables.items() if not set(var.dims) & set(region)]
       )
-      to_icechunk(result, session, region=region, mode="r+")
+      with sharding.write_order(save.shard_order):  # arrays opened here: shards in that order
+        to_icechunk(result, session, region=region, mode="r+")
     logger.info(f"{label} written in {time.monotonic() - writing:.0f} s")
 
   series = _series(dataset, configs.split_dims)

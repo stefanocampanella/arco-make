@@ -28,6 +28,8 @@ import icechunk
 import xarray as xr
 from icechunk.xarray import to_icechunk
 
+from arcomake import sharding
+
 logger = logging.getLogger(__name__)
 
 BRANCH = "main"
@@ -211,6 +213,7 @@ def write(
   retention: "Retention | None" = None,
   command: str = "write",
   align_chunks: bool = False,
+  shard_order: sharding.ShardOrder = sharding.DEFAULT,
 ) -> str:
   """Write `dataset` in a run of `command` of a single commit (see `Run`); return the new tip of
   `main`.
@@ -226,6 +229,7 @@ def write(
     append_dim=append_dim,
     group=group,
     align_chunks=align_chunks,
+    shard_order=shard_order,
   )
   return run.finish(retention)
 
@@ -361,14 +365,23 @@ class Run:
     group: str | None = None,
     metadata: Mapping[str, Any] | None = None,
     align_chunks: bool = False,
+    shard_order: sharding.ShardOrder = sharding.DEFAULT,
   ) -> str:
     """Write `dataset` (its variables' encodings set the layout) in one commit of the run. With
     `align_chunks`, Dask chunks that straddle stored chunks are rechunked to fit them (xarray's,
-    region-aware: an append may start inside a chunk); else such chunks fail the write."""
+    region-aware: an append may start inside a chunk); else such chunks fail the write.
+    `shard_order`: the order of the chunks inside shards (see `sharding`)."""
     session = self.session()
-    to_icechunk(
-      dataset, session, mode=mode, append_dim=append_dim, group=group, align_chunks=align_chunks
-    )
+    with sharding.write_order(shard_order):
+      if sharding.creates_arrays(shard_order, mode):
+        # Metadata first: values written into arrays zarr opens follow the order.
+        dataset.to_zarr(
+          session.store, mode=mode, group=group, compute=False, consolidated=False, zarr_format=3
+        )
+        mode = "r+"
+      to_icechunk(
+        dataset, session, mode=mode, append_dim=append_dim, group=group, align_chunks=align_chunks
+      )
     return self.commit(session, message, metadata)
 
   def last_block(self) -> str | None:

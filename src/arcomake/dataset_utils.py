@@ -29,7 +29,7 @@ from zarr.abc.codec import ArrayArrayCodec, ArrayBytesCodec, BytesBytesCodec
 from zarr.errors import ZarrUserWarning
 from zarr.registry import get_codec_class
 
-from arcomake import chunk_plan, hdf5_lock, icechunk_utils
+from arcomake import chunk_plan, hdf5_lock, icechunk_utils, sharding
 from arcomake.datetime_utils import (
   IterableDateInterval,
   may_parse_timedelta,
@@ -372,12 +372,17 @@ class SaveConfig(BaseModel):
   object each (Zarr v3 sharding), in the same form as `chunks`: per dimension (-1, or a dimension
   not listed: the whole dimension), one size per dimension, or one size for all. Without
   `shards`, every chunk is an object. Dask chunks may not straddle shards when writing.
+  `shard_order` is the physical order of the chunks inside a shard (see `sharding`): zarr's
+  "morton" by default; "lexicographic" puts the chunks of one step of the first dimension next to
+  each other (with time first, a day's whole depth profile), "colexicographic" those of one step
+  of the last.
   """
 
   model_config = ConfigDict(extra="forbid")
 
   chunks: StoredChunksConfig | None = None
   shards: StoredChunksConfig | None = None
+  shard_order: sharding.ShardOrder = sharding.DEFAULT
   # Compressors of the data variables; without them, zarr's default (zstd).
   compressors: CompressorsConfig | None = None
   encoding: dict[str, VariableEncodingConfig] | None = None
@@ -397,6 +402,12 @@ class SaveConfig(BaseModel):
     if not isinstance(value, str) or not re.search(r"[A-Za-z]", value):
       raise ValueError('keep_history is a duration with its unit, e.g. "30D"')
     return may_parse_timedelta(value)
+
+  @model_validator(mode="after")
+  def _order_needs_shards(self) -> "SaveConfig":
+    if self.shard_order != sharding.DEFAULT and self.shards is None:
+      raise ValueError("shard_order orders the chunks inside shards: give [save] shards")
+    return self
 
   @model_validator(mode="after")
   def _one_retention(self) -> "SaveConfig":
@@ -934,6 +945,7 @@ def write_output(
   """
   configs = configs or SaveConfig()
   prepared = prepare_for_writing(dataset, configs)
+  _warn_distributed_order(configs)
   if isinstance(destination, icechunk_utils.Run):
     logger.info(f"Writing to {destination.path} ({message}) with {configs}")
     return destination.write(
@@ -944,6 +956,7 @@ def write_output(
       group=configs.group,
       metadata=metadata,
       align_chunks=align_chunks,
+      shard_order=configs.shard_order,
     )
   path = _check_output_path(destination)
   logger.info(f"Writing to {path} ({message}) with {configs}")
@@ -958,6 +971,7 @@ def write_output(
     retention=configs.retention(),
     command=command,
     align_chunks=align_chunks,
+    shard_order=configs.shard_order,
   )
 
 
@@ -972,20 +986,32 @@ def _distributed_client() -> bool:
   return True
 
 
+def _warn_distributed_order(configs: SaveConfig) -> None:
+  """`[save] shard_order` is set in this process (zarr's configuration): a distributed client's
+  workers write in zarr's default order."""
+  if configs.shard_order != sharding.DEFAULT and _distributed_client():
+    logger.warning(
+      f"shard_order {configs.shard_order!r} applies to writes in this process: the workers of a"
+      f" distributed client write shards in zarr's default order ({sharding.DEFAULT})"
+    )
+
+
 def write_into_session(
   dataset: xr.Dataset, session: Any, configs: SaveConfig, *, compute: bool = True
 ) -> Delayed | None:
   """Write `dataset` (with the layout of `[save]`) into a writable Icechunk session, from this
   process: its threads may write, but no other process or worker (their writes would not reach
-  the session). With `compute=False`, only the metadata are written; returns the data's task."""
-  written = prepare_for_writing(dataset, configs).to_zarr(
-    session.store,
-    mode="w",
-    compute=compute,
-    consolidated=False,
-    zarr_format=3,
-    group=configs.group,
-  )
+  the session). With `compute=False`, only the metadata are written; returns the data's task
+  (with a `shard_order` other than zarr's, its arrays write their shards in that order)."""
+  prepared = prepare_for_writing(dataset, configs)
+  options: dict[str, Any] = {"consolidated": False, "zarr_format": 3, "group": configs.group}
+  with sharding.write_order(configs.shard_order):
+    if sharding.creates_arrays(configs.shard_order, "w"):
+      # Metadata first: values written into arrays zarr opens follow the order.
+      prepared.to_zarr(session.store, mode="w", compute=False, **options)
+      written = prepared.to_zarr(session.store, mode="r+", compute=compute, **options)
+    else:
+      written = prepared.to_zarr(session.store, mode="w", compute=compute, **options)
   return written if isinstance(written, Delayed) else None
 
 
@@ -1034,7 +1060,7 @@ def write_outputs_together(
       session = run.session()
       writes.append(write_into_session(dataset, session, configs, compute=False))
       sessions.append(session)
-    with dask.config.set(scheduler=_local_scheduler()):
+    with dask.config.set(scheduler=_local_scheduler()), sharding.write_order(configs.shard_order):
       dask.compute(*writes)
     for run, session in zip(runs, sessions, strict=True):
       run.commit(session, label)
