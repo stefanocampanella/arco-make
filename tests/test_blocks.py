@@ -95,6 +95,17 @@ def test_the_time_coverage_is_the_outputs(recipe, tmp_path: pathlib.Path, step: 
   assert attrs["time_coverage_resolution"] == "P1D"
 
 
+def test_coverage_attrs_belong_after_merging(recipe, tmp_path: pathlib.Path):
+  """Datasets are merged with identical attributes: `coverage_attrs` in a dataset's steps would
+  fail the merge (a checkpointed dataset's coverage is its last sub-block's), so it is refused at
+  load, saying where it goes."""
+  recipe.write_text(
+    recipe.read_text() + '\n[[datasets.ocean.postprocess]]\nname = "coverage_attrs"\n'
+  )
+  result = run(recipe, tmp_path / "out.zarr")
+  assert result.exit_code != 0 and "after merging" in result.output
+
+
 def test_blocks_option_is_gone(recipe, tmp_path: pathlib.Path):
   """`--blocks N` was removed: a block twice as long is faster, with less memory."""
   result = run(recipe, tmp_path / "out.zarr", "--blocks", "2")

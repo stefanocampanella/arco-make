@@ -141,8 +141,9 @@ def clip_negative(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
 
 
 def _regular_step(values: np.ndarray) -> Any:
-  """The spacing of coordinate values if it is constant, else None: exactly for times, within a
-  relative 1e-3 for numbers (a 0.1 or float32 1/12 degree grid is not exact in binary)."""
+  """The spacing of coordinate values if it is constant, else None: exactly for times; for
+  numbers, within the rounding of their own type (a 0.1 degree grid is not exact in binary, and
+  float32 coordinates near 360 are off by about 3e-5)."""
   if values.size < 2:
     return None
   ordered = np.sort(values)
@@ -150,8 +151,11 @@ def _regular_step(values: np.ndarray) -> Any:
   if not np.issubdtype(diffs.dtype, np.floating):
     steps = np.unique(diffs)
     return steps[0] if steps.size == 1 else None
+  ordered = ordered.astype(np.float64)
   step = (ordered[-1] - ordered[0]) / (values.size - 1)
-  return step if step > 0 and np.allclose(diffs, step, rtol=1e-3, atol=0.0) else None
+  rounding = 4 * np.finfo(values.dtype).eps * float(np.abs(ordered).max())
+  tolerance = max(1e-6 * step, rounding)
+  return step if step > 0 and np.all(np.abs(np.diff(ordered) - step) <= tolerance) else None
 
 
 def time_coverage(stamps: Any) -> dict[str, str]:
@@ -192,7 +196,9 @@ def coverage_attrs(
   `vertical_dim` is given, and `time_coverage_start`, `_end` (the first and last stamps) and
   `_resolution` (an ISO 8601 duration). Attributes typed by hand drift from the data, e.g.
   longitudes -180 to 180 over coordinates 0 to 359.75. In `download`, the time coverage is that
-  of the whole output (the stored stamps and the block's), not of the block::
+  of the whole output (the stored stamps and the block's), not of the block. It describes the
+  output: give it in a recipe's steps after merging, not in a dataset's (they are merged with
+  identical attributes)::
 
     name = "coverage_attrs"
     vertical_dim = "depth"
@@ -202,7 +208,7 @@ def coverage_attrs(
     (latitude_dim, "lat", "degrees_north"),
     (longitude_dim, "lon", "degrees_east"),
   ):
-    values = np.asarray(ds[dim].values, dtype=np.float64)
+    values = np.asarray(ds[dim].values)
     attrs[f"geospatial_{axis}_min"] = round(float(values.min()), 6)
     attrs[f"geospatial_{axis}_max"] = round(float(values.max()), 6)
     attrs[f"geospatial_{axis}_units"] = units

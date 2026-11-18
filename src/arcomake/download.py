@@ -469,24 +469,28 @@ def _write_block(
     )
 
 
+# The attributes `processing_utils.time_coverage` computes (a one-stamp output has no resolution).
+TIME_COVERAGE = ("time_coverage_start", "time_coverage_end", "time_coverage_resolution")
+
+
 def _with_output_coverage(
   dataset: xr.Dataset, run: icechunk_utils.Run, group: str | None, time_dim: str, first: bool
 ) -> xr.Dataset:
   """`dataset` with the time coverage of the whole output, if it has one (`coverage_attrs`).
 
-  xarray replaces a store's attributes with each appended block's, and a checkpointed dataset
-  carries its last sub-block's: the coverage is computed here from the output's stamps (those
-  stored on the run's branch, then the block's), for every block.
+  xarray replaces a store's attributes with each appended block's: the coverage is computed here
+  from the output's stamps (those stored on the run's branch, then the block's), for every block.
   """
   if "time_coverage_start" not in dataset.attrs:
     return dataset
   stamps = dataset[time_dim].values
   if not first:
     store = run.repo.readonly_session(branch=run.branch).store
-    stored = xr.open_zarr(store, group=group, consolidated=False)[time_dim].values
-    stamps = np.concatenate([stored, stamps])
-  attrs = {k: v for k, v in dataset.attrs.items() if not k.startswith("time_coverage_")}
-  return dataset.drop_attrs(deep=False).assign_attrs(attrs | time_coverage(stamps))
+    with xr.open_zarr(store, group=group, consolidated=False) as stored:
+      stamps = np.concatenate([stored[time_dim].values, stamps])
+  computed = time_coverage(stamps)
+  attrs = {k: v for k, v in dataset.attrs.items() if k not in TIME_COVERAGE}
+  return dataset.drop_attrs(deep=False).assign_attrs(attrs | computed)
 
 
 def _committed(run: icechunk_utils.Run, interval: DateInterval) -> bool:

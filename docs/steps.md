@@ -76,7 +76,9 @@ regular), `geospatial_vertical_*` (min, max, and the coordinate's `units` and `p
 `vertical_dim` is given, and `time_coverage_start`, `_end` (the first and last stamps) and
 `_resolution` (an ISO 8601 duration). Attributes typed by hand drift from the data, e.g.
 longitudes -180 to 180 over coordinates 0 to 359.75. In `download`, the time coverage is that
-of the whole output (the stored stamps and the block's), not of the block:
+of the whole output (the stored stamps and the block's), not of the block. It describes the
+output: give it in a recipe's steps after merging, not in a dataset's (they are merged with
+identical attributes):
 
 ```toml
 name = "coverage_attrs"

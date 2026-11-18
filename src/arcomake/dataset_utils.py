@@ -594,6 +594,18 @@ class DatasetConfig(BaseModel):
   def _no_chunk_steps(cls, steps: list[ProcessingStepConfig]) -> list[ProcessingStepConfig]:
     return refuse_chunk_steps(steps)
 
+  @field_validator("postprocess")
+  @classmethod
+  def _no_output_attrs(cls, steps: list[ProcessingStepConfig]) -> list[ProcessingStepConfig]:
+    # Datasets are merged with identical attributes: the output's extent belongs after merging.
+    for number, config in enumerate(steps, start=1):
+      if config.name == "coverage_attrs":
+        raise ValueError(
+          f"step {number}: coverage_attrs describes the output: give it in the recipe's"
+          " [[postprocess]], after merging"
+        )
+    return steps
+
 
 # The step lists of a recipe: its own steps (download, process) and each dataset's.
 _STEP_LISTS = ("postprocess", "process")
