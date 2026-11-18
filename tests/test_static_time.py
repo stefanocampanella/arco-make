@@ -81,6 +81,14 @@ def test_static_time_must_be_a_stamp_of_the_source(source: str):
     )
 
 
+def test_static_time_has_no_zone():
+  """The stamps of the sources have no zone: a zoned time is refused, not converted."""
+  with pytest.raises(pydantic.ValidationError, match="without a time zone"):
+    ZarrPartConfig.model_validate(
+      {"filename_or_obj": "x.zarr", "static_time": "2000-01-01T00:00+01:00"}
+    )
+
+
 def test_sources_with_a_time_range_do_not_take_static_time():
   """Copernicus Marine and EWDS parts are read over the block's range: no `static_time`."""
   with pytest.raises(pydantic.ValidationError):

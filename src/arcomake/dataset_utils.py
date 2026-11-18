@@ -145,6 +145,14 @@ class PartStaticTime(BaseModel):
 
   static_time: datetime.datetime | None = None
 
+  @field_validator("static_time")
+  @classmethod
+  def _without_zone(cls, value: datetime.datetime | None) -> datetime.datetime | None:
+    # The sources' stamps have no zone: a zoned time would be converted, to another stamp.
+    if value is not None and value.tzinfo is not None:
+      raise ValueError("static_time is a stamp of the source, without a time zone")
+    return value
+
 
 # Seconds a source may stay silent (no connection, no data) before the request fails. gcsfs
 # waits forever by default (N7): two downloads hung on a read from Google Cloud Storage.
