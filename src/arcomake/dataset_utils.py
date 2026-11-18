@@ -132,6 +132,20 @@ class PartTimeOffset(BaseModel):
     return may_parse_timedelta(value) if isinstance(value, str) else value
 
 
+class PartStaticTime(BaseModel):
+  """`static_time` of a part: its variables are read at this instant, without the time
+  dimension, instead of over each block.
+
+  For fields constant in time that a source stores as a time series, e.g. ERA5's geopotential at
+  the surface and land-sea mask: one field instead of every step of every block, the same in
+  every block, and none of the glitches some steps have (finding 4). Give such variables a part
+  of their own (the time-varying ones of the same source in another part). The instant must be a
+  stamp of the source (after `time_offset`, if any).
+  """
+
+  static_time: datetime.datetime | None = None
+
+
 # Seconds a source may stay silent (no connection, no data) before the request fails. gcsfs
 # waits forever by default (N7): two downloads hung on a read from Google Cloud Storage.
 DEFAULT_TIMEOUT = 120.0
@@ -250,7 +264,7 @@ class CopernicusMarinePartConfig(PartTimeOffset):
   storage_options: dict[str, Any] | None = None
 
 
-class NetCDFOverHTTPPartConfig(PartTimeOffset, PartTimeout):
+class NetCDFOverHTTPPartConfig(PartTimeOffset, PartTimeout, PartStaticTime):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
@@ -288,7 +302,7 @@ class EarlyWarningDataStorePartConfig(PartTimeOffset, PartTimeout):
     return _engine_given_or_implied(data, lambda url: _has_scheme(url, "ewds"))
 
 
-class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout):
+class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout, PartStaticTime):
   """A Zarr part: the arguments of `xarray.open_dataset`, read through a strict store."""
 
   filename_or_obj: str
@@ -300,7 +314,7 @@ class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout):
     return _engine_given_or_implied(data, lambda url: url.rstrip("/").endswith(".zarr"))
 
 
-class GenericPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout):
+class GenericPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout, PartStaticTime):
   """A part read by any other xarray engine, with the arguments of `xarray.open_dataset`."""
 
   filename_or_obj: str
@@ -581,6 +595,17 @@ def _shift_time(part: xr.Dataset, offset: datetime.timedelta, time_dim: str) -> 
   return part.assign_coords({time_dim: time.copy(data=time.values + np.timedelta64(offset))})
 
 
+def _static_at(part: xr.Dataset, instant: datetime.datetime, time_dim: str) -> xr.Dataset:
+  """`part` at `instant`, without the time dimension (`static_time`)."""
+  if time_dim not in part.coords:
+    raise ValueError(f"static_time needs a {time_dim!r} coordinate, which the part lacks")
+  try:
+    static = part.sel({time_dim: np.datetime64(instant, "ns")})
+  except KeyError:
+    raise ValueError(f"static_time {instant} is not a stamp of the part") from None
+  return static.drop_vars(time_dim)
+
+
 def _source_chunks(dataset: xr.Dataset) -> dict[Hashable, int]:
   """The chunks of the source's storage along each dimension (the least common multiple over the
   variables), as the backend reports them (`preferred_chunks`)."""
@@ -666,7 +691,10 @@ def download_and_process(
   opened: list[tuple[str, xr.Dataset]] = []
   for raw_part in configs.parts:
     offset = raw_part.time_offset or datetime.timedelta(0)
-    part_conf = raw_part.model_dump(exclude_unset=True, exclude={"time_offset", "timeout"})
+    static_time = getattr(raw_part, "static_time", None)
+    part_conf = raw_part.model_dump(
+      exclude_unset=True, exclude={"time_offset", "timeout", "static_time"}
+    )
     engine = getattr(raw_part, "engine", None) or part_conf.get("engine")
     if engine is not None:
       part_conf["engine"] = engine
@@ -677,7 +705,10 @@ def download_and_process(
     part = open_input(**part_conf)
     if offset:
       part = _shift_time(part, offset, time_dim)
-    part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
+    if static_time is not None:
+      part = _static_at(part, static_time, time_dim)
+    else:
+      part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
     opened.append((tokenize(repr(raw_part), start_datetime, end_datetime), part))
   if not opened:
     raise ValueError("No parts found in the dataset configuration")

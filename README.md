@@ -124,6 +124,12 @@ accumulations (the value stamped 00:00 covers the last hour of the previous day)
 `time_offset = "-1h"`: the time coordinate is moved before each block is selected, and the part is
 read over the block moved the other way, so that every day holds its own hours.
 
+Fields constant in time that a source stores as a time series (ERA5's geopotential at the surface
+and land-sea mask) take a part of their own with `static_time = 2000-01-01T00:00:00`, a stamp of the
+source: the part is read at that instant, without the time dimension, the same in every block.
+Zarr, NetCDF-over-HTTP and generic parts take it; Copernicus Marine and EWDS parts are read over the
+block's range.
+
 Every request to a source times out: a part's `timeout` (seconds a source may stay silent, default 120)
 applies to Zarr stores on Google Cloud Storage (gcsfs waits forever otherwise), NetCDF files over HTTP
 and EWDS requests, and to Zarr stores on S3 when given (botocore's default is 60 s). Connecting takes
