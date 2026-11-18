@@ -1069,3 +1069,12 @@ the output of an unchanged recipe:
 
 Masking after regridding needs nothing new: `apply_mask` does it; the arco-ocean recipes will use
 it in the Moby-Dick findings PR (NaN outside the masks).
+
+A high-effort review found nine issues, fixed in six commits (tests checked to fail before where
+the fix changes behaviour): the time coverage was per block (no resolution with one-stamp blocks,
+removed by a short last block; a checkpointed dataset's start), now the whole output's; grid
+resolutions of 0.1 and float32 1/12 degree were missing; `[grids]` changed the resume
+fingerprint, and a grid that is not a table raised a traceback; a zoned `static_time` was
+converted; two comments named one dataset's data; `validate` repeated `read_configs`. Its claim
+that `ensure_no_nans` lost an exact join was checked and dropped: variables of one Dataset share
+its indexes, so a variable and its mask cannot be misaligned.
