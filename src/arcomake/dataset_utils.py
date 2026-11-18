@@ -518,7 +518,7 @@ def open_input(filename_or_obj: Any, **kwargs: Any) -> xr.Dataset:
 
 
 # Download recipes give no chunk sizes: they are planned for each block (`chunk_plan`).
-PLANNED_CHUNKS = "chunks are planned for each block (download --memory-limit)"
+PLANNED_CHUNKS = "chunks are planned for each block (download --memory-limit; --plan shows them)"
 
 
 def refuse_chunk_steps(steps: list[ProcessingStepConfig]) -> list[ProcessingStepConfig]:

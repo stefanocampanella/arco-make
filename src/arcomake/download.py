@@ -7,6 +7,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import pathlib
 import shutil
 import threading
@@ -20,7 +21,7 @@ from typing import Self, get_args, override
 import click
 import xarray as xr
 from dask.diagnostics import ProgressBar
-from dask.utils import parse_bytes
+from dask.utils import format_bytes, parse_bytes
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from arcomake import icechunk_utils
@@ -186,6 +187,16 @@ class DownloadConfig(BaseModel):
   default=False,
   is_flag=True,
 )
+@click.option(
+  "--plan",
+  "plan_only",
+  help=(
+    "Print the chunks planned for the first block and exit, without reading data or writing"
+    " OUTPUT_PATH. Sources are opened (EWDS parts download their files to do so)"
+  ),
+  default=False,
+  is_flag=True,
+)
 def download(
   configs_path: str,
   output_path: str,
@@ -198,6 +209,7 @@ def download(
   log_level: str = "info",
   dask_setup: DaskSetupType = "threads",
   progress: bool = False,
+  plan_only: bool = False,
 ):
   """Download, process and merge the datasets of a recipe into one Zarr dataset.
 
@@ -250,6 +262,11 @@ def download(
       *(part.filename_or_obj for part in parts),
       copernicus_marine=any(part.engine == "copernicusmarine" for part in parts),
     )
+    blocks = list(IterableDateInterval(configs.start, configs.end, configs.step))
+    if plan_only:
+      if blocks:
+        _print_plan(configs, blocks[0], budget)
+      return
     # Check the output destination (a failed run waiting there, or an existing version), then
     # start a run on a branch of its own, or continue the failed one.
     recipe = recipe_fingerprint(configs)
@@ -264,7 +281,6 @@ def download(
       )
     except Exception as exc:
       raise click.ClickException(f"Could not start writing {output_path}: {exc}") from exc
-    blocks = list(IterableDateInterval(configs.start, configs.end, configs.step))
     written = list(waiting.blocks) if resume and waiting is not None else []
     done = set(written)
     if written != [block_key(b) for b in blocks[: len(written)]]:
@@ -312,6 +328,24 @@ def download(
       run.finish(configs.save.retention())
     except icechunk_utils.PromotionError as exc:
       raise click.ClickException(str(exc)) from exc
+
+
+def _print_plan(configs: DownloadConfig, interval: DateInterval, budget: Budget) -> None:
+  """Print the chunks of the first block's merged dataset, as it would be written (the plan of
+  each part is logged as it is opened); nothing is computed."""
+  click.echo(f"{_describe(interval)}, budget: {budget.describe()}")
+  with _processed_block(configs, interval, progress=False, budget=budget) as dataset:
+    for name, var in sorted(dataset.data_vars.items(), key=lambda item: str(item[0])):
+      dims = ", ".join(map(str, var.dims))
+      if var.chunks is None:
+        click.echo(f"  {name} ({dims}) {var.dtype}: in memory, {format_bytes(var.nbytes)}")
+        continue
+      shape = tuple(max(sizes) for sizes in var.chunks)
+      size = math.prod(shape) * var.dtype.itemsize
+      count = math.prod(len(sizes) for sizes in var.chunks)
+      click.echo(
+        f"  {name} ({dims}) {var.dtype}: chunks {shape}, {format_bytes(size)} each, {count} chunks"
+      )
 
 
 def _describe(interval: DateInterval) -> str:

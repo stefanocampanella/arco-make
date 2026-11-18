@@ -142,3 +142,18 @@ def test_download_recipes_set_no_chunk_sizes(recipe: dict, message: str):
   with pytest.raises(ValidationError, match=message):
     download_config.model_validate(recipe)
   download_config.model_validate(recipe_with(postprocess=[REGRID]) | {"save": {"chunks": 1}})
+
+
+def test_plan_prints_the_chunks_and_writes_nothing(recipe, tmp_path: pathlib.Path):
+  """`--plan`: the first block's variables with their chunks; no output, no data read."""
+  output = tmp_path / "out.zarr"
+  result = run(recipe, output, "--plan", "--memory-limit", "100kB")
+  assert result.exit_code == 0, result.output
+  assert "Block [2020-02-26T00:00, 2020-02-28T00:00), budget: target" in result.output
+  assert re.search(
+    r"  thetao \(time, depth, lat, lon\) float32: chunks \(1, 3, 4, 4\), ", result.output
+  )
+  assert re.search(
+    r"  t2m \(time, lat, lon\) float64: chunks \(1, 4, 4\), 128 B each, 2 chunks", result.output
+  )
+  assert not output.exists()
