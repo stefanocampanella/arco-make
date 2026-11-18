@@ -96,11 +96,11 @@ def test_at_most_n_blocks_are_held(recipe, tmp_path: pathlib.Path, monkeypatch: 
   lock = threading.Lock()
   counts = {"held": 0, "most": 0}
 
-  def stage(configs, interval):
+  def stage(configs, interval, budget):
     with lock:
       counts["held"] += 1
       counts["most"] = max(counts["most"], counts["held"])
-    return real_stage(configs, interval)
+    return real_stage(configs, interval, budget)
 
   def committed(run, interval):
     result = real_committed(run, interval)

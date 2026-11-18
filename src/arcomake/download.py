@@ -24,7 +24,7 @@ from dask.utils import parse_bytes
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from arcomake import icechunk_utils
-from arcomake.chunk_plan import detect_budget
+from arcomake.chunk_plan import Budget, detect_budget
 from arcomake.cli_utils import (
   check_aws_profile,
   check_destination,
@@ -284,12 +284,15 @@ def download(
               first=number == 0,
               progress=progress,
               recipe=recipe,
+              budget=budget,
             ),
             configs.retries,
             _describe(date_interval),
           )
       else:
-        _write_blocks_staged(configs, todo, run, blocks_at_once=blocks_at_once, recipe=recipe)
+        _write_blocks_staged(
+          configs, todo, run, blocks_at_once=blocks_at_once, recipe=recipe, budget=budget
+        )
     except click.ClickException:
       raise
     except Exception as exc:
@@ -311,10 +314,10 @@ def _describe(interval: DateInterval) -> str:
 
 @contextmanager
 def _processed_block(
-  configs: DownloadConfig, date_interval: DateInterval, *, progress: bool
+  configs: DownloadConfig, date_interval: DateInterval, *, progress: bool, budget: Budget | None
 ) -> Generator[xr.Dataset]:
   """The datasets of one block, read, processed and merged, with the global postprocessing
-  (lazy: computed when written)."""
+  (lazy: computed when written); with a `budget`, the parts are chunked as planned for it."""
   # Download and postprocess each dataset, possibly using checkpointing to disk.
   with ExitStack() as stack:
     datasets: list[xr.Dataset] = []
@@ -330,6 +333,8 @@ def _processed_block(
             date_interval.end,
             time_dim=configs.time_dim,
             progress=progress,
+            budget=budget,
+            name=dataset_name,
           )
         )
       )
@@ -360,13 +365,14 @@ def _write_block(
   first: bool,
   progress: bool,
   recipe: str,
+  budget: Budget | None = None,
 ) -> None:
   """Read, process and merge the datasets of one block, and commit it to the run's branch
   (written by the first block, appended along time by the others)."""
   if _committed(run, date_interval):
     return
   with (
-    _processed_block(configs, date_interval, progress=progress) as dataset,
+    _processed_block(configs, date_interval, progress=progress, budget=budget) as dataset,
     ProgressBar() if progress else nullcontext(),
   ):
     write_output(
@@ -389,13 +395,15 @@ class _Staged:
   prepared: xr.Dataset
 
 
-def _stage_block(configs: DownloadConfig, date_interval: DateInterval) -> _Staged:
+def _stage_block(
+  configs: DownloadConfig, date_interval: DateInterval, budget: Budget | None = None
+) -> _Staged:
   """Read, process and merge one block, and compute its values into a local Zarr store (a
   worker of `_write_blocks_staged`). Only values go there (no encoding but the chunks): the
   output's encodings are those `prepare_for_writing` gives the block, kept in memory."""
   registry = get_current_temp_registry()
   assert registry is not None
-  with _processed_block(configs, date_interval, progress=False) as dataset:
+  with _processed_block(configs, date_interval, progress=False, budget=budget) as dataset:
     prepared = prepare_for_writing(dataset, configs.save)
     values = prepared.copy(deep=False)
     for variable in values.variables.values():
@@ -455,6 +463,7 @@ def _write_blocks_staged(
   *,
   blocks_at_once: int,
   recipe: str,
+  budget: Budget | None = None,
 ) -> None:
   """Read and process up to `blocks_at_once` blocks at once, each staged on local disk by a
   worker thread, and commit them in order from this thread (appends along time need it). Each
@@ -469,7 +478,7 @@ def _write_blocks_staged(
       return
     number, interval = item
     logger.info(f"Downloading data from {interval.start} to {interval.end}")
-    stage = functools.partial(_stage_block, configs, interval)
+    stage = functools.partial(_stage_block, configs, interval, budget)
     action = functools.partial(with_retries, stage, configs.retries, _describe(interval))
     pending.append((number, interval, _start(action, f"block-{block_key(interval)}")))
 

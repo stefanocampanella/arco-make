@@ -18,6 +18,7 @@ import fsspec
 import fsspec.utils
 import numpy as np
 import xarray as xr
+from dask.base import tokenize
 from dask.delayed import Delayed
 from dask.diagnostics import ProgressBar
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -27,12 +28,13 @@ from zarr.abc.codec import ArrayArrayCodec, ArrayBytesCodec, BytesBytesCodec
 from zarr.errors import ZarrUserWarning
 from zarr.registry import get_codec_class
 
-from arcomake import hdf5_lock, icechunk_utils
+from arcomake import chunk_plan, hdf5_lock, icechunk_utils
 from arcomake.datetime_utils import (
   IterableDateInterval,
   may_parse_timedelta,
 )
 from arcomake.processing_utils import ProcessingStepConfig
+from arcomake.steps import needs_for
 from arcomake.temporary_utils import get_current_temp_registry
 
 logger = logging.getLogger(__name__)
@@ -533,21 +535,48 @@ def _shift_time(part: xr.Dataset, offset: datetime.timedelta, time_dim: str) -> 
   return part.assign_coords({time_dim: time.copy(data=time.values + np.timedelta64(offset))})
 
 
+def _planned(
+  part: xr.Dataset,
+  steps: list[ProcessingStepConfig],
+  budget: chunk_plan.Budget,
+  *,
+  time_dim: str,
+  token: str,
+  label: str,
+) -> xr.Dataset:
+  """`part` (the block's slice, not yet chunked) in the chunks `chunk_plan.plan` gives it for
+  `budget` and the needs of the dataset's `steps`. The plan is logged.
+
+  `token` names the Dask arrays: the lazily indexed arrays of a source are not tokenized.
+  """
+  needs = needs_for(steps, part)
+  planned = chunk_plan.plan(chunk_plan.shapes(part), budget, needs, grow_dim=time_dim)
+  logger.info(f"{label}: {planned.describe()}")
+  for warning in planned.warnings:
+    logger.warning(f"{label}: {warning}")
+  return part.chunk(planned.chunks, token=token)
+
+
 def download_and_process(
   configs: DatasetConfig,
   start_datetime: datetime.datetime,
   end_datetime: datetime.datetime,
   time_dim: str = "time",
+  budget: chunk_plan.Budget | None = None,
+  name: str = "dataset",
 ) -> xr.Dataset:
-  """
-  Downloads and pre-processes a dataset based on provided configurations.
+  """The dataset of `configs` over [start, end): its parts read, time-sliced and merged, then its
+  steps applied (lazily: computed when written).
+
+  With a `budget`, a part without `chunks` is chunked by `chunk_plan.plan` for its slice of the
+  block and the needs of the dataset's steps; without, it is read as its backend returns it.
   """
   # When downloading from Copernicus Marine Data Store or Climate Data Store, the typical case is a large dataset,
   # spanning a long time period, with several sets of variables in different datasets (bio, phys, etc.),
   # which needs to be downloaded one piece at a time. Hence, `parts` list in the TOML configuration file
   # represents different pieces of the same dataset.
   parts = []
-  for raw_part in configs.parts:
+  for number, raw_part in enumerate(configs.parts):
     offset = raw_part.time_offset or datetime.timedelta(0)
     part_conf = raw_part.model_dump(exclude_unset=True, exclude={"time_offset", "timeout"})
     engine = getattr(raw_part, "engine", None) or part_conf.get("engine")
@@ -557,10 +586,21 @@ def download_and_process(
       _with_timeout(part_conf, engine, getattr(raw_part, "timeout", None))
     if engine == "earlywarningdatastore" or engine == "copernicusmarine":
       part_conf.update(start_datetime=start_datetime - offset, end_datetime=end_datetime - offset)
+    plan = budget is not None and part_conf.get("chunks") is None
     part = open_input(**part_conf)
     if offset:
       part = _shift_time(part, offset, time_dim)
     part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
+    if plan:
+      assert budget is not None
+      part = _planned(
+        part,
+        configs.postprocess,
+        budget,
+        time_dim=time_dim,
+        token=tokenize(repr(raw_part), start_datetime, end_datetime),
+        label=f"{name}, part {number + 1}",
+      )
     parts.append(part)
   if not parts:
     raise ValueError("No parts found in the dataset configuration")
@@ -621,6 +661,8 @@ def maybe_checkpointing_download_and_process(
   end_datetime: datetime.datetime,
   time_dim: str = "time",
   progress: bool = True,
+  budget: chunk_plan.Budget | None = None,
+  name: str = "dataset",
 ) -> xr.Dataset:
   checkpointing_conf = configs.checkpointing
   checkpointing_step = checkpointing_conf.step if checkpointing_conf else None
@@ -631,10 +673,14 @@ def maybe_checkpointing_download_and_process(
   )
 
   if checkpointing_step is None:
-    return download_and_process(configs, start_datetime, end_datetime, time_dim=time_dim)
+    return download_and_process(
+      configs, start_datetime, end_datetime, time_dim=time_dim, budget=budget, name=name
+    )
   parsed_step = may_parse_timedelta(checkpointing_step)
   if parsed_step >= end_datetime - start_datetime:
-    return download_and_process(configs, start_datetime, end_datetime, time_dim=time_dim)
+    return download_and_process(
+      configs, start_datetime, end_datetime, time_dim=time_dim, budget=budget, name=name
+    )
 
   registry = get_current_temp_registry()
   if registry is not None:
@@ -649,7 +695,12 @@ def maybe_checkpointing_download_and_process(
   is_first_checkpoint = True
   for date_interval in date_intervals:
     with download_and_process(
-      configs, date_interval.start, date_interval.end, time_dim=time_dim
+      configs,
+      date_interval.start,
+      date_interval.end,
+      time_dim=time_dim,
+      budget=budget,
+      name=name,
     ) as downloaded:
       # A copy with its own encodings: the downloaded dataset is left unchanged.
       dataset = _without_zarr2_codecs(downloaded)
