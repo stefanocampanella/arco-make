@@ -33,7 +33,7 @@ apptainer exec oras://ghcr.io/stefanocampanella/arco-make:latest arco-make downl
 | Command | What it does |
 |---|---|
 | `arco-make download RECIPE OUTPUT` | Downloads, processes and merges the datasets of a recipe into one Icechunk repository |
-| `arco-make validate RECIPE INPUT` | Checks a dataset: time axis, grid, missing values inside masks |
+| `arco-make validate RECIPE INPUT` | Checks a dataset: time axis, grid, missing values inside masks; `--start`/`--end` give the expected time axis, as to `download` |
 | `arco-make process RECIPE INPUT OUTPUT` | Applies recipe steps to a dataset (e.g. a time mean) |
 | `arco-make compute-climatology RECIPE INPUT CLIMATOLOGY ANOMALY_STD` | Computes a periodic climatology and the standard deviation of the anomalies |
 | `arco-make steps` | Prints the reference of the processing steps ([docs/steps.md](docs/steps.md)) |
