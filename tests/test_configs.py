@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Recipe loading and command options: a recipe either runs as written or fails (intents 3, 4)."""
 
+import datetime
 import pathlib
 
 import click
@@ -71,6 +72,19 @@ def test_grids_are_named_once(tmp_path: pathlib.Path, sources: pathlib.Path):
     "north": 1.0,
     "west": 0.0,
     "east": 1.0,
+  }
+
+
+def test_injected_tables_are_merged(tmp_path: pathlib.Path):
+  """An injected table keeps the keys of the recipe's that it does not give (`validate --end`
+  sets one bound of the time check, the recipe's start and frequency stay)."""
+  path = tmp_path / "recipe.toml"
+  path.write_text('[checks.valid_time_coordinate]\nstart = 2020-01-01\nfreq = "1D"\n')
+  configs = read_configs(str(path), inject={"checks": {"valid_time_coordinate": {"end": 1}}})
+  assert configs["checks"]["valid_time_coordinate"] == {
+    "start": datetime.date(2020, 1, 1),
+    "freq": "1D",
+    "end": 1,
   }
 
 

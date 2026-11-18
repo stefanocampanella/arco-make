@@ -75,12 +75,8 @@ def validate(
 
   # Read configs; --start and --end set the bounds of the time check.
   bounds = {"start": start_datetime, "end": end_datetime}
-  inject = None
-  if any(value is not None for value in bounds.values()):
-    checks = read_configs(configs_path).get("checks", {})
-    time_check = {**checks.get("valid_time_coordinate", {})}
-    time_check.update({key: value for key, value in bounds.items() if value is not None})
-    inject = {"checks": {**checks, "valid_time_coordinate": time_check}}
+  given = {key: value for key, value in bounds.items() if value is not None}
+  inject = {"checks": {"valid_time_coordinate": given}} if given else None
   configs = read_configs(configs_path, schema=ValidateConfig, inject=inject)
   check_aws_profile(input_path)
 
