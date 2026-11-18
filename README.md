@@ -98,8 +98,16 @@ engine = "zarr"
 [[datasets.ocean.postprocess]] # steps applied to this dataset, in order
 name = "regrid"
 method = "conservative"
-grid = {south = -1.5, north = 1.5, west = 0.5, east = 3.5, resolution_lat = 1.0, resolution_lon = 1.0}
+grid = "one_degree"            # a grid of [grids], or the table itself
 kwargs = {skipna = true, nan_threshold = 1.0}
+
+[grids.one_degree]             # optional: a grid written once, named by regrid steps
+south = -1.5
+north = 1.5
+west = 0.5
+east = 3.5
+resolution_lat = 1.0
+resolution_lon = 1.0
 
 [[postprocess]]                # steps applied after merging all datasets
 name = "masked_fill"

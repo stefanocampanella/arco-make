@@ -10,6 +10,15 @@ end = 2020-03-02T00:00:00
 # Download in blocks of 2 days: each block is written (first) or appended (others) to the output.
 step = "2D"
 
+# The target grid of the regrid steps, written once and named by them.
+[grids.one_degree]
+south = -1.5
+north = 1.5
+west = 0.5
+east = 3.5
+resolution_lat = 1.0
+resolution_lon = 1.0
+
 # Atmosphere: hourly fields, averaged to daily values.
 [[datasets.atmosphere.parts]]
 filename_or_obj = "@SOURCES@/atmosphere.zarr"
@@ -29,7 +38,7 @@ reduce = "mean"
 [[datasets.atmosphere.postprocess]]
 name = "regrid"
 method = "conservative"
-grid = {south = -1.5, north = 1.5, west = 0.5, east = 3.5, resolution_lat = 1.0, resolution_lon = 1.0}
+grid = "one_degree"
 kwargs = {skipna = true, nan_threshold = 1.0}
 
 # Ocean: daily 3D fields, NaN on land and below the bottom.
@@ -49,7 +58,7 @@ replace = false
 [[datasets.ocean.postprocess]]
 name = "regrid"
 method = "conservative"
-grid = {south = -1.5, north = 1.5, west = 0.5, east = 3.5, resolution_lat = 1.0, resolution_lon = 1.0}
+grid = "one_degree"
 kwargs = {skipna = true, nan_threshold = 1.0}
 
 [[datasets.ocean.postprocess]]
@@ -70,7 +79,7 @@ engine = "zarr"
 [[datasets.ocean_static.postprocess]]
 name = "regrid"
 method = "conservative"
-grid = {south = -1.5, north = 1.5, west = 0.5, east = 3.5, resolution_lat = 1.0, resolution_lon = 1.0}
+grid = "one_degree"
 kwargs = {skipna = false}
 
 [[datasets.ocean_static.postprocess]]

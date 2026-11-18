@@ -587,6 +587,47 @@ class DatasetConfig(BaseModel):
     return refuse_chunk_steps(steps)
 
 
+# The step lists of a recipe: its own steps (download, process) and each dataset's.
+_STEP_LISTS = ("postprocess", "process")
+
+
+def inline_grids(data: Any) -> Any:
+  """A recipe whose `regrid` steps name a grid of its `[grids]` table (`grid = "quarter"`), with
+  the table's arguments in their place: a grid is written once per recipe.
+
+  Raises:
+    ValueError: for a name the table lacks.
+  """
+  if not isinstance(data, Mapping):
+    return data
+  grids = data.get("grids") or {}
+
+  def inlined(steps: Any, where: str) -> Any:
+    if not isinstance(steps, list):
+      return steps
+    result = []
+    for number, step in enumerate(steps, start=1):
+      named = isinstance(step, Mapping) and step.get("name") == "regrid"
+      if named and isinstance(step.get("grid"), str):
+        if step["grid"] not in grids:
+          known = ", ".join(sorted(grids)) or "none"
+          raise ValueError(f"{where} step {number}: no grid {step['grid']!r} in [grids] ({known})")
+        step = {**step, "grid": dict(grids[step["grid"]])}
+      result.append(step)
+    return result
+
+  data = {key: inlined(value, key) if key in _STEP_LISTS else value for key, value in data.items()}
+  datasets = data.get("datasets")
+  if isinstance(datasets, Mapping):
+    data["datasets"] = {
+      name: {**dataset, "postprocess": inlined(dataset["postprocess"], f"{name}.postprocess")}
+      if isinstance(dataset, Mapping) and "postprocess" in dataset
+      else dataset
+      for name, dataset in datasets.items()
+    }
+  return data
+
+
 def _shift_time(part: xr.Dataset, offset: datetime.timedelta, time_dim: str) -> xr.Dataset:
   """`part` with `offset` added to its time coordinate (attributes and encoding kept)."""
   if time_dim not in part.coords:

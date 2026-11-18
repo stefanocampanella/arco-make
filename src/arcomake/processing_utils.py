@@ -358,7 +358,8 @@ def regrid(
 
   Args:
     grid: Arguments of `xarray_regrid.Grid` (`north`, `east`, `south`, `west`,
-      `resolution_lat`, `resolution_lon`).
+      `resolution_lat`, `resolution_lon`). In a download or process recipe, also the name of a
+      grid of its `[grids]` table, to write a grid once for several steps.
     latitude_dim, longitude_dim: Names of the horizontal dimensions.
     method: The xarray-regrid method (default "nearest").
     kwargs: Further arguments of that method (e.g. `skipna`, `nan_threshold`; `output_chunks`

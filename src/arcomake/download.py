@@ -9,7 +9,7 @@ import warnings
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timedelta
-from typing import Self, get_args, override
+from typing import Any, Self, get_args, override
 
 import click
 import xarray as xr
@@ -31,6 +31,7 @@ from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
   download_and_process,
+  inline_grids,
   maybe_checkpointing_download_and_process,
   prepare_for_writing,
   refuse_chunk_steps,
@@ -72,6 +73,13 @@ class DownloadConfig(BaseModel):
   save: SaveConfig
   # How often a block is redone after a transient error (see `retries.RetryConfig`).
   retries: RetryConfig = Field(default_factory=RetryConfig)
+  # Target grids of `regrid` steps, by name (see `dataset_utils.inline_grids`).
+  grids: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+  @model_validator(mode="before")
+  @classmethod
+  def _inline_grids(cls, data: Any) -> Any:
+    return inline_grids(data)
 
   @field_validator("step", mode="before")
   @classmethod
