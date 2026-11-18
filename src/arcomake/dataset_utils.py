@@ -148,10 +148,13 @@ class PartStaticTime(BaseModel):
   @field_validator("static_time")
   @classmethod
   def _without_zone(cls, value: datetime.datetime | None) -> datetime.datetime | None:
-    # The sources' stamps have no zone: a zoned time would be converted, to another stamp.
-    if value is not None and value.tzinfo is not None:
-      raise ValueError("static_time is a stamp of the source, without a time zone")
-    return value
+    # The sources' stamps have no zone and are read as UTC: a UTC time is that stamp, another
+    # offset would be converted to a different one than written.
+    if value is None or value.tzinfo is None:
+      return value
+    if value.utcoffset() != datetime.timedelta(0):
+      raise ValueError("static_time is a stamp of the source: without a time zone, or in UTC")
+    return value.replace(tzinfo=None)
 
 
 # Seconds a source may stay silent (no connection, no data) before the request fails. gcsfs
