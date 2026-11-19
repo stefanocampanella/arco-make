@@ -76,3 +76,41 @@ def test_resample_daily_mean_and_sum(atmosphere_ds: xr.Dataset):
     total.tp.isel(time=1).values, atmosphere_ds.tp.isel(time=slice(24, 48)).sum("time").values
   )
   assert str(mean.time.values[0])[:10] == "2020-02-26"
+
+
+def _points(static_ds: xr.Dataset) -> xr.Dataset:
+  """1 at each sea point of the static grid, NaN on land: points to count."""
+  wet = static_ds.deptho.notnull()
+  return xr.Dataset({"n": wet.astype("float64").where(wet)})
+
+
+def _grid(south: float, north: float, west: float, east: float) -> dict[str, float]:
+  return {"south": south, "north": north, "west": west, "east": east}
+
+
+def test_stat_sum_on_a_dataset_beyond_the_source(static_ds: xr.Dataset):
+  """`stat` sums the points of each target cell; target cells beyond the source are NaN.
+
+  xarray-regrid 0.4.2 fails here without a `fill_value` (it reads `.dtype` of the Dataset): the
+  step passes NaN unless the recipe gives one.
+  """
+  grid = _grid(-3.5, 3.5, -0.5, 3.5) | {"resolution_lat": 1.0, "resolution_lon": 1.0}
+  points = _points(static_ds)
+  kwargs = {"method": "sum", "skipna": True}
+  out = pu.regrid(points, grid=grid, method="stat", kwargs=kwargs)
+  assert float(out.n.sum()) == float(points.n.sum())
+  assert out.n.sel(latitude=-3.5).isnull().all() and out.n.sel(longitude=-0.5).isnull().all()
+  given = pu.regrid(points, grid=grid, method="stat", kwargs=kwargs | {"fill_value": 0.0})
+  assert float(given.n.sel(latitude=-3.5).sum()) == 0.0
+
+
+def test_target_cells_centred_beyond_the_source_are_empty(static_ds: xr.Dataset):
+  """xarray-regrid blanks the target cells whose centre lies outside the source's centres, even
+  where they overlap source points, which are then lost, whatever the method. Checks of totals
+  rely on this; if xarray-regrid changes, this test tells."""
+  grid = _grid(-2.0, 2.0, 0.0, 4.0) | {"resolution_lat": 1.0, "resolution_lon": 1.0}
+  points = _points(static_ds)
+  out = pu.regrid(points, grid=grid, method="stat", kwargs={"method": "sum", "skipna": True})
+  assert out.n.sel(latitude=-2.0).isnull().all(), "centre -2 < -1.75, the first source centre"
+  lost = float(points.n.sel(latitude=-1.75).sum())
+  assert lost > 0 and float(out.n.sum()) <= float(points.n.sum()) - lost

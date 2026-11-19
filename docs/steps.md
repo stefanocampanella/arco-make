@@ -231,6 +231,15 @@ With `method = "conservative"`, `skipna = false` counts missing source cells as 
 as depth 0), while `skipna = true` averages the valid part of each target cell, and leaves NaN
 where its valid fraction is below `1 - nan_threshold`.
 
+With `method = "stat"` (`kwargs = {method = "sum"}`, say), each source point goes to the target
+cell containing its centre (a centre on an edge goes to the cell north or east of it), and
+target cells without points get `fill_value` (default NaN, settable). xarray-regrid 0.4.2
+fails on datasets without a `fill_value` when the target extends beyond the source.
+
+Whatever the method, xarray-regrid leaves NaN in the target cells whose centre lies outside
+the range of the source's centres, even where they overlap the source: a source covering
+latitudes -59.975 to 89.975 loses its points in the target rows centred at -60 and 90.
+
 Arguments:
 
 - `grid`: Arguments of `xarray_regrid.Grid` (`north`, `east`, `south`, `west`, `resolution_lat`, `resolution_lon`). In a download or process recipe, also the name of a grid of its `[grids]` table, to write a grid once for several steps.
