@@ -81,6 +81,27 @@ def test_a_missing_coordinate_value_fails(files, tmp_path: pathlib.Path):
     )
 
 
+def test_missing_values_at_the_same_positions_are_matched(files, tmp_path: pathlib.Path):
+  """Equal missing values merge without the tolerance too: they must not fail with it."""
+  paths = []
+  for number, path in enumerate(files):
+    ds = xr.open_dataset(path).load()
+    lat = "latitude" if number == 0 else "lat"
+    ds = ds.assign_coords({lat: np.where(np.arange(LAT.size) == 3, np.nan, ds[lat])})
+    paths.append(str(tmp_path / f"nan{number}.nc"))
+    ds.to_netcdf(paths[-1])
+  ds = dataset(
+    tuple(paths), rename={"lat": "latitude", "lon": "longitude"}, coordinate_tolerance=1e-9
+  )
+  assert np.isnan(ds.latitude.values[3]) and ds.ldd.notnull().all()
+
+
+def test_a_tolerance_matching_no_coordinate_fails(files):
+  """Without `rename`, no coordinate of the part is an earlier part's: nothing would be snapped."""
+  with pytest.raises(ValueError, match="no index coordinate of the part matches"):
+    dataset(files, coordinate_tolerance=1e-9)
+
+
 def test_tolerance_on_the_first_part_is_refused():
   """It has no earlier part to take coordinates from."""
   with pytest.raises(pydantic.ValidationError, match="first part"):

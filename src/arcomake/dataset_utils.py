@@ -165,7 +165,8 @@ class PartAlignment(BaseModel):
   `{lat = "latitude", lon = "longitude"}`. With `coordinate_tolerance`, each of the part's index
   coordinates that an earlier part of the dataset also has, with the same size, takes the earlier
   part's values if they differ by at most this much (absolute; else the dataset fails): parts are
-  merged only on equal coordinates. Not on the first part, and coordinates with missing values fail.
+  merged only on equal coordinates. Not on the first part; a part none of whose coordinates match
+  fails, and so do missing values at other positions than the earlier part's.
   """
 
   rename: dict[str, str] | None = None
@@ -177,6 +178,7 @@ def _snap_coordinates(
 ) -> xr.Dataset:
   """`part` with the index coordinates it shares with an earlier part (same name and size) taken
   from that part, if no value differs by more than `tolerance` (`PartAlignment`)."""
+  matched = False
   for name, index in part.indexes.items():
     reference = next(
       (p[name] for p in earlier if name in p.indexes and p.sizes[name] == part.sizes[name]), None
@@ -185,15 +187,27 @@ def _snap_coordinates(
       np.issubdtype(index.dtype, np.number) and np.issubdtype(reference.dtype, np.number)
     ):
       continue
-    if np.isnan(np.asarray(index, dtype="float64")).any() or np.isnan(reference.values).any():
-      raise ValueError(f"coordinate {name!r} has missing values: it cannot be matched")
-    difference = float(np.abs(np.asarray(index, dtype="float64") - reference.values).max())
+    values = np.asarray(index, dtype="float64")
+    expected = np.asarray(reference.values, dtype="float64")
+    missing = np.isnan(values)
+    if (missing != np.isnan(expected)).any():
+      raise ValueError(
+        f"coordinate {name!r} has missing values where an earlier part's has values, or the"
+        " reverse: it cannot be matched"
+      )
+    difference = float(np.abs(values[~missing] - expected[~missing]).max(initial=0.0))
     if difference > tolerance:
       raise ValueError(
         f"coordinate {name!r} differs from an earlier part's by {difference:g}, more than the"
         f" part's coordinate_tolerance {tolerance:g}"
       )
     part = part.assign_coords({name: (name, reference.values, part[name].attrs)})
+    matched = True
+  if not matched:
+    raise ValueError(
+      "coordinate_tolerance: no index coordinate of the part matches an earlier part's (same"
+      " name and size; `rename` may be missing)"
+    )
   return part
 
 
