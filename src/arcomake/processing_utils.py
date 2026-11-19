@@ -360,7 +360,7 @@ def fraction_mask(
     mask_name: Name of the new mask (none by default).
     threshold: Fraction above which a cell is in the mask.
     inclusive: Whether a fraction equal to `threshold` is in the mask.
-    tolerance: Fractions below it are set to 0 (0 keeps every value).
+    tolerance: Fractions below it are set to 0 (with 0, only negative round-off).
   """
   if not 0.0 <= threshold < 1.0 or (threshold == 0.0 and inclusive):
     raise ValueError(f"threshold must be in [0, 1) and not inclusive at 0, got {threshold}")

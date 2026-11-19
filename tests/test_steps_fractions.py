@@ -39,9 +39,13 @@ def test_fraction_mask_threshold_and_inclusive(threshold, inclusive, expected):
 
 
 def test_fraction_mask_settable_tolerance():
-  """`tolerance = 0` keeps every value: the round-off cell is then in the mask."""
-  out = pu.fraction_mask(fraction_ds(), fraction="f", mask_name="m", tolerance=0.0)
+  """`tolerance = 0` keeps every non-negative value: the round-off cell is then in the mask;
+  negative round-off still becomes 0."""
+  ds = fraction_ds()
+  ds["f"][0] = -1e-9
+  out = pu.fraction_mask(ds, fraction="f", mask_name="m", tolerance=0.0)
   assert out.f.values[1] == np.float32(1e-8) and out.m.values[1]
+  assert out.f.values[0] == 0.0 and not out.m.values[0]
 
 
 def test_fraction_mask_without_mask_name_only_cleans():

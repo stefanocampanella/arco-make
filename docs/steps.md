@@ -187,7 +187,7 @@ Arguments:
 - `mask_name`: Name of the new mask (none by default).
 - `threshold`: Fraction above which a cell is in the mask.
 - `inclusive`: Whether a fraction equal to `threshold` is in the mask.
-- `tolerance`: Fractions below it are set to 0 (0 keeps every value).
+- `tolerance`: Fractions below it are set to 0 (with 0, only negative round-off).
 
 | Argument | Type | Default |
 |---|---|---|
