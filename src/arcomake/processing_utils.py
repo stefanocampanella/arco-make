@@ -228,6 +228,26 @@ def coverage_attrs(
 
 
 @step
+def divide_by(ds: xr.Dataset, variables: Iterable[Hashable], by: Hashable) -> xr.Dataset:
+  """Divide variables by another, where it is positive; NaN where it is 0 or missing.
+
+  E.g. quantities averaged over whole coarse cells, land counted as 0, made averages over the
+  cells' sea part (`by` its sea fraction). For variables without one of `by`'s dimensions, the
+  first index of that dimension is used (e.g. the surface level of a 3D fraction)::
+
+    name = "divide_by"
+    variables = ["siconc", "sivol"]
+    by = "seafrac"
+  """
+  data_vars = dict(ds.data_vars)
+  for var in variables:
+    da = ds[var]
+    divisor = _broadcastable(ds[by], da)
+    data_vars[var] = (da / divisor.where(divisor > 0)).assign_attrs(da.attrs)
+  return xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
+
+
+@step
 def drop_static_vars(ds: xr.Dataset, time_dim: str = "time") -> xr.Dataset:
   """Drop the data variables without the time dimension (masks, bathymetry...)."""
   ds = ds.drop_vars([name for name, var in ds.data_vars.items() if time_dim not in var.dims])
@@ -520,6 +540,28 @@ def _regrid_needs(
   """Whole horizontal dimensions: xarray-regrid keeps their chunks, and one chunk is one task
   per time and level instead of a graph of partial products."""
   return Needs(whole=frozenset({latitude_dim, longitude_dim}))
+
+
+@step
+def products(ds: xr.Dataset, **kwargs: Iterable[Hashable]) -> xr.Dataset:
+  """Add variables that are products of others, one list of factors per new variable::
+
+    name = "products"
+    sivol = ["siconc", "sithick"]
+    usic = ["siconc", "usi"]
+
+  Missing factors give missing products. The new variables have no attributes.
+  """
+  ds = ds.copy(deep=False)
+  for name, factors in kwargs.items():
+    factors = list(factors)
+    if not factors:
+      raise ValueError(f"products: {name!r} has no factors")
+    product = ds[factors[0]].drop_attrs()
+    for factor in factors[1:]:
+      product = product * ds[factor].drop_attrs()
+    ds[name] = product
+  return ds
 
 
 @step(needs=_regrid_needs)

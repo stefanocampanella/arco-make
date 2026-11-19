@@ -90,3 +90,86 @@ def test_fill_from_above_then_zero_for_columns_without_values():
   ds = pu.fill_from_above(column_ds(), variables=["t"], depth_dim="depth", mask_name="m")
   out = pu.masked_fill(ds, variables=["t"], fill_value=0.0, mask_name="m")
   assert out.t.values[1, 0] == 0.0 and np.isnan(out.t.values[0, 4])
+
+
+# A 1-degree grid whose cells hold 2 x 2 cells of the synthetic grid (its first column is land).
+GRID = {
+  "south": -1.5,
+  "north": 1.5,
+  "west": 0.5,
+  "east": 3.5,
+  "resolution_lat": 1.0,
+  "resolution_lon": 1.0,
+}
+
+
+def ice_ds(static_ds: xr.Dataset) -> xr.Dataset:
+  """Sea ice as GLORYS gives it: concentration and thickness NaN where there is no ice (and on
+  land), velocity 0 where there is no ice; a sea mask."""
+  rng = np.random.default_rng(3)
+  sea = static_ds.deptho.notnull()
+  shape = sea.shape
+  has_ice = sea.values & (rng.random(shape) < 0.6)
+  c = np.where(has_ice, rng.uniform(0.05, 1.0, shape), np.nan)
+  h = np.where(has_ice, rng.uniform(0.1, 3.0, shape), np.nan)
+  u = np.where(sea.values, np.where(has_ice, rng.normal(0, 0.1, shape), 0.0), np.nan)
+  dims = ("latitude", "longitude")
+  return xr.Dataset(
+    {"siconc": (dims, c), "sithick": (dims, h), "usi": (dims, u), "sea": (dims, sea.values * 1.0)},
+    coords=static_ds.drop_vars("depth").coords,
+  )
+
+
+def test_products_multiply_and_propagate_missing_values():
+  ds = xr.Dataset({"a": ("x", [2.0, np.nan, 3.0], {"units": "1"}), "b": ("x", [4.0, 5.0, 0.5])})
+  out = pu.products(ds, ab=["a", "b"], aab=["a", "a", "b"])
+  np.testing.assert_array_equal(out.ab.values, [8.0, np.nan, 1.5])
+  np.testing.assert_array_equal(out.aab.values, [16.0, np.nan, 4.5])
+  assert out.ab.attrs == {} and out.a.attrs == {"units": "1"}
+  with pytest.raises(ValueError):
+    pu.products(ds, empty=[])
+
+
+def test_divide_by_is_nan_where_the_divisor_is_not_positive():
+  ds = xr.Dataset({"v": ("x", [1.0, 2.0, 3.0], {"units": "m"}), "f": ("x", [0.5, 0.0, np.nan])})
+  out = pu.divide_by(ds, variables=["v"], by="f")
+  np.testing.assert_array_equal(out.v.values, [2.0, np.nan, np.nan])
+  assert out.v.attrs == {"units": "m"}
+
+
+def test_divide_by_takes_the_first_level_of_a_3d_divisor(static_ds: xr.Dataset):
+  """2D fields are divided by the surface level of a 3D fraction."""
+  frac = xr.DataArray(np.array([0.5, 0.25, 1.0]), dims="depth")
+  ds = xr.Dataset({"z": ("x", [1.0, 2.0]), "frac": frac})
+  out = pu.divide_by(ds, variables=["z"], by="frac")
+  np.testing.assert_array_equal(out.z.values, [2.0, 4.0])
+
+
+def test_cell_means_over_the_sea_part_from_whole_cell_means(static_ds: xr.Dataset):
+  """Concentration over the sea part of coarse cells = (regridded with missing as 0) / (sea
+  fraction), exactly as regridding with land missing and ice-free sea as 0 gives it; thickness
+  and velocity over the ice cover = regridded c*h (c*u) / regridded c: ice volume (c h, per unit
+  sea area) is recovered from the published products."""
+  ice = ice_ds(static_ds)
+  native = pu.products(ice, sivol=["siconc", "sithick"], usic=["siconc", "usi"])
+  coarse = pu.regrid(native, grid=GRID, method="conservative", kwargs={"skipna": False})
+  coarse = pu.divide_by(coarse, variables=["siconc", "sivol", "usic"], by="sea")
+  # Reference: missing as land only, 0 on ice-free sea, the mean over the sea part.
+  sea = ice.sea > 0
+  c0 = ice.siconc.fillna(0).where(sea)
+  ref = pu.regrid(
+    xr.Dataset({"c": c0, "ch": (c0 * ice.sithick.fillna(0)).where(sea)}),
+    grid=GRID,
+    method="conservative",
+    kwargs={"skipna": True, "nan_threshold": 1.0},
+  )
+  np.testing.assert_allclose(coarse.siconc.values, ref.c.values, rtol=1e-12)
+  np.testing.assert_allclose(coarse.sivol.values, ref.ch.values, rtol=1e-12)
+  # Thickness over the ice cover, as GLORYS defines it, back from the published fields.
+  thickness = (coarse.sivol / coarse.siconc).values
+  lat = np.deg2rad(ice.latitude)
+  area = np.sin(lat + np.deg2rad(0.25)) - np.sin(lat - np.deg2rad(0.25))  # cell areas, relative
+  weights = (area * c0).coarsen(latitude=2, longitude=2).sum()
+  direct = (area * c0 * ice.sithick.fillna(0)).coarsen(latitude=2, longitude=2).sum() / weights
+  ok = weights.values > 0
+  np.testing.assert_allclose(thickness[ok], direct.values[ok], rtol=1e-6)

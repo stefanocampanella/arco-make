@@ -92,6 +92,25 @@ vertical_dim = "depth"
 | `vertical_dim` | `Hashable &#124; None` | `None` |
 | `time_dim` | `Hashable &#124; None` | `'time'` |
 
+## `divide_by`
+
+Divide variables by another, where it is positive; NaN where it is 0 or missing.
+
+E.g. quantities averaged over whole coarse cells, land counted as 0, made averages over the
+cells' sea part (`by` its sea fraction). For variables without one of `by`'s dimensions, the
+first index of that dimension is used (e.g. the surface level of a 3D fraction):
+
+```toml
+name = "divide_by"
+variables = ["siconc", "sivol"]
+by = "seafrac"
+```
+
+| Argument | Type | Default |
+|---|---|---|
+| `variables` | `Iterable[Hashable]` | required |
+| `by` | `Hashable` | required |
+
 ## `drop_static_vars`
 
 Drop the data variables without the time dimension (masks, bathymetry...).
@@ -272,6 +291,22 @@ first index of that dimension is used (e.g. the surface level).
 | `variables` | `Iterable[Hashable]` | required |
 | `fill_value` | `int &#124; float &#124; str &#124; Mapping[Hashable, int &#124; float &#124; Hashable]` | required |
 | `mask_name` | `Hashable` | required |
+
+## `products`
+
+Add variables that are products of others, one list of factors per new variable:
+
+```toml
+name = "products"
+sivol = ["siconc", "sithick"]
+usic = ["siconc", "usi"]
+```
+
+Missing factors give missing products. The new variables have no attributes.
+
+| Argument | Type | Default |
+|---|---|---|
+| *any other key* | `Iterable[Hashable]` |  |
 
 ## `regrid`
 
