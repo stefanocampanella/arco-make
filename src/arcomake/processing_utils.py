@@ -495,6 +495,31 @@ def is_positive_mask(ds: xr.Dataset, variable: Hashable, mask_name: Hashable) ->
 
 
 @step
+def keep_where(
+  ds: xr.Dataset,
+  variables: Iterable[Hashable],
+  condition: Hashable,
+  equals: Number,
+  other: Number = 0.0,
+) -> xr.Dataset:
+  """Keep values where another variable equals a value, `other` everywhere else (missing values
+  included). E.g. river discharge at the outlets of a drainage network, where its local drain
+  direction is 5 (a pit)::
+
+    name = "keep_where"
+    variables = ["dis24"]
+    condition = "ldd"
+    equals = 5
+  """
+  data_vars = dict(ds.data_vars)
+  keep = ds[condition] == equals
+  for var in variables:
+    da = ds[var]
+    data_vars[var] = da.where(_broadcastable(keep, da), other).assign_attrs(da.attrs)
+  return xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
+
+
+@step
 def masked_fill(
   ds: xr.Dataset,
   variables: Iterable[Hashable],
@@ -540,6 +565,67 @@ def _regrid_needs(
   """Whole horizontal dimensions: xarray-regrid keeps their chunks, and one chunk is one task
   per time and level instead of a graph of partial products."""
   return Needs(whole=frozenset({latitude_dim, longitude_dim}))
+
+
+EARTH_RADIUS = 6_371_000.0  # m, the mean radius
+
+
+def cell_areas(
+  latitude: np.ndarray, longitude: np.ndarray, radius: float = EARTH_RADIUS
+) -> np.ndarray:
+  """Areas (m2, on a sphere) of the cells of a regular latitude-longitude grid given by centres.
+
+  Bounds are midway between centres, the outer ones as far out as the inner (as xarray-regrid
+  builds them), latitudes clipped to the poles. Shape (latitude, longitude).
+  """
+
+  def bounds(centres: np.ndarray) -> np.ndarray:
+    centres = np.asarray(centres, dtype="float64")
+    if centres.size < 2:
+      raise ValueError("cell_areas needs at least two centres per dimension")
+    middle = (centres[:-1] + centres[1:]) / 2
+    return np.concatenate([[2 * centres[0] - middle[0]], middle, [2 * centres[-1] - middle[-1]]])
+
+  lat = np.deg2rad(np.clip(bounds(latitude), -90.0, 90.0))
+  lon = np.deg2rad(bounds(longitude))
+  bands = np.abs(np.diff(np.sin(lat)))
+  widths = np.abs(np.diff(lon))
+  return radius**2 * bands[:, None] * widths[None, :]
+
+
+@step
+def per_unit_area(
+  ds: xr.Dataset,
+  variables: Iterable[Hashable],
+  latitude_dim: str = "latitude",
+  longitude_dim: str = "longitude",
+  factor: float = 1.0,
+  radius: float = EARTH_RADIUS,
+) -> xr.Dataset:
+  """Divide variables by the area of their cells (m2, on a sphere), times `factor`.
+
+  Quantities of a cell (a river's discharge, m3/s) become densities (m/s), which conservative
+  regridding with `skipna = false` carries to any grid, keeping their totals (area times
+  density). `factor = 86400` gives metres per day, the unit of a daily precipitation total::
+
+    name = "per_unit_area"
+    variables = ["dis24"]
+    factor = 86400.0
+
+  Cells are bounded midway between centres (see `cell_areas`). A source cell straddling target
+  cells is split by its overlap in degrees, not in area (xarray-regrid): totals then move by
+  about 1e-7 of a 0.05-degree grid's on a 0.25-degree one.
+  """
+  areas = xr.DataArray(
+    cell_areas(ds[latitude_dim].values, ds[longitude_dim].values, radius),
+    dims=(latitude_dim, longitude_dim),
+    coords={latitude_dim: ds[latitude_dim], longitude_dim: ds[longitude_dim]},
+  )
+  data_vars = dict(ds.data_vars)
+  for var in variables:
+    da = ds[var]
+    data_vars[var] = (da * (factor / areas)).transpose(*da.dims).assign_attrs(da.attrs)
+  return xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
 
 
 @step

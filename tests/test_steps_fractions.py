@@ -173,3 +173,68 @@ def test_cell_means_over_the_sea_part_from_whole_cell_means(static_ds: xr.Datase
   direct = (area * c0 * ice.sithick.fillna(0)).coarsen(latitude=2, longitude=2).sum() / weights
   ok = weights.values > 0
   np.testing.assert_allclose(thickness[ok], direct.values[ok], rtol=1e-6)
+
+
+def test_keep_where_keeps_values_at_the_condition_only():
+  ds = xr.Dataset(
+    {
+      "q": ("x", [10.0, 20.0, np.nan, 40.0], {"units": "m3 s-1"}),
+      "ldd": ("x", [5.0, 2.0, 5.0, np.nan]),
+    }
+  )
+  out = pu.keep_where(ds, variables=["q"], condition="ldd", equals=5)
+  np.testing.assert_array_equal(out.q.values, [10.0, 0.0, np.nan, 0.0])
+  assert out.q.attrs == {"units": "m3 s-1"}
+  other = pu.keep_where(ds, variables=["q"], condition="ldd", equals=5, other=np.nan)
+  np.testing.assert_array_equal(other.q.values, [10.0, np.nan, np.nan, np.nan])
+
+
+def test_cell_areas_of_a_global_grid_sum_to_the_sphere():
+  """Bounds midway between centres, clipped at the poles: a global grid covers the sphere."""
+  areas = pu.cell_areas(np.arange(-90.0, 90.5, 1.0), np.arange(0.0, 360.0, 1.0), radius=1.0)
+  assert areas.shape == (181, 360)
+  np.testing.assert_allclose(areas.sum(), 4 * np.pi, rtol=1e-12)
+  np.testing.assert_allclose(areas[0, 0], np.pi / 180 * (1 - np.cos(np.deg2rad(0.5))), rtol=1e-9)
+
+
+def outlets_ds(static_ds: xr.Dataset) -> xr.Dataset:
+  """Point discharges (m3/s) in interior cells of the synthetic grid, 0 elsewhere."""
+  q = np.zeros(static_ds.deptho.shape)
+  q[2, 3], q[4, 4], q[5, 2] = 1000.0, 250.0, 40.0
+  return xr.Dataset(
+    {"q": (("latitude", "longitude"), q)}, coords=static_ds.drop_vars("depth").coords
+  )
+
+
+@pytest.mark.parametrize("offset", [0.0, 0.25])
+def test_densities_regridded_conservatively_keep_the_total(static_ds: xr.Dataset, offset: float):
+  """Discharge per unit area, regridded conservatively (missing as 0), times the coarse cells'
+  areas: the total is kept, whether source cells nest in the coarse ones or straddle their edges
+  (`offset`: the coarse grid moved by half a source cell, each point then split by overlap).
+
+  Split cells keep the total to about 1e-5 here: xarray-regrid splits a source cell by its
+  overlap in degrees of latitude, not in area (0.5-degree cells; 1e-7 for GloFAS's 0.05-degree
+  cells on a 0.25-degree grid)."""
+  ds = outlets_ds(static_ds)
+  grid = {
+    "south": -1.5 + offset,
+    "north": 1.5 + offset,
+    "west": 0.5 + offset,
+    "east": 3.5 + offset,
+    "resolution_lat": 1.0,
+    "resolution_lon": 1.0,
+  }
+  density = pu.per_unit_area(ds, variables=["q"])
+  coarse = pu.regrid(density, grid=grid, method="conservative", kwargs={"skipna": False})
+  areas = pu.cell_areas(coarse.latitude.values, coarse.longitude.values)
+  total = float(np.nansum(coarse.q.values * areas))
+  np.testing.assert_allclose(total, float(ds.q.sum()), rtol=1e-5 if offset else 1e-12)
+  if offset:
+    assert int((coarse.q.values > 0).sum()) > 3, "points on edges are split between cells"
+
+
+def test_per_unit_area_factor_gives_metres_per_day(static_ds: xr.Dataset):
+  ds = outlets_ds(static_ds)
+  out = pu.per_unit_area(ds, variables=["q"], factor=86400.0)
+  areas = pu.cell_areas(ds.latitude.values, ds.longitude.values)
+  np.testing.assert_allclose(out.q.values, ds.q.values * 86400.0 / areas)

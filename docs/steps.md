@@ -269,6 +269,26 @@ time = {start = 0, stop = 365}
 |---|---|---|
 | *any other key* | `Any` |  |
 
+## `keep_where`
+
+Keep values where another variable equals a value, `other` everywhere else (missing values
+included). E.g. river discharge at the outlets of a drainage network, where its local drain
+direction is 5 (a pit):
+
+```toml
+name = "keep_where"
+variables = ["dis24"]
+condition = "ldd"
+equals = 5
+```
+
+| Argument | Type | Default |
+|---|---|---|
+| `variables` | `Iterable[Hashable]` | required |
+| `condition` | `Hashable` | required |
+| `equals` | `int &#124; float` | required |
+| `other` | `int &#124; float` | `0.0` |
+
 ## `masked_fill`
 
 Fill missing values inside a mask; values outside the mask are left as they are.
@@ -291,6 +311,32 @@ first index of that dimension is used (e.g. the surface level).
 | `variables` | `Iterable[Hashable]` | required |
 | `fill_value` | `int &#124; float &#124; str &#124; Mapping[Hashable, int &#124; float &#124; Hashable]` | required |
 | `mask_name` | `Hashable` | required |
+
+## `per_unit_area`
+
+Divide variables by the area of their cells (m2, on a sphere), times `factor`.
+
+Quantities of a cell (a river's discharge, m3/s) become densities (m/s), which conservative
+regridding with `skipna = false` carries to any grid, keeping their totals (area times
+density). `factor = 86400` gives metres per day, the unit of a daily precipitation total:
+
+```toml
+name = "per_unit_area"
+variables = ["dis24"]
+factor = 86400.0
+```
+
+Cells are bounded midway between centres (see `cell_areas`). A source cell straddling target
+cells is split by its overlap in degrees, not in area (xarray-regrid): totals then move by
+about 1e-7 of a 0.05-degree grid's on a 0.25-degree one.
+
+| Argument | Type | Default |
+|---|---|---|
+| `variables` | `Iterable[Hashable]` | required |
+| `latitude_dim` | `str` | `'latitude'` |
+| `longitude_dim` | `str` | `'longitude'` |
+| `factor` | `float` | `1.0` |
+| `radius` | `float` | `6371000.0` |
 
 ## `products`
 
