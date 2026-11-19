@@ -116,6 +116,38 @@ Reverse the order along a dimension (e.g. make ERA5 latitudes increase).
 |---|---|---|
 | `dim` | `str` | required |
 
+## `fraction_mask`
+
+Clean a fraction (e.g. of sea, a 0/1 mask regridded conservatively) and add a mask from it.
+
+Values of `fraction` below `tolerance` become 0: regridding weights leave round-off (about
+1e-8) where a target cell barely touches the source's ones. With `mask_name`, a boolean mask
+is added, True where the fraction is above `threshold` (or at least, with `inclusive`): the
+default, `fraction > 0`, keeps every cell with some sea; `threshold = 0.5, inclusive = true`
+keeps those at least half sea:
+
+```toml
+name = "fraction_mask"
+fraction = "seafrac"
+mask_name = "sea"
+```
+
+Arguments:
+
+- `fraction`: Variable with values between 0 and 1.
+- `mask_name`: Name of the new mask (none by default).
+- `threshold`: Fraction above which a cell is in the mask.
+- `inclusive`: Whether a fraction equal to `threshold` is in the mask.
+- `tolerance`: Fractions below it are set to 0 (0 keeps every value).
+
+| Argument | Type | Default |
+|---|---|---|
+| `fraction` | `Hashable` | required |
+| `mask_name` | `Hashable &#124; None` | `None` |
+| `threshold` | `float` | `0.0` |
+| `inclusive` | `bool` | `False` |
+| `tolerance` | `float` | `1e-06` |
+
 ## `get_bottom`
 
 The deepest valid (non-NaN) value of each column along `depth_dim`.

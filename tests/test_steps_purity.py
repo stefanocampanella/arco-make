@@ -33,6 +33,7 @@ STEPS = {
   "drop_static_vars": {},
   "drop_var_attrs": {"variables": ["thetao"]},
   "flip": {"dim": "latitude"},
+  "fraction_mask": {"fraction": "deptho", "mask_name": "m4", "threshold": 0.5},
   "get_bottom": {"depth_dim": "depth", "variables": {"thetao": "tb"}, "replace": False},
   "get_notnull_mask": {"variable": "deptho", "mask_name": "m2"},
   "get_sea_mask": {"bathymetry": "deptho", "depth_dim": "depth", "mask_name": "m3"},

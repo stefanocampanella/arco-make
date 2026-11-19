@@ -249,6 +249,47 @@ def flip(ds: xr.Dataset, dim: str) -> xr.Dataset:
   return ds.isel({dim: slice(None, None, -1)})
 
 
+@step
+def fraction_mask(
+  ds: xr.Dataset,
+  fraction: Hashable,
+  mask_name: Hashable | None = None,
+  threshold: float = 0.0,
+  inclusive: bool = False,
+  tolerance: float = 1e-6,
+) -> xr.Dataset:
+  """Clean a fraction (e.g. of sea, a 0/1 mask regridded conservatively) and add a mask from it.
+
+  Values of `fraction` below `tolerance` become 0: regridding weights leave round-off (about
+  1e-8) where a target cell barely touches the source's ones. With `mask_name`, a boolean mask
+  is added, True where the fraction is above `threshold` (or at least, with `inclusive`): the
+  default, `fraction > 0`, keeps every cell with some sea; `threshold = 0.5, inclusive = true`
+  keeps those at least half sea::
+
+    name = "fraction_mask"
+    fraction = "seafrac"
+    mask_name = "sea"
+
+  Args:
+    fraction: Variable with values between 0 and 1.
+    mask_name: Name of the new mask (none by default).
+    threshold: Fraction above which a cell is in the mask.
+    inclusive: Whether a fraction equal to `threshold` is in the mask.
+    tolerance: Fractions below it are set to 0 (0 keeps every value).
+  """
+  if not 0.0 <= threshold < 1.0 or (threshold == 0.0 and inclusive):
+    raise ValueError(f"threshold must be in [0, 1) and not inclusive at 0, got {threshold}")
+  if tolerance < 0.0:
+    raise ValueError(f"tolerance must not be negative, got {tolerance}")
+  da = ds[fraction]
+  cleaned = da.where(~(da < tolerance), 0.0).astype(da.dtype)  # NaN stays NaN
+  ds = ds.assign({fraction: cleaned})
+  if mask_name is not None:
+    mask = cleaned >= threshold if inclusive else cleaned > threshold
+    ds = ds.assign({mask_name: mask.drop_attrs()})
+  return ds
+
+
 def _get_bottom_needs(ds: xr.Dataset, depth_dim: str, **_: Any) -> Needs:
   """`get_bottom` joins the whole depth of a variable in each of its tasks."""
   return Needs(gathered=frozenset({depth_dim}))
