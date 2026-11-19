@@ -316,6 +316,8 @@ def test_conservation_check_on_an_output_in_several_horizontal_chunks(static_ds:
     conservation_tolerance=1e-9,
   )
   assert len(out.q.chunks[1]) > 1 and len(out.q.chunks[2]) > 1
+  unchecked = pu.regrid(density.chunk(time=1), grid=GRID, method="conservative", kwargs=split)
+  assert out.q.chunks == unchecked.q.chunks and out.q.dtype == unchecked.q.dtype
   expected = pu.regrid(density, grid=GRID, **CONSERVATIVE)
   xr.testing.assert_allclose(out.load(), expected, rtol=0, atol=0)
   ds = outlets_ds(static_ds)

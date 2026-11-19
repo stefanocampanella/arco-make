@@ -749,8 +749,11 @@ def _totals(da: xr.DataArray, latitude_dim: str, longitude_dim: str) -> xr.DataA
   return (da.fillna(0).astype("float64") * areas).sum([latitude_dim, longitude_dim])
 
 
-def _conserved(source: np.ndarray, target: np.ndarray, *, name: str, tolerance: float):
-  """True where the totals agree within the tolerance (everywhere); else ValueError."""
+def _checked(
+  values: np.ndarray, source: np.ndarray, target: np.ndarray, *, name: str, tolerance: float
+) -> np.ndarray:
+  """`values`, unchanged, if the totals (broadcast to them) agree within the tolerance; else
+  ValueError."""
   change = np.abs(target - source)
   bad = change > tolerance * np.maximum(np.abs(source), np.finfo("float64").tiny)
   if np.any(bad):
@@ -761,7 +764,7 @@ def _conserved(source: np.ndarray, target: np.ndarray, *, name: str, tolerance: 
       f"regrid: the total of {name!r} changed by {worst:.3g} (relative), more than the"
       f" conservation_tolerance {tolerance:g}"
     )
-  return np.ones(np.shape(source), dtype=bool)
+  return values
 
 
 def _with_conserved_totals(
@@ -769,23 +772,26 @@ def _with_conserved_totals(
 ) -> xr.Dataset:
   """`target` whose variables fail when computed if their totals differ from `source`'s.
 
-  The totals are compared per time step and level, and the result (True) kept with `where`:
-  the variable then depends on the check, whatever its chunks along latitude and longitude.
+  The totals (per time step and level) are broadcast to each chunk of the variable, which the
+  check returns unchanged: it needs no whole latitude and longitude, and the variable depends on
+  it. Coordinates are joined exactly.
   """
   data_vars = dict(target.data_vars)
   horizontal = [latitude_dim, longitude_dim]
   for name, da in target.data_vars.items():
     if not set(horizontal) <= set(da.dims) or name not in source:
       continue
-    conserved = xr.apply_ufunc(
-      _conserved,
+    data_vars[name] = xr.apply_ufunc(
+      _checked,
+      da,
       _totals(source[name], latitude_dim, longitude_dim),
       _totals(da, latitude_dim, longitude_dim),
       dask="parallelized",
-      output_dtypes=[bool],
+      output_dtypes=[da.dtype],
+      join="exact",
+      keep_attrs=True,
       kwargs={"name": str(name), "tolerance": tolerance},
-    )
-    data_vars[name] = da.where(conserved).astype(da.dtype).assign_attrs(da.attrs)
+    ).transpose(*da.dims)
   return xr.Dataset(data_vars=data_vars, coords=target.coords, attrs=target.attrs)
 
 
