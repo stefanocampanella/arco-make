@@ -1159,4 +1159,13 @@ comparison read units such as "seconds" as durations (NaT never equal) and compa
 a first block retried once its commit had landed; the conservation check copied and promoted
 values through `where` (now passed through unchanged, coordinates joined exactly);
 `coordinate_tolerance` refused equal NaN positions and ignored a tolerance matching no coordinate.
-Left: sharing the count-and-report code of `ensure_no_nans` and `fraction_domain`.
+The two points left by the reviews were done afterwards: `ensure_no_nans` and `fraction_domain`
+share their count-and-report code (same reports, pinned by a test that passes before and after).
+The attribute fix has no `output:` prefix (the commit was pushed): it changes the output only of
+recipes using `products` or `fraction_mask`, new on this branch, where no other dataset gives the
+coordinates their attributes. The 1 deg fork recipe's two-day output is identical before and
+after it (values, encodings, coordinate attributes; the merge took them from other datasets).
+A third review, of these commits, found a defect in older code, fixed: `ensure_no_nans` raised
+KeyError on a mask missing from the dataset, stopping `validate`. Left to the maintainer, since
+they change what existing recipes accept: a listed variable missing from the dataset only warns
+in `ensure_no_nans` (an error in `fraction_domain`), and a mask with NaN counts them as inside.
