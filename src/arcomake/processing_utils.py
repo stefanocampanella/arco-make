@@ -743,10 +743,8 @@ def _totals(da: xr.DataArray, latitude_dim: str, longitude_dim: str) -> xr.DataA
   return (da.fillna(0).astype("float64") * areas).sum([latitude_dim, longitude_dim])
 
 
-def _checked(
-  values: np.ndarray, source: np.ndarray, target: np.ndarray, *, name: str, tolerance: float
-):
-  """`values`, if the totals agree within the tolerance; else ValueError."""
+def _conserved(source: np.ndarray, target: np.ndarray, *, name: str, tolerance: float):
+  """True where the totals agree within the tolerance (everywhere); else ValueError."""
   change = np.abs(target - source)
   bad = change > tolerance * np.maximum(np.abs(source), np.finfo("float64").tiny)
   if np.any(bad):
@@ -757,30 +755,31 @@ def _checked(
       f"regrid: the total of {name!r} changed by {worst:.3g} (relative), more than the"
       f" conservation_tolerance {tolerance:g}"
     )
-  return values
+  return np.ones(np.shape(source), dtype=bool)
 
 
 def _with_conserved_totals(
   source: xr.Dataset, target: xr.Dataset, latitude_dim: str, longitude_dim: str, tolerance: float
 ) -> xr.Dataset:
-  """`target` whose variables fail when computed if their totals differ from `source`'s."""
+  """`target` whose variables fail when computed if their totals differ from `source`'s.
+
+  The totals are compared per time step and level, and the result (True) kept with `where`:
+  the variable then depends on the check, whatever its chunks along latitude and longitude.
+  """
   data_vars = dict(target.data_vars)
   horizontal = [latitude_dim, longitude_dim]
   for name, da in target.data_vars.items():
     if not set(horizontal) <= set(da.dims) or name not in source:
       continue
-    data_vars[name] = xr.apply_ufunc(
-      _checked,
-      da,
+    conserved = xr.apply_ufunc(
+      _conserved,
       _totals(source[name], latitude_dim, longitude_dim),
       _totals(da, latitude_dim, longitude_dim),
-      input_core_dims=[horizontal, [], []],
-      output_core_dims=[horizontal],
       dask="parallelized",
-      output_dtypes=[da.dtype],
-      keep_attrs=True,
+      output_dtypes=[bool],
       kwargs={"name": str(name), "tolerance": tolerance},
-    ).transpose(*da.dims)
+    )
+    data_vars[name] = da.where(conserved).astype(da.dtype).assign_attrs(da.attrs)
   return xr.Dataset(data_vars=data_vars, coords=target.coords, attrs=target.attrs)
 
 

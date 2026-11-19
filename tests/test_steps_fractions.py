@@ -299,6 +299,36 @@ def test_conservation_check_fails_when_points_are_lost(static_ds: xr.Dataset, ch
     pu.regrid(density, grid=grid, conservation_tolerance=1e-6, **CONSERVATIVE).load()
 
 
+def test_conservation_check_on_an_output_in_several_horizontal_chunks(static_ds: xr.Dataset):
+  """`process` recipes may split the regridded output along latitude and longitude
+  (`output_chunks`): the check needs no whole horizontal dimensions, and still fails."""
+  density = pu.per_unit_area(outlets_ds(static_ds), variables=["q"]).expand_dims(time=2)
+  split = {"skipna": False, "output_chunks": {"latitude": 2, "longitude": 2}}
+  out = pu.regrid(
+    density.chunk(time=1),
+    grid=GRID,
+    method="conservative",
+    kwargs=split,
+    conservation_tolerance=1e-9,
+  )
+  assert len(out.q.chunks[1]) > 1 and len(out.q.chunks[2]) > 1
+  expected = pu.regrid(density, grid=GRID, **CONSERVATIVE)
+  xr.testing.assert_allclose(out.load(), expected, rtol=0, atol=0)
+  ds = outlets_ds(static_ds)
+  ds["q"][0, 3] = 500.0  # latitude -1.75, in the target row centred at -2, blanked
+  lost = pu.per_unit_area(ds, variables=["q"]).expand_dims(time=2)
+  grid = {"south": -2.0, "north": 2.0, "west": 0.0, "east": 4.0}
+  grid |= {"resolution_lat": 1.0, "resolution_lon": 1.0}
+  with pytest.raises(ValueError, match="total of 'q' changed"):
+    pu.regrid(
+      lost.chunk(time=1),
+      grid=grid,
+      method="conservative",
+      kwargs=split,
+      conservation_tolerance=1e-6,
+    ).load()
+
+
 @pytest.mark.parametrize(
   ("method", "kwargs"), [("conservative", {"skipna": True}), ("conservative", {}), ("nearest", {})]
 )
