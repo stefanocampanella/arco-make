@@ -1090,3 +1090,58 @@ dataset: it did not need to, the recipe's steps run on the reopened block. Left 
 `output:` prefix (no recipe could use `coverage_attrs` before this branch), the fingerprint
 change for runs of older code (unreleased), and reading the output's time coordinate for each
 block (about 380 blocks in production).
+
+## 2026-11-19: coarsening GLORYS and GloFAS, decided with the maintainer
+
+The reasons and the figures are in `docs/coarsen-ocean-datasets.md`, measured at 0.25, 0.5 and
+1 degree by `docs/coarsen_analysis.py`; the decisions, in order of the discussion:
+
+- **Sea is any water** (**[Moby-Dick]**): a coarse cell is sea at a level where GLORYS has some
+  sea cell under it. `seafrac` (static), GLORYS's 3D mask regridded conservatively, is published:
+  the share of the cell where the model has a sea cell. The recipes' rule (the regridded depth
+  below the level's centre) is GLORYS's own rule applied to a flat column: right in total, wrong
+  by layer (+1.2 % of the water at the surface, -1.6 % at 5275 m, at 0.25 deg), and 8,869 surface
+  cells it called sea were less than half sea. With any water, regridded values (nan_threshold 1)
+  and sea cells coincide; masks count every sea cell as full (+5 % of the volume at 0.25 deg, +16 %
+  at 1 deg): volumes, heat contents and a model's loss should weigh by `seafrac` x layer thickness x
+  area (a note for Moby-Dick). `glorys_mask` is gone; `deptho` is the mean depth with land as 0.
+- **Level 49 dropped** (**[Moby-Dick]**): NEMO never computes it (no value on any day); 49 levels.
+- **Gaps filled from above** (**[Moby-Dick]**), velocities included, 0 where nothing is above: the
+  few sea cells without values (1,505 at 0.25 deg, the same every day) take the nearest value
+  above in the column. Leaving a level out and refilling it, this beats the regridded bottom
+  values the recipes used at every level and resolution (temperature RMSE at 5275 m: 0.043 against
+  0.084 at 0.25 deg, 0.041 against 0.63 at 1 deg). `*_bottom` variables are gone.
+- **No latitude cut**: the rows it removed (-77, 90) are sea in GLORYS's static mask without values,
+  but leave no coarse sea cell empty; the cut itself caused round-off fractions (1e-8) at three
+  0.25 deg columns.
+- **Sea ice** (**[Moby-Dick]**): GLORYS's `sithick`, `usi`, `vsi` are means over the ice cover
+  (`cell_methods = "area: mean where sea_ice"`), which the recipes averaged with open water and
+  land as 0 (thickness neither of the ice nor per area; ice drift slowed by about 17 % where the
+  ice covers less than half a cell). Published now, over the sea part: `siconc`, `sivol` (siconc x
+  sithick), `usic`, `vsic` (siconc x velocity); GLORYS's thickness and velocity come back as ratios
+  to `siconc` (relative error 1.5e-7 in float32), ice area and volume are kept.
+- **Rivers** (**[Moby-Dick]**): the recipes' `dis24` was a mean over coarse cells, kept only where
+  a cell is all land (nan_threshold 0): 1.7 % of the discharge reaching the coast was kept, the
+  Amazon's none; inland it was a fifth of the main river at 0.25 deg, a twentieth at 1 deg.
+  `dis24_outlets` replaces it: the discharge at the pits of GloFAS's drainage network (LDD v4.0,
+  152,629 pits; their upstream area equals the land area), in metres per day over each cell,
+  regridded conservatively with its total checked (1,079,449 m3/s on 1 Mar 2013). `dis24`,
+  `glofas_mask` and `uparea` are gone.
+- **WAVERYS dropped**: its sea differs from GLORYS's (none north of about 81 N), waves are missing
+  where ERA5's ice cover exceeds about 0.3, and the recipes averaged the direction arithmetically
+  and filled it with 0 under ice.
+
+arco-make, generic: steps `fraction_mask`, `fill_from_above`, `products`, `divide_by`,
+`keep_where`, `per_unit_area`; `regrid`'s `conservation_tolerance`; parts' `rename` and
+`coordinate_tolerance` (the LDD's coordinates differ from the discharge's by 4e-12); the check
+`fraction_domain` (values exactly where a static fraction is positive); static datasets computed
+once per run, and compared with the stored ones by a resumed run (they were recomputed for every
+block and discarded by the appends). Two fixes: `regrid` with `stat` crashed on datasets
+(xarray-regrid 0.4.2 reads `.dtype` of a Dataset when the target extends beyond the source; also
+on upstream main; NaN is now passed as `fill_value`), and `apply_mask` made 2D fields 3D with a 3D
+mask. xarray-regrid blanks target cells centred outside the source's centres, whatever the
+method (GloFAS loses its -60 and 90 rows: no rivers there); the conservation check catches it.
+
+Checked: the full suite; the notes' doctests, offline and live; the analysis at three
+resolutions; a two-day download with the new 1 deg recipe (static datasets computed once, river
+total equal to the pits', `validate` with `fraction_domain` passed).
