@@ -1145,3 +1145,18 @@ method (GloFAS loses its -60 and 90 rows: no rivers there); the conservation che
 Checked: the full suite; the notes' doctests, offline and live; the analysis at three
 resolutions; a two-day download with the new 1 deg recipe (static datasets computed once, river
 total equal to the pits', `validate` with `fraction_domain` passed).
+
+A high-effort review found ten issues; nine were fixed in six commits (tests checked to fail
+before where behaviour changed): `products` and `fraction_mask` removed every coordinate's
+attributes; the static comparison ran at the second block of every run, not only on `--resume`,
+and failed on static variables packed by `[save.encoding]` (`scale_factor`); `fraction_domain`
+crashed on a missing fraction, kept one fraction's counts for a variable under two, and accepted
+`inclusive` at 0; the conservation check could not be built on outputs split along latitude or
+longitude; `coordinate_tolerance` let NaN coordinates through and did nothing on the first part;
+`fraction_mask`'s docstring on `tolerance = 0`. A second review, of the fixes, found nine more;
+seven were fixed in four commits: a fraction stored as a coordinate was "not found"; the static
+comparison read units such as "seconds" as durations (NaT never equal) and compared again after
+a first block retried once its commit had landed; the conservation check copied and promoted
+values through `where` (now passed through unchanged, coordinates joined exactly);
+`coordinate_tolerance` refused equal NaN positions and ignored a tolerance matching no coordinate.
+Left: sharing the count-and-report code of `ensure_no_nans` and `fraction_domain`.
