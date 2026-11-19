@@ -245,3 +245,33 @@ def test_fraction_domain_needs_a_static_fraction(ocean_ds, static_ds):
   ds["seafrac"] = ds.seafrac.expand_dims(time=ds.time)
   with pytest.raises(ValidationError, match="must be static"):
     ds.arcomake.validate(domain_config(seafrac=["thetao"]), fail=True)
+
+
+def test_fraction_domain_computes_once(ocean_ds, static_ds):
+  """One computation for every variable and time step; the report lists static variables
+  first, one line each, then per time step the variables wrong at it."""
+  ds = with_seafrac(ocean_ds, static_ds)
+  ds["deptho"] = static_ds.deptho.fillna(0.0)  # values on land
+  thetao = ds.thetao.values.copy()
+  thetao[1, 0, 3, 4] = np.nan  # a sea cell
+  thetao[3, 2, 3, 1] = 1.0  # below the sea floor
+  ds["thetao"] = (ds.thetao.dims, thetao)
+  ds["zos"] = ds.zos.where(ds.time != ds.time[3])
+  calls = []
+
+  def counting(dsk, keys, **kwargs):
+    calls.append(1)
+    return dask.get(dsk, keys, **kwargs)
+
+  with dask.config.set(scheduler=counting), pytest.raises(ValidationError) as raised:
+    checks.fraction_domain(ds.chunk(time=1), seafrac=["deptho", "thetao", "zos"])
+  assert len(calls) == 1
+  land = int((ds.seafrac.isel(depth=0) == 0).sum())
+  sea = int(ds.seafrac.isel(depth=0).sum())
+  times = ds.time.to_index()
+  assert str(raised.value).splitlines() == [
+    f"deptho: {land} values present outside seafrac",
+    f"{times[1]}: thetao: 1 values missing inside seafrac",
+    f"{times[3]}: thetao: 1 values present outside seafrac, zos: {sea} values missing inside"
+    " seafrac",
+  ]

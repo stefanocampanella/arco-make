@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 import logging
 import warnings
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Mapping
 from datetime import datetime
 from typing import Literal, Self, cast
 
@@ -90,6 +90,37 @@ class ChecksConfig(BaseModel):
   fraction_domain: FractionDomainCheck | None = None
 
 
+def _report_by_time[K: Hashable](
+  dataset: xr.Dataset,
+  flags: Mapping[K, xr.DataArray],
+  time_dim: str,
+  describe: Callable[[K, int], str],
+) -> tuple[list[str], list[tuple[object, list[str]]]]:
+  """Count the flagged cells of each boolean array per time step, all in one computation, not
+  one per array and time step (a check over decades looped over thousands of days).
+
+  Returns `describe(key, count)` for the non-zero counts of arrays without `time_dim`, and per time
+  step with any, in time order, its stamp and the descriptions of its non-zero counts; keys keep
+  the order of `flags`.
+  """
+  sums = {key: da.sum([d for d in da.dims if d != time_dim]) for key, da in flags.items()}
+  computed = cast(dict[K, xr.DataArray], dask.compute(sums)[0])
+  static: list[str] = []
+  per_time: dict[int, list[str]] = {}
+  for key, count in computed.items():
+    if time_dim not in count.dims:
+      if int(count) > 0:
+        static.append(describe(key, int(count)))
+      continue
+    values = count.values
+    for index in np.flatnonzero(values):
+      per_time.setdefault(int(index), []).append(describe(key, int(values[index])))
+  if not per_time:
+    return static, []
+  stamps = dataset[time_dim].to_index()
+  return static, [(stamps[index], per_time[index]) for index in sorted(per_time)]
+
+
 def ensure_no_nans(
   dataset: xr.Dataset,
   time_dim: str = "time",
@@ -112,44 +143,27 @@ def ensure_no_nans(
       else:
         warnings.warn(f"Variable {variable_name} not found in dataset")
 
-  # Missing values inside the masks, counted per time step in one computation, not two per day
-  # and variable: a check over decades looped over thousands of days.
-  counts: dict[Hashable, xr.DataArray] = {}
+  # Missing values inside the masks.
+  invalid: dict[Hashable, xr.DataArray] = {}
   for variable_name, da in dataset.data_vars.items():
-    invalid = da.isnull()
+    invalid[variable_name] = da.isnull()
     if variable_name in variable_mask_mapping:
       mask_da = dataset[variable_mask_mapping[variable_name]]
       # A variable without a dimension of its mask (surface data, 3D mask) is checked against the
       # mask's first entry along it (the first depth level).
       mask_da = mask_da.isel({dim: 0 for dim in mask_da.dims if dim not in da.dims}, drop=True)
-      invalid = invalid & mask_da.astype(bool)
-    counts[variable_name] = invalid.sum([dim for dim in invalid.dims if dim != time_dim])
+      invalid[variable_name] = invalid[variable_name] & mask_da.astype(bool)
 
   logger.info("Checking for Nans.")
-  computed = cast(dict[Hashable, xr.DataArray], dask.compute(counts)[0])
-  per_time: dict[int, list[str]] = {}
-  static_errors = []
-  for variable_name, count in computed.items():
-    if time_dim not in count.dims:
-      if int(count) > 0:
-        static_errors.append(f"{int(count)} NaN values found for variable {variable_name}")
-      continue
-    for index in np.flatnonzero(count.values):
-      per_time.setdefault(int(index), []).append(
-        f"{int(count.values[index])} NaN values found for variable {variable_name}"
-      )
+  static, per_time = _report_by_time(
+    dataset, invalid, time_dim, lambda name, n: f"{n} NaN values found for variable {name}"
+  )
   dataset_errors = []
-  if static_errors:
-    dataset_errors.append(
-      f"{len(static_errors)} errors found without time: " + ", ".join(static_errors)
-    )
-  datetimes = dataset[time_dim].to_index()
-  for index in sorted(per_time):
-    errors_on_datetime = per_time[index]
-    dataset_errors.append(
-      f"{len(errors_on_datetime)} errors found for time {datetimes[index]}: "
-      + ", ".join(errors_on_datetime)
-    )
+  if static:
+    dataset_errors.append(f"{len(static)} errors found without time: " + ", ".join(static))
+  dataset_errors += [
+    f"{len(found)} errors found for time {stamp}: " + ", ".join(found) for stamp, found in per_time
+  ]
   if dataset_errors:
     raise ValidationError("\n".join(dataset_errors))
 
@@ -174,7 +188,7 @@ def fraction_domain(
       outside.
   """
   errors: list[str] = []
-  counts: dict[tuple[str, str, str], xr.DataArray] = {}
+  wrong: dict[tuple[str, str, str], xr.DataArray] = {}
   for fraction_name, variable_names in kwargs.items():
     if fraction_name not in dataset.variables:
       errors.append(f"fraction {fraction_name!r} not found")
@@ -190,25 +204,17 @@ def fraction_domain(
         continue
       da = dataset[name]
       inside = inside_all.isel({d: 0 for d in inside_all.dims if d not in da.dims}, drop=True)
-      other = [d for d in da.dims if d != time_dim]
-      counts[(fraction_name, name, "missing inside")] = (da.isnull() & inside).sum(other)
-      counts[(fraction_name, name, "present outside")] = (da.notnull() & ~inside).sum(other)
+      wrong[(fraction_name, name, "missing inside")] = da.isnull() & inside
+      wrong[(fraction_name, name, "present outside")] = da.notnull() & ~inside
+
+  def describe(key: tuple[str, str, str], n: int) -> str:
+    of_fraction, variable, kind = key
+    return f"{variable}: {n} values {kind} {of_fraction}"
 
   logger.info("Checking variables against their fractions' domains.")
-  computed = cast(dict[tuple[str, str, str], xr.DataArray], dask.compute(counts)[0])
-  per_time: dict[int, list[str]] = {}
-  for (fraction_name, name, kind), count in computed.items():
-    if time_dim not in count.dims:
-      if int(count) > 0:
-        errors.append(f"{name}: {int(count)} values {kind} {fraction_name}")
-      continue
-    for index in np.flatnonzero(count.values):
-      per_time.setdefault(int(index), []).append(
-        f"{name}: {int(count.values[index])} values {kind} {fraction_name}"
-      )
-  if per_time:
-    stamps = dataset[time_dim].to_index()
-    errors += [f"{stamps[i]}: " + ", ".join(per_time[i]) for i in sorted(per_time)]
+  static, per_time = _report_by_time(dataset, wrong, time_dim, describe)
+  errors += static
+  errors += [f"{stamp}: " + ", ".join(found) for stamp, found in per_time]
   if errors:
     raise ValidationError("\n".join(errors))
 
