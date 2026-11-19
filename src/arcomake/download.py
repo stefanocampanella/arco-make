@@ -506,14 +506,16 @@ def _write_block(
       # Chunks are planned for reading; the stored layout is the recipe's.
       align_chunks=True,
     )
+  if first and static is not None:
+    static.checked = True  # this run wrote them: its later blocks reuse the same
 
 
 def _check_static(
   dataset: xr.Dataset, run: icechunk_utils.Run, group: str | None, time_dim: str
 ) -> None:
   """Fail if a static variable of `dataset` differs from the one stored on the run's branch
-  (compared in the stored dtype, NaN equal to NaN): appends do not rewrite them, so the output
-  would keep the old ones."""
+  (compared as stored: packed with the stored variable's encoding, NaN equal to NaN): appends do
+  not rewrite them, so the output would keep the old ones."""
   names = [name for name, var in dataset.data_vars.items() if time_dim not in var.dims]
   if not names:
     return
@@ -525,7 +527,7 @@ def _check_static(
           f"Static variable {name!r} is not in the output: start over with --replace"
         )
       expected = stored[name].values
-      computed = np.asarray(dataset[name].values).astype(expected.dtype)
+      computed = np.asarray(_as_stored(dataset[name], stored[name]).values).astype(expected.dtype)
       equal_nan = bool(np.issubdtype(expected.dtype, np.floating))
       if computed.shape != expected.shape or not np.array_equal(
         computed, expected, equal_nan=equal_nan
@@ -535,6 +537,18 @@ def _check_static(
           " changed): start over with --replace"
         )
   logger.info(f"Static variables identical to the stored ones: {', '.join(map(str, names))}")
+
+
+# Encoding keys that change stored values: packing into another type, with scale and offset.
+_VALUE_ENCODING = ("dtype", "scale_factor", "add_offset", "_FillValue")
+
+
+def _as_stored(computed: xr.DataArray, stored: xr.DataArray) -> xr.DataArray:
+  """`computed` encoded as `stored` was (e.g. floats packed into int16) and decoded again."""
+  variable = computed.variable.copy(deep=False)
+  variable.encoding = {k: v for k, v in stored.encoding.items() if k in _VALUE_ENCODING}
+  encoded = xr.conventions.encode_cf_variable(variable, name=str(computed.name))
+  return computed.copy(data=xr.conventions.decode_cf_variable(computed.name, encoded).values)
 
 
 # The attributes `processing_utils.time_coverage` computes (a one-stamp output has no resolution).

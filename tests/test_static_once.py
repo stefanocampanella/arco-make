@@ -55,6 +55,31 @@ def test_static_datasets_are_processed_once_per_run(recipe, reads, tmp_path: pat
   assert "time" not in out.sea_mask.dims and out.sea_mask.any()
 
 
+def test_a_run_that_writes_the_first_block_does_not_check_static_variables(
+  recipe, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+):
+  """The comparison is for resumed runs: a run's later blocks reuse what its first one wrote."""
+  calls = []
+  monkeypatch.setattr(download_module, "_check_static", lambda *args: calls.append(args))
+  assert run(recipe, tmp_path / "out.zarr").exit_code == 0
+  assert calls == []
+
+
+def test_resume_with_packed_static_variables_goes_on(recipe, reads, tmp_path: pathlib.Path):
+  """A static variable packed into integers (scale_factor) is stored rounded: the computed one
+  is compared after the same packing, not as computed."""
+  packed = recipe.read_text() + (
+    '\n[save.encoding.deptho]\ndtype = "int16"\nscale_factor = 0.3\n_FillValue = -32768\n'
+  )
+  recipe.write_text(packed)
+  output = tmp_path / "out.zarr"
+  reads["fail"] = SECOND_BLOCK
+  assert run(recipe, output).exit_code != 0
+  reads["fail"] = None
+  resumed = run(recipe, output, "--resume")
+  assert resumed.exit_code == 0, resumed.output
+
+
 def test_resume_checks_the_static_variables(recipe, reads, sources, tmp_path: pathlib.Path):
   """A resumed run computes the static datasets again (its first block is not the output's) and
   refuses to go on if they differ from the stored ones: appends do not rewrite them."""
