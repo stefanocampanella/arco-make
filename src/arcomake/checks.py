@@ -130,13 +130,21 @@ def ensure_no_nans(
 
   Each extra argument maps a mask to the variables it applies to, e.g.
   `glorys_mask = ["thetao", "so"]`: those are checked only where the mask is True (the first
-  level of a 3D mask for 2D variables). Other variables are checked everywhere.
+  level of a 3D mask for 2D variables). Other variables are checked everywhere. A mask missing
+  from the dataset is reported, and its variables are not checked.
 
   Raises:
     ValidationError: listing, per time step, the variables with missing values.
   """
+  dataset_errors: list[str] = []
   variable_mask_mapping: dict[Hashable, str] = {}
+  unchecked: set[Hashable] = set()
   for mask_name, variable_names in kwargs.items():
+    if mask_name not in dataset.variables:
+      # Its variables are not checked: everywhere, they would be reported missing on land.
+      dataset_errors.append(f"mask {mask_name!r} not found")
+      unchecked.update(variable_names)
+      continue
     for variable_name in variable_names:
       if variable_name in dataset.data_vars:
         variable_mask_mapping[variable_name] = mask_name
@@ -146,6 +154,8 @@ def ensure_no_nans(
   # Missing values inside the masks.
   invalid: dict[Hashable, xr.DataArray] = {}
   for variable_name, da in dataset.data_vars.items():
+    if variable_name in unchecked and variable_name not in variable_mask_mapping:
+      continue
     invalid[variable_name] = da.isnull()
     if variable_name in variable_mask_mapping:
       mask_da = dataset[variable_mask_mapping[variable_name]]
@@ -158,7 +168,6 @@ def ensure_no_nans(
   static, per_time = _report_by_time(
     dataset, invalid, time_dim, lambda name, n: f"{n} NaN values found for variable {name}"
   )
-  dataset_errors = []
   if static:
     dataset_errors.append(f"{len(static)} errors found without time: " + ", ".join(static))
   dataset_errors += [

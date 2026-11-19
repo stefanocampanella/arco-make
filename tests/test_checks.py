@@ -275,3 +275,12 @@ def test_fraction_domain_computes_once(ocean_ds, static_ds):
     f"{times[3]}: thetao: 1 values present outside seafrac, zos: {sea} values missing inside"
     " seafrac",
   ]
+
+
+def test_ensure_no_nans_reports_a_missing_mask(ocean_ds: xr.Dataset):
+  """A failure to report, not a KeyError that stops `validate` and the other checks; the
+  variables of the missing mask are not checked (without it, NaN on land would be reported)."""
+  config = ChecksConfig.model_validate({"ensure_no_nans": {"m": ["zos"]}})
+  with pytest.warns(UserWarning, match="mask 'm' not found") as record:
+    ocean_ds[["zos"]].arcomake.validate(config)
+  assert "NaN values" not in str(record[0].message)
