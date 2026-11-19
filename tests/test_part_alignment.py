@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: 2026 Stefano Campanella
+# SPDX-License-Identifier: MIT
+"""`rename` and `coordinate_tolerance` of a part: a static file of the same grid from another
+publisher (other coordinate names, coordinates off by rounding) merged with a dataset's other
+parts, which are merged only on equal coordinates."""
+
+import datetime
+import pathlib
+
+import numpy as np
+import pydantic
+import pytest
+import xarray as xr
+
+from arcomake.dataset_utils import DatasetConfig, GenericPartConfig, download_and_process
+
+START = datetime.datetime(2020, 1, 1)
+LAT = np.arange(-59.975, -59.0, 0.05)
+LON = np.arange(-179.975, -179.0, 0.05)
+
+
+@pytest.fixture
+def files(tmp_path: pathlib.Path) -> tuple[str, str]:
+  """A field on (latitude, longitude), and a static field on (lat, lon) whose coordinates differ
+  by 4e-12, as GloFAS's discharge and its drainage directions do."""
+  rng = np.random.default_rng(0)
+  field = xr.Dataset(
+    {"q": (("latitude", "longitude"), rng.random((LAT.size, LON.size)))},
+    coords={"latitude": LAT, "longitude": LON},
+  )
+  static = xr.Dataset(
+    {"ldd": (("lat", "lon"), rng.integers(1, 10, (LAT.size, LON.size)).astype("float32"))},
+    coords={"lat": LAT + 4e-12, "lon": LON - 4e-12},
+  )
+  static.lat.attrs = {"units": "degrees_north"}
+  paths = tmp_path / "q.nc", tmp_path / "ldd.nc"
+  field.to_netcdf(paths[0])
+  static.to_netcdf(paths[1])
+  return str(paths[0]), str(paths[1])
+
+
+def dataset(files: tuple[str, str], **static_options) -> xr.Dataset:
+  configs = DatasetConfig(
+    parts=[
+      GenericPartConfig(filename_or_obj=files[0]),
+      GenericPartConfig(filename_or_obj=files[1], **static_options),
+    ]
+  )
+  return download_and_process(configs, START, START + datetime.timedelta(days=1)).load()
+
+
+def test_renamed_part_with_tolerance_takes_the_first_parts_coordinates(files):
+  ds = dataset(files, rename={"lat": "latitude", "lon": "longitude"}, coordinate_tolerance=1e-9)
+  assert set(ds.data_vars) == {"q", "ldd"}
+  np.testing.assert_array_equal(ds.latitude.values, LAT)
+  np.testing.assert_array_equal(ds.longitude.values, LON)
+  assert ds.ldd.notnull().all()
+
+
+def test_without_tolerance_parts_merge_only_on_equal_coordinates(files):
+  with pytest.raises(ValueError):
+    dataset(files, rename={"lat": "latitude", "lon": "longitude"})
+
+
+def test_a_difference_above_the_tolerance_fails(files):
+  with pytest.raises(ValueError, match="differs from an earlier part's"):
+    dataset(files, rename={"lat": "latitude", "lon": "longitude"}, coordinate_tolerance=1e-13)
+
+
+def test_tolerance_must_be_positive():
+  with pytest.raises(pydantic.ValidationError):
+    GenericPartConfig(filename_or_obj="x.nc", coordinate_tolerance=0.0)

@@ -157,6 +157,42 @@ class PartStaticTime(BaseModel):
     return value.replace(tzinfo=None)
 
 
+class PartAlignment(BaseModel):
+  """`rename` and `coordinate_tolerance` of a part: to merge a part whose names or coordinates
+  differ slightly from the other parts' (a static file of the same grid from another publisher).
+
+  `rename` renames the part's variables, coordinates or dimensions right after it is opened, e.g.
+  `{lat = "latitude", lon = "longitude"}`. With `coordinate_tolerance`, each of the part's index
+  coordinates that an earlier part of the dataset also has, with the same size, takes the earlier
+  part's values if they differ by at most this much (absolute; else the dataset fails): parts are
+  merged only on equal coordinates.
+  """
+
+  rename: dict[str, str] | None = None
+  coordinate_tolerance: float | None = Field(default=None, gt=0)
+
+
+def _snap_coordinates(
+  part: xr.Dataset, earlier: Sequence[xr.Dataset], tolerance: float
+) -> xr.Dataset:
+  """`part` with the index coordinates it shares with an earlier part (same name and size) taken
+  from that part, if no value differs by more than `tolerance` (`PartAlignment`)."""
+  for name, index in part.indexes.items():
+    reference = next(
+      (p[name] for p in earlier if name in p.indexes and p.sizes[name] == part.sizes[name]), None
+    )
+    if reference is None or not np.issubdtype(index.dtype, np.number):
+      continue
+    difference = float(np.abs(np.asarray(index, dtype="float64") - reference.values).max())
+    if difference > tolerance:
+      raise ValueError(
+        f"coordinate {name!r} differs from an earlier part's by {difference:g}, more than the"
+        f" part's coordinate_tolerance {tolerance:g}"
+      )
+    part = part.assign_coords({name: (name, reference.values, part[name].attrs)})
+  return part
+
+
 # Seconds a source may stay silent (no connection, no data) before the request fails. gcsfs
 # waits forever by default (N7): two downloads hung on a read from Google Cloud Storage.
 DEFAULT_TIMEOUT = 120.0
@@ -254,7 +290,7 @@ def _has_scheme(url: str, *schemes: str) -> bool:
   return url.split("://", 1)[0].lower() in schemes if "://" in url else False
 
 
-class CopernicusMarinePartConfig(PartTimeOffset):
+class CopernicusMarinePartConfig(PartTimeOffset, PartAlignment):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
@@ -275,7 +311,7 @@ class CopernicusMarinePartConfig(PartTimeOffset):
   storage_options: dict[str, Any] | None = None
 
 
-class NetCDFOverHTTPPartConfig(PartTimeOffset, PartTimeout, PartStaticTime):
+class NetCDFOverHTTPPartConfig(PartTimeOffset, PartTimeout, PartStaticTime, PartAlignment):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
@@ -290,7 +326,7 @@ class NetCDFOverHTTPPartConfig(PartTimeOffset, PartTimeout, PartStaticTime):
     )
 
 
-class EarlyWarningDataStorePartConfig(PartTimeOffset, PartTimeout):
+class EarlyWarningDataStorePartConfig(PartTimeOffset, PartTimeout, PartAlignment):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
@@ -313,7 +349,9 @@ class EarlyWarningDataStorePartConfig(PartTimeOffset, PartTimeout):
     return _engine_given_or_implied(data, lambda url: _has_scheme(url, "ewds"))
 
 
-class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout, PartStaticTime):
+class ZarrPartConfig(
+  OpenDatasetArguments, PartTimeOffset, PartTimeout, PartStaticTime, PartAlignment
+):
   """A Zarr part: the arguments of `xarray.open_dataset`, read through a strict store."""
 
   filename_or_obj: str
@@ -325,7 +363,9 @@ class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout, PartStat
     return _engine_given_or_implied(data, lambda url: url.rstrip("/").endswith(".zarr"))
 
 
-class GenericPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout, PartStaticTime):
+class GenericPartConfig(
+  OpenDatasetArguments, PartTimeOffset, PartTimeout, PartStaticTime, PartAlignment
+):
   """A part read by any other xarray engine, with the arguments of `xarray.open_dataset`."""
 
   filename_or_obj: str
@@ -761,7 +801,8 @@ def download_and_process(
     offset = raw_part.time_offset or datetime.timedelta(0)
     static_time = getattr(raw_part, "static_time", None)
     part_conf = raw_part.model_dump(
-      exclude_unset=True, exclude={"time_offset", "timeout", "static_time"}
+      exclude_unset=True,
+      exclude={"time_offset", "timeout", "static_time", "rename", "coordinate_tolerance"},
     )
     engine = getattr(raw_part, "engine", None) or part_conf.get("engine")
     if engine is not None:
@@ -771,6 +812,10 @@ def download_and_process(
     if engine == "earlywarningdatastore" or engine == "copernicusmarine":
       part_conf.update(start_datetime=start_datetime - offset, end_datetime=end_datetime - offset)
     part = open_input(**part_conf)
+    if raw_part.rename is not None:
+      part = part.rename(raw_part.rename)
+    if raw_part.coordinate_tolerance is not None:
+      part = _snap_coordinates(part, [p for _, p in opened], raw_part.coordinate_tolerance)
     if offset:
       part = _shift_time(part, offset, time_dim)
     if static_time is not None:
