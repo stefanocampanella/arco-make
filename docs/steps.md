@@ -108,6 +108,33 @@ Remove all attributes of the listed variables or coordinates.
 |---|---|---|
 | `variables` | `Iterable[Hashable]` | required |
 
+## `fill_from_above`
+
+Fill missing values with the nearest valid value above them in the same column.
+
+For cells a coarse grid calls sea where the source has no value (a model's gaps, or its
+levels below the sea floor). Cells with no valid value above stay missing (fill them with
+`masked_fill`). With `mask_name`, only missing values inside the mask are filled:
+
+```toml
+name = "fill_from_above"
+variables = ["thetao", "so", "uo", "vo"]
+depth_dim = "depth"
+mask_name = "sea"
+```
+
+Arguments:
+
+- `variables`: Variables with `depth_dim`.
+- `depth_dim`: Vertical dimension; its first index must be the top.
+- `mask_name`: Boolean variable, True where missing values are filled (default: everywhere).
+
+| Argument | Type | Default |
+|---|---|---|
+| `variables` | `Iterable[Hashable]` | required |
+| `depth_dim` | `str` | required |
+| `mask_name` | `Hashable &#124; None` | `None` |
+
 ## `flip`
 
 Reverse the order along a dimension (e.g. make ERA5 latitudes increase).

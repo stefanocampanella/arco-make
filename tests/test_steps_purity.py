@@ -32,6 +32,7 @@ STEPS = {
   "coverage_attrs": {"latitude_dim": "latitude", "longitude_dim": "longitude"},
   "drop_static_vars": {},
   "drop_var_attrs": {"variables": ["thetao"]},
+  "fill_from_above": {"variables": ["thetao"], "depth_dim": "depth", "mask_name": "m"},
   "flip": {"dim": "latitude"},
   "fraction_mask": {"fraction": "deptho", "mask_name": "m4", "threshold": 0.5},
   "get_bottom": {"depth_dim": "depth", "variables": {"thetao": "tb"}, "replace": False},

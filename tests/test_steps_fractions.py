@@ -57,3 +57,36 @@ def test_fraction_mask_rejects_meaningless_arguments(kwargs):
   meaningless."""
   with pytest.raises(ValueError):
     pu.fraction_mask(fraction_ds(), fraction="f", mask_name="m", **kwargs)
+
+
+def column_ds(chunked: bool = False) -> xr.Dataset:
+  """Two columns of five levels: gaps under valid values, a column starting with a gap."""
+  t = np.array([[1.0, np.nan, 3.0, np.nan, np.nan], [np.nan, 2.0, np.nan, np.nan, np.nan]])
+  mask = np.array([[True, True, True, True, False], [True, True, True, False, False]])
+  ds = xr.Dataset(
+    {"t": (("x", "depth"), t, {"units": "degC"}), "m": (("x", "depth"), mask)},
+    coords={"depth": [1.0, 2.0, 3.0, 4.0, 5.0]},
+  )
+  return ds.chunk(depth=2) if chunked else ds
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_fill_from_above_inside_the_mask(chunked: bool):
+  """Each gap inside the mask takes the nearest value above; a gap with nothing above stays."""
+  out = pu.fill_from_above(column_ds(chunked), variables=["t"], depth_dim="depth", mask_name="m")
+  expected = [[1.0, 1.0, 3.0, 3.0, np.nan], [np.nan, 2.0, 2.0, np.nan, np.nan]]
+  np.testing.assert_array_equal(out.t.values, expected)
+  assert out.t.attrs == {"units": "degC"} and out.t.dims == ("x", "depth")
+
+
+def test_fill_from_above_without_mask_fills_every_gap_below_a_value():
+  out = pu.fill_from_above(column_ds(), variables=["t"], depth_dim="depth")
+  expected = [[1.0, 1.0, 3.0, 3.0, 3.0], [np.nan, 2.0, 2.0, 2.0, 2.0]]
+  np.testing.assert_array_equal(out.t.values, expected)
+
+
+def test_fill_from_above_then_zero_for_columns_without_values():
+  """The recipe's pair: from above, then `masked_fill` with 0 for what has nothing above."""
+  ds = pu.fill_from_above(column_ds(), variables=["t"], depth_dim="depth", mask_name="m")
+  out = pu.masked_fill(ds, variables=["t"], fill_value=0.0, mask_name="m")
+  assert out.t.values[1, 0] == 0.0 and np.isnan(out.t.values[0, 4])

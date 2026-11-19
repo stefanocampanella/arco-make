@@ -243,6 +243,68 @@ def drop_var_attrs(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
   return ds
 
 
+def _fill_from_above_needs(ds: xr.Dataset, depth_dim: str, **_: Any) -> Needs:
+  """`fill_from_above` joins the whole depth of a variable in each of its tasks."""
+  return Needs(gathered=frozenset({depth_dim}))
+
+
+def _filled_downwards(values: np.ndarray) -> np.ndarray:
+  """Each NaN replaced by the nearest valid value before it along the last axis (NaN if none)."""
+  valid = ~np.isnan(values)
+  index = np.where(valid, np.arange(values.shape[-1]), 0)
+  np.maximum.accumulate(index, axis=-1, out=index)
+  filled = np.take_along_axis(values, index, axis=-1)
+  return np.where(np.take_along_axis(valid, index, axis=-1), filled, np.nan)
+
+
+@step(needs=_fill_from_above_needs)
+def fill_from_above(
+  ds: xr.Dataset,
+  variables: Iterable[Hashable],
+  depth_dim: str,
+  mask_name: Hashable | None = None,
+) -> xr.Dataset:
+  """Fill missing values with the nearest valid value above them in the same column.
+
+  For cells a coarse grid calls sea where the source has no value (a model's gaps, or its
+  levels below the sea floor). Cells with no valid value above stay missing (fill them with
+  `masked_fill`). With `mask_name`, only missing values inside the mask are filled::
+
+    name = "fill_from_above"
+    variables = ["thetao", "so", "uo", "vo"]
+    depth_dim = "depth"
+    mask_name = "sea"
+
+  Args:
+    variables: Variables with `depth_dim`.
+    depth_dim: Vertical dimension; its first index must be the top.
+    mask_name: Boolean variable, True where missing values are filled (default: everywhere).
+  """
+  data_vars = dict(ds.data_vars)
+  for var in variables:
+    da = ds[var]
+    filled = xr.apply_ufunc(
+      _filled_downwards,
+      da.chunk({depth_dim: -1}) if da.chunks is not None else da,
+      input_core_dims=[[depth_dim]],
+      output_core_dims=[[depth_dim]],
+      dask="parallelized",
+      output_dtypes=[da.dtype],
+      keep_attrs=True,
+    ).transpose(*da.dims)
+    if mask_name is not None:
+      mask = _broadcastable(ds[mask_name], da)
+      filled = da.where(da.notnull() | ~mask, filled)
+    data_vars[var] = filled
+  return xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
+
+
+def _broadcastable(other: xr.DataArray, da: xr.DataArray) -> xr.DataArray:
+  """`other` without the dimensions `da` lacks, taking their first index (e.g. the surface level
+  of a 3D mask for a 2D field)."""
+  return other.isel({dim: 0 for dim in other.dims if dim not in da.dims}, drop=True)
+
+
 @step
 def flip(ds: xr.Dataset, dim: str) -> xr.Dataset:
   """Reverse the order along a dimension (e.g. make ERA5 latitudes increase)."""
@@ -437,7 +499,7 @@ def masked_fill(
   mask = ds[mask_name]
   data_vars = {}
   for var, da in ds.data_vars.items():
-    _mask = mask.isel({dim: 0 for dim in mask.dims if dim not in da.dims}, drop=True)
+    _mask = _broadcastable(mask, da)
     if var in variables:
       # Check if the fill value is per variable
       _fill_name_or_value = fill_value[var] if isinstance(fill_value, dict) else fill_value
