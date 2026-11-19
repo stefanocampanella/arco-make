@@ -7,6 +7,7 @@ from datetime import datetime
 
 import dask
 import numpy as np
+import pydantic
 import pytest
 import xarray as xr
 
@@ -206,6 +207,29 @@ def test_fraction_domain_threshold(ocean_ds, static_ds):
   with pytest.raises(ValidationError, match="present outside"):
     ds.arcomake.validate(domain_config(seafrac=["thetao"], threshold=0.5), fail=True)
   ds.arcomake.validate(domain_config(seafrac=["thetao"], threshold=0.5, inclusive=True), fail=True)
+
+
+def test_fraction_domain_reports_a_missing_fraction(ocean_ds):
+  """A failure to report, not an error that stops `validate` and the other checks."""
+  with pytest.warns(UserWarning, match="fraction 'seafrac' not found"):
+    ocean_ds.arcomake.validate(domain_config(seafrac=["thetao"]))
+
+
+def test_fraction_domain_checks_a_variable_against_each_of_its_fractions(ocean_ds, static_ds):
+  """A variable under two fractions is checked against both: the second does not replace the
+  first's counts."""
+  ds = with_seafrac(ocean_ds, static_ds)
+  ds["everywhere"] = xr.ones_like(ds.seafrac)
+  with pytest.raises(ValidationError, match="thetao: .* values missing inside everywhere"):
+    ds.arcomake.validate(domain_config(seafrac=["thetao"], everywhere=["thetao"]), fail=True)
+  with pytest.raises(ValidationError, match="thetao: .* values missing inside everywhere"):
+    ds.arcomake.validate(domain_config(everywhere=["thetao"], seafrac=["thetao"]), fail=True)
+
+
+def test_fraction_domain_refuses_inclusive_at_zero():
+  """Every cell, land included, would be inside."""
+  with pytest.raises(pydantic.ValidationError, match="not inclusive at 0"):
+    domain_config(seafrac=["thetao"], inclusive=True)
 
 
 def test_fraction_domain_needs_a_static_fraction(ocean_ds, static_ds):

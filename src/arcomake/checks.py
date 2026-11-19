@@ -68,6 +68,8 @@ class FractionDomainCheck(BaseModel):
 
   @model_validator(mode="after")
   def _fractions_map_to_variable_lists(self) -> Self:
+    if not 0.0 <= self.threshold < 1.0 or (self.threshold == 0.0 and self.inclusive):
+      raise ValueError(f"threshold must be in [0, 1) and not inclusive at 0, got {self.threshold}")
     for fraction, variables in (self.model_extra or {}).items():
       if not (isinstance(variables, list) and all(isinstance(v, str) for v in variables)):
         raise ValueError(f"fraction {fraction!r} must map to a list of variable names")
@@ -167,8 +169,11 @@ def fraction_domain(
       outside.
   """
   errors: list[str] = []
-  counts: dict[tuple[str, str], xr.DataArray] = {}
+  counts: dict[tuple[str, str, str], xr.DataArray] = {}
   for fraction_name, variable_names in kwargs.items():
+    if fraction_name not in dataset.data_vars:
+      errors.append(f"fraction {fraction_name!r} not found")
+      continue
     fraction = dataset[fraction_name]
     if time_dim in fraction.dims:
       errors.append(f"fraction {fraction_name!r} has the time dimension: it must be static")
@@ -181,20 +186,20 @@ def fraction_domain(
       da = dataset[name]
       inside = inside_all.isel({d: 0 for d in inside_all.dims if d not in da.dims}, drop=True)
       other = [d for d in da.dims if d != time_dim]
-      counts[(name, "missing inside")] = (da.isnull() & inside).sum(other)
-      counts[(name, "present outside")] = (da.notnull() & ~inside).sum(other)
+      counts[(fraction_name, name, "missing inside")] = (da.isnull() & inside).sum(other)
+      counts[(fraction_name, name, "present outside")] = (da.notnull() & ~inside).sum(other)
 
   logger.info("Checking variables against their fractions' domains.")
-  computed = cast(dict[tuple[str, str], xr.DataArray], dask.compute(counts)[0])
+  computed = cast(dict[tuple[str, str, str], xr.DataArray], dask.compute(counts)[0])
   per_time: dict[int, list[str]] = {}
-  for (name, kind), count in computed.items():
+  for (fraction_name, name, kind), count in computed.items():
     if time_dim not in count.dims:
       if int(count) > 0:
-        errors.append(f"{name}: {int(count)} values {kind}")
+        errors.append(f"{name}: {int(count)} values {kind} {fraction_name}")
       continue
     for index in np.flatnonzero(count.values):
       per_time.setdefault(int(index), []).append(
-        f"{name}: {int(count.values[index])} values {kind}"
+        f"{name}: {int(count.values[index])} values {kind} {fraction_name}"
       )
   if per_time:
     stamps = dataset[time_dim].to_index()
