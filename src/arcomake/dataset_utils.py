@@ -165,7 +165,7 @@ class PartAlignment(BaseModel):
   `{lat = "latitude", lon = "longitude"}`. With `coordinate_tolerance`, each of the part's index
   coordinates that an earlier part of the dataset also has, with the same size, takes the earlier
   part's values if they differ by at most this much (absolute; else the dataset fails): parts are
-  merged only on equal coordinates.
+  merged only on equal coordinates. Not on the first part, and coordinates with missing values fail.
   """
 
   rename: dict[str, str] | None = None
@@ -181,8 +181,12 @@ def _snap_coordinates(
     reference = next(
       (p[name] for p in earlier if name in p.indexes and p.sizes[name] == part.sizes[name]), None
     )
-    if reference is None or not np.issubdtype(index.dtype, np.number):
+    if reference is None or not (
+      np.issubdtype(index.dtype, np.number) and np.issubdtype(reference.dtype, np.number)
+    ):
       continue
+    if np.isnan(np.asarray(index, dtype="float64")).any() or np.isnan(reference.values).any():
+      raise ValueError(f"coordinate {name!r} has missing values: it cannot be matched")
     difference = float(np.abs(np.asarray(index, dtype="float64") - reference.values).max())
     if difference > tolerance:
       raise ValueError(
@@ -631,6 +635,19 @@ class DatasetConfig(BaseModel):
         if isinstance(part, Mapping) and "chunks" in part:
           raise ValueError(f"part {number}: {PLANNED_CHUNKS}: remove `chunks`")
     return data
+
+  @field_validator("parts")
+  @classmethod
+  def _tolerance_after_the_first_part(
+    cls, parts: list[DatasetPartConfig]
+  ) -> list[DatasetPartConfig]:
+    # The tolerance takes coordinates from earlier parts: the first one has none.
+    if parts and parts[0].coordinate_tolerance is not None:
+      raise ValueError(
+        "the first part has no earlier part to take coordinates from: give"
+        " coordinate_tolerance to a later part"
+      )
+    return parts
 
   @field_validator("postprocess")
   @classmethod

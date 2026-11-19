@@ -67,6 +67,31 @@ def test_a_difference_above_the_tolerance_fails(files):
     dataset(files, rename={"lat": "latitude", "lon": "longitude"}, coordinate_tolerance=1e-13)
 
 
+def test_a_missing_coordinate_value_fails(files, tmp_path: pathlib.Path):
+  """NaN differs by NaN, which no tolerance check catches: the coordinates were replaced."""
+  static = xr.open_dataset(files[1]).load()
+  static = static.assign_coords(lat=np.where(np.arange(LAT.size) == 3, np.nan, static.lat))
+  path = tmp_path / "nan.nc"
+  static.to_netcdf(path)
+  with pytest.raises(ValueError, match="missing values"):
+    dataset(
+      (files[0], str(path)),
+      rename={"lat": "latitude", "lon": "longitude"},
+      coordinate_tolerance=1e-9,
+    )
+
+
+def test_tolerance_on_the_first_part_is_refused():
+  """It has no earlier part to take coordinates from."""
+  with pytest.raises(pydantic.ValidationError, match="first part"):
+    DatasetConfig(
+      parts=[
+        GenericPartConfig(filename_or_obj="a.nc", coordinate_tolerance=1e-9),
+        GenericPartConfig(filename_or_obj="b.nc"),
+      ]
+    )
+
+
 def test_tolerance_must_be_positive():
   with pytest.raises(pydantic.ValidationError):
     GenericPartConfig(filename_or_obj="x.nc", coordinate_tolerance=0.0)
