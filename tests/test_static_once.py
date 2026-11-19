@@ -80,6 +80,68 @@ def test_resume_with_packed_static_variables_goes_on(recipe, reads, tmp_path: pa
   assert resumed.exit_code == 0, resumed.output
 
 
+def test_resume_with_static_variables_in_time_units_goes_on(recipe, reads, tmp_path: pathlib.Path):
+  """A static variable with missing values whose units read as a duration ("seconds") is not
+  compared as durations, where missing values (NaT) never equal each other."""
+  steps = """
+# Missing where the first level is not all water (depth below 1 m).
+[[datasets.ocean_static.postprocess]]
+name = "get_sea_mask"
+bathymetry = "deptho"
+depth_coordinate = "depth"
+depth_dim = "depth"
+threshold = 0.0
+mask_name = "full"
+
+[[datasets.ocean_static.postprocess]]
+name = "apply_mask"
+mask_name = "full"
+variables = ["deptho"]
+
+[[datasets.ocean_static.postprocess]]
+name = "drop_vars"
+names = ["full"]
+
+[[datasets.ocean_static.postprocess]]
+name = "assign_var_attrs"
+deptho = {units = "seconds"}
+
+# Steps applied after merging all datasets."""
+  text = recipe.read_text()
+  assert "# Steps applied after merging all datasets." in text
+  recipe.write_text(text.replace("\n# Steps applied after merging all datasets.", steps))
+  output = tmp_path / "out.zarr"
+  reads["fail"] = SECOND_BLOCK
+  assert run(recipe, output).exit_code != 0
+  reads["fail"] = None
+  resumed = run(recipe, output, "--resume")
+  assert resumed.exit_code == 0, resumed.output
+  assert open_output(output).deptho.isnull().any()
+
+
+def test_a_first_block_already_committed_counts_as_written(
+  recipe, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+):
+  """A first block retried after its commit landed (its answer lost) is not written again, and
+  the run's later blocks still skip the comparison."""
+  real_write = download_module.write_output
+  state = {"lost": True}
+
+  def lost_answer(*args, **kwargs):
+    real_write(*args, **kwargs)
+    if state["lost"]:
+      state["lost"] = False
+      raise TimeoutError("answer lost after the commit")
+
+  recipe.write_text(recipe.read_text() + '\n[retries]\nwait = "0s"\n')
+  calls = []
+  monkeypatch.setattr(download_module, "write_output", lost_answer)
+  monkeypatch.setattr(download_module, "_check_static", lambda *args: calls.append(args))
+  result = run(recipe, tmp_path / "out.zarr")
+  assert result.exit_code == 0, result.output
+  assert not state["lost"] and calls == []
+
+
 def test_resume_checks_the_static_variables(recipe, reads, sources, tmp_path: pathlib.Path):
   """A resumed run computes the static datasets again (its first block is not the output's) and
   refuses to go on if they differ from the stored ones: appends do not rewrite them."""

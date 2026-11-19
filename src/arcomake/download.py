@@ -483,6 +483,8 @@ def _write_block(
   block. A run that does not write the first block (`--resume`) compares its static variables
   with the stored ones, once: they must be identical.
   """
+  if first and static is not None:
+    static.checked = True  # this run writes them (or wrote them, if its answer was lost)
   if _committed(run, date_interval):
     return
   with (
@@ -506,8 +508,6 @@ def _write_block(
       # Chunks are planned for reading; the stored layout is the recipe's.
       align_chunks=True,
     )
-  if first and static is not None:
-    static.checked = True  # this run wrote them: its later blocks reuse the same
 
 
 def _check_static(
@@ -515,12 +515,13 @@ def _check_static(
 ) -> None:
   """Fail if a static variable of `dataset` differs from the one stored on the run's branch
   (compared as stored: packed with the stored variable's encoding, NaN equal to NaN): appends do
-  not rewrite them, so the output would keep the old ones."""
+  not rewrite them, so the output would keep the old ones. Units are not read as durations:
+  "seconds" stays a number, whose missing values equal each other."""
   names = [name for name, var in dataset.data_vars.items() if time_dim not in var.dims]
   if not names:
     return
   store = run.repo.readonly_session(branch=run.branch).store
-  with xr.open_zarr(store, group=group, consolidated=False) as stored:
+  with xr.open_zarr(store, group=group, consolidated=False, decode_timedelta=False) as stored:
     for name in names:
       if name not in stored:
         raise click.ClickException(
@@ -528,7 +529,7 @@ def _check_static(
         )
       expected = stored[name].values
       computed = np.asarray(_as_stored(dataset[name], stored[name]).values).astype(expected.dtype)
-      equal_nan = bool(np.issubdtype(expected.dtype, np.floating))
+      equal_nan = expected.dtype.kind in "fcmM"  # NaN, NaT
       if computed.shape != expected.shape or not np.array_equal(
         computed, expected, equal_nan=equal_nan
       ):
@@ -539,8 +540,9 @@ def _check_static(
   logger.info(f"Static variables identical to the stored ones: {', '.join(map(str, names))}")
 
 
-# Encoding keys that change stored values: packing into another type, with scale and offset.
-_VALUE_ENCODING = ("dtype", "scale_factor", "add_offset", "_FillValue")
+# Encoding keys that change stored values: packing into another type, with scale and offset, and
+# the units and calendar of times.
+_VALUE_ENCODING = ("dtype", "scale_factor", "add_offset", "_FillValue", "units", "calendar")
 
 
 def _as_stored(computed: xr.DataArray, stored: xr.DataArray) -> xr.DataArray:
@@ -548,7 +550,8 @@ def _as_stored(computed: xr.DataArray, stored: xr.DataArray) -> xr.DataArray:
   variable = computed.variable.copy(deep=False)
   variable.encoding = {k: v for k, v in stored.encoding.items() if k in _VALUE_ENCODING}
   encoded = xr.conventions.encode_cf_variable(variable, name=str(computed.name))
-  return computed.copy(data=xr.conventions.decode_cf_variable(computed.name, encoded).values)
+  decoded = xr.conventions.decode_cf_variable(computed.name, encoded, decode_timedelta=False)
+  return computed.copy(data=decoded.values)
 
 
 # The attributes `processing_utils.time_coverage` computes (a one-stamp output has no resolution).
