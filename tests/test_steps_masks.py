@@ -81,6 +81,16 @@ def test_apply_mask_default_leaves_the_mask_boolean(ocean_ds: xr.Dataset, static
   assert out.zos.isel(longitude=0).isnull().all()
 
 
+def test_apply_mask_uses_the_surface_of_a_3d_mask_for_2d_fields(ocean_ds, static_ds):
+  """A 2D field keeps its dimensions: it is masked by the mask's first level, not broadcast
+  to the mask's depth (as `masked_fill` does)."""
+  ds = pu.get_sea_mask(xr.merge([ocean_ds, static_ds]), depth_dim="depth", mask_name="m")
+  out = pu.apply_mask(ds, mask_name="m", variables=["zos", "thetao"])
+  assert out.zos.dims == ds.zos.dims
+  xr.testing.assert_identical(out.zos, ds.zos.where(ds.m.isel(depth=0, drop=True)))
+  xr.testing.assert_identical(out.thetao, ds.thetao.where(ds.m))
+
+
 def test_masked_fill_constant_inside_mask_only(ocean_ds: xr.Dataset, static_ds: xr.Dataset):
   """NaN inside the mask are filled; NaN outside the mask stay NaN; valid values are unchanged."""
   ds = pu.get_notnull_mask(xr.merge([ocean_ds, static_ds]), variable="deptho", mask_name="m")

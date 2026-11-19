@@ -10,6 +10,9 @@ dataset and never modifies its input.
 
 Set variables to NaN outside a mask.
 
+For variables without one of the mask's dimensions (e.g. 2D fields and a 3D mask), the first
+index of that dimension is used (e.g. the surface level).
+
 Arguments:
 
 - `mask_name`: Boolean variable, True where values are kept.

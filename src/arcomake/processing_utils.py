@@ -59,6 +59,9 @@ def apply_mask(
 ) -> xr.Dataset:
   """Set variables to NaN outside a mask.
 
+  For variables without one of the mask's dimensions (e.g. 2D fields and a 3D mask), the first
+  index of that dimension is used (e.g. the surface level).
+
   Args:
     mask_name: Boolean variable, True where values are kept.
     variables: Variables to mask; by default every data variable except the mask.
@@ -69,7 +72,7 @@ def apply_mask(
   data_vars = {}
   for var in ds.data_vars:
     if var in variables:
-      data_vars[var] = ds[var].where(mask)
+      data_vars[var] = ds[var].where(_broadcastable(mask, ds[var]))
     else:
       data_vars[var] = ds[var]
   ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
