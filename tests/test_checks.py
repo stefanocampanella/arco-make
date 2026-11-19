@@ -161,3 +161,55 @@ def test_validate_accessor_warns_or_raises(ocean_ds: xr.Dataset):
     ocean_ds.arcomake.validate(config)
   with pytest.raises(ValidationError):
     ocean_ds.arcomake.validate(config, fail=True)
+
+
+def with_seafrac(ocean_ds: xr.Dataset, static_ds: xr.Dataset) -> xr.Dataset:
+  """The synthetic ocean with a static sea fraction: 1 where it has values, 0 below the sea
+  floor and on land (`thetao` is NaN exactly there)."""
+  frac = ocean_ds.thetao.isel(time=0, drop=True).notnull().astype("float32")
+  return ocean_ds.assign(seafrac=frac)
+
+
+def domain_config(**fractions) -> ChecksConfig:
+  return ChecksConfig.model_validate({"fraction_domain": fractions})
+
+
+def test_fraction_domain_accepts_values_exactly_inside(ocean_ds, static_ds):
+  ds = with_seafrac(ocean_ds, static_ds)
+  ds.arcomake.validate(domain_config(seafrac=["thetao", "zos"]), fail=True)
+
+
+@pytest.mark.parametrize("kind", ["missing inside", "present outside"])
+def test_fraction_domain_reports_both_directions(ocean_ds, static_ds, kind: str):
+  ds = with_seafrac(ocean_ds, static_ds)
+  thetao = ds.thetao.values.copy()
+  if kind == "missing inside":
+    thetao[2, 0, 3, 4] = np.nan  # a sea cell
+  else:
+    thetao[2, 2, 3, 1] = 1.0  # below the sea floor
+  ds["thetao"] = (ds.thetao.dims, thetao)
+  with pytest.raises(ValidationError, match=f"2020-02-28.*thetao: 1 values {kind}"):
+    ds.arcomake.validate(domain_config(seafrac=["thetao"]), fail=True)
+
+
+def test_fraction_domain_uses_the_surface_for_2d_fields(ocean_ds, static_ds):
+  ds = with_seafrac(ocean_ds, static_ds)
+  ds["zos"] = ds.zos.fillna(0.0)  # values on land
+  with pytest.raises(ValidationError, match="zos: 8 values present outside"):
+    ds.arcomake.validate(domain_config(seafrac=["zos"]), fail=True)
+
+
+def test_fraction_domain_threshold(ocean_ds, static_ds):
+  """With threshold 0.5, cells half sea or less are outside: their values are reported."""
+  ds = with_seafrac(ocean_ds, static_ds)
+  ds["seafrac"] = ds.seafrac * 0.5
+  with pytest.raises(ValidationError, match="present outside"):
+    ds.arcomake.validate(domain_config(seafrac=["thetao"], threshold=0.5), fail=True)
+  ds.arcomake.validate(domain_config(seafrac=["thetao"], threshold=0.5, inclusive=True), fail=True)
+
+
+def test_fraction_domain_needs_a_static_fraction(ocean_ds, static_ds):
+  ds = with_seafrac(ocean_ds, static_ds)
+  ds["seafrac"] = ds.seafrac.expand_dims(time=ds.time)
+  with pytest.raises(ValidationError, match="must be static"):
+    ds.arcomake.validate(domain_config(seafrac=["thetao"]), fail=True)

@@ -56,12 +56,31 @@ class EnsureNoNansCheck(BaseModel):
     return self
 
 
+class FractionDomainCheck(BaseModel):
+  """`time_dim`, `threshold`, `inclusive`, and one key per fraction:
+  `FRACTION = ["variable", ...]` checks those variables against it."""
+
+  model_config = ConfigDict(extra="allow")
+
+  time_dim: str = "time"
+  threshold: float = 0.0
+  inclusive: bool = False
+
+  @model_validator(mode="after")
+  def _fractions_map_to_variable_lists(self) -> Self:
+    for fraction, variables in (self.model_extra or {}).items():
+      if not (isinstance(variables, list) and all(isinstance(v, str) for v in variables)):
+        raise ValueError(f"fraction {fraction!r} must map to a list of variable names")
+    return self
+
+
 class ChecksConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   valid_global_ecmwf_coordinates: ValidGlobalECMWFCoordinatesCheck | None = None
   valid_time_coordinate: ValidTimeCoordinateCheck | None = None
   ensure_no_nans: EnsureNoNansCheck | None = None
+  fraction_domain: FractionDomainCheck | None = None
 
 
 def ensure_no_nans(
@@ -126,6 +145,62 @@ def ensure_no_nans(
     )
   if dataset_errors:
     raise ValidationError("\n".join(dataset_errors))
+
+
+def fraction_domain(
+  dataset: xr.Dataset,
+  time_dim: str = "time",
+  threshold: float = 0.0,
+  inclusive: bool = False,
+  **kwargs: list[str],
+) -> None:
+  """Check that variables have values exactly where a static fraction says the domain is.
+
+  Each extra argument maps a fraction (e.g. of sea, without the time dimension) to the variables
+  it decides: inside (fraction above `threshold`, or at least with `inclusive`) no value may be
+  missing, outside every value must be. Variables without one of the fraction's dimensions are
+  checked against its first index along it (the surface level, for 2D fields). A fraction with
+  the time dimension fails: the domain is static.
+
+  Raises:
+    ValidationError: listing, per time step, the variables with missing values inside or values
+      outside.
+  """
+  errors: list[str] = []
+  counts: dict[tuple[str, str], xr.DataArray] = {}
+  for fraction_name, variable_names in kwargs.items():
+    fraction = dataset[fraction_name]
+    if time_dim in fraction.dims:
+      errors.append(f"fraction {fraction_name!r} has the time dimension: it must be static")
+      continue
+    inside_all = fraction >= threshold if inclusive else fraction > threshold
+    for name in variable_names:
+      if name not in dataset.data_vars:
+        errors.append(f"variable {name!r} of fraction {fraction_name!r} not found")
+        continue
+      da = dataset[name]
+      inside = inside_all.isel({d: 0 for d in inside_all.dims if d not in da.dims}, drop=True)
+      other = [d for d in da.dims if d != time_dim]
+      counts[(name, "missing inside")] = (da.isnull() & inside).sum(other)
+      counts[(name, "present outside")] = (da.notnull() & ~inside).sum(other)
+
+  logger.info("Checking variables against their fractions' domains.")
+  computed = cast(dict[tuple[str, str], xr.DataArray], dask.compute(counts)[0])
+  per_time: dict[int, list[str]] = {}
+  for (name, kind), count in computed.items():
+    if time_dim not in count.dims:
+      if int(count) > 0:
+        errors.append(f"{name}: {int(count)} values {kind}")
+      continue
+    for index in np.flatnonzero(count.values):
+      per_time.setdefault(int(index), []).append(
+        f"{name}: {int(count.values[index])} values {kind}"
+      )
+  if per_time:
+    stamps = dataset[time_dim].to_index()
+    errors += [f"{stamps[i]}: " + ", ".join(per_time[i]) for i in sorted(per_time)]
+  if errors:
+    raise ValidationError("\n".join(errors))
 
 
 def valid_global_ecmwf_coordinates(
@@ -270,5 +345,6 @@ CHECKS: dict[str, Callable[..., None]] = {
   "valid_global_ecmwf_coordinates": valid_global_ecmwf_coordinates,
   "valid_time_coordinate": valid_time_coordinate,
   "ensure_no_nans": ensure_no_nans,
+  "fraction_domain": fraction_domain,
 }
 assert set(CHECKS) == set(ChecksConfig.model_fields)
