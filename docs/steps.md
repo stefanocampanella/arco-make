@@ -380,12 +380,19 @@ Whatever the method, xarray-regrid leaves NaN in the target cells whose centre l
 the range of the source's centres, even where they overlap the source: a source covering
 latitudes -59.975 to 89.975 loses its points in the target rows centred at -60 and 90.
 
+With `conservation_tolerance` (conservative method, `skipna = false`, for densities such as
+the output of `per_unit_area`), the total of each variable (density times cell area, missing as
+0) is compared with the source's, at every time step and level: a relative difference above
+the tolerance fails the computation, naming the variable. It catches values lost in blanked
+edge cells, or grids whose cells do not cover the source's.
+
 Arguments:
 
 - `grid`: Arguments of `xarray_regrid.Grid` (`north`, `east`, `south`, `west`, `resolution_lat`, `resolution_lon`). In a download or process recipe, also the name of a grid of its `[grids]` table, to write a grid once for several steps.
 - `latitude_dim, longitude_dim`: Names of the horizontal dimensions.
 - `method`: The xarray-regrid method (default "nearest").
 - `kwargs`: Further arguments of that method (e.g. `skipna`, `nan_threshold`; `output_chunks` only outside download recipes, whose chunks are planned).
+- `conservation_tolerance`: Largest relative change of totals allowed (none: not checked).
 
 | Argument | Type | Default |
 |---|---|---|
@@ -394,6 +401,7 @@ Arguments:
 | `longitude_dim` | `str` | `'longitude'` |
 | `method` | `Literal['nearest', 'linear', 'cubic', 'conservative', 'most_common', 'least_common', 'stat']` | `'nearest'` |
 | `kwargs` | `Mapping[str, Any] &#124; None` | `None` |
+| `conservation_tolerance` | `float &#124; None` | `None` |
 
 ## `rename_coordinates`
 

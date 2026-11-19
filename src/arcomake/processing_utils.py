@@ -660,6 +660,7 @@ def regrid(
     "nearest", "linear", "cubic", "conservative", "most_common", "least_common", "stat"
   ] = "nearest",
   kwargs: Mapping[str, Any] | None = None,
+  conservation_tolerance: float | None = None,
 ) -> xr.Dataset:
   """Regrid to a regular latitude-longitude grid with xarray-regrid.
 
@@ -683,6 +684,12 @@ def regrid(
   the range of the source's centres, even where they overlap the source: a source covering
   latitudes -59.975 to 89.975 loses its points in the target rows centred at -60 and 90.
 
+  With `conservation_tolerance` (conservative method, `skipna = false`, for densities such as
+  the output of `per_unit_area`), the total of each variable (density times cell area, missing as
+  0) is compared with the source's, at every time step and level: a relative difference above
+  the tolerance fails the computation, naming the variable. It catches values lost in blanked
+  edge cells, or grids whose cells do not cover the source's.
+
   Args:
     grid: Arguments of `xarray_regrid.Grid` (`north`, `east`, `south`, `west`,
       `resolution_lat`, `resolution_lon`). In a download or process recipe, also the name of a
@@ -691,7 +698,15 @@ def regrid(
     method: The xarray-regrid method (default "nearest").
     kwargs: Further arguments of that method (e.g. `skipna`, `nan_threshold`; `output_chunks`
       only outside download recipes, whose chunks are planned).
+    conservation_tolerance: Largest relative change of totals allowed (none: not checked).
   """
+  if conservation_tolerance is not None and (
+    method != "conservative" or (kwargs or {}).get("skipna", True)
+  ):
+    raise ValueError(
+      "conservation_tolerance needs method = 'conservative' and kwargs.skipna = false: only then"
+      " are totals kept"
+    )
   new_grid = xarray_regrid.Grid(**grid)
   target_dataset = new_grid.create_regridding_dataset(lat_name=latitude_dim, lon_name=longitude_dim)
   target_dataset = target_dataset.assign_coords(
@@ -709,7 +724,61 @@ def regrid(
     regrid_conf.setdefault("fill_value", np.nan)
   regridded = getattr(ds.regrid, method)(target_dataset, **regrid_conf)
   assert isinstance(regridded, xr.Dataset)
+  if conservation_tolerance is not None:
+    regridded = _with_conserved_totals(
+      ds, regridded, latitude_dim, longitude_dim, conservation_tolerance
+    )
   return regridded
+
+
+def _totals(da: xr.DataArray, latitude_dim: str, longitude_dim: str) -> xr.DataArray:
+  """Area-weighted sums (density times cell area, missing as 0) over the horizontal dimensions."""
+  areas = xr.DataArray(
+    cell_areas(da[latitude_dim].values, da[longitude_dim].values),
+    dims=(latitude_dim, longitude_dim),
+  )
+  return (da.fillna(0).astype("float64") * areas).sum([latitude_dim, longitude_dim])
+
+
+def _checked(
+  values: np.ndarray, source: np.ndarray, target: np.ndarray, *, name: str, tolerance: float
+):
+  """`values`, if the totals agree within the tolerance; else ValueError."""
+  change = np.abs(target - source)
+  bad = change > tolerance * np.maximum(np.abs(source), np.finfo("float64").tiny)
+  if np.any(bad):
+    worst = float(
+      np.max(np.where(bad, change / np.maximum(np.abs(source), np.finfo("float64").tiny), 0))
+    )
+    raise ValueError(
+      f"regrid: the total of {name!r} changed by {worst:.3g} (relative), more than the"
+      f" conservation_tolerance {tolerance:g}"
+    )
+  return values
+
+
+def _with_conserved_totals(
+  source: xr.Dataset, target: xr.Dataset, latitude_dim: str, longitude_dim: str, tolerance: float
+) -> xr.Dataset:
+  """`target` whose variables fail when computed if their totals differ from `source`'s."""
+  data_vars = dict(target.data_vars)
+  horizontal = [latitude_dim, longitude_dim]
+  for name, da in target.data_vars.items():
+    if not set(horizontal) <= set(da.dims) or name not in source:
+      continue
+    data_vars[name] = xr.apply_ufunc(
+      _checked,
+      da,
+      _totals(source[name], latitude_dim, longitude_dim),
+      _totals(da, latitude_dim, longitude_dim),
+      input_core_dims=[horizontal, [], []],
+      output_core_dims=[horizontal],
+      dask="parallelized",
+      output_dtypes=[da.dtype],
+      keep_attrs=True,
+      kwargs={"name": str(name), "tolerance": tolerance},
+    ).transpose(*da.dims)
+  return xr.Dataset(data_vars=data_vars, coords=target.coords, attrs=target.attrs)
 
 
 @step

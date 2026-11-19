@@ -238,3 +238,41 @@ def test_per_unit_area_factor_gives_metres_per_day(static_ds: xr.Dataset):
   out = pu.per_unit_area(ds, variables=["q"], factor=86400.0)
   areas = pu.cell_areas(ds.latitude.values, ds.longitude.values)
   np.testing.assert_allclose(out.q.values, ds.q.values * 86400.0 / areas)
+
+
+CONSERVATIVE = {"method": "conservative", "kwargs": {"skipna": False}}
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_conservation_check_passes_when_totals_are_kept(static_ds: xr.Dataset, chunked: bool):
+  density = pu.per_unit_area(outlets_ds(static_ds), variables=["q"])
+  density = density.expand_dims(time=3).chunk(time=1) if chunked else density
+  out = pu.regrid(density, grid=GRID, conservation_tolerance=1e-9, **CONSERVATIVE)
+  xr.testing.assert_allclose(
+    out.load(), pu.regrid(density, grid=GRID, **CONSERVATIVE).load(), rtol=0, atol=0
+  )
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_conservation_check_fails_when_points_are_lost(static_ds: xr.Dataset, chunked: bool):
+  """A point in a source cell whose target cell is centred beyond the source's centres is lost
+  (xarray-regrid blanks that cell): the check names the variable."""
+  ds = outlets_ds(static_ds)
+  ds["q"][0, 3] = 500.0  # latitude -1.75, in the target row centred at -2
+  grid = {"south": -2.0, "north": 2.0, "west": 0.0, "east": 4.0}
+  grid |= {"resolution_lat": 1.0, "resolution_lon": 1.0}
+  density = pu.per_unit_area(ds, variables=["q"])
+  density = density.expand_dims(time=2).chunk(time=1) if chunked else density
+  with pytest.raises(ValueError, match="total of 'q' changed"):
+    pu.regrid(density, grid=grid, conservation_tolerance=1e-6, **CONSERVATIVE).load()
+
+
+@pytest.mark.parametrize(
+  ("method", "kwargs"), [("conservative", {"skipna": True}), ("conservative", {}), ("nearest", {})]
+)
+def test_conservation_check_needs_conservative_without_skipna(static_ds, method, kwargs):
+  """With skipna the conservative method averages the valid part of cells: totals change."""
+  with pytest.raises(ValueError, match="conservation_tolerance needs"):
+    pu.regrid(
+      outlets_ds(static_ds), grid=GRID, method=method, kwargs=kwargs, conservation_tolerance=1e-6
+    )
