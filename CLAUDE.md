@@ -28,7 +28,7 @@ Code style: **2-space indentation**, line length 100 (ruff config in `pyproject.
 
 Registered in `src/arcomake/__init__.py`: `download`, `process`, `compute-climatology` (from `climatology.py`), `validate`, and `steps` (prints the step reference). Each data command has a Pydantic config model (`DownloadConfig`, `ProcessConfig`, `ClimatologyConfig`, `ValidateConfig`) loaded via `cli_utils.read_configs(path, schema=..., inject=...)`; CLI options like `--start/--end` are injected into the parsed TOML before validation, and the output check runs after (it uses `[save] storage_options`). Checkpointing is configured as `[datasets.<name>.checkpointing]` with `step` and optional `compressors`.
 
-**Documentation is tested:** `docs/steps.md` must equal `arco-make steps` (regenerate with `uv run arco-make steps > docs/steps.md` after changing a step or its docstring), every TOML example in a step docstring must validate, and the README recipe must load as a `DownloadConfig`.
+**Documentation is tested:** `docs/steps.md` must equal `arco-make steps` (regenerate with `uv run arco-make steps > docs/steps.md` after changing a step or its docstring), every TOML example in a step docstring must validate, and the README recipe must load as a `DownloadConfig`. `docs/coarsen-ocean-datasets.md` (how ocean datasets are coarsened: sea fraction, fills, sea ice, river outlets) is a doctest: ```` ```pycon ```` blocks run offline (`tests/test_coarsening_notes.py`), ```` ```pycon live ```` blocks with the live checks; its global figures come from `docs/coarsen_analysis.py` (`measure RES OUT.json`, then `tables`), run by hand with credentials.
 
 ## Architecture
 

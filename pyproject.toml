@@ -90,7 +90,6 @@ extend-exclude = [
     "build",
     "dist",
     "scripts",
-    "notebooks",
 ]
 
 [tool.ruff.lint]
