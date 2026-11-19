@@ -175,6 +175,38 @@ def test_cell_means_over_the_sea_part_from_whole_cell_means(static_ds: xr.Datase
   np.testing.assert_allclose(thickness[ok], direct.values[ok], rtol=1e-6)
 
 
+def with_coordinate_attrs(ds: xr.Dataset) -> xr.Dataset:
+  for name in ds.coords:
+    ds[name].attrs = {"long_name": f"the {name}"}
+  return ds
+
+
+@pytest.mark.parametrize(
+  ("step", "kwargs"),
+  [
+    (pu.fraction_mask, {"fraction": "sea", "mask_name": "m"}),
+    (pu.products, {"ch": ["siconc", "sithick"]}),
+    (pu.divide_by, {"variables": ["siconc"], "by": "sea"}),
+    (pu.keep_where, {"variables": ["siconc"], "condition": "sea", "equals": 1}),
+    (pu.per_unit_area, {"variables": ["siconc"]}),
+  ],
+)
+def test_steps_keep_the_coordinates_attributes(static_ds: xr.Dataset, step, kwargs):
+  """A new variable assigned with its coordinates' attributes dropped took them from the
+  dataset's coordinates too (`products`, `fraction_mask`)."""
+  ds = with_coordinate_attrs(ice_ds(static_ds))
+  out = step(ds, **kwargs)
+  for name in ds.coords:
+    assert out[name].attrs == ds[name].attrs, name
+
+
+def test_fill_from_above_keeps_the_coordinates_attributes():
+  ds = with_coordinate_attrs(column_ds().assign_coords(x=[10, 20]))
+  out = pu.fill_from_above(ds, variables=["t"], depth_dim="depth", mask_name="m")
+  for name in ds.coords:
+    assert out[name].attrs == ds[name].attrs, name
+
+
 def test_keep_where_keeps_values_at_the_condition_only():
   ds = xr.Dataset(
     {

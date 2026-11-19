@@ -371,7 +371,7 @@ def fraction_mask(
   ds = ds.assign({fraction: cleaned})
   if mask_name is not None:
     mask = cleaned >= threshold if inclusive else cleaned > threshold
-    ds = ds.assign({mask_name: mask.drop_attrs()})
+    ds = ds.assign({mask_name: mask.drop_attrs(deep=False)})
   return ds
 
 
@@ -646,9 +646,9 @@ def products(ds: xr.Dataset, **kwargs: Iterable[Hashable]) -> xr.Dataset:
     factors = list(factors)
     if not factors:
       raise ValueError(f"products: {name!r} has no factors")
-    product = ds[factors[0]].drop_attrs()
+    product = ds[factors[0]].drop_attrs(deep=False)
     for factor in factors[1:]:
-      product = product * ds[factor].drop_attrs()
+      product = product * ds[factor].drop_attrs(deep=False)
     ds[name] = product
   return ds
 
