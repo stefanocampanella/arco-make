@@ -215,6 +215,14 @@ def test_fraction_domain_reports_a_missing_fraction(ocean_ds):
     ocean_ds.arcomake.validate(domain_config(seafrac=["thetao"]))
 
 
+def test_fraction_domain_takes_a_fraction_stored_as_a_coordinate(ocean_ds, static_ds):
+  ds = with_seafrac(ocean_ds, static_ds).set_coords("seafrac")
+  ds.arcomake.validate(domain_config(seafrac=["thetao", "zos"]), fail=True)
+  ds["zos"] = ds.zos.fillna(0.0)
+  with pytest.raises(ValidationError, match="zos: 8 values present outside seafrac"):
+    ds.arcomake.validate(domain_config(seafrac=["zos"]), fail=True)
+
+
 def test_fraction_domain_checks_a_variable_against_each_of_its_fractions(ocean_ds, static_ds):
   """A variable under two fractions is checked against both: the second does not replace the
   first's counts."""

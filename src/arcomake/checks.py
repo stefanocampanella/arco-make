@@ -12,6 +12,8 @@ import pandas as pd
 import xarray as xr
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from arcomake.processing_utils import check_fraction_threshold
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,9 +69,12 @@ class FractionDomainCheck(BaseModel):
   inclusive: bool = False
 
   @model_validator(mode="after")
+  def _threshold_leaves_cells_in_and_out(self) -> Self:
+    check_fraction_threshold(self.threshold, self.inclusive)  # as the `fraction_mask` step
+    return self
+
+  @model_validator(mode="after")
   def _fractions_map_to_variable_lists(self) -> Self:
-    if not 0.0 <= self.threshold < 1.0 or (self.threshold == 0.0 and self.inclusive):
-      raise ValueError(f"threshold must be in [0, 1) and not inclusive at 0, got {self.threshold}")
     for fraction, variables in (self.model_extra or {}).items():
       if not (isinstance(variables, list) and all(isinstance(v, str) for v in variables)):
         raise ValueError(f"fraction {fraction!r} must map to a list of variable names")
@@ -171,7 +176,7 @@ def fraction_domain(
   errors: list[str] = []
   counts: dict[tuple[str, str, str], xr.DataArray] = {}
   for fraction_name, variable_names in kwargs.items():
-    if fraction_name not in dataset.data_vars:
+    if fraction_name not in dataset.variables:
       errors.append(f"fraction {fraction_name!r} not found")
       continue
     fraction = dataset[fraction_name]

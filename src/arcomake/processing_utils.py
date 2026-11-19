@@ -334,6 +334,13 @@ def flip(ds: xr.Dataset, dim: str) -> xr.Dataset:
   return ds.isel({dim: slice(None, None, -1)})
 
 
+def check_fraction_threshold(threshold: float, inclusive: bool) -> None:
+  """A fraction's threshold must leave some cells out and some in: in [0, 1), not inclusive at
+  0 (every cell, land included, would be in). Raises ValueError otherwise."""
+  if not 0.0 <= threshold < 1.0 or (threshold == 0.0 and inclusive):
+    raise ValueError(f"threshold must be in [0, 1) and not inclusive at 0, got {threshold}")
+
+
 @step
 def fraction_mask(
   ds: xr.Dataset,
@@ -362,8 +369,7 @@ def fraction_mask(
     inclusive: Whether a fraction equal to `threshold` is in the mask.
     tolerance: Fractions below it are set to 0 (with 0, only negative round-off).
   """
-  if not 0.0 <= threshold < 1.0 or (threshold == 0.0 and inclusive):
-    raise ValueError(f"threshold must be in [0, 1) and not inclusive at 0, got {threshold}")
+  check_fraction_threshold(threshold, inclusive)
   if tolerance < 0.0:
     raise ValueError(f"tolerance must not be negative, got {tolerance}")
   da = ds[fraction]
