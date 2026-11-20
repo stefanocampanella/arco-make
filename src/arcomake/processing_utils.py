@@ -15,15 +15,19 @@ In a recipe, `name` selects the step and every other key is an argument:
 `docs/steps.md` (or `arco-make steps`) lists every step with its arguments.
 """
 
+import datetime
 import logging
 from collections.abc import Hashable, Iterable, Mapping
 from typing import Any, Literal
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 import xarray_regrid
+from pandas.tseries.frequencies import to_offset
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from arcomake.chunk_plan import Needs
 from arcomake.steps import check_arguments, step
 
 logger = logging.getLogger(__name__)
@@ -158,7 +162,12 @@ def flip(ds: xr.Dataset, dim: str) -> xr.Dataset:
   return ds.isel({dim: slice(None, None, -1)})
 
 
-@step
+def _get_bottom_needs(ds: xr.Dataset, depth_dim: str, **_: Any) -> Needs:
+  """`get_bottom` joins the whole depth of a variable in each of its tasks."""
+  return Needs(gathered=frozenset({depth_dim}))
+
+
+@step(needs=_get_bottom_needs)
 def get_bottom(
   ds: xr.Dataset,
   depth_dim: str,
@@ -315,7 +324,15 @@ def masked_fill(
   return ds
 
 
-@step
+def _regrid_needs(
+  ds: xr.Dataset, latitude_dim: str = "latitude", longitude_dim: str = "longitude", **_: Any
+) -> Needs:
+  """Whole horizontal dimensions: xarray-regrid keeps their chunks, and one chunk is one task
+  per time and level instead of a graph of partial products."""
+  return Needs(whole=frozenset({latitude_dim, longitude_dim}))
+
+
+@step(needs=_regrid_needs)
 def regrid(
   ds: xr.Dataset,
   grid: Mapping[str, Any],
@@ -344,7 +361,8 @@ def regrid(
       `resolution_lat`, `resolution_lon`).
     latitude_dim, longitude_dim: Names of the horizontal dimensions.
     method: The xarray-regrid method (default "nearest").
-    kwargs: Further arguments of that method (e.g. `skipna`, `nan_threshold`, `output_chunks`).
+    kwargs: Further arguments of that method (e.g. `skipna`, `nan_threshold`; `output_chunks`
+      only outside download recipes, whose chunks are planned).
   """
   new_grid = xarray_regrid.Grid(**grid)
   target_dataset = new_grid.create_regridding_dataset(lat_name=latitude_dim, lon_name=longitude_dim)
@@ -395,7 +413,69 @@ def rename_coordinates(
   return ds
 
 
-@step
+def _fixed_period(frequency: Any) -> pd.Timedelta | None:
+  """The length of a resampling frequency if fixed ("1D", "3h"), else None ("1MS", "1W")."""
+  if isinstance(frequency, datetime.timedelta):
+    return pd.Timedelta(frequency)
+  try:
+    offset = to_offset(frequency)
+  except (TypeError, ValueError):
+    return None
+  if isinstance(offset, pd.offsets.Tick):
+    return pd.Timedelta(offset)
+  if isinstance(offset, pd.offsets.Day):  # calendar days: 24 h in UTC, as the data are
+    return pd.Timedelta(days=offset.n)
+  return None
+
+
+def _regular_spacing(index: pd.Index) -> pd.Timedelta | None:
+  """The step between consecutive values of a time index, if they are evenly spaced."""
+  if len(index) < 2:
+    return None
+  steps = np.unique(np.diff(np.asarray(index)))
+  return pd.Timedelta(steps[0]) if len(steps) == 1 else None
+
+
+def _since_midnight(stamp: Any) -> pd.Timedelta:
+  """Time from the midnight of its day to `stamp` (numpy or cftime)."""
+  if isinstance(stamp, np.datetime64):
+    timestamp = pd.Timestamp(stamp)
+    return timestamp - timestamp.normalize()
+  return pd.Timedelta(stamp - stamp.replace(hour=0, minute=0, second=0, microsecond=0))
+
+
+# Arguments of `Dataset.resample` that move the bins away from the day's midnight.
+_SHIFTED_BINS = ("offset", "origin", "base", "loffset")
+
+
+def _resample_needs(
+  ds: xr.Dataset, indexer: Mapping[Hashable, Any] | None = None, **kwargs: Any
+) -> Needs:
+  """Chunks of whole bins: a fixed frequency over evenly spaced stamps is a number of steps per
+  bin, and chunk sizes along the dimension are multiples of it, so that no bin straddles chunks.
+  Only for bins starting at the first stamp (chunks start there): left-closed, from midnight
+  (no offset or origin), the first stamp on a bin edge."""
+  if kwargs.get("closed") == "right" or any(key in kwargs for key in _SHIFTED_BINS):
+    return Needs()
+  multiple: dict[Hashable, int] = {}
+  for dim, frequency in {**(indexer or {}), **kwargs}.items():
+    if dim not in ds.indexes:  # `reduce`, `label`, `closed`...
+      continue
+    index = ds.indexes[dim]
+    period = _fixed_period(frequency)
+    spacing = _regular_spacing(index)
+    if period is None or spacing is None or spacing <= pd.Timedelta(0):
+      logger.debug(f"resample along {dim!r}: bins of no fixed number of steps")
+      continue
+    if _since_midnight(np.asarray(index)[0]) % period != pd.Timedelta(0):
+      logger.debug(f"resample along {dim!r}: the first stamp is not on a bin edge")
+      continue
+    if period % spacing == pd.Timedelta(0) and period >= spacing:
+      multiple[dim] = int(period // spacing)
+  return Needs(multiple=multiple)
+
+
+@step(needs=_resample_needs)
 def resample(
   ds: xr.Dataset,
   reduce: Literal["mean", "sum", "min", "max", "median", "std", "var", "first", "last", "count"],

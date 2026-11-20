@@ -12,6 +12,7 @@ import pytest
 import xarray as xr
 
 from arcomake import dataset_utils
+from arcomake.chunk_plan import Budget
 from arcomake.dataset_utils import (
   CopernicusMarinePartConfig,
   DatasetConfig,
@@ -21,6 +22,8 @@ from arcomake.dataset_utils import (
 
 DAY = datetime.timedelta(days=1)
 START = datetime.datetime(2020, 1, 1)
+
+BUDGET = Budget(memory_limit=10**9, threads=1)  # parts chunked as download plans them
 
 
 @pytest.fixture
@@ -36,7 +39,7 @@ def accumulations(tmp_path: pathlib.Path) -> tuple[str, xr.Dataset]:
 
 
 def daily_sums(path: str, start: datetime.datetime, end: datetime.datetime, step, offset):
-  part = {"filename_or_obj": path, "chunks": {}}
+  part = {"filename_or_obj": path}
   if offset is not None:
     part["time_offset"] = offset
   config = DatasetConfig.model_validate(
@@ -51,7 +54,7 @@ def daily_sums(path: str, start: datetime.datetime, end: datetime.datetime, step
   block_start = start
   while block_start < end:
     block_end = min(block_start + step, end)
-    blocks.append(download_and_process(config, block_start, block_end).load())
+    blocks.append(download_and_process(config, block_start, block_end, budget=BUDGET).load())
     block_start = block_end
   return xr.concat(blocks, dim="time")
 

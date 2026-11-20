@@ -30,6 +30,7 @@ import tempfile
 import warnings
 from collections.abc import Iterable, MutableMapping
 
+from dask.utils import parse_bytes
 from pydantic import Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -37,6 +38,21 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PATH = pathlib.Path("~/.arcomakerc")
 ENV_VAR = "ARCOMAKE_RC"
+
+
+def parse_memory(value: str) -> int:
+  """An amount of memory as Dask writes them ("100GB", "80GiB", "2e9"), in bytes.
+
+  Raises:
+    ValueError: if `value` is not a positive amount.
+  """
+  try:
+    amount = parse_bytes(value)
+  except (ValueError, TypeError):
+    amount = 0
+  if amount <= 0:
+    raise ValueError("not an amount of memory (e.g. 100GB, 80GiB)")
+  return amount
 
 
 class SettingsError(Exception):
@@ -95,6 +111,15 @@ class ArcoMakeSettings(BaseSettings):
     default=None, validation_alias="ECCODES_DEFINITION_PATH"
   )
   eccodes_samples_path: str | None = Field(default=None, validation_alias="ECCODES_SAMPLES_PATH")
+  # Memory `download` plans its chunks for (`--memory-limit`, which reads it), e.g. "100GB".
+  arcomake_memory_limit: str | None = Field(default=None, validation_alias="ARCOMAKE_MEMORY_LIMIT")
+
+  @field_validator("arcomake_memory_limit")
+  @classmethod
+  def _bytes(cls, value: str | None) -> str | None:
+    if value is not None:
+      parse_memory(value)
+    return value
 
   @field_validator("tmpdir")
   @classmethod

@@ -92,7 +92,7 @@ class CopernicusMarine(BackendEntrypoint):
       end_datetime=end_datetime,
       # IMPORTANT: the toolbox returns Dask arrays of its own chunking (e.g. time 2, all depths),
       # unless `chunk_size_limit` is falsy (undocumented): then it returns lazily indexed arrays,
-      # and the part's `chunks` decide the reads. tests/live checks that this still holds.
+      # and the planned chunks (`chunk_plan`) decide the reads. tests/live checks that this holds.
       chunk_size_limit=False,
     )
     assert isinstance(dataset, xr.Dataset)

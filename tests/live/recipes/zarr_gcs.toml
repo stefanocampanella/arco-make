@@ -12,7 +12,6 @@ consolidated = true
 # of silence) reaches gcsfs as a timeout that it retries (not `requests_timeout`, a total).
 timeout = 120
 storage_options = {token = "anon"}
-chunks = {time = 24, latitude = -1, longitude = -1}
 
 [[datasets.era5.postprocess]]
 name = "select_variables"
@@ -31,4 +30,5 @@ closed = "left"
 reduce = "mean"
 
 [save]
+chunks = {time = 1}
 compressors = [{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuffle = "shuffle"}}]

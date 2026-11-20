@@ -7,6 +7,7 @@ import functools
 import hashlib
 import json
 import logging
+import math
 import pathlib
 import shutil
 import threading
@@ -15,14 +16,16 @@ from collections.abc import Callable, Generator
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timedelta
-from typing import Self, get_args
+from typing import Self, get_args, override
 
 import click
 import xarray as xr
 from dask.diagnostics import ProgressBar
+from dask.utils import format_bytes
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from arcomake import icechunk_utils
+from arcomake.chunk_plan import Budget, PlanError, detect_budget, stored_warnings
 from arcomake.cli_utils import (
   check_aws_profile,
   check_destination,
@@ -35,16 +38,34 @@ from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
   _write_zarr,
+  download_and_process,
   maybe_checkpointing_download_and_process,
   prepare_for_writing,
+  refuse_chunk_steps,
   write_output,
 )
 from arcomake.datetime_utils import DateInterval, IterableDateInterval, may_parse_timedelta
 from arcomake.processing_utils import ProcessingStepConfig
 from arcomake.retries import RetryConfig, with_retries
+from arcomake.settings import parse_memory
 from arcomake.temporary_utils import TempDirectoryRegistry, get_current_temp_registry
 
 logger = logging.getLogger(__name__)
+
+
+class Memory(click.ParamType[int]):
+  """An amount of memory, as Dask writes them: "100GB", "80GiB", "2e9"."""
+
+  name = "memory"
+
+  @override
+  def convert(self, value, param, ctx) -> int:
+    if isinstance(value, int):
+      return value
+    try:
+      return parse_memory(value)
+    except ValueError as error:
+      self.fail(f"{value!r} is {error}", param, ctx)
 
 
 class DownloadConfig(BaseModel):
@@ -65,10 +86,26 @@ class DownloadConfig(BaseModel):
   def parse_step(cls, value: str | timedelta) -> timedelta:
     return may_parse_timedelta(value)
 
+  @field_validator("postprocess")
+  @classmethod
+  def _no_chunk_steps(cls, steps: list[ProcessingStepConfig]) -> list[ProcessingStepConfig]:
+    return refuse_chunk_steps(steps)
+
   @model_validator(mode="after")
   def validate_date_range(self) -> Self:
     if self.start > self.end:
       raise ValueError("start datetime must be before or equal to end datetime")
+    return self
+
+  @model_validator(mode="after")
+  def _stored_layout(self) -> Self:
+    # Without it, the stored chunks would be the chunks planned for reading: they depend on the
+    # machine's memory, its threads and --blocks, and so would the output.
+    if self.save.chunks is None:
+      raise ValueError(
+        "[save] chunks: give the stored layout (e.g. {time = 1}; dimensions not listed are"
+        " whole): chunks for reading are planned for each machine"
+      )
     return self
 
 
@@ -128,6 +165,18 @@ class DownloadConfig(BaseModel):
   ),
 )
 @click.option(
+  "--memory-limit",
+  type=Memory(),
+  default=None,
+  envvar="ARCOMAKE_MEMORY_LIMIT",
+  show_envvar=True,
+  help=(
+    "Memory the chunks of each block are planned for, e.g. 100GB (default: what this process may"
+    " use: physical memory, or its cgroup's or Slurm job's limit), shared among Dask's threads"
+    " and the blocks at once"
+  ),
+)
+@click.option(
   "--log-level",
   default="info",
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
@@ -148,6 +197,16 @@ class DownloadConfig(BaseModel):
   default=False,
   is_flag=True,
 )
+@click.option(
+  "--plan",
+  "plan_only",
+  help=(
+    "Print the chunks planned for the first block and exit, without reading data or writing"
+    " OUTPUT_PATH. Sources are opened (EWDS parts download their files to do so)"
+  ),
+  default=False,
+  is_flag=True,
+)
 def download(
   configs_path: str,
   output_path: str,
@@ -156,9 +215,11 @@ def download(
   replace: bool = False,
   resume: bool = False,
   blocks_at_once: int = 1,
+  memory_limit: int | None = None,
   log_level: str = "info",
   dask_setup: DaskSetupType = "threads",
   progress: bool = False,
+  plan_only: bool = False,
 ):
   """Download, process and merge the datasets of a recipe into one Zarr dataset.
 
@@ -203,12 +264,19 @@ def download(
     if end_datetime is not None:
       update_time_interval["end"] = end_datetime
     configs = read_configs(configs_path, inject=update_time_interval, schema=DownloadConfig)
+    budget = detect_budget(memory_limit, blocks_at_once)
+    logger.info(f"Chunks planned for a budget of {budget.describe()}")
     parts = [part for dataset in configs.datasets.values() for part in dataset.parts]
     check_aws_profile(
       output_path,
       *(part.filename_or_obj for part in parts),
       copernicus_marine=any(part.engine == "copernicusmarine" for part in parts),
     )
+    blocks = list(IterableDateInterval(configs.start, configs.end, configs.step))
+    if plan_only:
+      if blocks:
+        _print_plan(configs, blocks[0], budget)
+      return
     # Check the output destination (a failed run waiting there, or an existing version), then
     # start a run on a branch of its own, or continue the failed one.
     recipe = recipe_fingerprint(configs)
@@ -223,7 +291,6 @@ def download(
       )
     except Exception as exc:
       raise click.ClickException(f"Could not start writing {output_path}: {exc}") from exc
-    blocks = list(IterableDateInterval(configs.start, configs.end, configs.step))
     written = list(waiting.blocks) if resume and waiting is not None else []
     done = set(written)
     if written != [block_key(b) for b in blocks[: len(written)]]:
@@ -249,14 +316,22 @@ def download(
               first=number == 0,
               progress=progress,
               recipe=recipe,
+              budget=budget,
             ),
             configs.retries,
             _describe(date_interval),
           )
       else:
-        _write_blocks_staged(configs, todo, run, blocks_at_once=blocks_at_once, recipe=recipe)
+        _write_blocks_staged(
+          configs, todo, run, blocks_at_once=blocks_at_once, recipe=recipe, budget=budget
+        )
     except click.ClickException:
       raise
+    except PlanError as exc:
+      raise click.ClickException(
+        f"{exc}. The blocks written are on branch {run.branch}, `main` is unchanged;"
+        " --resume continues from there."
+      ) from exc
     except Exception as exc:
       logger.exception("An error occurred during download")
       raise click.ClickException(
@@ -270,16 +345,71 @@ def download(
       raise click.ClickException(str(exc)) from exc
 
 
+def _print_plan(configs: DownloadConfig, interval: DateInterval, budget: Budget) -> None:
+  """Print the chunks of the first block's merged dataset, as it would be written, with the
+  stored chunks (the plan of each dataset is logged as it is opened). Nothing is computed:
+  checkpointed datasets are planned over the whole block (a run plans each sub-block, so its
+  time chunks may be shorter).
+
+  Raises:
+    click.ClickException: if the budget leaves no room for a task (`PlanError`).
+  """
+  click.echo(f"{_describe(interval)}, budget: {budget.describe()}")
+  try:
+    with ExitStack() as stack:
+      datasets = []
+      for name, conf in configs.datasets.items():
+        if conf.skip:
+          continue
+        if conf.checkpointing is not None:
+          click.echo(f"  ({name} is checkpointed: a run plans each sub-block of it)")
+        datasets.append(
+          stack.enter_context(
+            download_and_process(
+              conf,
+              interval.start,
+              interval.end,
+              time_dim=configs.time_dim,
+              budget=budget,
+              name=name,
+              later_steps=configs.postprocess,
+            )
+          )
+        )
+      dataset = xr.merge(datasets, join="exact", compat="no_conflicts", combine_attrs="identical")
+      if configs.postprocess:
+        dataset = dataset.arcomake.process(steps=configs.postprocess)
+      prepared = prepare_for_writing(dataset, configs.save)
+  except PlanError as error:
+    raise click.ClickException(str(error)) from error
+  for name, var in sorted(prepared.data_vars.items(), key=lambda item: str(item[0])):
+    dims = ", ".join(map(str, var.dims))
+    stored = var.encoding.get("shards") or var.encoding.get("chunks")
+    where = f"; stored {tuple(stored)}" if stored is not None else ""
+    if var.chunks is None:
+      click.echo(f"  {name} ({dims}) {var.dtype}: in memory, {format_bytes(var.nbytes)}{where}")
+      continue
+    shape = tuple(max(sizes) for sizes in var.chunks)
+    size = math.prod(shape) * var.dtype.itemsize
+    count = math.prod(len(sizes) for sizes in var.chunks)
+    click.echo(
+      f"  {name} ({dims}) {var.dtype}: chunks {shape}, {format_bytes(size)} each, {count} chunks"
+      f"{where}"
+    )
+  for warning in stored_warnings(prepared, budget):
+    click.echo(f"  warning: {warning}")
+
+
 def _describe(interval: DateInterval) -> str:
   return f"Block [{interval.start:%Y-%m-%dT%H:%M}, {interval.end:%Y-%m-%dT%H:%M})"
 
 
 @contextmanager
 def _processed_block(
-  configs: DownloadConfig, date_interval: DateInterval, *, progress: bool
+  configs: DownloadConfig, date_interval: DateInterval, *, progress: bool, budget: Budget | None
 ) -> Generator[xr.Dataset]:
   """The datasets of one block, read, processed and merged, with the global postprocessing
-  (lazy: computed when written)."""
+  (lazy: computed when written); with a `budget`, the parts are chunked as planned for it."""
   # Download and postprocess each dataset, possibly using checkpointing to disk.
   with ExitStack() as stack:
     datasets: list[xr.Dataset] = []
@@ -295,6 +425,9 @@ def _processed_block(
             date_interval.end,
             time_dim=configs.time_dim,
             progress=progress,
+            budget=budget,
+            name=dataset_name,
+            later_steps=configs.postprocess,
           )
         )
       )
@@ -304,6 +437,9 @@ def _processed_block(
       if configs.postprocess:
         dataset = dataset.arcomake.process(steps=configs.postprocess)
       assert isinstance(dataset, xr.Dataset)
+      if budget is not None:
+        for warning in stored_warnings(prepare_for_writing(dataset, configs.save), budget):
+          logger.warning(warning)
       yield dataset
 
 
@@ -325,13 +461,14 @@ def _write_block(
   first: bool,
   progress: bool,
   recipe: str,
+  budget: Budget | None = None,
 ) -> None:
   """Read, process and merge the datasets of one block, and commit it to the run's branch
   (written by the first block, appended along time by the others)."""
   if _committed(run, date_interval):
     return
   with (
-    _processed_block(configs, date_interval, progress=progress) as dataset,
+    _processed_block(configs, date_interval, progress=progress, budget=budget) as dataset,
     ProgressBar() if progress else nullcontext(),
   ):
     write_output(
@@ -342,6 +479,8 @@ def _write_block(
       mode="w" if first else "a-",
       append_dim=None if first else configs.time_dim,
       metadata=_block_metadata(date_interval, recipe),
+      # Chunks are planned for reading; the stored layout is the recipe's.
+      align_chunks=True,
     )
 
 
@@ -354,13 +493,15 @@ class _Staged:
   prepared: xr.Dataset
 
 
-def _stage_block(configs: DownloadConfig, date_interval: DateInterval) -> _Staged:
+def _stage_block(
+  configs: DownloadConfig, date_interval: DateInterval, budget: Budget | None = None
+) -> _Staged:
   """Read, process and merge one block, and compute its values into a local Zarr store (a
   worker of `_write_blocks_staged`). Only values go there (no encoding but the chunks): the
   output's encodings are those `prepare_for_writing` gives the block, kept in memory."""
   registry = get_current_temp_registry()
   assert registry is not None
-  with _processed_block(configs, date_interval, progress=False) as dataset:
+  with _processed_block(configs, date_interval, progress=False, budget=budget) as dataset:
     prepared = prepare_for_writing(dataset, configs.save)
     values = prepared.copy(deep=False)
     for variable in values.variables.values():
@@ -369,7 +510,7 @@ def _stage_block(configs: DownloadConfig, date_interval: DateInterval) -> _Stage
     path = registry.create_temp_dir(suffix=".zarr")
     logger.info(f"{_describe(date_interval)}: staging to {path}")
     try:
-      _write_zarr(values, str(path), mode="w", consolidated=False)
+      _write_zarr(values, str(path), mode="w", consolidated=False, align_chunks=True)
     except BaseException:
       shutil.rmtree(path, ignore_errors=True)  # a retry stages again, elsewhere
       raise
@@ -381,7 +522,7 @@ def _stage_block(configs: DownloadConfig, date_interval: DateInterval) -> _Stage
 def _from_stage(staged: _Staged) -> xr.Dataset:
   """The block as its direct write would see it: the prepared dataset with the staged values in
   place of every variable not in memory: Dask arrays in the same chunks, lazily indexed arrays
-  (parts opened without `chunks`) loaded, as their direct write would. The block's sources are
+  (variables not chunked) loaded, as their direct write would. The block's sources are
   closed by then: nothing may read them again."""
   values = xr.open_zarr(str(staged.path), consolidated=False)
   dataset = staged.prepared.copy(deep=False)
@@ -420,6 +561,7 @@ def _write_blocks_staged(
   *,
   blocks_at_once: int,
   recipe: str,
+  budget: Budget | None = None,
 ) -> None:
   """Read and process up to `blocks_at_once` blocks at once, each staged on local disk by a
   worker thread, and commit them in order from this thread (appends along time need it). Each
@@ -434,7 +576,7 @@ def _write_blocks_staged(
       return
     number, interval = item
     logger.info(f"Downloading data from {interval.start} to {interval.end}")
-    stage = functools.partial(_stage_block, configs, interval)
+    stage = functools.partial(_stage_block, configs, interval, budget)
     action = functools.partial(with_retries, stage, configs.retries, _describe(interval))
     pending.append((number, interval, _start(action, f"block-{block_key(interval)}")))
 
@@ -455,6 +597,7 @@ def _write_blocks_staged(
         append_dim=None if first else configs.time_dim,
         group=configs.save.group,
         metadata=_block_metadata(interval, recipe),
+        align_chunks=True,
       )
 
     with_retries(commit, configs.retries, f"{_describe(interval)} (commit)")

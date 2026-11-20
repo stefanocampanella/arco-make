@@ -7,7 +7,6 @@ step = "1D"
 [[datasets.uparea.parts]]
 filename_or_obj = "https://confluence.ecmwf.int/download/attachments/242067380/uparea_glofas_v4_0.nc"
 engine = "netcdfoverhttp"
-chunks = {latitude = -1, longitude = -1}
 
 [[datasets.uparea.postprocess]]
 name = "sel"
@@ -15,4 +14,5 @@ latitude = {start = 46.0, stop = 40.0}
 longitude = {start = 12.0, stop = 20.0}
 
 [save]
+chunks = {time = 1}
 compressors = [{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuffle = "shuffle"}}]

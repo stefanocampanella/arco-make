@@ -3,12 +3,13 @@
 import datetime
 import functools
 import logging
+import math
 import pathlib
 import re
 import shutil
 import tempfile
 import warnings
-from collections.abc import Callable, Generator, Hashable, Mapping
+from collections.abc import Callable, Generator, Hashable, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from typing import Annotated, Any, Literal, Self
 
@@ -18,6 +19,7 @@ import fsspec
 import fsspec.utils
 import numpy as np
 import xarray as xr
+from dask.base import tokenize
 from dask.delayed import Delayed
 from dask.diagnostics import ProgressBar
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -27,12 +29,13 @@ from zarr.abc.codec import ArrayArrayCodec, ArrayBytesCodec, BytesBytesCodec
 from zarr.errors import ZarrUserWarning
 from zarr.registry import get_codec_class
 
-from arcomake import hdf5_lock, icechunk_utils
+from arcomake import chunk_plan, hdf5_lock, icechunk_utils
 from arcomake.datetime_utils import (
   IterableDateInterval,
   may_parse_timedelta,
 )
 from arcomake.processing_utils import ProcessingStepConfig
+from arcomake.steps import needs_for
 from arcomake.temporary_utils import get_current_temp_registry
 
 logger = logging.getLogger(__name__)
@@ -49,11 +52,11 @@ ChunksConfig = (
 
 
 class OpenDatasetArguments(BaseModel):
-  """Arguments of `xarray.open_dataset`, except `engine`."""
+  """Arguments of `xarray.open_dataset`, except `engine` and `chunks` (download parts are
+  chunked as planned: `chunk_plan`)."""
 
   model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
-  chunks: ChunksConfig | None = None
   cache: bool | None = None
   decode_cf: bool | None = None
   mask_and_scale: bool | Mapping[str, bool] | None = None
@@ -79,6 +82,7 @@ class ReadConfig(OpenDatasetArguments):
   """Arguments of `xarray.open_dataset` (the `[read]` table of a recipe)."""
 
   engine: EngineType | None = None
+  chunks: ChunksConfig | None = None
 
 
 class CodecConfig(BaseModel):
@@ -243,7 +247,6 @@ class CopernicusMarinePartConfig(PartTimeOffset):
   service: str | None = None
   start_datetime: datetime.datetime | str | None = None
   end_datetime: datetime.datetime | str | None = None
-  chunks: ChunksConfig | None = None
   storage_options: dict[str, Any] | None = None
 
 
@@ -253,7 +256,6 @@ class NetCDFOverHTTPPartConfig(PartTimeOffset, PartTimeout):
   filename_or_obj: str
   engine: Literal["netcdfoverhttp"] | None = "netcdfoverhttp"
   drop_variables: str | list[str] | None = None
-  chunks: ChunksConfig | None = None
 
   @model_validator(mode="before")
   @classmethod
@@ -279,7 +281,6 @@ class EarlyWarningDataStorePartConfig(PartTimeOffset, PartTimeout):
   time_dim: str | None = None
   latitude_dim: str | None = None
   longitude_dim: str | None = None
-  chunks: ChunksConfig | None = None
 
   @model_validator(mode="before")
   @classmethod
@@ -299,10 +300,11 @@ class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout):
     return _engine_given_or_implied(data, lambda url: url.rstrip("/").endswith(".zarr"))
 
 
-class GenericPartConfig(ReadConfig, PartTimeOffset, PartTimeout):
+class GenericPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout):
   """A part read by any other xarray engine, with the arguments of `xarray.open_dataset`."""
 
   filename_or_obj: str
+  engine: EngineType | None = None
 
   @field_validator("engine")
   @classmethod
@@ -516,6 +518,26 @@ def open_input(filename_or_obj: Any, **kwargs: Any) -> xr.Dataset:
   return hdf5_lock.open_dataset(filename_or_obj, **kwargs)
 
 
+# Download recipes give no chunk sizes: they are planned for each block (`chunk_plan`).
+PLANNED_CHUNKS = "chunks are planned for each block (download --memory-limit; --plan shows them)"
+
+
+def refuse_chunk_steps(steps: list[ProcessingStepConfig]) -> list[ProcessingStepConfig]:
+  """`steps` of a download recipe, which may not set chunk sizes: no `chunk` step, no regrid
+  `output_chunks` (they are planned).
+
+  Raises:
+    ValueError: naming the step.
+  """
+  for number, config in enumerate(steps, start=1):
+    if config.name == "chunk":
+      raise ValueError(f"step {number} (chunk): {PLANNED_CHUNKS}: remove the step")
+    kwargs = (config.model_extra or {}).get("kwargs") or {}
+    if config.name == "regrid" and isinstance(kwargs, Mapping) and "output_chunks" in kwargs:
+      raise ValueError(f"step {number} (regrid): {PLANNED_CHUNKS}: remove `output_chunks`")
+  return steps
+
+
 class DatasetConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
@@ -523,6 +545,21 @@ class DatasetConfig(BaseModel):
   checkpointing: CheckpointingConfig | None = None
   parts: list[DatasetPartConfig] = Field(default_factory=list)
   postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
+
+  @model_validator(mode="before")
+  @classmethod
+  def _no_part_chunks(cls, data: Any) -> Any:
+    # Before the parts are parsed: one message, not one per model of the union.
+    if isinstance(data, Mapping):
+      for number, part in enumerate(data.get("parts") or [], start=1):
+        if isinstance(part, Mapping) and "chunks" in part:
+          raise ValueError(f"part {number}: {PLANNED_CHUNKS}: remove `chunks`")
+    return data
+
+  @field_validator("postprocess")
+  @classmethod
+  def _no_chunk_steps(cls, steps: list[ProcessingStepConfig]) -> list[ProcessingStepConfig]:
+    return refuse_chunk_steps(steps)
 
 
 def _shift_time(part: xr.Dataset, offset: datetime.timedelta, time_dim: str) -> xr.Dataset:
@@ -533,20 +570,89 @@ def _shift_time(part: xr.Dataset, offset: datetime.timedelta, time_dim: str) -> 
   return part.assign_coords({time_dim: time.copy(data=time.values + np.timedelta64(offset))})
 
 
+def _source_chunks(dataset: xr.Dataset) -> dict[Hashable, int]:
+  """The chunks of the source's storage along each dimension (the least common multiple over the
+  variables), as the backend reports them (`preferred_chunks`)."""
+  chunks: dict[Hashable, int] = {}
+  for var in dataset.data_vars.values():
+    for dim, size in (var.encoding.get("preferred_chunks") or {}).items():
+      if dim in var.dims and isinstance(size, int) and size > 0:
+        chunks[dim] = math.lcm(chunks.get(dim, 1), size)
+  return chunks
+
+
+def _kept_variables(steps: Sequence[ProcessingStepConfig], dataset: xr.Dataset) -> set[Hashable]:
+  """The data variables of `dataset` that its leading selection steps (`select_variables`,
+  `drop_vars`) keep: the others are dropped before any computation, so they are not planned
+  for (an ERA5 store's pressure-level variables, say)."""
+  kept = set(dataset.data_vars)
+  for config in steps:
+    arguments = config.model_dump(exclude_unset=True)
+    name = arguments.pop("name")
+    if name == "select_variables":
+      kept &= set(arguments["variables"])
+    elif name == "drop_vars":
+      names = arguments.get("names", ())
+      kept -= {names} if isinstance(names, str) else set(names)
+    else:
+      break
+  return kept
+
+
+def _planned(
+  parts: list[tuple[str, xr.Dataset]],
+  steps: Sequence[ProcessingStepConfig],
+  budget: chunk_plan.Budget,
+  *,
+  time_dim: str,
+  label: str,
+) -> list[xr.Dataset]:
+  """The parts of a dataset (their block's slices, not yet chunked), each with a token naming
+  its Dask arrays (lazily indexed source arrays are not tokenized), in the chunks
+  `chunk_plan.plan` gives them together, so that merged variables share their chunks: for
+  `budget`, the needs of the `steps` that will process them, and the sources' chunks, over the
+  variables the leading selection steps keep. The plan is logged."""
+  needs = chunk_plan.Needs()
+  variables: dict[Hashable, chunk_plan.Shape] = {}
+  preferred: dict[Hashable, int] = {}
+  for number, (_, part) in enumerate(parts, start=1):
+    needs = needs.merge(needs_for(steps, part))
+    used = part[sorted(_kept_variables(steps, part), key=str)]
+    for name, shape in chunk_plan.shapes(used).items():
+      variables[name if name not in variables else f"{name} (part {number})"] = shape
+    for dim, size in _source_chunks(used).items():
+      preferred[dim] = math.lcm(preferred.get(dim, 1), size)
+  planned = chunk_plan.plan(variables, budget, needs, grow_dim=time_dim, preferred=preferred)
+  logger.info(f"{label}: {planned.describe()}")
+  for warning in planned.warnings:
+    logger.warning(f"{label}: {warning}")
+  return [
+    part.chunk({dim: size for dim, size in planned.chunks.items() if dim in part.dims}, token=token)
+    for token, part in parts
+  ]
+
+
 def download_and_process(
   configs: DatasetConfig,
   start_datetime: datetime.datetime,
   end_datetime: datetime.datetime,
   time_dim: str = "time",
+  budget: chunk_plan.Budget | None = None,
+  name: str = "dataset",
+  later_steps: Sequence[ProcessingStepConfig] = (),
 ) -> xr.Dataset:
-  """
-  Downloads and pre-processes a dataset based on provided configurations.
+  """The dataset of `configs` over [start, end): its parts read, time-sliced and merged, then its
+  steps applied (lazily: computed when written).
+
+  With a `budget`, the parts are chunked by `chunk_plan.plan` for their slices of the block and
+  the needs of the dataset's steps and of the `later_steps` (the recipe's steps after merging);
+  without, they are read as their backends return them.
   """
   # When downloading from Copernicus Marine Data Store or Climate Data Store, the typical case is a large dataset,
   # spanning a long time period, with several sets of variables in different datasets (bio, phys, etc.),
   # which needs to be downloaded one piece at a time. Hence, `parts` list in the TOML configuration file
   # represents different pieces of the same dataset.
-  parts = []
+  opened: list[tuple[str, xr.Dataset]] = []
   for raw_part in configs.parts:
     offset = raw_part.time_offset or datetime.timedelta(0)
     part_conf = raw_part.model_dump(exclude_unset=True, exclude={"time_offset", "timeout"})
@@ -561,9 +667,14 @@ def download_and_process(
     if offset:
       part = _shift_time(part, offset, time_dim)
     part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
-    parts.append(part)
-  if not parts:
+    opened.append((tokenize(repr(raw_part), start_datetime, end_datetime), part))
+  if not opened:
     raise ValueError("No parts found in the dataset configuration")
+  if budget is not None:
+    steps = [*configs.postprocess, *later_steps]
+    parts = _planned(opened, steps, budget, time_dim=time_dim, label=name)
+  else:
+    parts = [part for _, part in opened]
   dataset = xr.merge(parts, join="exact")
   assert isinstance(dataset, xr.Dataset)
   if configs.postprocess:
@@ -621,6 +732,9 @@ def maybe_checkpointing_download_and_process(
   end_datetime: datetime.datetime,
   time_dim: str = "time",
   progress: bool = True,
+  budget: chunk_plan.Budget | None = None,
+  name: str = "dataset",
+  later_steps: Sequence[ProcessingStepConfig] = (),
 ) -> xr.Dataset:
   checkpointing_conf = configs.checkpointing
   checkpointing_step = checkpointing_conf.step if checkpointing_conf else None
@@ -631,10 +745,26 @@ def maybe_checkpointing_download_and_process(
   )
 
   if checkpointing_step is None:
-    return download_and_process(configs, start_datetime, end_datetime, time_dim=time_dim)
+    return download_and_process(
+      configs,
+      start_datetime,
+      end_datetime,
+      time_dim=time_dim,
+      budget=budget,
+      name=name,
+      later_steps=later_steps,
+    )
   parsed_step = may_parse_timedelta(checkpointing_step)
   if parsed_step >= end_datetime - start_datetime:
-    return download_and_process(configs, start_datetime, end_datetime, time_dim=time_dim)
+    return download_and_process(
+      configs,
+      start_datetime,
+      end_datetime,
+      time_dim=time_dim,
+      budget=budget,
+      name=name,
+      later_steps=later_steps,
+    )
 
   registry = get_current_temp_registry()
   if registry is not None:
@@ -649,7 +779,13 @@ def maybe_checkpointing_download_and_process(
   is_first_checkpoint = True
   for date_interval in date_intervals:
     with download_and_process(
-      configs, date_interval.start, date_interval.end, time_dim=time_dim
+      configs,
+      date_interval.start,
+      date_interval.end,
+      time_dim=time_dim,
+      budget=budget,
+      name=name,
+      later_steps=later_steps,
     ) as downloaded:
       # A copy with its own encodings: the downloaded dataset is left unchanged.
       dataset = _without_zarr2_codecs(downloaded)
@@ -660,11 +796,19 @@ def maybe_checkpointing_download_and_process(
       progress_bar = nullcontext if not progress else ProgressBar
       with progress_bar():
         if is_first_checkpoint:
-          _write_zarr(dataset, str(checkpoint_path), mode="w", consolidated=False)
+          # Planned chunks may straddle the checkpoint's (those of its first write).
+          _write_zarr(
+            dataset, str(checkpoint_path), mode="w", consolidated=False, align_chunks=True
+          )
           is_first_checkpoint = False
         else:
           _write_zarr(
-            dataset, str(checkpoint_path), mode="a-", append_dim=time_dim, consolidated=False
+            dataset,
+            str(checkpoint_path),
+            mode="a-",
+            append_dim=time_dim,
+            consolidated=False,
+            align_chunks=True,
           )
     del dataset
 
@@ -773,8 +917,12 @@ def write_output(
   append_dim: str | None = None,
   command: str = "write",
   metadata: Mapping[str, Any] | None = None,
+  align_chunks: bool = False,
 ) -> str:
   """Write a dataset with the layout of `[save]` (see `prepare_for_writing`) in one commit.
+
+  With `align_chunks`, Dask chunks that straddle the stored chunks (or shards) are rechunked to
+  fit them (see `icechunk_utils.Run.write`); else such a layout is refused.
 
   `destination` is a run (`icechunk_utils.Run`, which the caller finishes) or the path of a
   repository: then the write is a run of its own (labelled with `command`), finished at once
@@ -795,6 +943,7 @@ def write_output(
       append_dim=append_dim,
       group=configs.group,
       metadata=metadata,
+      align_chunks=align_chunks,
     )
   path = _check_output_path(destination)
   logger.info(f"Writing to {path} ({message}) with {configs}")
@@ -808,6 +957,7 @@ def write_output(
     group=configs.group,
     retention=configs.retention(),
     command=command,
+    align_chunks=align_chunks,
   )
 
 

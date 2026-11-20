@@ -22,6 +22,7 @@ SETTINGS = [
   "CDSAPI_KEY",
   "COPERNICUSMARINE_SERVICE_PASSWORD",
   "COPERNICUSMARINE_MAX_POOL_CONNECTIONS",
+  "ARCOMAKE_MEMORY_LIMIT",
   "DASK_ARCOMAKE_TEST",
 ]
 
@@ -79,6 +80,19 @@ def test_invalid_values_are_reported_without_the_value(rc):
   result = CliRunner().invoke(cli, ["steps"])
   assert result.exit_code != 0 and "CDSAPI_URL" in result.output
   assert "secret" not in result.output and "Traceback" not in result.output
+
+
+def test_memory_limit_is_an_amount_of_memory(rc, monkeypatch: pytest.MonkeyPatch):
+  """`ARCOMAKE_MEMORY_LIMIT` (read by `download --memory-limit`) from the file reaches the
+  environment, where the option reads it; other values are refused."""
+  rc("ARCOMAKE_MEMORY_LIMIT=100GB\n")
+  assert settings.load() == ["ARCOMAKE_MEMORY_LIMIT"]
+  assert os.environ["ARCOMAKE_MEMORY_LIMIT"] == "100GB"
+  for bad in ("lots", "0", "-1GB"):
+    monkeypatch.delenv("ARCOMAKE_MEMORY_LIMIT", raising=False)
+    rc(f"ARCOMAKE_MEMORY_LIMIT={bad}\n")
+    with pytest.raises(settings.SettingsError, match="ARCOMAKE_MEMORY_LIMIT"):
+      settings.load()
 
 
 def test_copernicus_marine_pool_size_is_a_positive_integer(rc, monkeypatch: pytest.MonkeyPatch):
