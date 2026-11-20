@@ -343,6 +343,7 @@ class Run:
     `waiting_run`) on its branch. `recipe`: its fingerprint, in every commit's metadata."""
     self.path = str(path)
     self.recipe = recipe
+    provenance.environment()  # what made the output, read when the run starts
     self.repo = icechunk.Repository.open_or_create(storage(path, storage_options))
     if waiting is not None:
       self.label, self.branch, self.base = waiting.label, waiting.branch, waiting.base

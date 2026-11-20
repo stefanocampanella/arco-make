@@ -94,8 +94,12 @@ def _commit() -> str | None:
     return commit
   if BUILD_COMMIT_FILE.is_file():
     return BUILD_COMMIT_FILE.read_text().strip() or None
-  source = pathlib.Path(__file__).parent
+  source = pathlib.Path(__file__).resolve().parent
   try:
+    # Only arco-make's own checkout: installed into another project's tree, git would name it.
+    top = pathlib.Path(_git(source, "rev-parse", "--show-toplevel")).resolve()
+    if source != top / "src" / "arcomake":
+      return None
     commit = _git(source, "rev-parse", "HEAD")
     dirty = _git(source, "status", "--porcelain", "--untracked-files=no", "--", ".")
   except (OSError, subprocess.SubprocessError):

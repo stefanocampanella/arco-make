@@ -6,6 +6,7 @@ recipe's fingerprint; in the commit's metadata, without naming the machine or it
 import os
 import pathlib
 import socket
+import subprocess
 
 import icechunk
 import numpy as np
@@ -107,3 +108,33 @@ def test_climatology_outputs_record_provenance_and_recipe(tmp_path: pathlib.Path
     (snapshot,) = commits(output)
     assert snapshot.metadata[provenance.PROVENANCE_KEY] == provenance.environment()
     assert len(snapshot.metadata[icechunk_utils.RECIPE_KEY]) == 16
+
+
+def test_no_commit_of_another_repository(monkeypatch, tmp_path):
+  """Installed (not editable) inside another project's checkout, git would name that project's
+  commit: only arco-make's own checkout counts."""
+  monkeypatch.delenv("ARCOMAKE_COMMIT", raising=False)
+  monkeypatch.setattr(provenance, "BUILD_COMMIT_FILE", tmp_path / "missing")
+  project = tmp_path / "project"
+  package = project / ".venv" / "lib" / "site-packages" / "arcomake"
+  package.mkdir(parents=True)
+  subprocess.run(["git", "init", "-q", str(project)], check=True)
+  subprocess.run(
+    [
+      "git",
+      "-C",
+      str(project),
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@t",
+      "commit",
+      "-q",
+      "--allow-empty",
+      "-m",
+      "x",
+    ],
+    check=True,
+  )
+  monkeypatch.setattr(provenance, "__file__", str(package / "provenance.py"))
+  assert provenance._commit() is None
