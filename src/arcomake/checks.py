@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-import warnings
 from collections.abc import Callable, Hashable, Mapping
 from datetime import datetime
 from typing import Literal, Self, cast
@@ -130,8 +129,8 @@ def ensure_no_nans(
 
   Each extra argument maps a mask to the variables it applies to, e.g.
   `glorys_mask = ["thetao", "so"]`: those are checked only where the mask is True (the first
-  level of a 3D mask for 2D variables). Other variables are checked everywhere. A mask missing
-  from the dataset is reported, and its variables are not checked.
+  level of a 3D mask for 2D variables). Other variables are checked everywhere. A mask or a listed
+  variable missing from the dataset is a failure; the variables of a missing mask are not checked.
 
   Raises:
     ValidationError: listing, per time step, the variables with missing values.
@@ -149,7 +148,7 @@ def ensure_no_nans(
       if variable_name in dataset.data_vars:
         variable_mask_mapping[variable_name] = mask_name
       else:
-        warnings.warn(f"Variable {variable_name} not found in dataset")
+        dataset_errors.append(f"variable {variable_name!r} of mask {mask_name!r} not found")
 
   # Missing values inside the masks.
   invalid: dict[Hashable, xr.DataArray] = {}

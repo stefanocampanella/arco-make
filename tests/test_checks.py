@@ -284,3 +284,14 @@ def test_ensure_no_nans_reports_a_missing_mask(ocean_ds: xr.Dataset):
   with pytest.warns(UserWarning, match="mask 'm' not found") as record:
     ocean_ds[["zos"]].arcomake.validate(config)
   assert "NaN values" not in str(record[0].message)
+
+
+def test_ensure_no_nans_fails_on_a_missing_variable(ocean_ds: xr.Dataset, static_ds: xr.Dataset):
+  """A listed variable missing from the dataset (a typo, a variable dropped upstream) fails, as in
+  `fraction_domain`: with only a warning, the check passed without checking it."""
+  ds = xr.merge([ocean_ds, static_ds])
+  ds["m"] = ds.deptho.notnull()
+  ds = ds.assign(zos=ds.zos.fillna(0.0).where(ds.m))[["zos", "m"]]
+  checks.ensure_no_nans(ds, m=["zos"])
+  with pytest.raises(ValidationError, match="variable 'zoss' of mask 'm' not found"):
+    checks.ensure_no_nans(ds, m=["zos", "zoss"])
