@@ -1090,3 +1090,123 @@ dataset: it did not need to, the recipe's steps run on the reopened block. Left 
 `output:` prefix (no recipe could use `coverage_attrs` before this branch), the fingerprint
 change for runs of older code (unreleased), and reading the output's time coordinate for each
 block (about 380 blocks in production).
+
+## 2026-11-19: coarsening GLORYS and GloFAS, decided with the maintainer
+
+The reasons and the figures are in `docs/coarsen-ocean-datasets.md`, measured at 0.25, 0.5 and
+1 degree by `docs/coarsen_analysis.py`; the decisions, in order of the discussion:
+
+- **Sea is any water** (**[Moby-Dick]**): a coarse cell is sea at a level where GLORYS has some
+  sea cell under it. `seafrac` (static), GLORYS's 3D mask regridded conservatively, is published:
+  the share of the cell where the model has a sea cell. The recipes' rule (the regridded depth
+  below the level's centre) is GLORYS's own rule applied to a flat column: right in total, wrong
+  by layer (+1.2 % of the water at the surface, -1.6 % at 5275 m, at 0.25 deg), and 8,869 surface
+  cells it called sea were less than half sea. With any water, regridded values (nan_threshold 1)
+  and sea cells coincide; masks count every sea cell as full (+5 % of the volume at 0.25 deg, +16 %
+  at 1 deg): volumes, heat contents and a model's loss should weigh by `seafrac` x layer thickness x
+  area (a note for Moby-Dick). `glorys_mask` is gone; `deptho` is the mean depth with land as 0.
+- **Level 49 dropped** (**[Moby-Dick]**): NEMO never computes it (no value on any day); 49 levels.
+- **Gaps filled from above** (**[Moby-Dick]**), velocities included, 0 where nothing is above: the
+  few sea cells without values (1,505 at 0.25 deg, the same every day) take the nearest value
+  above in the column. Leaving a level out and refilling it, this beats the regridded bottom
+  values the recipes used at every level and resolution (temperature RMSE at 5275 m: 0.043 against
+  0.084 at 0.25 deg, 0.041 against 0.63 at 1 deg). `*_bottom` variables are gone.
+- **No latitude cut**: the rows it removed (-77, 90) are sea in GLORYS's static mask without values,
+  but leave no coarse sea cell empty; the cut itself caused round-off fractions (1e-8) at three
+  0.25 deg columns.
+- **Sea ice** (**[Moby-Dick]**): GLORYS's `sithick`, `usi`, `vsi` are means over the ice cover
+  (`cell_methods = "area: mean where sea_ice"`), which the recipes averaged with open water and
+  land as 0 (thickness neither of the ice nor per area; ice drift slowed by about 17 % where the
+  ice covers less than half a cell). Published now, over the sea part: `siconc`, `sivol` (siconc x
+  sithick), `usic`, `vsic` (siconc x velocity); GLORYS's thickness and velocity come back as ratios
+  to `siconc` (relative error 1.5e-7 in float32), ice area and volume are kept.
+- **Rivers** (**[Moby-Dick]**): the recipes' `dis24` was a mean over coarse cells, kept only where
+  a cell is all land (nan_threshold 0): 1.7 % of the discharge reaching the coast was kept, the
+  Amazon's none; inland it was a fifth of the main river at 0.25 deg, a twentieth at 1 deg.
+  `dis24_outlets` replaces it: the discharge at the pits of GloFAS's drainage network (LDD v4.0,
+  152,629 pits; their upstream area equals the land area), in metres per day over each cell,
+  regridded conservatively with its total checked (1,079,449 m3/s on 1 Mar 2013). `dis24`,
+  `glofas_mask` and `uparea` are gone.
+- **WAVERYS dropped**: its sea differs from GLORYS's (none north of about 81 N), waves are missing
+  where ERA5's ice cover exceeds about 0.3, and the recipes averaged the direction arithmetically
+  and filled it with 0 under ice.
+
+arco-make, generic: steps `fraction_mask`, `fill_from_above`, `products`, `divide_by`,
+`keep_where`, `per_unit_area`; `regrid`'s `conservation_tolerance`; parts' `rename` and
+`coordinate_tolerance` (the LDD's coordinates differ from the discharge's by 4e-12); the check
+`fraction_domain` (values exactly where a static fraction is positive); static datasets computed
+once per run, and compared with the stored ones by a resumed run (they were recomputed for every
+block and discarded by the appends). Two fixes: `regrid` with `stat` crashed on datasets
+(xarray-regrid 0.4.2 reads `.dtype` of a Dataset when the target extends beyond the source; also
+on upstream main; NaN is now passed as `fill_value`), and `apply_mask` made 2D fields 3D with a 3D
+mask. xarray-regrid blanks target cells centred outside the source's centres, whatever the
+method (GloFAS loses its -60 and 90 rows: no rivers there); the conservation check catches it.
+
+Checked: the full suite; the notes' doctests, offline and live; the analysis at three
+resolutions; a two-day download with the new 1 deg recipe (static datasets computed once, river
+total equal to the pits', `validate` with `fraction_domain` passed).
+
+A high-effort review found ten issues; nine were fixed in six commits (tests checked to fail
+before where behaviour changed): `products` and `fraction_mask` removed every coordinate's
+attributes; the static comparison ran at the second block of every run, not only on `--resume`,
+and failed on static variables packed by `[save.encoding]` (`scale_factor`); `fraction_domain`
+crashed on a missing fraction, kept one fraction's counts for a variable under two, and accepted
+`inclusive` at 0; the conservation check could not be built on outputs split along latitude or
+longitude; `coordinate_tolerance` let NaN coordinates through and did nothing on the first part;
+`fraction_mask`'s docstring on `tolerance = 0`. A second review, of the fixes, found nine more;
+seven were fixed in four commits: a fraction stored as a coordinate was "not found"; the static
+comparison read units such as "seconds" as durations (NaT never equal) and compared again after
+a first block retried once its commit had landed; the conservation check copied and promoted
+values through `where` (now passed through unchanged, coordinates joined exactly);
+`coordinate_tolerance` refused equal NaN positions and ignored a tolerance matching no coordinate.
+The two points left by the reviews were done afterwards: `ensure_no_nans` and `fraction_domain`
+share their count-and-report code (same reports, pinned by a test that passes before and after).
+The attribute fix has no `output:` prefix (the commit was pushed): it changes the output only of
+recipes using `products` or `fraction_mask`, new on this branch, where no other dataset gives the
+coordinates their attributes. The 1 deg fork recipe's two-day output is identical before and
+after it (values, encodings, coordinate attributes; the merge took them from other datasets).
+A third review, of these commits, found a defect in older code, fixed: `ensure_no_nans` raised
+KeyError on a mask missing from the dataset, stopping `validate`. Left to the maintainer, since
+they change what existing recipes accept: a listed variable missing from the dataset only warns
+in `ensure_no_nans` (an error in `fraction_domain`), and a mask with NaN counts them as inside.
+Both were decided on 20 Nov (below).
+
+### 20 Nov: cell measures, one check for masks
+
+Maintainer's decisions: GLORYS's sea and ERA5's grid stay separate domains (the grids do not
+overlap, and users may postprocess them differently; no routing of outlets to the sea); ERA5's
+`z` and `lsm` stay as they are; the dataset publishes cell bounds, areas and sea volumes, with
+areas on the sphere of GLORYS12's static product; `ensure_no_nans` absorbs `fraction_domain`
+and fails on a listed variable missing from the dataset.
+
+- GLORYS12's static `e1t` and `e2t` are spherical (`e1t` = R cos(lat) dlon) with R = 6,378,100 m,
+  not NEMO's 6,371,229 m nor the mean radius. Any sphere is off the WGS84 ellipsoid by +0.45 %
+  (cells at the equator) to -0.89 % (near the poles); the geoid's departures (about 100 m) are
+  negligible. The static product's two parts (`bathy`, `coords`) give depths differing by float32
+  rounding (at most 0.5 mm): the `e3t` part takes `coordinate_tolerance`.
+- New: `regrid` passes variables without the horizontal dimensions through (the conservative
+  method failed on them, linear and nearest gave them a latitude dimension: `output:`); steps
+  `cell_bounds` (CF bounds as coordinates; depth from thicknesses) and `cell_area`; a resumed
+  download compares static coordinates too; `ensure_no_nans` reads masks as `mask > threshold`
+  (boolean masks and fractions alike, NaN and negative round-off outside), takes `exact` (true or
+  a list of masks), names the mask of each count, and refuses a static variable under a
+  time-varying mask.
+- At 1 deg (1-2 Mar 2013, the fork recipe): the total of `volcello` equals GLORYS12's own volume
+  (sum of `e1t` x `e2t` x `e3t` x `mask`, levels 0-48, 1.330e18 m3) to 1.8e-7, every level to
+  3e-7; the sea area at the surface agrees; the river total rebuilt with `areacello` equals the
+  pits' (1,079,448.71 m3/s); `areacello` sums to 4 pi R^2 to 7e-10; `validate --fail` passes.
+- **[Moby-Dick]** The recipes kept GLORYS12's attributes on `thetao`, `so`, `uo`, `vo`, `zos`:
+  `cell_methods = "area: mean"` (the coarse values are means over the sea part) and the
+  `valid_min`/`valid_max` of GLORYS12's packed int16 values (thetao: -32766 to 21306), meaningless
+  on unpacked floats. The new recipes replace them; the published dataset probably carries them
+  (not checked).
+- A high-effort review of these commits found nine points; eight were fixed before pushing.
+  Left: a mask whose inside is negative (-1 for sea, say) is now all outside (the maintainer's
+  `mask > threshold` rule).
+- Correction (maintainer, later on 20 Nov): "`z` and `lsm` stay" meant that they stay in the
+  dataset, as static data. The fork recipes had never adopted `static_time` and still stored them
+  as daily means; they now read them at 2000-01-01T00:00, once per run, without time. The
+  source's values at that stamp equal those of 1993-01-01, 2010-07-01 and 2021-06-30; `z`
+  differs from 2022-10-01 on at the two polar rows (2,880 cells, up to 364 m2 s-2). At 1 deg the
+  static fields differ from the old daily means by float32 rounding only; the statistics leave
+  them out (Moby-Dick notes, item 3: their z-scores were rounding noise).

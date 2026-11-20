@@ -1,8 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-import warnings
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Mapping
 from datetime import datetime
 from typing import Literal, Self, cast
 
@@ -11,6 +10,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 from pydantic import BaseModel, ConfigDict, model_validator
+
+from arcomake.processing_utils import check_fraction_threshold
 
 logger = logging.getLogger(__name__)
 
@@ -41,11 +42,20 @@ class ValidTimeCoordinateCheck(BaseModel):
 
 
 class EnsureNoNansCheck(BaseModel):
-  """`time_dim`, and one key per mask: `MASK = ["variable", ...]` checks those variables inside it."""
+  """`time_dim`, `threshold`, `inclusive`, `exact` (all masks, or a list of them), and one key
+  per mask: `MASK = ["variable", ...]` checks those variables inside it."""
 
   model_config = ConfigDict(extra="allow")
 
   time_dim: str | None = None
+  threshold: float = 0.0
+  inclusive: bool = False
+  exact: bool | list[str] = False
+
+  @model_validator(mode="after")
+  def _threshold_leaves_cells_in_and_out(self) -> Self:
+    check_fraction_threshold(self.threshold, self.inclusive)  # as the `fraction_mask` step
+    return self
 
   @model_validator(mode="after")
   def _masks_map_to_variable_lists(self) -> Self:
@@ -64,66 +74,119 @@ class ChecksConfig(BaseModel):
   ensure_no_nans: EnsureNoNansCheck | None = None
 
 
+def _report_by_time[K: Hashable](
+  dataset: xr.Dataset,
+  flags: Mapping[K, xr.DataArray],
+  time_dim: str,
+  describe: Callable[[K, int], str],
+) -> tuple[list[str], list[tuple[object, list[str]]]]:
+  """Count the flagged cells of each boolean array per time step, all in one computation, not
+  one per array and time step (a check over decades looped over thousands of days).
+
+  Returns `describe(key, count)` for the non-zero counts of arrays without `time_dim`, and per time
+  step with any, in time order, its stamp and the descriptions of its non-zero counts; keys keep
+  the order of `flags`.
+  """
+  sums = {key: da.sum([d for d in da.dims if d != time_dim]) for key, da in flags.items()}
+  computed = cast(dict[K, xr.DataArray], dask.compute(sums)[0])
+  static: list[str] = []
+  per_time: dict[int, list[str]] = {}
+  for key, count in computed.items():
+    if time_dim not in count.dims:
+      if int(count) > 0:
+        static.append(describe(key, int(count)))
+      continue
+    values = count.values
+    for index in np.flatnonzero(values):
+      per_time.setdefault(int(index), []).append(describe(key, int(values[index])))
+  if not per_time:
+    return static, []
+  stamps = dataset[time_dim].to_index()
+  return static, [(stamps[index], per_time[index]) for index in sorted(per_time)]
+
+
 def ensure_no_nans(
   dataset: xr.Dataset,
   time_dim: str = "time",
+  threshold: float = 0.0,
+  inclusive: bool = False,
+  exact: bool | list[str] = False,
   **kwargs: list[str],
 ) -> None:
-  """Check that variables have no missing value, inside their mask if one is given.
+  """Check that variables have no missing value: inside their masks, or everywhere.
 
   Each extra argument maps a mask to the variables it applies to, e.g.
-  `glorys_mask = ["thetao", "so"]`: those are checked only where the mask is True (the first
-  level of a 3D mask for 2D variables). Other variables are checked everywhere.
+  `seafrac = ["thetao", "so"]`: those are checked only inside it, where it is above `threshold`
+  (at least `threshold` with `inclusive`): by default where a boolean mask is True or a fraction
+  positive. Missing values of a mask count as outside; the mask itself is checked like any other
+  variable. Variables without one of the mask's dimensions are checked against its first index
+  along it (the surface level, for 2D fields); a mask with the time dimension needs it in its
+  variables. With `exact` (true, or a list of masks), values outside those masks are failures
+  too: their variables have values exactly inside. A variable under several masks is checked
+  against each. Other variables are checked everywhere. A mask or a listed variable missing from
+  the dataset is a failure; the variables of a missing mask are not checked.
 
   Raises:
-    ValidationError: listing, per time step, the variables with missing values.
+    ValidationError: listing, per time step, the variables with missing values inside their
+      masks (or anywhere) and, with `exact`, with values outside.
   """
-  variable_mask_mapping: dict[Hashable, str] = {}
+  dataset_errors: list[str] = []
+  exact_masks = set(kwargs) if exact is True else set(exact or [])
+  for mask_name in sorted(exact_masks - set(kwargs)):
+    dataset_errors.append(f"exact: {mask_name!r} is not one of the masks")
+  masks_of: dict[Hashable, list[Hashable]] = {}
+  unchecked: set[Hashable] = set()
   for mask_name, variable_names in kwargs.items():
+    if mask_name not in dataset.variables:
+      # Its variables are not checked: everywhere, they would be reported missing on land.
+      dataset_errors.append(f"mask {mask_name!r} not found")
+      unchecked.update(variable_names)
+      continue
     for variable_name in variable_names:
       if variable_name in dataset.data_vars:
-        variable_mask_mapping[variable_name] = mask_name
+        masks_of.setdefault(variable_name, []).append(mask_name)
       else:
-        warnings.warn(f"Variable {variable_name} not found in dataset")
+        dataset_errors.append(f"variable {variable_name!r} of mask {mask_name!r} not found")
 
-  # Missing values inside the masks, counted per time step in one computation, not two per day
-  # and variable: a check over decades looped over thousands of days.
-  counts: dict[Hashable, xr.DataArray] = {}
+  # Per variable and mask: missing values inside it and, with `exact`, values outside.
+  wrong: dict[tuple[Hashable, Hashable | None, str], xr.DataArray] = {}
+  # Each mask is compared with the threshold once, then reduced to the dimensions of each variable.
+  inside_all = {
+    name: dataset[name] >= threshold if inclusive else dataset[name] > threshold
+    for name in {m for masks in masks_of.values() for m in masks}
+  }
   for variable_name, da in dataset.data_vars.items():
-    invalid = da.isnull()
-    if variable_name in variable_mask_mapping:
-      mask_da = dataset[variable_mask_mapping[variable_name]]
-      # A variable without a dimension of its mask (surface data, 3D mask) is checked against the
-      # mask's first entry along it (the first depth level).
-      mask_da = mask_da.isel({dim: 0 for dim in mask_da.dims if dim not in da.dims}, drop=True)
-      invalid = invalid & mask_da.astype(bool)
-    counts[variable_name] = invalid.sum([dim for dim in invalid.dims if dim != time_dim])
+    if variable_name in unchecked and variable_name not in masks_of:
+      continue
+    missing = da.isnull()
+    if variable_name not in masks_of:
+      wrong[(variable_name, None, "missing")] = missing
+    for mask_name in masks_of.get(variable_name, []):
+      inside = inside_all[mask_name]
+      if time_dim in inside.dims and time_dim not in da.dims:
+        dataset_errors.append(
+          f"variable {variable_name!r} has no {time_dim!r} but its mask {mask_name!r} has"
+        )
+        continue
+      inside = inside.isel({dim: 0 for dim in inside.dims if dim not in da.dims}, drop=True)
+      wrong[(variable_name, mask_name, "missing")] = missing & inside
+      if mask_name in exact_masks:
+        wrong[(variable_name, mask_name, "outside")] = da.notnull() & ~inside
+
+  def describe(key: tuple[Hashable, Hashable | None, str], n: int) -> str:
+    variable, mask_name, kind = key
+    if kind == "outside":
+      return f"{n} values found outside mask {mask_name} for variable {variable}"
+    inside = "" if mask_name is None else f" inside mask {mask_name}"
+    return f"{n} NaN values found for variable {variable}{inside}"
 
   logger.info("Checking for Nans.")
-  computed = cast(dict[Hashable, xr.DataArray], dask.compute(counts)[0])
-  per_time: dict[int, list[str]] = {}
-  static_errors = []
-  for variable_name, count in computed.items():
-    if time_dim not in count.dims:
-      if int(count) > 0:
-        static_errors.append(f"{int(count)} NaN values found for variable {variable_name}")
-      continue
-    for index in np.flatnonzero(count.values):
-      per_time.setdefault(int(index), []).append(
-        f"{int(count.values[index])} NaN values found for variable {variable_name}"
-      )
-  dataset_errors = []
-  if static_errors:
-    dataset_errors.append(
-      f"{len(static_errors)} errors found without time: " + ", ".join(static_errors)
-    )
-  datetimes = dataset[time_dim].to_index()
-  for index in sorted(per_time):
-    errors_on_datetime = per_time[index]
-    dataset_errors.append(
-      f"{len(errors_on_datetime)} errors found for time {datetimes[index]}: "
-      + ", ".join(errors_on_datetime)
-    )
+  static, per_time = _report_by_time(dataset, wrong, time_dim, describe)
+  if static:
+    dataset_errors.append(f"{len(static)} errors found without time: " + ", ".join(static))
+  dataset_errors += [
+    f"{len(found)} errors found for time {stamp}: " + ", ".join(found) for stamp, found in per_time
+  ]
   if dataset_errors:
     raise ValidationError("\n".join(dataset_errors))
 

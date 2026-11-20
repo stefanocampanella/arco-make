@@ -8,6 +8,7 @@ import math
 import warnings
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Self, get_args, override
 
@@ -292,6 +293,7 @@ def download(
     # error is redone (`retries`), others stop the run.
     todo = [(n, b) for n, b in enumerate(blocks) if block_key(b) not in done]
     progress = progress and dask_setup in ("processes", "threads")
+    static = RunStatic()
     try:
       for number, date_interval in todo:
         logger.info(f"Downloading data from {date_interval.start} to {date_interval.end}")
@@ -305,6 +307,7 @@ def download(
             progress=progress,
             recipe=recipe,
             budget=budget,
+            static=static,
           ),
           configs.retries,
           _describe(date_interval),
@@ -388,12 +391,31 @@ def _describe(interval: DateInterval) -> str:
   return f"Block [{interval.start:%Y-%m-%dT%H:%M}, {interval.end:%Y-%m-%dT%H:%M})"
 
 
+@dataclass
+class RunStatic:
+  """The static datasets of a run (no time dimension once processed: masks, fractions,
+  bathymetry), computed once, by the first block, and reused by the others; `checked` once the
+  static variables of a resumed run were compared with the stored ones."""
+
+  datasets: dict[str, xr.Dataset] = field(default_factory=dict)
+  checked: bool = False
+
+
 @contextmanager
 def _processed_block(
-  configs: DownloadConfig, date_interval: DateInterval, *, progress: bool, budget: Budget | None
+  configs: DownloadConfig,
+  date_interval: DateInterval,
+  *,
+  progress: bool,
+  budget: Budget | None,
+  static: RunStatic | None = None,
 ) -> Generator[xr.Dataset]:
   """The datasets of one block, read, processed and merged, with the global postprocessing
-  (lazy: computed when written); with a `budget`, the parts are chunked as planned for it."""
+  (lazy: computed when written); with a `budget`, the parts are chunked as planned for it.
+
+  With `static`, a dataset without the time dimension once processed is computed by the first
+  block (in memory) and reused by the others, instead of being read and processed for each.
+  """
   # Download and postprocess each dataset, possibly using checkpointing to disk.
   with ExitStack() as stack:
     datasets: list[xr.Dataset] = []
@@ -401,20 +423,26 @@ def _processed_block(
       if dataset_conf.skip:
         logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
         continue
-      datasets.append(
-        stack.enter_context(
-          maybe_checkpointing_download_and_process(
-            dataset_conf,
-            date_interval.start,
-            date_interval.end,
-            time_dim=configs.time_dim,
-            progress=progress,
-            budget=budget,
-            name=dataset_name,
-            later_steps=configs.postprocess,
-          )
+      if static is not None and dataset_name in static.datasets:
+        datasets.append(static.datasets[dataset_name])
+        continue
+      dataset = stack.enter_context(
+        maybe_checkpointing_download_and_process(
+          dataset_conf,
+          date_interval.start,
+          date_interval.end,
+          time_dim=configs.time_dim,
+          progress=progress,
+          budget=budget,
+          name=dataset_name,
+          later_steps=configs.postprocess,
         )
       )
+      if static is not None and configs.time_dim not in dataset.dims:
+        logger.info(f"{dataset_name} is static: computed once for the run")
+        dataset = dataset.load()
+        static.datasets[dataset_name] = dataset
+      datasets.append(dataset)
     with xr.merge(
       datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
     ) as dataset:
@@ -446,15 +474,28 @@ def _write_block(
   progress: bool,
   recipe: str,
   budget: Budget | None = None,
+  static: RunStatic | None = None,
 ) -> None:
   """Read, process and merge the datasets of one block, and commit it to the run's branch
-  (written by the first block, appended along time by the others)."""
+  (written by the first block, appended along time by the others).
+
+  Appends write only variables with the time dimension: the static ones are those of the first
+  block. A run that does not write the first block (`--resume`) compares its static variables
+  with the stored ones, once: they must be identical.
+  """
+  if first and static is not None:
+    static.checked = True  # this run writes them (or wrote them, if its answer was lost)
   if _committed(run, date_interval):
     return
   with (
-    _processed_block(configs, date_interval, progress=progress, budget=budget) as dataset,
+    _processed_block(
+      configs, date_interval, progress=progress, budget=budget, static=static
+    ) as dataset,
     ProgressBar() if progress else nullcontext(),
   ):
+    if not first and static is not None and not static.checked:
+      _check_static(dataset, run, configs.save.group, configs.time_dim)
+      static.checked = True
     dataset = _with_output_coverage(dataset, run, configs.save.group, configs.time_dim, first)
     write_output(
       dataset,
@@ -467,6 +508,55 @@ def _write_block(
       # Chunks are planned for reading; the stored layout is the recipe's.
       align_chunks=True,
     )
+
+
+def _check_static(
+  dataset: xr.Dataset, run: icechunk_utils.Run, group: str | None, time_dim: str
+) -> None:
+  """Fail if a static variable of `dataset` differs from the one stored on the run's branch
+  (compared as stored: packed with the stored variable's encoding, NaN equal to NaN): appends do
+  not rewrite them, so the output would keep the old ones. Static coordinates other than indexes
+  (cell bounds, say) are compared too. Units are not read as durations: "seconds" stays a number,
+  whose missing values equal each other."""
+  names = [
+    name
+    for name, var in dataset.variables.items()
+    if time_dim not in var.dims and name not in dataset.indexes
+  ]
+  if not names:
+    return
+  store = run.repo.readonly_session(branch=run.branch).store
+  with xr.open_zarr(store, group=group, consolidated=False, decode_timedelta=False) as stored:
+    for name in names:
+      if name not in stored:
+        raise click.ClickException(
+          f"Static variable {name!r} is not in the output: start over with --replace"
+        )
+      expected = stored[name].values
+      computed = np.asarray(_as_stored(dataset[name], stored[name]).values).astype(expected.dtype)
+      equal_nan = expected.dtype.kind in "fcmM"  # NaN, NaT
+      if computed.shape != expected.shape or not np.array_equal(
+        computed, expected, equal_nan=equal_nan
+      ):
+        raise click.ClickException(
+          f"Static variable {name!r} differs from the stored one (a source or the recipe"
+          " changed): start over with --replace"
+        )
+  logger.info(f"Static variables identical to the stored ones: {', '.join(map(str, names))}")
+
+
+# Encoding keys that change stored values: packing into another type, with scale and offset, and
+# the units and calendar of times.
+_VALUE_ENCODING = ("dtype", "scale_factor", "add_offset", "_FillValue", "units", "calendar")
+
+
+def _as_stored(computed: xr.DataArray, stored: xr.DataArray) -> xr.DataArray:
+  """`computed` encoded as `stored` was (e.g. floats packed into int16) and decoded again."""
+  variable = computed.variable.copy(deep=False)
+  variable.encoding = {k: v for k, v in stored.encoding.items() if k in _VALUE_ENCODING}
+  encoded = xr.conventions.encode_cf_variable(variable, name=str(computed.name))
+  decoded = xr.conventions.decode_cf_variable(computed.name, encoded, decode_timedelta=False)
+  return computed.copy(data=decoded.values)
 
 
 # The attributes `processing_utils.time_coverage` computes (a one-stamp output has no resolution).

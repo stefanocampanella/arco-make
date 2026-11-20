@@ -65,7 +65,8 @@ def validate(
 
   Checks: `valid_time_coordinate` (complete, sorted, without duplicates, between `start` and
   `end` excluded), `valid_global_ecmwf_coordinates` (latitudes increasing within [-90, 90],
-  longitudes within [0, 360)) and `ensure_no_nans` (no missing value inside each mask).
+  longitudes within [0, 360)) and `ensure_no_nans` (no missing value inside each mask, or
+  everywhere; with `exact`, none present outside).
   Failed checks are warnings, or an error with --fail. `--start` and `--end` give the bounds
   of `valid_time_coordinate` (over the recipe's), so that a script passes the same dates to
   `download` and `validate`.

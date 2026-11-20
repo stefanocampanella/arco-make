@@ -59,6 +59,9 @@ def apply_mask(
 ) -> xr.Dataset:
   """Set variables to NaN outside a mask.
 
+  For variables without one of the mask's dimensions (e.g. 2D fields and a 3D mask), the first
+  index of that dimension is used (e.g. the surface level).
+
   Args:
     mask_name: Boolean variable, True where values are kept.
     variables: Variables to mask; by default every data variable except the mask.
@@ -69,7 +72,7 @@ def apply_mask(
   data_vars = {}
   for var in ds.data_vars:
     if var in variables:
-      data_vars[var] = ds[var].where(mask)
+      data_vars[var] = ds[var].where(_broadcastable(mask, ds[var]))
     else:
       data_vars[var] = ds[var]
   ds = xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
@@ -228,6 +231,26 @@ def coverage_attrs(
 
 
 @step
+def divide_by(ds: xr.Dataset, variables: Iterable[Hashable], by: Hashable) -> xr.Dataset:
+  """Divide variables by another, where it is positive; NaN where it is 0 or missing.
+
+  E.g. quantities averaged over whole coarse cells, land counted as 0, made averages over the
+  cells' sea part (`by` its sea fraction). For variables without one of `by`'s dimensions, the
+  first index of that dimension is used (e.g. the surface level of a 3D fraction)::
+
+    name = "divide_by"
+    variables = ["siconc", "sivol"]
+    by = "seafrac"
+  """
+  data_vars = dict(ds.data_vars)
+  for var in variables:
+    da = ds[var]
+    divisor = _broadcastable(ds[by], da)
+    data_vars[var] = (da / divisor.where(divisor > 0)).assign_attrs(da.attrs)
+  return xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
+
+
+@step
 def drop_static_vars(ds: xr.Dataset, time_dim: str = "time") -> xr.Dataset:
   """Drop the data variables without the time dimension (masks, bathymetry...)."""
   ds = ds.drop_vars([name for name, var in ds.data_vars.items() if time_dim not in var.dims])
@@ -243,10 +266,119 @@ def drop_var_attrs(ds: xr.Dataset, variables: Iterable[Hashable]) -> xr.Dataset:
   return ds
 
 
+def _fill_from_above_needs(ds: xr.Dataset, depth_dim: str, **_: Any) -> Needs:
+  """`fill_from_above` joins the whole depth of a variable in each of its tasks."""
+  return Needs(gathered=frozenset({depth_dim}))
+
+
+def _filled_downwards(values: np.ndarray) -> np.ndarray:
+  """Each NaN replaced by the nearest valid value before it along the last axis (NaN if none)."""
+  valid = ~np.isnan(values)
+  index = np.where(valid, np.arange(values.shape[-1]), 0)
+  np.maximum.accumulate(index, axis=-1, out=index)
+  filled = np.take_along_axis(values, index, axis=-1)
+  return np.where(np.take_along_axis(valid, index, axis=-1), filled, np.nan)
+
+
+@step(needs=_fill_from_above_needs)
+def fill_from_above(
+  ds: xr.Dataset,
+  variables: Iterable[Hashable],
+  depth_dim: str,
+  mask_name: Hashable | None = None,
+) -> xr.Dataset:
+  """Fill missing values with the nearest valid value above them in the same column.
+
+  For cells a coarse grid calls sea where the source has no value (a model's gaps, or its
+  levels below the sea floor). Cells with no valid value above stay missing (fill them with
+  `masked_fill`). With `mask_name`, only missing values inside the mask are filled::
+
+    name = "fill_from_above"
+    variables = ["thetao", "so", "uo", "vo"]
+    depth_dim = "depth"
+    mask_name = "sea"
+
+  Args:
+    variables: Variables with `depth_dim`.
+    depth_dim: Vertical dimension; its first index must be the top.
+    mask_name: Boolean variable, True where missing values are filled (default: everywhere).
+  """
+  data_vars = dict(ds.data_vars)
+  for var in variables:
+    da = ds[var]
+    filled = xr.apply_ufunc(
+      _filled_downwards,
+      da.chunk({depth_dim: -1}) if da.chunks is not None else da,
+      input_core_dims=[[depth_dim]],
+      output_core_dims=[[depth_dim]],
+      dask="parallelized",
+      output_dtypes=[da.dtype],
+      keep_attrs=True,
+    ).transpose(*da.dims)
+    if mask_name is not None:
+      mask = _broadcastable(ds[mask_name], da)
+      filled = da.where(da.notnull() | ~mask, filled)
+    data_vars[var] = filled
+  return xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
+
+
+def _broadcastable(other: xr.DataArray, da: xr.DataArray) -> xr.DataArray:
+  """`other` without the dimensions `da` lacks, taking their first index (e.g. the surface level
+  of a 3D mask for a 2D field)."""
+  return other.isel({dim: 0 for dim in other.dims if dim not in da.dims}, drop=True)
+
+
 @step
 def flip(ds: xr.Dataset, dim: str) -> xr.Dataset:
   """Reverse the order along a dimension (e.g. make ERA5 latitudes increase)."""
   return ds.isel({dim: slice(None, None, -1)})
+
+
+def check_fraction_threshold(threshold: float, inclusive: bool) -> None:
+  """A fraction's threshold must leave some cells out and some in: in [0, 1), not inclusive at
+  0 (every cell, land included, would be in). Raises ValueError otherwise."""
+  if not 0.0 <= threshold < 1.0 or (threshold == 0.0 and inclusive):
+    raise ValueError(f"threshold must be in [0, 1) and not inclusive at 0, got {threshold}")
+
+
+@step
+def fraction_mask(
+  ds: xr.Dataset,
+  fraction: Hashable,
+  mask_name: Hashable | None = None,
+  threshold: float = 0.0,
+  inclusive: bool = False,
+  tolerance: float = 1e-6,
+) -> xr.Dataset:
+  """Clean a fraction (e.g. of sea, a 0/1 mask regridded conservatively) and add a mask from it.
+
+  Values of `fraction` below `tolerance` become 0: regridding weights leave round-off (about
+  1e-8) where a target cell barely touches the source's ones. With `mask_name`, a boolean mask
+  is added, True where the fraction is above `threshold` (or at least, with `inclusive`): the
+  default, `fraction > 0`, keeps every cell with some sea; `threshold = 0.5, inclusive = true`
+  keeps those at least half sea::
+
+    name = "fraction_mask"
+    fraction = "seafrac"
+    mask_name = "sea"
+
+  Args:
+    fraction: Variable with values between 0 and 1.
+    mask_name: Name of the new mask (none by default).
+    threshold: Fraction above which a cell is in the mask.
+    inclusive: Whether a fraction equal to `threshold` is in the mask.
+    tolerance: Fractions below it are set to 0 (with 0, only negative round-off).
+  """
+  check_fraction_threshold(threshold, inclusive)
+  if tolerance < 0.0:
+    raise ValueError(f"tolerance must not be negative, got {tolerance}")
+  da = ds[fraction]
+  cleaned = da.where(~(da < tolerance), 0.0).astype(da.dtype)  # NaN stays NaN
+  ds = ds.assign({fraction: cleaned})
+  if mask_name is not None:
+    mask = cleaned >= threshold if inclusive else cleaned > threshold
+    ds = ds.assign({mask_name: mask.drop_attrs(deep=False)})
+  return ds
 
 
 def _get_bottom_needs(ds: xr.Dataset, depth_dim: str, **_: Any) -> Needs:
@@ -372,6 +504,31 @@ def is_positive_mask(ds: xr.Dataset, variable: Hashable, mask_name: Hashable) ->
 
 
 @step
+def keep_where(
+  ds: xr.Dataset,
+  variables: Iterable[Hashable],
+  condition: Hashable,
+  equals: Number,
+  other: Number = 0.0,
+) -> xr.Dataset:
+  """Keep values where another variable equals a value, `other` everywhere else (missing values
+  included). E.g. river discharge at the outlets of a drainage network, where its local drain
+  direction is 5 (a pit)::
+
+    name = "keep_where"
+    variables = ["dis24"]
+    condition = "ldd"
+    equals = 5
+  """
+  data_vars = dict(ds.data_vars)
+  keep = ds[condition] == equals
+  for var in variables:
+    da = ds[var]
+    data_vars[var] = da.where(_broadcastable(keep, da), other).assign_attrs(da.attrs)
+  return xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
+
+
+@step
 def masked_fill(
   ds: xr.Dataset,
   variables: Iterable[Hashable],
@@ -396,7 +553,7 @@ def masked_fill(
   mask = ds[mask_name]
   data_vars = {}
   for var, da in ds.data_vars.items():
-    _mask = mask.isel({dim: 0 for dim in mask.dims if dim not in da.dims}, drop=True)
+    _mask = _broadcastable(mask, da)
     if var in variables:
       # Check if the fill value is per variable
       _fill_name_or_value = fill_value[var] if isinstance(fill_value, dict) else fill_value
@@ -419,6 +576,176 @@ def _regrid_needs(
   return Needs(whole=frozenset({latitude_dim, longitude_dim}))
 
 
+EARTH_RADIUS = 6_371_000.0  # m, the mean radius
+
+
+def cell_areas(
+  latitude: np.ndarray, longitude: np.ndarray, radius: float = EARTH_RADIUS
+) -> np.ndarray:
+  """Areas (m2, on a sphere) of the cells of a regular latitude-longitude grid given by centres.
+
+  Bounds are midway between centres, the outer ones as far out as the inner (as xarray-regrid
+  builds them), latitudes clipped to the poles. Shape (latitude, longitude).
+  """
+  lat = np.deg2rad(_latitude_edges(latitude))
+  lon = np.deg2rad(_midway_edges(longitude))
+  bands = np.abs(np.diff(np.sin(lat)))
+  widths = np.abs(np.diff(lon))
+  return radius**2 * bands[:, None] * widths[None, :]
+
+
+def _midway_edges(centres: np.ndarray) -> np.ndarray:
+  """Cell edges midway between centres, the outer ones as far out as the inner (float64)."""
+  centres = np.asarray(centres, dtype="float64")
+  if centres.size < 2:
+    raise ValueError("cell edges need at least two centres per dimension")
+  middle = (centres[:-1] + centres[1:]) / 2
+  return np.concatenate([[2 * centres[0] - middle[0]], middle, [2 * centres[-1] - middle[-1]]])
+
+
+def _latitude_edges(centres: np.ndarray) -> np.ndarray:
+  return np.clip(_midway_edges(centres), -90.0, 90.0)
+
+
+@step
+def cell_bounds(
+  ds: xr.Dataset,
+  latitude_dim: str = "latitude",
+  longitude_dim: str = "longitude",
+  depth_dim: str | None = None,
+  thickness: str | None = None,
+  bounds_dim: str = "bnds",
+) -> xr.Dataset:
+  """Add CF bounds `<dim>_bnds` (dimensions `dim` and `bounds_dim`) for latitude and longitude,
+  and for depth from layer thicknesses; each coordinate gets a `bounds` attribute naming them::
+
+    name = "cell_bounds"
+    latitude_dim = "lat"
+    longitude_dim = "lon"
+    depth_dim = "depth"
+    thickness = "e3t"
+
+  Horizontal bounds are midway between centres, the outer ones as far out as the inner,
+  latitudes clipped to the poles: the cells that conservative regridding and `cell_area` assume.
+  Depth bounds are the faces of layers stacked from 0 with the thicknesses of `thickness` (a
+  variable along `depth_dim` only, e.g. GLORYS's `e3t`); each level's centre must lie inside its
+  layer. Bounds are coordinates, of their coordinate's type if it is a float (float64 else).
+  """
+  if (depth_dim is None) != (thickness is None):
+    raise ValueError("cell_bounds: depth_dim and thickness go together")
+  edges = {
+    latitude_dim: _latitude_edges(ds[latitude_dim].values),
+    longitude_dim: _midway_edges(ds[longitude_dim].values),
+  }
+  if depth_dim is not None and thickness is not None:
+    layers = ds[thickness]
+    if layers.dims != (depth_dim,):
+      raise ValueError(f"cell_bounds: {thickness!r} must have the one dimension {depth_dim!r}")
+    faces = np.concatenate([[0.0], np.cumsum(layers.values.astype("float64"))])
+    centres = ds[depth_dim].values.astype("float64")
+    outside = ~((faces[:-1] <= centres) & (centres <= faces[1:]))
+    if outside.any():
+      raise ValueError(
+        f"cell_bounds: levels {centres[outside].tolist()} lie outside their layers (faces from 0"
+        f" and the cumulative sum of {thickness!r})"
+      )
+    edges[depth_dim] = faces
+  out = ds.copy(deep=False)
+  for dim, dim_edges in edges.items():
+    name = f"{dim}_bnds"
+    dtype = ds[dim].dtype if np.issubdtype(ds[dim].dtype, np.floating) else np.float64
+    values = np.stack([dim_edges[:-1], dim_edges[1:]], axis=-1).astype(dtype)
+    # Coordinates, so that steps acting on every data variable leave them alone.
+    out = out.assign_coords({name: ((dim, bounds_dim), values)})
+    out[dim].attrs = {**ds[dim].attrs, "bounds": name}  # a new dict: the input keeps its own
+  return out
+
+
+@step
+def cell_area(
+  ds: xr.Dataset,
+  variable: str = "areacello",
+  latitude_dim: str = "latitude",
+  longitude_dim: str = "longitude",
+  radius: float = EARTH_RADIUS,
+) -> xr.Dataset:
+  """Add the area of each cell (m2, float64) on a sphere of `radius` (m), as `variable`::
+
+    name = "cell_area"
+    latitude_dim = "lat"
+    longitude_dim = "lon"
+    radius = 6378100.0
+
+  The cells are those of `cell_bounds` and of conservative regridding. Sums over a global grid
+  give 4 pi radius^2; times a sea fraction and a layer thickness, sea volumes (`products`).
+  """
+  areas = cell_areas(ds[latitude_dim].values, ds[longitude_dim].values, radius)
+  area = xr.DataArray(
+    areas,
+    dims=(latitude_dim, longitude_dim),
+    coords={latitude_dim: ds[latitude_dim], longitude_dim: ds[longitude_dim]},
+    attrs={"standard_name": "cell_area", "units": "m2"},
+  )
+  return ds.assign({variable: area})
+
+
+@step
+def per_unit_area(
+  ds: xr.Dataset,
+  variables: Iterable[Hashable],
+  latitude_dim: str = "latitude",
+  longitude_dim: str = "longitude",
+  factor: float = 1.0,
+  radius: float = EARTH_RADIUS,
+) -> xr.Dataset:
+  """Divide variables by the area of their cells (m2, on a sphere), times `factor`.
+
+  Quantities of a cell (a river's discharge, m3/s) become densities (m/s), which conservative
+  regridding with `skipna = false` carries to any grid, keeping their totals (area times
+  density). `factor = 86400` gives metres per day, the unit of a daily precipitation total::
+
+    name = "per_unit_area"
+    variables = ["dis24"]
+    factor = 86400.0
+
+  Cells are bounded midway between centres (see `cell_areas`). A source cell straddling target
+  cells is split by its overlap in degrees, not in area (xarray-regrid): totals then move by
+  about 1e-7 of a 0.05-degree grid's on a 0.25-degree one.
+  """
+  areas = xr.DataArray(
+    cell_areas(ds[latitude_dim].values, ds[longitude_dim].values, radius),
+    dims=(latitude_dim, longitude_dim),
+    coords={latitude_dim: ds[latitude_dim], longitude_dim: ds[longitude_dim]},
+  )
+  data_vars = dict(ds.data_vars)
+  for var in variables:
+    da = ds[var]
+    data_vars[var] = (da * (factor / areas)).transpose(*da.dims).assign_attrs(da.attrs)
+  return xr.Dataset(data_vars=data_vars, coords=ds.coords, attrs=ds.attrs)
+
+
+@step
+def products(ds: xr.Dataset, **kwargs: Iterable[Hashable]) -> xr.Dataset:
+  """Add variables that are products of others, one list of factors per new variable::
+
+    name = "products"
+    sivol = ["siconc", "sithick"]
+    usic = ["siconc", "usi"]
+
+  Missing factors give missing products. The new variables have no attributes.
+  """
+  ds = ds.copy(deep=False)
+  for name, factors in kwargs.items():
+    factors = list(factors)
+    if not factors:
+      raise ValueError(f"products: {name!r} has no factors")
+    product = ds[factors[0]].drop_attrs(deep=False)
+    for factor in factors[1:]:
+      product = product * ds[factor].drop_attrs(deep=False)
+    ds[name] = product
+  return ds
+
+
 @step(needs=_regrid_needs)
 def regrid(
   ds: xr.Dataset,
@@ -429,6 +756,7 @@ def regrid(
     "nearest", "linear", "cubic", "conservative", "most_common", "least_common", "stat"
   ] = "nearest",
   kwargs: Mapping[str, Any] | None = None,
+  conservation_tolerance: float | None = None,
 ) -> xr.Dataset:
   """Regrid to a regular latitude-longitude grid with xarray-regrid.
 
@@ -443,6 +771,23 @@ def regrid(
   as depth 0), while `skipna = true` averages the valid part of each target cell, and leaves NaN
   where its valid fraction is below `1 - nan_threshold`.
 
+  With `method = "stat"` (`kwargs = {method = "sum"}`, say), each source point goes to the target
+  cell containing its centre (a centre on an edge goes to the cell north or east of it), and
+  target cells without points get `fill_value` (default NaN, settable). xarray-regrid 0.4.2
+  fails on datasets without a `fill_value` when the target extends beyond the source.
+
+  Whatever the method, xarray-regrid leaves NaN in the target cells whose centre lies outside
+  the range of the source's centres, even where they overlap the source: a source covering
+  latitudes -59.975 to 89.975 loses its points in the target rows centred at -60 and 90.
+
+  Variables without the horizontal dimensions (layer thicknesses, say) pass through unchanged.
+
+  With `conservation_tolerance` (conservative method, `skipna = false`, for densities such as
+  the output of `per_unit_area`), the total of each variable (density times cell area, missing as
+  0) is compared with the source's, at every time step and level: a relative difference above
+  the tolerance fails the computation, naming the variable. It catches values lost in blanked
+  edge cells, or grids whose cells do not cover the source's.
+
   Args:
     grid: Arguments of `xarray_regrid.Grid` (`north`, `east`, `south`, `west`,
       `resolution_lat`, `resolution_lon`). In a download or process recipe, also the name of a
@@ -451,7 +796,15 @@ def regrid(
     method: The xarray-regrid method (default "nearest").
     kwargs: Further arguments of that method (e.g. `skipna`, `nan_threshold`; `output_chunks`
       only outside download recipes, whose chunks are planned).
+    conservation_tolerance: Largest relative change of totals allowed (none: not checked).
   """
+  if conservation_tolerance is not None and (
+    method != "conservative" or (kwargs or {}).get("skipna", True)
+  ):
+    raise ValueError(
+      "conservation_tolerance needs method = 'conservative' and kwargs.skipna = false: only then"
+      " are totals kept"
+    )
   new_grid = xarray_regrid.Grid(**grid)
   target_dataset = new_grid.create_regridding_dataset(lat_name=latitude_dim, lon_name=longitude_dim)
   target_dataset = target_dataset.assign_coords(
@@ -463,9 +816,76 @@ def regrid(
   regrid_conf = dict(kwargs or {})
   if method == "conservative":
     regrid_conf["latitude_coord"] = latitude_dim
-  regridded = getattr(ds.regrid, method)(target_dataset, **regrid_conf)
+  if method == "stat":
+    # Without it, xarray-regrid 0.4.2 reads `.dtype` of a Dataset (AttributeError) whenever the
+    # target extends beyond the source (`restore_properties`).
+    regrid_conf.setdefault("fill_value", np.nan)
+  horizontal = {latitude_dim, longitude_dim}
+  # Variables without the horizontal dimensions (layer thicknesses, say) pass through unchanged:
+  # the conservative method failed on them, linear and nearest gave them a latitude dimension.
+  others = [name for name, da in ds.data_vars.items() if not horizontal & set(da.dims)]
+  regridded = getattr(ds.drop_vars(others).regrid, method)(target_dataset, **regrid_conf)
   assert isinstance(regridded, xr.Dataset)
-  return regridded
+  if conservation_tolerance is not None:
+    regridded = _with_conserved_totals(
+      ds, regridded, latitude_dim, longitude_dim, conservation_tolerance
+    )
+  return regridded.assign({name: ds[name] for name in others})
+
+
+def _totals(da: xr.DataArray, latitude_dim: str, longitude_dim: str) -> xr.DataArray:
+  """Area-weighted sums (density times cell area, missing as 0) over the horizontal dimensions."""
+  areas = xr.DataArray(
+    cell_areas(da[latitude_dim].values, da[longitude_dim].values),
+    dims=(latitude_dim, longitude_dim),
+  )
+  return (da.fillna(0).astype("float64") * areas).sum([latitude_dim, longitude_dim])
+
+
+def _checked(
+  values: np.ndarray, source: np.ndarray, target: np.ndarray, *, name: str, tolerance: float
+) -> np.ndarray:
+  """`values`, unchanged, if the totals (broadcast to them) agree within the tolerance; else
+  ValueError."""
+  change = np.abs(target - source)
+  bad = change > tolerance * np.maximum(np.abs(source), np.finfo("float64").tiny)
+  if np.any(bad):
+    worst = float(
+      np.max(np.where(bad, change / np.maximum(np.abs(source), np.finfo("float64").tiny), 0))
+    )
+    raise ValueError(
+      f"regrid: the total of {name!r} changed by {worst:.3g} (relative), more than the"
+      f" conservation_tolerance {tolerance:g}"
+    )
+  return values
+
+
+def _with_conserved_totals(
+  source: xr.Dataset, target: xr.Dataset, latitude_dim: str, longitude_dim: str, tolerance: float
+) -> xr.Dataset:
+  """`target` whose variables fail when computed if their totals differ from `source`'s.
+
+  The totals (per time step and level) are broadcast to each chunk of the variable, which the
+  check returns unchanged: it needs no whole latitude and longitude, and the variable depends on
+  it. Coordinates are joined exactly.
+  """
+  data_vars = dict(target.data_vars)
+  horizontal = [latitude_dim, longitude_dim]
+  for name, da in target.data_vars.items():
+    if not set(horizontal) <= set(da.dims) or name not in source:
+      continue
+    data_vars[name] = xr.apply_ufunc(
+      _checked,
+      da,
+      _totals(source[name], latitude_dim, longitude_dim),
+      _totals(da, latitude_dim, longitude_dim),
+      dask="parallelized",
+      output_dtypes=[da.dtype],
+      join="exact",
+      keep_attrs=True,
+      kwargs={"name": str(name), "tolerance": tolerance},
+    ).transpose(*da.dims)
+  return xr.Dataset(data_vars=data_vars, coords=target.coords, attrs=target.attrs)
 
 
 @step

@@ -10,6 +10,9 @@ dataset and never modifies its input.
 
 Set variables to NaN outside a mask.
 
+For variables without one of the mask's dimensions (e.g. 2D fields and a 3D mask), the first
+index of that dimension is used (e.g. the surface level).
+
 Arguments:
 
 - `mask_name`: Boolean variable, True where values are kept.
@@ -59,6 +62,54 @@ uparea = {dtype = "float32", casting = "same_kind"}
 | `casting` | `Optional[Literal['no', 'equiv', 'safe', 'same_kind', 'unsafe']]` | `None` |
 | *any other key* | `Mapping[str, Any]` |  |
 
+## `cell_area`
+
+Add the area of each cell (m2, float64) on a sphere of `radius` (m), as `variable`:
+
+```toml
+name = "cell_area"
+latitude_dim = "lat"
+longitude_dim = "lon"
+radius = 6378100.0
+```
+
+The cells are those of `cell_bounds` and of conservative regridding. Sums over a global grid
+give 4 pi radius^2; times a sea fraction and a layer thickness, sea volumes (`products`).
+
+| Argument | Type | Default |
+|---|---|---|
+| `variable` | `str` | `'areacello'` |
+| `latitude_dim` | `str` | `'latitude'` |
+| `longitude_dim` | `str` | `'longitude'` |
+| `radius` | `float` | `6371000.0` |
+
+## `cell_bounds`
+
+Add CF bounds `<dim>_bnds` (dimensions `dim` and `bounds_dim`) for latitude and longitude,
+and for depth from layer thicknesses; each coordinate gets a `bounds` attribute naming them:
+
+```toml
+name = "cell_bounds"
+latitude_dim = "lat"
+longitude_dim = "lon"
+depth_dim = "depth"
+thickness = "e3t"
+```
+
+Horizontal bounds are midway between centres, the outer ones as far out as the inner,
+latitudes clipped to the poles: the cells that conservative regridding and `cell_area` assume.
+Depth bounds are the faces of layers stacked from 0 with the thicknesses of `thickness` (a
+variable along `depth_dim` only, e.g. GLORYS's `e3t`); each level's centre must lie inside its
+layer. Bounds are coordinates, of their coordinate's type if it is a float (float64 else).
+
+| Argument | Type | Default |
+|---|---|---|
+| `latitude_dim` | `str` | `'latitude'` |
+| `longitude_dim` | `str` | `'longitude'` |
+| `depth_dim` | `str &#124; None` | `None` |
+| `thickness` | `str &#124; None` | `None` |
+| `bounds_dim` | `str` | `'bnds'` |
+
 ## `clip_negative`
 
 Set negative values of the listed variables to 0 (e.g. accumulated precipitation); NaN stay.
@@ -92,6 +143,25 @@ vertical_dim = "depth"
 | `vertical_dim` | `Hashable &#124; None` | `None` |
 | `time_dim` | `Hashable &#124; None` | `'time'` |
 
+## `divide_by`
+
+Divide variables by another, where it is positive; NaN where it is 0 or missing.
+
+E.g. quantities averaged over whole coarse cells, land counted as 0, made averages over the
+cells' sea part (`by` its sea fraction). For variables without one of `by`'s dimensions, the
+first index of that dimension is used (e.g. the surface level of a 3D fraction):
+
+```toml
+name = "divide_by"
+variables = ["siconc", "sivol"]
+by = "seafrac"
+```
+
+| Argument | Type | Default |
+|---|---|---|
+| `variables` | `Iterable[Hashable]` | required |
+| `by` | `Hashable` | required |
+
 ## `drop_static_vars`
 
 Drop the data variables without the time dimension (masks, bathymetry...).
@@ -108,6 +178,33 @@ Remove all attributes of the listed variables or coordinates.
 |---|---|---|
 | `variables` | `Iterable[Hashable]` | required |
 
+## `fill_from_above`
+
+Fill missing values with the nearest valid value above them in the same column.
+
+For cells a coarse grid calls sea where the source has no value (a model's gaps, or its
+levels below the sea floor). Cells with no valid value above stay missing (fill them with
+`masked_fill`). With `mask_name`, only missing values inside the mask are filled:
+
+```toml
+name = "fill_from_above"
+variables = ["thetao", "so", "uo", "vo"]
+depth_dim = "depth"
+mask_name = "sea"
+```
+
+Arguments:
+
+- `variables`: Variables with `depth_dim`.
+- `depth_dim`: Vertical dimension; its first index must be the top.
+- `mask_name`: Boolean variable, True where missing values are filled (default: everywhere).
+
+| Argument | Type | Default |
+|---|---|---|
+| `variables` | `Iterable[Hashable]` | required |
+| `depth_dim` | `str` | required |
+| `mask_name` | `Hashable &#124; None` | `None` |
+
 ## `flip`
 
 Reverse the order along a dimension (e.g. make ERA5 latitudes increase).
@@ -115,6 +212,38 @@ Reverse the order along a dimension (e.g. make ERA5 latitudes increase).
 | Argument | Type | Default |
 |---|---|---|
 | `dim` | `str` | required |
+
+## `fraction_mask`
+
+Clean a fraction (e.g. of sea, a 0/1 mask regridded conservatively) and add a mask from it.
+
+Values of `fraction` below `tolerance` become 0: regridding weights leave round-off (about
+1e-8) where a target cell barely touches the source's ones. With `mask_name`, a boolean mask
+is added, True where the fraction is above `threshold` (or at least, with `inclusive`): the
+default, `fraction > 0`, keeps every cell with some sea; `threshold = 0.5, inclusive = true`
+keeps those at least half sea:
+
+```toml
+name = "fraction_mask"
+fraction = "seafrac"
+mask_name = "sea"
+```
+
+Arguments:
+
+- `fraction`: Variable with values between 0 and 1.
+- `mask_name`: Name of the new mask (none by default).
+- `threshold`: Fraction above which a cell is in the mask.
+- `inclusive`: Whether a fraction equal to `threshold` is in the mask.
+- `tolerance`: Fractions below it are set to 0 (with 0, only negative round-off).
+
+| Argument | Type | Default |
+|---|---|---|
+| `fraction` | `Hashable` | required |
+| `mask_name` | `Hashable &#124; None` | `None` |
+| `threshold` | `float` | `0.0` |
+| `inclusive` | `bool` | `False` |
+| `tolerance` | `float` | `1e-06` |
 
 ## `get_bottom`
 
@@ -191,6 +320,26 @@ time = {start = 0, stop = 365}
 |---|---|---|
 | *any other key* | `Any` |  |
 
+## `keep_where`
+
+Keep values where another variable equals a value, `other` everywhere else (missing values
+included). E.g. river discharge at the outlets of a drainage network, where its local drain
+direction is 5 (a pit):
+
+```toml
+name = "keep_where"
+variables = ["dis24"]
+condition = "ldd"
+equals = 5
+```
+
+| Argument | Type | Default |
+|---|---|---|
+| `variables` | `Iterable[Hashable]` | required |
+| `condition` | `Hashable` | required |
+| `equals` | `int &#124; float` | required |
+| `other` | `int &#124; float` | `0.0` |
+
 ## `masked_fill`
 
 Fill missing values inside a mask; values outside the mask are left as they are.
@@ -214,6 +363,48 @@ first index of that dimension is used (e.g. the surface level).
 | `fill_value` | `int &#124; float &#124; str &#124; Mapping[Hashable, int &#124; float &#124; Hashable]` | required |
 | `mask_name` | `Hashable` | required |
 
+## `per_unit_area`
+
+Divide variables by the area of their cells (m2, on a sphere), times `factor`.
+
+Quantities of a cell (a river's discharge, m3/s) become densities (m/s), which conservative
+regridding with `skipna = false` carries to any grid, keeping their totals (area times
+density). `factor = 86400` gives metres per day, the unit of a daily precipitation total:
+
+```toml
+name = "per_unit_area"
+variables = ["dis24"]
+factor = 86400.0
+```
+
+Cells are bounded midway between centres (see `cell_areas`). A source cell straddling target
+cells is split by its overlap in degrees, not in area (xarray-regrid): totals then move by
+about 1e-7 of a 0.05-degree grid's on a 0.25-degree one.
+
+| Argument | Type | Default |
+|---|---|---|
+| `variables` | `Iterable[Hashable]` | required |
+| `latitude_dim` | `str` | `'latitude'` |
+| `longitude_dim` | `str` | `'longitude'` |
+| `factor` | `float` | `1.0` |
+| `radius` | `float` | `6371000.0` |
+
+## `products`
+
+Add variables that are products of others, one list of factors per new variable:
+
+```toml
+name = "products"
+sivol = ["siconc", "sithick"]
+usic = ["siconc", "usi"]
+```
+
+Missing factors give missing products. The new variables have no attributes.
+
+| Argument | Type | Default |
+|---|---|---|
+| *any other key* | `Iterable[Hashable]` |  |
+
 ## `regrid`
 
 Regrid to a regular latitude-longitude grid with xarray-regrid.
@@ -231,12 +422,30 @@ With `method = "conservative"`, `skipna = false` counts missing source cells as 
 as depth 0), while `skipna = true` averages the valid part of each target cell, and leaves NaN
 where its valid fraction is below `1 - nan_threshold`.
 
+With `method = "stat"` (`kwargs = {method = "sum"}`, say), each source point goes to the target
+cell containing its centre (a centre on an edge goes to the cell north or east of it), and
+target cells without points get `fill_value` (default NaN, settable). xarray-regrid 0.4.2
+fails on datasets without a `fill_value` when the target extends beyond the source.
+
+Whatever the method, xarray-regrid leaves NaN in the target cells whose centre lies outside
+the range of the source's centres, even where they overlap the source: a source covering
+latitudes -59.975 to 89.975 loses its points in the target rows centred at -60 and 90.
+
+Variables without the horizontal dimensions (layer thicknesses, say) pass through unchanged.
+
+With `conservation_tolerance` (conservative method, `skipna = false`, for densities such as
+the output of `per_unit_area`), the total of each variable (density times cell area, missing as
+0) is compared with the source's, at every time step and level: a relative difference above
+the tolerance fails the computation, naming the variable. It catches values lost in blanked
+edge cells, or grids whose cells do not cover the source's.
+
 Arguments:
 
 - `grid`: Arguments of `xarray_regrid.Grid` (`north`, `east`, `south`, `west`, `resolution_lat`, `resolution_lon`). In a download or process recipe, also the name of a grid of its `[grids]` table, to write a grid once for several steps.
 - `latitude_dim, longitude_dim`: Names of the horizontal dimensions.
 - `method`: The xarray-regrid method (default "nearest").
 - `kwargs`: Further arguments of that method (e.g. `skipna`, `nan_threshold`; `output_chunks` only outside download recipes, whose chunks are planned).
+- `conservation_tolerance`: Largest relative change of totals allowed (none: not checked).
 
 | Argument | Type | Default |
 |---|---|---|
@@ -245,6 +454,7 @@ Arguments:
 | `longitude_dim` | `str` | `'longitude'` |
 | `method` | `Literal['nearest', 'linear', 'cubic', 'conservative', 'most_common', 'least_common', 'stat']` | `'nearest'` |
 | `kwargs` | `Mapping[str, Any] &#124; None` | `None` |
+| `conservation_tolerance` | `float &#124; None` | `None` |
 
 ## `rename_coordinates`
 
