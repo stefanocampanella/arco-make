@@ -398,10 +398,23 @@ Findings, measured on 1 Mar and 15 Sep 2013 (`docs/coarsen_analysis.py`, section
 | `zos` | time, lat, lon | average over the sea part |
 | `siconc`, `sivol`, `usic`, `vsic` | time, lat, lon | over the sea part (section 10) |
 | `dis24_outlets` | time, lat, lon | river input, metres per day over the cell (section 11) |
+| `areacello` | lat, lon (static) | cell area (m²) on GLORYS12's sphere |
+| `volcello` | depth, lat, lon (static) | sea water volume (m³): `seafrac` × layer thickness × `areacello` |
+| `lat_bnds`, `lon_bnds`, `depth_bnds` | coordinate, bnds | CF cell bounds |
 
-Values exist exactly where `seafrac > 0` (`ensure_no_nans` with `exact`). Volumes and heat contents
-are sums of value × `seafrac` × layer thickness × area, not of the mask; a model's loss is best
-weighted the same way (water volume), so that cells barely touched by the sea weigh little.
+Values exist exactly where `seafrac > 0` (`ensure_no_nans` with `exact`). Volumes and heat
+contents are sums of value × `volcello`, not of the mask; a model's loss is best weighted the
+same way (water volume), so that cells barely touched by the sea weigh little. The ocean
+variables name these weights in `cell_measures`, so CF tools find them.
+
+The cells are those conservative regridding assumes: bounds midway between centres, the polar
+rows half as tall. Areas are on a sphere of radius 6,378,100 m, the one GLORYS12's static cell
+sizes (`e1t`, `e2t`) imply, so totals match the source's: at 1°, the total of `volcello` equals
+GLORYS12's own (the sum of `e1t` × `e2t` × `e3t` × `mask` over levels 0-48, 1.330 × 10¹⁸ m³) to
+2 × 10⁻⁷, at every level to 3 × 10⁻⁷. A sphere is not the Earth: against the WGS84 ellipsoid,
+its cells are 0.45 % larger at the equator and 0.89 % smaller near the poles, whatever the
+radius. Depth bounds are the faces `[0, cumsum(e3t)]` (section 2). River totals use the same
+areas: discharge (m³/s) = `dis24_outlets` × `areacello` / 86400.
 
 ## Measurements
 
