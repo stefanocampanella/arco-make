@@ -383,6 +383,8 @@ Whatever the method, xarray-regrid leaves NaN in the target cells whose centre l
 the range of the source's centres, even where they overlap the source: a source covering
 latitudes -59.975 to 89.975 loses its points in the target rows centred at -60 and 90.
 
+Variables without the horizontal dimensions (layer thicknesses, say) pass through unchanged.
+
 With `conservation_tolerance` (conservative method, `skipna = false`, for densities such as
 the output of `per_unit_area`), the total of each variable (density times cell area, missing as
 0) is compared with the source's, at every time step and level: a relative difference above

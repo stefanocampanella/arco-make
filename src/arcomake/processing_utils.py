@@ -693,6 +693,8 @@ def regrid(
   the range of the source's centres, even where they overlap the source: a source covering
   latitudes -59.975 to 89.975 loses its points in the target rows centred at -60 and 90.
 
+  Variables without the horizontal dimensions (layer thicknesses, say) pass through unchanged.
+
   With `conservation_tolerance` (conservative method, `skipna = false`, for densities such as
   the output of `per_unit_area`), the total of each variable (density times cell area, missing as
   0) is compared with the source's, at every time step and level: a relative difference above
@@ -731,13 +733,17 @@ def regrid(
     # Without it, xarray-regrid 0.4.2 reads `.dtype` of a Dataset (AttributeError) whenever the
     # target extends beyond the source (`restore_properties`).
     regrid_conf.setdefault("fill_value", np.nan)
-  regridded = getattr(ds.regrid, method)(target_dataset, **regrid_conf)
+  horizontal = {latitude_dim, longitude_dim}
+  # Variables without the horizontal dimensions (layer thicknesses, say) pass through unchanged:
+  # the conservative method failed on them, linear and nearest gave them a latitude dimension.
+  others = [name for name, da in ds.data_vars.items() if not horizontal & set(da.dims)]
+  regridded = getattr(ds.drop_vars(others).regrid, method)(target_dataset, **regrid_conf)
   assert isinstance(regridded, xr.Dataset)
   if conservation_tolerance is not None:
     regridded = _with_conserved_totals(
       ds, regridded, latitude_dim, longitude_dim, conservation_tolerance
     )
-  return regridded
+  return regridded.assign({name: ds[name] for name in others})
 
 
 def _totals(da: xr.DataArray, latitude_dim: str, longitude_dim: str) -> xr.DataArray:

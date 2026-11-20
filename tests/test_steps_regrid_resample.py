@@ -3,6 +3,7 @@
 """Regridding and resampling steps (processing_utils)."""
 
 import numpy as np
+import pytest
 import xarray as xr
 
 from arcomake import processing_utils as pu
@@ -62,6 +63,30 @@ def test_regrid_does_not_modify_its_arguments(atmosphere_ds: xr.Dataset):
   kwargs = {"skipna": True}
   pu.regrid(atmosphere_ds.isel(time=0), grid=GRID, method="conservative", kwargs=kwargs)
   assert kwargs == {"skipna": True}
+
+
+@pytest.mark.parametrize("method", ["conservative", "linear", "nearest"])
+def test_regrid_passes_variables_without_horizontal_dimensions_through(
+  static_ds: xr.Dataset, method: str
+):
+  """A layer thickness (depth only) regridded with the bathymetry: the conservative method failed
+  on it, linear and nearest gave it a latitude dimension."""
+  thickness = xr.DataArray([1.0, 2.0, 4.0], dims="depth", name="e3t", attrs={"units": "m"})
+  ds = static_ds.assign(e3t=thickness, label=xr.DataArray(7))
+  kwargs = {"skipna": False} if method == "conservative" else None
+  out = pu.regrid(ds, grid=GRID, method=method, kwargs=kwargs)
+  xr.testing.assert_identical(out.e3t, ds.e3t)
+  assert int(out.label) == 7
+  regridded = pu.regrid(static_ds, grid=GRID, method=method, kwargs=kwargs)
+  xr.testing.assert_identical(out.deptho, regridded.deptho)
+
+
+def test_regrid_keeps_regridding_a_variable_with_one_horizontal_dimension(static_ds: xr.Dataset):
+  """A zonal profile (latitude only) is regridded along latitude by `linear`, as before."""
+  ds = static_ds.assign(zonal=static_ds.deptho.fillna(0.0).mean("longitude"))
+  out = pu.regrid(ds, grid=GRID, method="linear")
+  assert out.zonal.dims == ("latitude",)
+  np.testing.assert_array_equal(out.zonal.latitude.values, out.latitude.values)
 
 
 def test_resample_daily_mean_and_sum(atmosphere_ds: xr.Dataset):
