@@ -62,6 +62,54 @@ uparea = {dtype = "float32", casting = "same_kind"}
 | `casting` | `Optional[Literal['no', 'equiv', 'safe', 'same_kind', 'unsafe']]` | `None` |
 | *any other key* | `Mapping[str, Any]` |  |
 
+## `cell_area`
+
+Add the area of each cell (m2, float64) on a sphere of `radius` (m), as `variable`:
+
+```toml
+name = "cell_area"
+latitude_dim = "lat"
+longitude_dim = "lon"
+radius = 6378100.0
+```
+
+The cells are those of `cell_bounds` and of conservative regridding. Sums over a global grid
+give 4 pi radius^2; times a sea fraction and a layer thickness, sea volumes (`products`).
+
+| Argument | Type | Default |
+|---|---|---|
+| `variable` | `str` | `'areacello'` |
+| `latitude_dim` | `str` | `'latitude'` |
+| `longitude_dim` | `str` | `'longitude'` |
+| `radius` | `float` | `6371000.0` |
+
+## `cell_bounds`
+
+Add CF bounds `<dim>_bnds` (dimensions `dim` and `bounds_dim`) for latitude and longitude,
+and for depth from layer thicknesses; each coordinate gets a `bounds` attribute naming them:
+
+```toml
+name = "cell_bounds"
+latitude_dim = "lat"
+longitude_dim = "lon"
+depth_dim = "depth"
+thickness = "e3t"
+```
+
+Horizontal bounds are midway between centres, the outer ones as far out as the inner,
+latitudes clipped to the poles: the cells that conservative regridding and `cell_area` assume.
+Depth bounds are the faces of layers stacked from 0 with the thicknesses of `thickness` (a
+variable along `depth_dim` only, e.g. GLORYS's `e3t`); each level's centre must lie inside its
+layer. Bounds are coordinates, of their coordinate's type if it is a float (float64 else).
+
+| Argument | Type | Default |
+|---|---|---|
+| `latitude_dim` | `str` | `'latitude'` |
+| `longitude_dim` | `str` | `'longitude'` |
+| `depth_dim` | `str &#124; None` | `None` |
+| `thickness` | `str &#124; None` | `None` |
+| `bounds_dim` | `str` | `'bnds'` |
+
 ## `clip_negative`
 
 Set negative values of the listed variables to 0 (e.g. accumulated precipitation); NaN stay.

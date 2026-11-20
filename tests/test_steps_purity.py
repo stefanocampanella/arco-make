@@ -28,6 +28,8 @@ STEPS = {
   "apply_mask": {"mask_name": "m", "variables": ["zos"]},
   "assign_var_attrs": {"zos": {"units": "cm"}},
   "astype": {"dtype": "float32", "casting": "same_kind"},
+  "cell_area": {"variable": "a", "radius": 6378100.0},
+  "cell_bounds": {},
   "clip_negative": {"variables": ["zos"]},
   "coverage_attrs": {"latitude_dim": "latitude", "longitude_dim": "longitude"},
   "divide_by": {"variables": ["zos"], "by": "deptho"},

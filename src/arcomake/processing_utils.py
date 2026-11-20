@@ -587,19 +587,106 @@ def cell_areas(
   Bounds are midway between centres, the outer ones as far out as the inner (as xarray-regrid
   builds them), latitudes clipped to the poles. Shape (latitude, longitude).
   """
-
-  def bounds(centres: np.ndarray) -> np.ndarray:
-    centres = np.asarray(centres, dtype="float64")
-    if centres.size < 2:
-      raise ValueError("cell_areas needs at least two centres per dimension")
-    middle = (centres[:-1] + centres[1:]) / 2
-    return np.concatenate([[2 * centres[0] - middle[0]], middle, [2 * centres[-1] - middle[-1]]])
-
-  lat = np.deg2rad(np.clip(bounds(latitude), -90.0, 90.0))
-  lon = np.deg2rad(bounds(longitude))
+  lat = np.deg2rad(_latitude_edges(latitude))
+  lon = np.deg2rad(_midway_edges(longitude))
   bands = np.abs(np.diff(np.sin(lat)))
   widths = np.abs(np.diff(lon))
   return radius**2 * bands[:, None] * widths[None, :]
+
+
+def _midway_edges(centres: np.ndarray) -> np.ndarray:
+  """Cell edges midway between centres, the outer ones as far out as the inner (float64)."""
+  centres = np.asarray(centres, dtype="float64")
+  if centres.size < 2:
+    raise ValueError("cell edges need at least two centres per dimension")
+  middle = (centres[:-1] + centres[1:]) / 2
+  return np.concatenate([[2 * centres[0] - middle[0]], middle, [2 * centres[-1] - middle[-1]]])
+
+
+def _latitude_edges(centres: np.ndarray) -> np.ndarray:
+  return np.clip(_midway_edges(centres), -90.0, 90.0)
+
+
+@step
+def cell_bounds(
+  ds: xr.Dataset,
+  latitude_dim: str = "latitude",
+  longitude_dim: str = "longitude",
+  depth_dim: str | None = None,
+  thickness: str | None = None,
+  bounds_dim: str = "bnds",
+) -> xr.Dataset:
+  """Add CF bounds `<dim>_bnds` (dimensions `dim` and `bounds_dim`) for latitude and longitude,
+  and for depth from layer thicknesses; each coordinate gets a `bounds` attribute naming them::
+
+    name = "cell_bounds"
+    latitude_dim = "lat"
+    longitude_dim = "lon"
+    depth_dim = "depth"
+    thickness = "e3t"
+
+  Horizontal bounds are midway between centres, the outer ones as far out as the inner,
+  latitudes clipped to the poles: the cells that conservative regridding and `cell_area` assume.
+  Depth bounds are the faces of layers stacked from 0 with the thicknesses of `thickness` (a
+  variable along `depth_dim` only, e.g. GLORYS's `e3t`); each level's centre must lie inside its
+  layer. Bounds are coordinates, of their coordinate's type if it is a float (float64 else).
+  """
+  if (depth_dim is None) != (thickness is None):
+    raise ValueError("cell_bounds: depth_dim and thickness go together")
+  edges = {
+    latitude_dim: _latitude_edges(ds[latitude_dim].values),
+    longitude_dim: _midway_edges(ds[longitude_dim].values),
+  }
+  if depth_dim is not None and thickness is not None:
+    layers = ds[thickness]
+    if layers.dims != (depth_dim,):
+      raise ValueError(f"cell_bounds: {thickness!r} must have the one dimension {depth_dim!r}")
+    faces = np.concatenate([[0.0], np.cumsum(layers.values.astype("float64"))])
+    centres = ds[depth_dim].values.astype("float64")
+    outside = ~((faces[:-1] <= centres) & (centres <= faces[1:]))
+    if outside.any():
+      raise ValueError(
+        f"cell_bounds: levels {centres[outside].tolist()} lie outside their layers (faces from 0"
+        f" and the cumulative sum of {thickness!r})"
+      )
+    edges[depth_dim] = faces
+  out = ds.copy(deep=False)
+  for dim, dim_edges in edges.items():
+    name = f"{dim}_bnds"
+    dtype = ds[dim].dtype if np.issubdtype(ds[dim].dtype, np.floating) else np.float64
+    values = np.stack([dim_edges[:-1], dim_edges[1:]], axis=-1).astype(dtype)
+    # Coordinates, so that steps acting on every data variable leave them alone.
+    out = out.assign_coords({name: ((dim, bounds_dim), values)})
+    out[dim].attrs = {**ds[dim].attrs, "bounds": name}  # a new dict: the input keeps its own
+  return out
+
+
+@step
+def cell_area(
+  ds: xr.Dataset,
+  variable: str = "areacello",
+  latitude_dim: str = "latitude",
+  longitude_dim: str = "longitude",
+  radius: float = EARTH_RADIUS,
+) -> xr.Dataset:
+  """Add the area of each cell (m2, float64) on a sphere of `radius` (m), as `variable`::
+
+    name = "cell_area"
+    latitude_dim = "lat"
+    longitude_dim = "lon"
+    radius = 6378100.0
+
+  The cells are those of `cell_bounds` and of conservative regridding. Sums over a global grid
+  give 4 pi radius^2; times a sea fraction and a layer thickness, sea volumes (`products`).
+  """
+  areas = cell_areas(ds[latitude_dim].values, ds[longitude_dim].values, radius)
+  area = xr.DataArray(
+    areas,
+    dims=(latitude_dim, longitude_dim),
+    coords={latitude_dim: ds[latitude_dim], longitude_dim: ds[longitude_dim]},
+    attrs={"standard_name": "cell_area", "units": "m2"},
+  )
+  return ds.assign({variable: area})
 
 
 @step
