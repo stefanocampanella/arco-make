@@ -84,8 +84,8 @@ after merging, and the stored layout. A complete example, run by the tests on sy
 
 ```toml
 time_dim = "time"
-start = 2020-02-26T00:00:00
-end = 2020-03-02T00:00:00      # excluded: intervals are [start, end)
+start = 2020-02-26T00:00:00    # optional: or --start (the recipe is then the same for any period)
+end = 2020-03-02T00:00:00      # optional: or --end; excluded, intervals are [start, end)
 step = "2D"                    # blocks written (then appended) one at a time
 
 [datasets.ocean.checkpointing] # optional: process this source in sub-blocks saved to temporary Zarr
@@ -151,10 +151,18 @@ or throttling answer) is redone, after a wait that doubles each time: `[retries]
 log says which kind it was.
 
 A download that fails leaves `main` as it was and its committed blocks on its branch: rerun it with
-`--resume` (same recipe, `--start` and `--end`) to write only the missing blocks. Each block's commit
-records its interval and a fingerprint of the recipe; `--resume` refuses another recipe (request timeouts,
-checkpointing and `[retries]` may change), or a run that started before `main` last moved. A plain rerun refuses to start beside a failed run it could continue;
-`--replace` starts over. Do not resume a run that is still going.
+`--resume` (same recipe and `--start`) to write only the missing blocks. Each block's commit
+records its interval and a fingerprint of the recipe, its dates aside; `--resume` refuses another
+recipe (request timeouts, checkpointing and `[retries]` may change), blocks that are not the first
+ones of the interval, or a run that started before `main` last moved; it may stop at another `--end`.
+A plain rerun refuses to start beside a failed run it could continue; `--replace` starts over. Do not
+resume a run that is still going.
+
+`--extend` appends the days after an output's last stored day, up to `--end`, as a new version: with
+the recipe the output was written with (its dates aside), the static variables compared with the
+stored ones, every block appended. A failed extension continues with `--extend --resume`. With the
+dates left to the command, one recipe serves the first download and every extension:
+`download --start 1993-01-01 --end 2026-07-01 R OUT`, then `download --extend --end 2026-08-01 R OUT`.
 
 A download recipe may give `[checks]`, the tables of a `validate` recipe, run on each block before its
 commit, like pre-commit hooks: `valid_time_coordinate` over the block (its table takes no dates),

@@ -12,6 +12,7 @@ from typing import Any, Self, get_args, override
 
 import click
 import numpy as np
+import pandas as pd
 import xarray as xr
 from dask.diagnostics import ProgressBar
 from dask.utils import format_bytes
@@ -67,8 +68,10 @@ class DownloadConfig(BaseModel):
 
   time_dim: str = "time"
   step: timedelta
-  start: datetime
-  end: datetime
+  # Dates may be left to the command (--start, --end; --extend sets the start): a recipe is then
+  # the same for every period, and so is its fingerprint.
+  start: datetime | None = None
+  end: datetime | None = None
   datasets: dict[str, DatasetConfig]
   postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
   save: SaveConfig
@@ -86,22 +89,15 @@ class DownloadConfig(BaseModel):
 
   @model_validator(mode="before")
   @classmethod
-  def _time_check_over_the_recipe(cls, data: Any) -> Any:
-    # Each block's time axis is checked over the block: the table takes no dates (they would go
-    # unused), and gets the recipe's to satisfy the model.
+  def _time_check_over_the_block(cls, data: Any) -> Any:
+    # Each block's time axis is checked over the block: dates in the table would go unused.
     if isinstance(data, dict) and isinstance(data.get("checks"), dict):
       table = data["checks"].get("valid_time_coordinate")
-      if isinstance(table, dict):
-        if "start" in table or "end" in table:
-          raise ValueError(
-            "checks.valid_time_coordinate: a download checks each block's time axis over the"
-            " block: remove start and end"
-          )
-        data["checks"]["valid_time_coordinate"] = {
-          "start": data.get("start"),
-          "end": data.get("end"),
-          **table,
-        }
+      if isinstance(table, dict) and ("start" in table or "end" in table):
+        raise ValueError(
+          "checks.valid_time_coordinate: a download checks each block's time axis over the"
+          " block: remove start and end"
+        )
     return data
 
   @field_validator("step", mode="before")
@@ -116,7 +112,7 @@ class DownloadConfig(BaseModel):
 
   @model_validator(mode="after")
   def validate_date_range(self) -> Self:
-    if self.start > self.end:
+    if self.start is not None and self.end is not None and self.start > self.end:
       raise ValueError("start datetime must be before or equal to end datetime")
     return self
 
@@ -178,6 +174,16 @@ class DownloadConfig(BaseModel):
   is_flag=True,
 )
 @click.option(
+  "--extend/--no-extend",
+  help=(
+    "Append the days after the last one stored in OUTPUT_PATH, up to --end (or the recipe's end),"
+    " as a new version: same recipe (its dates aside), static variables compared with the stored"
+    " ones. --start is the day after the last stored; with --resume, continues a failed extension"
+  ),
+  default=False,
+  is_flag=True,
+)
+@click.option(
   "--memory-limit",
   type=Memory(),
   default=None,
@@ -226,6 +232,7 @@ def download(
   end_datetime: datetime | None = None,
   replace: bool = False,
   resume: bool = False,
+  extend: bool = False,
   memory_limit: int | None = None,
   log_level: str = "info",
   dask_setup: DaskSetupType = "threads",
@@ -275,6 +282,17 @@ def download(
     if end_datetime is not None:
       update_time_interval["end"] = end_datetime
     configs = read_configs(configs_path, inject=update_time_interval, schema=DownloadConfig)
+    if extend:
+      if replace or start_datetime is not None:
+        raise click.ClickException(
+          "--extend starts the day after the output's last: not with --replace nor --start"
+        )
+      configs = configs.model_copy(update={"start": _next_stamp(output_path, configs)})
+    if configs.start is None or configs.end is None:
+      raise click.ClickException("The recipe has no dates: give --start and --end")
+    if extend and configs.start >= configs.end:
+      logger.info(f"Nothing to extend: {output_path} reaches {configs.end} already")
+      return
     budget = detect_budget(memory_limit)
     logger.info(f"Chunks planned for a budget of {budget.describe()}")
     parts = [part for dataset in configs.datasets.values() for part in dataset.parts]
@@ -292,7 +310,9 @@ def download(
     # start a run on a branch of its own, or continue the failed one.
     recipe = recipe_fingerprint(configs)
     waiting = _waiting_run(output_path, configs, resume=resume, replace=replace, recipe=recipe)
-    check_destination(output_path, replace=replace or resume, save_configs=configs.save)
+    if extend and not resume:
+      _check_extended_recipe(output_path, configs, recipe)
+    check_destination(output_path, replace=replace or resume or extend, save_configs=configs.save)
     try:
       run = icechunk_utils.Run(
         output_path,
@@ -325,7 +345,7 @@ def download(
             configs,
             date_interval,
             run,
-            first=number == 0,
+            first=number == 0 and not extend,
             progress=progress,
             recipe=recipe,
             budget=budget,
@@ -671,15 +691,44 @@ def recipe_fingerprint(configs: DownloadConfig) -> str:
   longer ones. Options at their default are left out too: an option a later version adds, with a
   default keeping the earlier behaviour, does not change the fingerprint of recipes without it.
   `[grids]` is left out: the regrid steps carry the grids they name. `[checks]` is left out: a
-  run stopped by a check may resume once the check is changed."""
+  run stopped by a check may resume once the check is changed. The dates are left out: a recipe
+  is the same over any period (an extension keeps it), and a resumed run's blocks are checked
+  against those stored."""
   recipe = configs.model_dump(
-    mode="json", exclude={"retries", "grids", "checks"}, exclude_defaults=True
+    mode="json", exclude={"retries", "grids", "checks", "start", "end"}, exclude_defaults=True
   )
   for dataset in recipe["datasets"].values():
     dataset.pop("checkpointing", None)
     for part in dataset["parts"]:
       part.pop("timeout", None)
   return provenance.hash_recipe(recipe)
+
+
+def _next_stamp(output_path: str, configs: DownloadConfig) -> datetime:
+  """The stamp after the last of the output's `main` (the step between its last two stamps)."""
+  try:
+    store = icechunk_utils.readonly_store(output_path, configs.save.storage_options)
+    with xr.open_zarr(store, group=configs.save.group, consolidated=False) as stored:
+      stamps = stored[configs.time_dim].values
+  except Exception as exc:
+    raise click.ClickException(f"Nothing to extend at {output_path}: {exc}") from exc
+  if stamps.size < 2:
+    raise click.ClickException(
+      f"{output_path} has fewer than two stamps: its step is unknown, rerun it with --replace"
+    )
+  return pd.Timestamp(stamps[-1] + (stamps[-1] - stamps[-2])).to_pydatetime()
+
+
+def _check_extended_recipe(output_path: str, configs: DownloadConfig, recipe: str) -> None:
+  """An extension uses the recipe the output was written with (its dates aside)."""
+  stored = icechunk_utils.main_metadata(output_path, configs.save.storage_options).get(
+    icechunk_utils.RECIPE_KEY
+  )
+  if stored != recipe:
+    raise click.ClickException(
+      f"{output_path} was written with another recipe (fingerprint {stored}, this one {recipe}):"
+      " extend it with the same, or rewrite it with --replace"
+    )
 
 
 def _waiting_run(

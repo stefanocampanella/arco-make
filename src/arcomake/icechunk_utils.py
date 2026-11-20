@@ -235,6 +235,14 @@ def write(
   return run.finish(retention)
 
 
+def main_metadata(
+  path: str | pathlib.Path, storage_options: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+  """The metadata of the commit `main` points to."""
+  repo = icechunk.Repository.open(storage(path, storage_options))
+  return dict(next(iter(repo.ancestry(branch=BRANCH))).metadata or {})
+
+
 def readonly_store(
   path: str | pathlib.Path,
   storage_options: Mapping[str, Any] | None = None,
