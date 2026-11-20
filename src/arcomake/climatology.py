@@ -505,9 +505,16 @@ def _bin_statistics(
     .construct({time_dim: ("_period", time_dim)})
     .assign_coords(bin_coords)
   )
+  folded = _chunked_for_the_window(folded, time_dim)
   count, mean, m2 = _fold_statistics(folded)
   if is_feb_29.any():
     leap = dataset.isel({time_dim: is_feb_29}).rename({time_dim: "_period"})
+    if folded.chunks:
+      # In the tiles of the other days, or combining them would cut every bin's statistics into
+      # the intersections of both tilings.
+      leap = leap.chunk(
+        {dim: folded.chunksizes[dim] for dim in leap.dims if dim not in ("_period", time_dim)}
+      )
     feb_28 = (
       count.isel({time_dim: FEB_29_BIN}),
       mean.isel({time_dim: FEB_29_BIN}),
@@ -521,6 +528,26 @@ def _bin_statistics(
   assert isinstance(count, xr.Dataset) and isinstance(mean, xr.Dataset)
   assert isinstance(m2, xr.Dataset)
   return count, mean, m2
+
+
+def _chunked_for_the_window(folded: xr.Dataset, time_dim: str) -> xr.Dataset:
+  """`folded` (periods x bins x ...) chunked once, before the statistics: one period per chunk and
+  every bin, so that the reduction over periods and the window over bins need no rechunk; the
+  other dimensions in "auto" tiles under Dask's chunk size, those split one index per chunk kept
+  so. Left to Dask, the window's rechunk to whole bins split the grid into small tiles and built
+  an all-to-all graph (747,727 tasks for one 3D variable at 1 deg; 26 GiB for three variables of
+  8 days)."""
+  # Per variable: variables may be chunked differently (`Dataset.chunks` would raise).
+  sizes = [var.chunksizes for var in folded.data_vars.values() if var.chunks is not None]
+  if not sizes:
+    return folded
+  chunks: dict[Hashable, Any] = {"_period": 1, time_dim: -1}
+  for dim in {dim for var_sizes in sizes for dim in var_sizes}:
+    if dim not in chunks:
+      split = all(set(var_sizes[dim]) == {1} for var_sizes in sizes if dim in var_sizes)
+      chunks[dim] = 1 if split else "auto"
+  # "auto" tiles follow each variable's data type: unified, all variables share them.
+  return folded.chunk(chunks).unify_chunks()
 
 
 def _compute_climatology(

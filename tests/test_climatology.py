@@ -4,6 +4,7 @@
 
 import datetime
 
+import dask
 import numpy as np
 import pandas as pd
 import pydantic
@@ -244,3 +245,45 @@ def test_read_blocks_follow_stored_chunks_without_dask():
   da = xr.DataArray(np.zeros((1000, 721, 1440), dtype="float32"), dims=("time", "lat", "lon"))
   da.encoding["preferred_chunks"] = {"time": 50, "lat": 721, "lon": 1440}
   assert _read_block(da, "time") == 200
+
+
+def test_the_window_does_not_tile_the_grid():
+  """Folded data are chunked once, every bin in a chunk: the window needs no rechunk. Left to
+  Dask, its rechunk to whole bins cut the 1 deg grid into 7 x 7 tiles (747,727 tasks for one
+  variable of 49 levels)."""
+  time = pd.date_range("2013-03-01", periods=8, freq="1D")
+  values = np.zeros((8, 3, 181, 360), dtype="float32")
+  ds = xr.Dataset(
+    {"t": (("time", "depth", "lat", "lon"), values)},
+    coords={
+      "time": time,
+      "depth": [0.5, 1.5, 2.5],
+      "lat": np.arange(-90.0, 91.0),
+      "lon": np.arange(360.0),
+    },
+  ).chunk({"time": 8, "depth": 1, "lat": -1, "lon": -1})
+  mean, _ = _compute_climatology(ds, 365, 29, "gaussian", 7.0, "time", False, "day_of_year")
+  assert mean.t.chunks == ((365,), (1, 1, 1), (181,), (360,))
+  assert len(mean.t.__dask_graph__()) < 3000
+
+
+def test_variables_chunked_differently_share_the_window_tiles():
+  """Variables chunked differently (`Dataset.chunks` raised for them) or of different types get
+  the same tiles for the window, and so do Feb 29's statistics (combining them in the input's
+  tiles cut every bin's statistics into the intersections of both tilings)."""
+  time = pd.date_range("2019-03-01", "2021-03-01", freq="1D", inclusive="left")  # Feb 29, 2020
+  rng = np.random.default_rng(3)
+  t = rng.standard_normal((time.size, 30, 20)).astype("float32")
+  z = rng.standard_normal((time.size, 30, 20))  # float64: other "auto" tiles
+  dims = ("time", "lat", "lon")
+  source = xr.Dataset({"t": (dims, t), "z": (dims, z)}, coords={"time": time})
+  ds = source.assign(t=source.t.chunk(time=50, lat=7), z=source.z.chunk(time=50, lat=11))
+  with dask.config.set({"array.chunk-size": "64KiB"}):
+    statistics = _compute_climatology(ds, 365, 5, "gaussian", 2.0, "time", False, "day_of_year")
+  expected = _compute_climatology(source, 365, 5, "gaussian", 2.0, "time", False, "day_of_year")
+  for out, reference in zip(statistics, expected, strict=True):
+    tilings = {out[name].chunksizes["lat"] for name in out.data_vars}
+    assert len(tilings) == 1
+    (lat,) = tilings
+    assert len(lat) > 1 and len(set(lat[:-1])) == 1  # tiled, regularly: no intersections
+    xr.testing.assert_allclose(out.compute(), reference)
