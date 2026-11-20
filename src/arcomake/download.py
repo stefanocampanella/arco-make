@@ -12,7 +12,6 @@ from typing import Any, Self, get_args, override
 
 import click
 import numpy as np
-import pandas as pd
 import xarray as xr
 from dask.diagnostics import ProgressBar
 from dask.utils import format_bytes
@@ -282,14 +281,21 @@ def download(
     if end_datetime is not None:
       update_time_interval["end"] = end_datetime
     configs = read_configs(configs_path, inject=update_time_interval, schema=DownloadConfig)
+    tip: icechunk_utils.Tip | None = None
     if extend:
       if replace or start_datetime is not None:
         raise click.ClickException(
-          "--extend starts the day after the output's last: not with --replace nor --start"
+          "--extend starts where the output's last block ended: not with --replace nor --start"
         )
-      configs = configs.model_copy(update={"start": _next_stamp(output_path, configs)})
+      # `main` read once: the extension's start and recipe, and the version it extends.
+      tip = _main_tip(output_path, configs)
+      configs = configs.model_copy(update={"start": _extension_start(output_path, tip)})
     if configs.start is None or configs.end is None:
-      raise click.ClickException("The recipe has no dates: give --start and --end")
+      raise click.ClickException(
+        "The recipe has no end: give --end"
+        if extend
+        else "The recipe has no dates: give --start and --end"
+      )
     if extend and configs.start >= configs.end:
       logger.info(f"Nothing to extend: {output_path} reaches {configs.end} already")
       return
@@ -309,20 +315,28 @@ def download(
     # Check the output destination (a failed run waiting there, or an existing version), then
     # start a run on a branch of its own, or continue the failed one.
     recipe = recipe_fingerprint(configs)
-    waiting = _waiting_run(output_path, configs, resume=resume, replace=replace, recipe=recipe)
-    if extend and not resume:
-      _check_extended_recipe(output_path, configs, recipe)
+    waiting = _waiting_run(
+      output_path, configs, resume=resume, replace=replace, extend=extend, recipe=recipe
+    )
+    if tip is not None:
+      _check_extended_recipe(output_path, tip, recipe)
     check_destination(output_path, replace=replace or resume or extend, save_configs=configs.save)
     try:
       run = icechunk_utils.Run(
         output_path,
         configs.save.storage_options,
-        icechunk_utils.run_label("download"),
+        icechunk_utils.run_label(EXTEND_COMMAND if extend else "download"),
         waiting=waiting if resume else None,
         recipe=recipe,
       )
     except Exception as exc:
       raise click.ClickException(f"Could not start writing {output_path}: {exc}") from exc
+    if tip is not None and run.base != tip.snapshot:
+      raise click.ClickException(
+        f"main of {output_path} moved while the extension started (another run was promoted):"
+        " run it again"
+      )
+    again = "--extend --resume" if extend else "--resume"
     written = list(waiting.blocks) if resume and waiting is not None else []
     done = set(written)
     if written != [block_key(b) for b in blocks[: len(written)]]:
@@ -347,7 +361,6 @@ def download(
             run,
             first=number == 0 and not extend,
             progress=progress,
-            recipe=recipe,
             budget=budget,
             static=static,
           ),
@@ -360,18 +373,18 @@ def download(
       raise click.ClickException(
         f"A check of [checks] failed, so the block was not committed: {exc}. The blocks written"
         f" are on branch {run.branch}, `main` is unchanged; once the cause (or the check) is"
-        " fixed, --resume continues from there."
+        f" fixed, {again} continues from there."
       ) from exc
     except PlanError as exc:
       raise click.ClickException(
         f"{exc}. The blocks written are on branch {run.branch}, `main` is unchanged;"
-        " --resume continues from there."
+        f" {again} continues from there."
       ) from exc
     except Exception as exc:
       logger.exception("An error occurred during download")
       raise click.ClickException(
         f"An error occurred ({type(exc).__name__}). Aborting: the blocks written are on branch"
-        f" {run.branch}, `main` is unchanged; --resume continues from there."
+        f" {run.branch}, `main` is unchanged; {again} continues from there."
       ) from exc
     # Every block is written: `main` moves to them, then the recipe's retention applies.
     try:
@@ -509,8 +522,9 @@ def _commit_message(interval: DateInterval) -> str:
   return f"download [{interval.start:%Y-%m-%dT%H:%M}, {interval.end:%Y-%m-%dT%H:%M})"
 
 
-def _block_metadata(interval: DateInterval, recipe: str) -> dict[str, str]:
-  return {icechunk_utils.BLOCK_KEY: block_key(interval), icechunk_utils.RECIPE_KEY: recipe}
+def _block_metadata(interval: DateInterval) -> dict[str, str]:
+  """The block of a commit; the run adds the recipe's fingerprint (`Run(recipe=...)`)."""
+  return {icechunk_utils.BLOCK_KEY: block_key(interval)}
 
 
 def _write_block(
@@ -520,7 +534,6 @@ def _write_block(
   *,
   first: bool,
   progress: bool,
-  recipe: str,
   budget: Budget | None = None,
   static: RunStatic | None = None,
 ) -> None:
@@ -554,7 +567,7 @@ def _write_block(
       message=_commit_message(date_interval),
       mode="w" if first else "a-",
       append_dim=None if first else configs.time_dim,
-      metadata=_block_metadata(date_interval, recipe),
+      metadata=_block_metadata(date_interval),
       # Chunks are planned for reading; the stored layout is the recipe's.
       align_chunks=True,
     )
@@ -685,18 +698,21 @@ def block_key(interval: DateInterval) -> str:
 
 
 def recipe_fingerprint(configs: DownloadConfig) -> str:
-  """A fingerprint of what decides what a download writes (the recipe, its start and end): a run
-  is resumed only with the same. Settings that only change how blocks are read are left out
+  """A fingerprint of what decides what a download writes: a run is resumed, and an output
+  extended, only with the same. Settings that only change how blocks are read are left out
   (`[retries]`, parts' `timeout`, `checkpointing`): a run that failed on timeouts can resume with
   longer ones. Options at their default are left out too: an option a later version adds, with a
   default keeping the earlier behaviour, does not change the fingerprint of recipes without it.
   `[grids]` is left out: the regrid steps carry the grids they name. `[checks]` is left out: a
   run stopped by a check may resume once the check is changed. The dates are left out: a recipe
   is the same over any period (an extension keeps it), and a resumed run's blocks are checked
-  against those stored."""
+  against those stored. `[save]` access and retention (`storage_options`, `keep_history`,
+  `keep_versions`) are left out: a renamed profile or a new retention must not block extensions."""
   recipe = configs.model_dump(
     mode="json", exclude={"retries", "grids", "checks", "start", "end"}, exclude_defaults=True
   )
+  for key in ("storage_options", "keep_history", "keep_versions"):
+    recipe.get("save", {}).pop(key, None)
   for dataset in recipe["datasets"].values():
     dataset.pop("checkpointing", None)
     for part in dataset["parts"]:
@@ -704,26 +720,31 @@ def recipe_fingerprint(configs: DownloadConfig) -> str:
   return provenance.hash_recipe(recipe)
 
 
-def _next_stamp(output_path: str, configs: DownloadConfig) -> datetime:
-  """The stamp after the last of the output's `main` (the step between its last two stamps)."""
+# The command of extension runs (their label and branch): a failed one resumes only as one.
+EXTEND_COMMAND = "download-extend"
+
+
+def _main_tip(output_path: str, configs: DownloadConfig) -> icechunk_utils.Tip:
   try:
-    store = icechunk_utils.readonly_store(output_path, configs.save.storage_options)
-    with xr.open_zarr(store, group=configs.save.group, consolidated=False) as stored:
-      stamps = stored[configs.time_dim].values
+    return icechunk_utils.main_tip(output_path, configs.save.storage_options)
   except Exception as exc:
     raise click.ClickException(f"Nothing to extend at {output_path}: {exc}") from exc
-  if stamps.size < 2:
+
+
+def _extension_start(output_path: str, tip: icechunk_utils.Tip) -> datetime:
+  """Where an extension starts: the end of the last block `main`'s tip commits (exact, whatever
+  the time axis: calendars, labels, resampling)."""
+  block = tip.metadata.get(icechunk_utils.BLOCK_KEY)
+  if not isinstance(block, str) or "/" not in block:
     raise click.ClickException(
-      f"{output_path} has fewer than two stamps: its step is unknown, rerun it with --replace"
+      f"{output_path} records no download block in its last commit: rewrite it with --replace"
     )
-  return pd.Timestamp(stamps[-1] + (stamps[-1] - stamps[-2])).to_pydatetime()
+  return datetime.strptime(block.split("/")[1], "%Y-%m-%dT%H:%M")
 
 
-def _check_extended_recipe(output_path: str, configs: DownloadConfig, recipe: str) -> None:
+def _check_extended_recipe(output_path: str, tip: icechunk_utils.Tip, recipe: str) -> None:
   """An extension uses the recipe the output was written with (its dates aside)."""
-  stored = icechunk_utils.main_metadata(output_path, configs.save.storage_options).get(
-    icechunk_utils.RECIPE_KEY
-  )
+  stored = tip.metadata.get(icechunk_utils.RECIPE_KEY)
   if stored != recipe:
     raise click.ClickException(
       f"{output_path} was written with another recipe (fingerprint {stored}, this one {recipe}):"
@@ -732,10 +753,18 @@ def _check_extended_recipe(output_path: str, configs: DownloadConfig, recipe: st
 
 
 def _waiting_run(
-  output_path: str, configs: DownloadConfig, *, resume: bool, replace: bool, recipe: str
+  output_path: str,
+  configs: DownloadConfig,
+  *,
+  resume: bool,
+  replace: bool,
+  extend: bool,
+  recipe: str,
 ) -> icechunk_utils.WaitingRun | None:
   """The failed download run at `output_path`, checked against the options: --resume needs one
-  that can continue with this recipe, a plain run refuses to start beside one."""
+  that can continue with this recipe, of the same kind (an extension resumes only with
+  --extend: resumed as a download, its first block would replace the output), a plain run
+  refuses to start beside one."""
   try:
     waiting = icechunk_utils.waiting_run(output_path, configs.save.storage_options, "download")
   except Exception as exc:
@@ -748,14 +777,27 @@ def _waiting_run(
         f"main changed since {waiting.branch} started, which can no longer be promoted: start"
         " over with --replace"
       )
+    extension = waiting.label.startswith(f"{EXTEND_COMMAND}-")
+    if extension != extend:
+      raise click.ClickException(
+        f"{waiting.branch} is a failed extension: --extend --resume continues it"
+        if extension
+        else f"{waiting.branch} is a failed download, not an extension: --resume continues it"
+      )
     if waiting.recipe is not None and waiting.recipe != recipe:
       raise click.ClickException(
-        f"{waiting.branch} was written with another recipe (or --start/--end): resume it with"
-        " the same, or start over with --replace"
+        f"{waiting.branch} was written with another recipe: resume it with the same, or start"
+        " over with --replace"
       )
   elif waiting is not None and waiting.current and not replace:
+    if waiting.label.startswith(f"{EXTEND_COMMAND}-"):
+      how = "--extend --resume continues it; --replace (without --extend) rewrites the output"
+    elif extend:
+      how = "it is not an extension: --resume or --replace, without --extend"
+    else:
+      how = "--resume continues it, --replace starts over"
     raise click.ClickException(
       f"A download run failed at {output_path} ({waiting.branch}, {len(waiting.blocks)} blocks"
-      " written): --resume continues it, --replace starts over"
+      f" written): {how}"
     )
   return waiting

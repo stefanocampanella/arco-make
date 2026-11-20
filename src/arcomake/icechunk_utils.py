@@ -235,12 +235,19 @@ def write(
   return run.finish(retention)
 
 
-def main_metadata(
-  path: str | pathlib.Path, storage_options: Mapping[str, Any] | None = None
-) -> dict[str, Any]:
-  """The metadata of the commit `main` points to."""
+@dataclasses.dataclass(frozen=True)
+class Tip:
+  """The commit `main` points to: its snapshot and metadata."""
+
+  snapshot: str
+  metadata: dict[str, Any]
+
+
+def main_tip(path: str | pathlib.Path, storage_options: Mapping[str, Any] | None = None) -> Tip:
+  """The commit `main` points to."""
   repo = icechunk.Repository.open(storage(path, storage_options))
-  return dict(next(iter(repo.ancestry(branch=BRANCH))).metadata or {})
+  info = next(iter(repo.ancestry(branch=BRANCH)))
+  return Tip(snapshot=str(info.id), metadata=dict(info.metadata or {}))
 
 
 def readonly_store(
@@ -295,7 +302,11 @@ def waiting_run(
   if not icechunk.Repository.exists(repository_storage):
     return None
   repo = icechunk.Repository.open(repository_storage)
-  branches = sorted(b for b in repo.list_branches() if b.startswith(f"run/{command}-"))
+  # The newest by start time (the label's last part): extension runs share the prefix.
+  branches = sorted(
+    (b for b in repo.list_branches() if b.startswith(f"run/{command}-")),
+    key=lambda branch: branch.rsplit("-", 1)[-1],
+  )
   if not branches:
     return None
   branch = branches[-1]

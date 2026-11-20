@@ -5,6 +5,7 @@ output's last appended as a new version, with the recipe it was written with."""
 
 import importlib
 import pathlib
+import tomllib
 
 import icechunk
 import pytest
@@ -12,6 +13,7 @@ import xarray as xr
 from click.testing import CliRunner, Result
 
 from arcomake import cli, icechunk_utils
+from arcomake.dataset_utils import write_output
 from tests.conftest import make_static_dataset, open_output, render_recipe
 
 download_module = importlib.import_module("arcomake.download")  # the module, not the command
@@ -106,3 +108,85 @@ def test_a_failed_extension_resumes(recipe, tmp_path, monkeypatch):
   resumed = run(recipe, output, "--extend", "--resume", f"--end={END}")
   assert resumed.exit_code == 0, resumed.output
   xr.testing.assert_identical(open_output(output), open_output(tmp_path / "whole"))
+
+
+def fail_every_block(monkeypatch):
+  def failing(configs, start, end, **kwargs):
+    raise RuntimeError("simulated failure")
+
+  monkeypatch.setattr(download_module, "maybe_checkpointing_download_and_process", failing)
+
+
+def test_a_failed_extension_resumes_only_as_one(recipe, tmp_path, monkeypatch):
+  """Resumed as a download, an extension that committed no block would write its first block
+  in place of the output (mode "w"); with another recipe it would append unchecked."""
+  output = tmp_path / "out"
+  assert run(recipe, output, f"--start={START}", f"--end={MIDDLE}").exit_code == 0
+  real = download_module.maybe_checkpointing_download_and_process
+  fail_every_block(monkeypatch)
+  assert run(recipe, output, "--extend", f"--end={END}").exit_code != 0
+  monkeypatch.setattr(download_module, "maybe_checkpointing_download_and_process", real)
+  plain = run(recipe, output, "--resume", f"--start={MIDDLE}", f"--end={END}")
+  assert plain.exit_code != 0 and "is a failed extension: --extend --resume" in plain.output
+  again = run(recipe, output, "--extend", f"--end={END}")
+  assert again.exit_code != 0 and "--extend --resume continues it" in again.output
+  recipe.write_text(recipe.read_text().replace('title = "Synthetic sample dataset"', 'title = "x"'))
+  other = run(recipe, output, "--extend", "--resume", f"--end={END}")
+  assert other.exit_code != 0 and "another recipe" in other.output
+  assert open_output(output).sizes["time"] == 2  # `main` as it was
+
+
+def test_an_extension_starts_where_the_last_block_ended(recipe, tmp_path):
+  """Not from the stamps (monthly or right-labelled axes, cftime): from the last block."""
+  output = tmp_path / "out"
+  assert run(recipe, output, f"--start={START}", f"--end={MIDDLE}").exit_code == 0
+  configs = download_module.DownloadConfig.model_validate(
+    tomllib.loads(recipe.read_text()) | {"end": END}
+  )
+  tip = download_module._main_tip(str(output), configs)
+  assert str(download_module._extension_start(str(output), tip)) == "2020-02-28 00:00:00"
+
+
+def test_only_a_download_output_can_be_extended(recipe, tmp_path):
+  output = tmp_path / "other"
+  write_output(xr.Dataset({"x": ("time", [1.0, 2.0])}), output, message="not a download")
+  refused = run(recipe, output, "--extend", f"--end={END}")
+  assert refused.exit_code != 0 and "records no download block" in refused.output
+
+
+def test_access_and_retention_do_not_change_the_fingerprint(recipe):
+  """A renamed profile or another retention must not block extensions."""
+  configs = download_module.DownloadConfig.model_validate(tomllib.loads(recipe.read_text()))
+  other_save = configs.save.model_copy(
+    update={"keep_versions": 5, "storage_options": {"anon": True}}
+  )
+  other = configs.model_copy(update={"save": other_save})
+  assert download_module.recipe_fingerprint(other) == download_module.recipe_fingerprint(configs)
+
+
+def test_an_extension_refuses_a_main_that_moved_meanwhile(recipe, tmp_path, monkeypatch):
+  """Its start was read from `main`: if another run was promoted before this one started, it
+  would append days already stored."""
+  output = tmp_path / "out"
+  assert run(recipe, output, f"--start={START}", f"--end={MIDDLE}").exit_code == 0
+  real = download_module._main_tip
+
+  def stale(output_path, configs):
+    tip = real(output_path, configs)
+    return icechunk_utils.Tip(snapshot="0" * 20, metadata=tip.metadata)
+
+  monkeypatch.setattr(download_module, "_main_tip", stale)
+  moved = run(recipe, output, "--extend", f"--end={END}")
+  assert moved.exit_code != 0 and "moved while the extension started" in moved.output
+  assert open_output(output).sizes["time"] == 2
+
+
+def test_extension_messages(recipe, tmp_path, monkeypatch):
+  """A failed extension says how to continue it; without an end, only --end is asked for."""
+  output = tmp_path / "out"
+  assert run(recipe, output, f"--start={START}", f"--end={MIDDLE}").exit_code == 0
+  no_end = run(recipe, output, "--extend")
+  assert no_end.exit_code != 0 and "give --end" in no_end.output and "--start" not in no_end.output
+  fail_every_block(monkeypatch)
+  failed = run(recipe, output, "--extend", f"--end={END}")
+  assert failed.exit_code != 0 and "--extend --resume continues from there" in failed.output

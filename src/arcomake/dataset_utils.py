@@ -1119,6 +1119,8 @@ def write_output(
     ValueError: for a `.zip` destination (zip outputs were removed with Zarr v3), or a layout
       `prepare_for_writing` refuses.
   """
+  if isinstance(destination, icechunk_utils.Run) and recipe is not None:
+    raise ValueError("write_output: a run carries its recipe's fingerprint (`Run(recipe=...)`)")
   configs = configs or SaveConfig()
   prepared = prepare_for_writing(dataset, configs)
   if isinstance(destination, icechunk_utils.Run):

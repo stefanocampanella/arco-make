@@ -138,3 +138,9 @@ def test_no_commit_of_another_repository(monkeypatch, tmp_path):
   )
   monkeypatch.setattr(provenance, "__file__", str(package / "provenance.py"))
   assert provenance._commit() is None
+
+
+def test_a_run_carries_the_recipe_not_write_output(tmp_path):
+  run = icechunk_utils.Run(tmp_path / "out", None, "write-1", recipe="abc")
+  with pytest.raises(ValueError, match="carries its recipe"):
+    write_output(xr.Dataset({"x": ("t", [1.0])}), run, message="m", recipe="abc")
