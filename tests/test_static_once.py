@@ -8,9 +8,13 @@ import collections
 import datetime
 import importlib
 import pathlib
+import types
 
+import click
+import icechunk
 import numpy as np
 import pytest
+import xarray as xr
 from click.testing import CliRunner, Result
 
 from arcomake import cli
@@ -167,3 +171,25 @@ def test_resume_with_the_same_static_variables_goes_on(recipe, reads, tmp_path: 
   assert resumed.exit_code == 0, resumed.output
   assert reads["count"] == {"atmosphere": 2, "ocean": 2, "ocean_static": 1}
   assert np.isfinite(open_output(output).deptho.values).any()
+
+
+def test_resume_compares_static_coordinates(tmp_path: pathlib.Path):
+  """Static coordinates that are not indexes (cell bounds) are not rewritten by appends either:
+  a resumed run compares them too."""
+  stored = xr.Dataset(
+    {"v": (("time", "lat"), np.zeros((1, 2)))},
+    coords={
+      "time": [0],
+      "lat": [0.0, 1.0],
+      "lat_bnds": (("lat", "bnds"), [[-0.5, 0.5], [0.5, 1.5]]),
+    },
+  )
+  repo = icechunk.Repository.create(icechunk.local_filesystem_storage(str(tmp_path / "repo")))
+  session = repo.writable_session("main")
+  stored.to_zarr(session.store, consolidated=False, zarr_format=3)
+  session.commit("first block")
+  run_on_main = types.SimpleNamespace(repo=repo, branch="main")
+  download_module._check_static(stored, run_on_main, None, "time")
+  moved = stored.assign_coords(lat_bnds=stored.lat_bnds + 0.25)
+  with pytest.raises(click.ClickException, match="Static variable 'lat_bnds' differs"):
+    download_module._check_static(moved, run_on_main, None, "time")

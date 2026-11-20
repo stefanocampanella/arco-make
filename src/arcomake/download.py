@@ -515,9 +515,14 @@ def _check_static(
 ) -> None:
   """Fail if a static variable of `dataset` differs from the one stored on the run's branch
   (compared as stored: packed with the stored variable's encoding, NaN equal to NaN): appends do
-  not rewrite them, so the output would keep the old ones. Units are not read as durations:
-  "seconds" stays a number, whose missing values equal each other."""
-  names = [name for name, var in dataset.data_vars.items() if time_dim not in var.dims]
+  not rewrite them, so the output would keep the old ones. Static coordinates other than indexes
+  (cell bounds, say) are compared too. Units are not read as durations: "seconds" stays a number,
+  whose missing values equal each other."""
+  names = [
+    name
+    for name, var in dataset.variables.items()
+    if time_dim not in var.dims and name not in dataset.indexes
+  ]
   if not names:
     return
   store = run.repo.readonly_session(branch=run.branch).store
