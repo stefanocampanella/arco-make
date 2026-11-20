@@ -1168,9 +1168,16 @@ def write_into_session(
   """Write `dataset` (with the layout of `[save]`) into a writable Icechunk session, from this
   process: its threads may write, but no other process or worker (their writes would not reach
   the session). With `compute=False`, only the metadata are written; returns the data's task
-  (with a `shard_order` other than zarr's, its arrays write their shards in that order)."""
+  (with a `shard_order` other than zarr's, its arrays write their shards in that order). Dask
+  chunks straddling the stored chunks or shards are rechunked to fit them (`align_chunks`, as in
+  download): statistics computed level by level are stored in shards of all levels."""
   prepared = prepare_for_writing(dataset, configs)
-  options: dict[str, Any] = {"consolidated": False, "zarr_format": 3, "group": configs.group}
+  options: dict[str, Any] = {
+    "consolidated": False,
+    "zarr_format": 3,
+    "group": configs.group,
+    "align_chunks": True,
+  }
   with sharding.write_order(configs.shard_order):
     if sharding.creates_arrays(configs.shard_order, "w"):
       sharding.create_arrays(prepared, session.store, mode="w", group=configs.group)
@@ -1221,7 +1228,7 @@ def write_outputs_together(
       "Distributed scheduler: each output is computed separately, shared work is repeated"
     )
     for (dataset, _), run in zip(outputs, runs, strict=True):
-      write_output(dataset, run, configs, message=label)
+      write_output(dataset, run, configs, message=label, align_chunks=True)
   else:
     sessions, writes = [], []
     for (dataset, _), run in zip(outputs, runs, strict=True):

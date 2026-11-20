@@ -279,3 +279,27 @@ def test_zip_outputs_are_refused_before_any_work(recipes, tmp_path: pathlib.Path
   result = CliRunner().invoke(cli, ["download", *THREADS, str(recipes["download"]), str(output)])
   assert result.exit_code != 0 and "zip outputs are not supported" in result.output
   assert not output.exists()
+
+
+def test_climatology_writes_shards_its_chunks_straddle(tmp_path: pathlib.Path):
+  """Read one level per chunk, stored in shards of all levels (the layout of the historical
+  datasets, used by the statistics too): the writes are aligned to the stored layout, as in
+  download; xarray refused Dask chunks overlapping a shard."""
+  time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
+  values = np.random.default_rng(0).standard_normal((time.size, 3, 4, 4)).astype("float32")
+  coords = {"time": time, "depth": [0.5, 1.5, 2.5], "lat": np.arange(4.0), "lon": np.arange(4.0)}
+  source = tmp_path / "in.zarr"
+  xr.Dataset({"t3": (("time", "depth", "lat", "lon"), values)}, coords=coords).to_zarr(source)
+  recipe = tmp_path / "climatology.toml"
+  recipe.write_text(
+    'period = 365\nbins = "day_of_year"\nwindow = 5\nweighting = "gaussian"\nweighting_scale = 2\n'
+    '[read]\nengine = "zarr"\nchunks = {time = "auto", depth = 1, lat = -1, lon = -1}\n'
+    "[save]\nchunks = {time = 1, depth = 1, lat = -1, lon = -1}\n"
+    'shards = {time = 8, depth = -1, lat = -1, lon = -1}\nshard_order = "lexicographic"\n'
+  )
+  clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
+  result = run("compute-climatology", *THREADS, str(recipe), str(source), str(clim), str(std))
+  assert result.exit_code == 0, result.output
+  stored = output_group(clim)["t3"]
+  assert stored.shards == (8, 3, 4, 4) and stored.chunks == (1, 1, 4, 4)
+  assert open_output(clim).t3.shape == (365, 3, 4, 4)
