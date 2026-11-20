@@ -190,7 +190,7 @@ def coverage_attrs(
   latitude_dim: Hashable = "lat",
   longitude_dim: Hashable = "lon",
   vertical_dim: Hashable | None = None,
-  time_dim: Hashable | None = "time",
+  time_dim: Hashable | Literal[False] | None = "time",
 ) -> xr.Dataset:
   """Set the ACDD attributes of the dataset's extent from its coordinates.
 
@@ -205,6 +205,9 @@ def coverage_attrs(
 
     name = "coverage_attrs"
     vertical_dim = "depth"
+
+  `time_dim = false` leaves the time coverage alone (a recipe cannot give None), e.g. for
+  statistics whose time axis is bins of a year.
   """
   attrs: dict[str, Any] = {}
   for dim, axis, units in (
@@ -225,7 +228,7 @@ def coverage_attrs(
     for key in ("units", "positive"):
       if key in vertical.attrs:
         attrs[f"geospatial_vertical_{key}"] = vertical.attrs[key]
-  if time_dim is not None:
+  if time_dim is not None and time_dim is not False:
     attrs |= time_coverage(ds[time_dim].values)
   return ds.assign_attrs(attrs)
 

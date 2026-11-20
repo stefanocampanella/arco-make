@@ -136,12 +136,15 @@ name = "coverage_attrs"
 vertical_dim = "depth"
 ```
 
+`time_dim = false` leaves the time coverage alone (a recipe cannot give None), e.g. for
+statistics whose time axis is bins of a year.
+
 | Argument | Type | Default |
 |---|---|---|
 | `latitude_dim` | `Hashable` | `'lat'` |
 | `longitude_dim` | `Hashable` | `'lon'` |
 | `vertical_dim` | `Hashable &#124; None` | `None` |
-| `time_dim` | `Hashable &#124; None` | `'time'` |
+| `time_dim` | `Union[Hashable, Literal[False], NoneType]` | `'time'` |
 
 ## `divide_by`
 

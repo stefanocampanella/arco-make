@@ -7,6 +7,7 @@ import pytest
 import xarray as xr
 
 from arcomake import processing_utils as pu
+from arcomake.processing_utils import ProcessingStepConfig
 
 
 def test_astype_whole_dataset(ocean_ds: xr.Dataset):
@@ -114,6 +115,24 @@ def test_coverage_attrs_come_from_the_coordinates(ocean_ds: xr.Dataset):
   assert attrs["time_coverage_start"] == f"{times[0]:%Y-%m-%dT%H:%M:%S}Z"
   assert attrs["time_coverage_end"] == f"{times[-1]:%Y-%m-%dT%H:%M:%S}Z"
   assert attrs["time_coverage_resolution"] == "P1D"
+
+
+def test_coverage_attrs_without_time_from_a_recipe(ocean_ds: xr.Dataset):
+  """`time_dim = false` (TOML has no null) leaves a time coverage given by hand, e.g. over the
+  bins of a climatology: as a number of a bin it would read as 1970."""
+  bins = ocean_ds.assign_coords(time=np.arange(ocean_ds.sizes["time"]))
+  bins.attrs["time_coverage_start"] = "1993-01-01T00:00:00Z"
+  config = ProcessingStepConfig.model_validate(
+    {
+      "name": "coverage_attrs",
+      "latitude_dim": "latitude",
+      "longitude_dim": "longitude",
+      "time_dim": False,
+    }
+  )
+  attrs = bins.arcomake.process(steps=[config]).attrs
+  assert attrs["time_coverage_start"] == "1993-01-01T00:00:00Z"
+  assert attrs["geospatial_lat_min"] == -1.75
 
 
 @pytest.mark.parametrize(
