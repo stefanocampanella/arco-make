@@ -6,7 +6,7 @@ import json
 import logging
 import math
 import warnings
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -19,7 +19,8 @@ from dask.diagnostics import ProgressBar
 from dask.utils import format_bytes
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from arcomake import icechunk_utils
+from arcomake import checks, icechunk_utils
+from arcomake.checks import ChecksConfig, ValidationError
 from arcomake.chunk_plan import Budget, PlanError, detect_budget, stored_warnings
 from arcomake.cli_utils import (
   check_aws_profile,
@@ -77,11 +78,33 @@ class DownloadConfig(BaseModel):
   retries: RetryConfig = Field(default_factory=RetryConfig)
   # Target grids of `regrid` steps, by name (see `dataset_utils.inline_grids`).
   grids: dict[str, dict[str, Any]] = Field(default_factory=dict)
+  # Checks run on each block before its commit (see `_checked_block`).
+  checks: ChecksConfig | None = None
 
   @model_validator(mode="before")
   @classmethod
   def _inline_grids(cls, data: Any) -> Any:
     return inline_grids(data)
+
+  @model_validator(mode="before")
+  @classmethod
+  def _time_check_over_the_recipe(cls, data: Any) -> Any:
+    # Each block's time axis is checked over the block: the table takes no dates (they would go
+    # unused), and gets the recipe's to satisfy the model.
+    if isinstance(data, dict) and isinstance(data.get("checks"), dict):
+      table = data["checks"].get("valid_time_coordinate")
+      if isinstance(table, dict):
+        if "start" in table or "end" in table:
+          raise ValueError(
+            "checks.valid_time_coordinate: a download checks each block's time axis over the"
+            " block: remove start and end"
+          )
+        data["checks"]["valid_time_coordinate"] = {
+          "start": data.get("start"),
+          "end": data.get("end"),
+          **table,
+        }
+    return data
 
   @field_validator("step", mode="before")
   @classmethod
@@ -314,6 +337,12 @@ def download(
         )
     except click.ClickException:
       raise
+    except ValidationError as exc:
+      raise click.ClickException(
+        f"A check of [checks] failed, so the block was not committed: {exc}. The blocks written"
+        f" are on branch {run.branch}, `main` is unchanged; once the cause (or the check) is"
+        " fixed, --resume continues from there."
+      ) from exc
     except PlanError as exc:
       raise click.ClickException(
         f"{exc}. The blocks written are on branch {run.branch}, `main` is unchanged;"
@@ -497,6 +526,8 @@ def _write_block(
       _check_static(dataset, run, configs.save.group, configs.time_dim)
       static.checked = True
     dataset = _with_output_coverage(dataset, run, configs.save.group, configs.time_dim, first)
+    if configs.checks is not None:
+      dataset = _checked_block(dataset, configs.checks, date_interval, configs.time_dim)
     write_output(
       dataset,
       run,
@@ -508,6 +539,43 @@ def _write_block(
       # Chunks are planned for reading; the stored layout is the recipe's.
       align_chunks=True,
     )
+
+
+def _checked_block(
+  dataset: xr.Dataset, config: ChecksConfig, date_interval: DateInterval, time_dim: str
+) -> xr.Dataset:
+  """`dataset` checked by the recipe's `[checks]`, like pre-commit hooks: the time axis over the
+  block, and the checks reading only coordinates and attributes (`checks.METADATA_CHECKS`), now;
+  missing values while the block is written (`guard_no_nans`, no second reading). Tables without
+  a `time_dim` take the recipe's. A failure raises `ValidationError` naming the check, so the
+  block is not committed.
+  """
+  if (time_check := config.valid_time_coordinate) is not None:
+    _named(
+      "valid_time_coordinate",
+      checks.valid_time_coordinate,
+      dataset,
+      date_interval.start,
+      date_interval.end,
+      freq=time_check.freq,
+      time_dim=time_check.time_dim if "time_dim" in time_check.model_fields_set else time_dim,
+    )
+  for name in sorted(checks.METADATA_CHECKS):
+    if (table := getattr(config, name)) is not None:
+      _named(name, checks.CHECKS[name], dataset, **table.model_dump())
+  if (no_nans := config.ensure_no_nans) is not None:
+    table = no_nans.model_dump(exclude_none=True)
+    table.setdefault("time_dim", time_dim)
+    dataset = checks.guard_no_nans(dataset, **table)
+  return dataset
+
+
+def _named(name: str, check: Callable[..., None], *args: Any, **kwargs: Any) -> None:
+  """Run `check`; its `ValidationError` names it."""
+  try:
+    check(*args, **kwargs)
+  except ValidationError as exc:
+    raise ValidationError(f"{name}: {exc}") from exc
 
 
 def _check_static(
@@ -603,8 +671,11 @@ def recipe_fingerprint(configs: DownloadConfig) -> str:
   (`[retries]`, parts' `timeout`, `checkpointing`): a run that failed on timeouts can resume with
   longer ones. Options at their default are left out too: an option a later version adds, with a
   default keeping the earlier behaviour, does not change the fingerprint of recipes without it.
-  `[grids]` is left out: the regrid steps carry the grids they name."""
-  recipe = configs.model_dump(mode="json", exclude={"retries", "grids"}, exclude_defaults=True)
+  `[grids]` is left out: the regrid steps carry the grids they name. `[checks]` is left out: a
+  run stopped by a check may resume once the check is changed."""
+  recipe = configs.model_dump(
+    mode="json", exclude={"retries", "grids", "checks"}, exclude_defaults=True
+  )
   for dataset in recipe["datasets"].values():
     dataset.pop("checkpointing", None)
     for part in dataset["parts"]:

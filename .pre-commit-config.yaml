@@ -11,7 +11,8 @@ repos:
         name: ruff format
         entry: uv run --frozen ruff format --check --force-exclude
         language: system
-        types: [python]
+        # Markdown too: ruff formats the Python examples of the docs, and CI checks them.
+        types_or: [python, markdown]
       - id: ty-check
         name: ty check
         entry: uv run --frozen ty check

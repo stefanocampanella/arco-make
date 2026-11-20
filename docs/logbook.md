@@ -1210,3 +1210,38 @@ and fails on a listed variable missing from the dataset.
   differs from 2022-10-01 on at the two polar rows (2,880 cells, up to 364 m2 s-2). At 1 deg the
   static fields differ from the old daily means by float32 rounding only; the statistics leave
   them out (Moby-Dick notes, item 3: their z-scores were rounding noise).
+
+### 20 Nov: findings for Moby-Dick, checks on each block
+
+The Moby-Dick findings plan (maintainer, 17 Nov), with what the coarsening already did:
+- `msl` becomes `mslp` in the arco-ocean recipes (the fork; a typo, "in ARCO-OCEAN v2").
+- NaN outside the masks: done by the coarsening (`apply_mask` on the sea, `ensure_no_nans` with
+  `exact`).
+- Checks before each block's commit: a download recipe may give `[checks]`. The time axis is
+  checked over the block, the coordinates and attributes before writing, and missing values
+  while the block is written: `checks.guard_no_nans` wraps each variable in a pass-through
+  `apply_ufunc` that raises on a chunk breaking the rule, so nothing is read twice (reading a
+  32-day block back from the output would mean about 13 GB at 0.25 deg). A failing block is not
+  committed; the message names the check, the variable, the mask and the first day wrong in the
+  chunk that failed (chunks fail in any order); `[checks]` is out
+  of the fingerprint, so the run resumes once the cause or the check is fixed. On the 1 deg fork
+  recipe (1-9 Mar 2013) the block passed; the run took 5 min (its cost against a run without
+  checks was not measured).
+- The notes of Moby-Dick's development (`arco-ocean-notes.md`, 19 items): items 1-2, 10-13 were
+  handled by group 6 and the dropped tendency std; 3-4 by static `z` and `lsm` (read at
+  2000-01-01T00:00; the source's `z` differs from 2022-10-01 on at the two polar rows, 2,880
+  cells); 5-6 and 15 by dropping WAVERYS; 7-9, 16-17 by the coarsening; 14 by the shard layout;
+  18 by the new check `attributes` (required attributes, distinct `long_name`s); 19 by the
+  attribution of every source in the fork's recipes.
+- The notebook `notebooks/regrid_glorys12.ipynb` was reviewed in the coarsening (its notes,
+  `docs/coarsen-ocean-datasets.md`).
+- The pre-commit hook `ruff format` checks Markdown too, as CI does.
+
+Fork recipes (`production-recipes`): `mslp`; `[grids]` (the grid once per recipe, same
+fingerprints); the production layout (32-day blocks, shards of 8 days and all levels,
+lexicographic); `coverage_attrs` instead of hand-written extents (they said longitudes -180 to
+180 over 0 to 359 and a coverage to 2023); attribution of ERA5, GLORYS12 and GloFAS; `[checks]`;
+and a fix: `scripts/download.sh` still passed `--blocks`, removed from arco-make, so it failed at
+once. Open for the maintainer: the recipes end on 2024-01-01 but GLORYS12's multi-year product
+ends on 2021-06-30 (end there, or add its interim product); how outputs record the arco-make
+version (A15: the version is a fixed "0.1.0").
