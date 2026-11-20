@@ -1245,3 +1245,37 @@ and a fix: `scripts/download.sh` still passed `--blocks`, removed from arco-make
 once. Open for the maintainer: the recipes end on 2024-01-01 but GLORYS12's multi-year product
 ends on 2021-06-30 (end there, or add its interim product); how outputs record the arco-make
 version (A15: the version is a fixed "0.1.0").
+
+### 20 Nov: sources to mid-2026, statistics over 1993-2023, provenance, extensions
+
+Maintainer's decisions: statistics in the datasets' shard layout and over 1993-2023 (a 30-year
+normal, as climatological normals are; was 1993-2018 with later years held out); the time mean
+is no longer computed; the analysis/forecast recipe is removed, the Mediterranean one kept
+loadable but not run; the extent maximal; recipes without dates; provenance in the commits'
+metadata, not their messages.
+
+- **How far the sources reach** (20 Nov 2026): GLORYS12's multi-year dataset id
+  (`cmems_mod_glo_phy_my_0.083deg_P1D-m`, version 202311) continues past 2021-06-30 to
+  2026-10-06, values continuous across mid-2021 (no separate interim id is served); ERA5's ARCO
+  store has final data to 2026-06-30 and ERA5T, preliminary and revised within months, to
+  2026-11-04; GloFAS v5 consolidated to 2026-08-31 (the service's cost estimate, day by day; its
+  intermediate product refuses these requests, v4 and v5). The historical recipes end on
+  2026-07-01, the last day every source has as final data, so revisions stay out. An earlier
+  commit of the fork had set 2021-07-01 on the wrong belief that the multi-year id ends there.
+- **Provenance:** every commit's metadata hold `arcomake_provenance` (arco-make's version and
+  commit, Python and OS, CPUs and memory, the versions of the packages that decide the values, a
+  hash of every installed distribution; nothing naming the machine or its paths) and the
+  recipe's fingerprint, for `process` and `compute-climatology` too. The image build writes the
+  commit into `src/arcomake/BUILD_COMMIT` (the image has no history). Icechunk keeps nested
+  metadata (checked).
+- **Recipes without dates; `download --extend`:** the fingerprint leaves the dates out; a recipe
+  may omit them (the command gives them); `--extend` appends the days after `main`'s last stamp
+  as a new version, with the same recipe and the static variables compared; an extension equals
+  one download over the whole period (tested), and a failed one resumes. Estimated before:
+  about 100 lines in `download`; it took about 70 in `download` and `icechunk_utils` (the dates
+  made optional included), plus 125 of tests. Rewriting days already
+  stored (for revised data) is left out: ending at final data makes it unnecessary.
+- `coverage_attrs` takes `time_dim = false` (a recipe cannot give None), for statistics whose
+  time axis holds the bins of a year.
+- The xarray-regrid issue (`stat` on a Dataset beyond the source) still reproduces on 0.4.2 and
+  upstream main; posting it needs the maintainer (the VM's token cannot open issues elsewhere).
