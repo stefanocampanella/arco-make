@@ -140,10 +140,12 @@ def test_ensure_no_nans_computes_once(ocean_ds: xr.Dataset, static_ds: xr.Datase
   times = ds.time.to_index()
   in_mask = int(ds.m.sum())
   assert lines[1] == (
-    f"1 errors found for time {times[1]}: {in_mask} NaN values found for variable zos"
+    f"1 errors found for time {times[1]}: {in_mask} NaN values found for variable zos inside mask m"
   )
   assert lines[2].startswith(f"1 errors found for time {times[3]}: ")
-  assert lines[2].endswith(f"{int(ds.m3.sum())} NaN values found for variable thetao")
+  assert lines[2].endswith(
+    f"{int(ds.m3.sum())} NaN values found for variable thetao inside mask m3"
+  )
   assert len(lines) == 3
 
 
@@ -164,93 +166,122 @@ def test_validate_accessor_warns_or_raises(ocean_ds: xr.Dataset):
     ocean_ds.arcomake.validate(config, fail=True)
 
 
-def with_seafrac(ocean_ds: xr.Dataset, static_ds: xr.Dataset) -> xr.Dataset:
+def with_seafrac(ocean_ds: xr.Dataset) -> xr.Dataset:
   """The synthetic ocean with a static sea fraction: 1 where it has values, 0 below the sea
   floor and on land (`thetao` is NaN exactly there)."""
   frac = ocean_ds.thetao.isel(time=0, drop=True).notnull().astype("float32")
   return ocean_ds.assign(seafrac=frac)
 
 
-def domain_config(**fractions) -> ChecksConfig:
-  return ChecksConfig.model_validate({"fraction_domain": fractions})
+def no_nans_config(**arguments) -> ChecksConfig:
+  return ChecksConfig.model_validate({"ensure_no_nans": arguments})
 
 
-def test_fraction_domain_accepts_values_exactly_inside(ocean_ds, static_ds):
-  ds = with_seafrac(ocean_ds, static_ds)
-  ds.arcomake.validate(domain_config(seafrac=["thetao", "zos"]), fail=True)
+def test_exact_accepts_values_exactly_inside(ocean_ds):
+  ds = with_seafrac(ocean_ds)
+  ds.arcomake.validate(no_nans_config(exact=True, seafrac=["thetao", "zos"]), fail=True)
 
 
-@pytest.mark.parametrize("kind", ["missing inside", "present outside"])
-def test_fraction_domain_reports_both_directions(ocean_ds, static_ds, kind: str):
-  ds = with_seafrac(ocean_ds, static_ds)
+@pytest.mark.parametrize(
+  ("kind", "message"),
+  [
+    ("missing inside", "1 NaN values found for variable thetao inside mask seafrac"),
+    ("present outside", "1 values found outside mask seafrac for variable thetao"),
+  ],
+)
+def test_exact_reports_both_directions(ocean_ds, kind: str, message: str):
+  ds = with_seafrac(ocean_ds)
   thetao = ds.thetao.values.copy()
   if kind == "missing inside":
     thetao[2, 0, 3, 4] = np.nan  # a sea cell
   else:
     thetao[2, 2, 3, 1] = 1.0  # below the sea floor
   ds["thetao"] = (ds.thetao.dims, thetao)
-  with pytest.raises(ValidationError, match=f"2020-02-28.*thetao: 1 values {kind}"):
-    ds.arcomake.validate(domain_config(seafrac=["thetao"]), fail=True)
+  with pytest.raises(ValidationError, match=f"2020-02-28.*{message}"):
+    ds.arcomake.validate(no_nans_config(exact=True, seafrac=["thetao", "zos"]), fail=True)
+  if kind == "present outside":  # without `exact`, values outside are allowed
+    ds.arcomake.validate(no_nans_config(seafrac=["thetao", "zos"]), fail=True)
 
 
-def test_fraction_domain_uses_the_surface_for_2d_fields(ocean_ds, static_ds):
-  ds = with_seafrac(ocean_ds, static_ds)
+def test_exact_uses_the_surface_for_2d_fields(ocean_ds):
+  ds = with_seafrac(ocean_ds)
   ds["zos"] = ds.zos.fillna(0.0)  # values on land
-  with pytest.raises(ValidationError, match="zos: 8 values present outside"):
-    ds.arcomake.validate(domain_config(seafrac=["zos"]), fail=True)
+  with pytest.raises(ValidationError, match="8 values found outside mask seafrac for variable zos"):
+    ds.arcomake.validate(no_nans_config(exact=True, seafrac=["thetao", "zos"]), fail=True)
 
 
-def test_fraction_domain_threshold(ocean_ds, static_ds):
-  """With threshold 0.5, cells half sea or less are outside: their values are reported."""
-  ds = with_seafrac(ocean_ds, static_ds)
+def test_masks_are_read_with_the_threshold(ocean_ds):
+  """A fraction is inside where above `threshold` (at least, with `inclusive`): with 0.5, cells
+  half sea are outside, so their values are reported with `exact`."""
+  ds = with_seafrac(ocean_ds)
   ds["seafrac"] = ds.seafrac * 0.5
-  with pytest.raises(ValidationError, match="present outside"):
-    ds.arcomake.validate(domain_config(seafrac=["thetao"], threshold=0.5), fail=True)
-  ds.arcomake.validate(domain_config(seafrac=["thetao"], threshold=0.5, inclusive=True), fail=True)
+  config = {"exact": True, "seafrac": ["thetao", "zos"]}
+  with pytest.raises(ValidationError, match="outside mask seafrac"):
+    ds.arcomake.validate(no_nans_config(threshold=0.5, **config), fail=True)
+  ds.arcomake.validate(no_nans_config(threshold=0.5, inclusive=True, **config), fail=True)
 
 
-def test_fraction_domain_reports_a_missing_fraction(ocean_ds):
-  """A failure to report, not an error that stops `validate` and the other checks."""
-  with pytest.warns(UserWarning, match="fraction 'seafrac' not found"):
-    ocean_ds.arcomake.validate(domain_config(seafrac=["thetao"]))
+@pytest.mark.parametrize(
+  "values", [[True, True, False, False], [1.0, 0.3, 0.0, 0.0], [1.0, 0.3, -1e-9, 0.0]]
+)
+def test_boolean_masks_and_fractions_alike(values):
+  """A boolean mask is inside where True, a fraction where positive (negative round-off is
+  outside); the variable is missing on the last two cells."""
+  ds = xr.Dataset({"v": ("x", [1.0, 2.0, np.nan, np.nan]), "m": ("x", values)})
+  checks.ensure_no_nans(ds, time_dim="t", exact=True, m=["v"])
 
 
-def test_fraction_domain_takes_a_fraction_stored_as_a_coordinate(ocean_ds, static_ds):
-  ds = with_seafrac(ocean_ds, static_ds).set_coords("seafrac")
-  ds.arcomake.validate(domain_config(seafrac=["thetao", "zos"]), fail=True)
+def test_missing_values_of_a_mask_are_outside_and_reported():
+  """The mask's NaN are outside (no false alarm for its variables), and the mask itself, checked
+  everywhere like any other variable, is reported."""
+  ds = xr.Dataset({"v": ("x", [1.0, 2.0, np.nan, np.nan]), "m": ("x", [1.0, 1.0, np.nan, np.nan])})
+  with pytest.raises(ValidationError) as raised:
+    checks.ensure_no_nans(ds, time_dim="t", m=["v"])
+  assert str(raised.value) == "1 errors found without time: 2 NaN values found for variable m"
+
+
+def test_a_mask_stored_as_a_coordinate(ocean_ds):
+  ds = with_seafrac(ocean_ds).set_coords("seafrac")
+  ds.arcomake.validate(no_nans_config(exact=True, seafrac=["thetao", "zos"]), fail=True)
   ds["zos"] = ds.zos.fillna(0.0)
-  with pytest.raises(ValidationError, match="zos: 8 values present outside seafrac"):
-    ds.arcomake.validate(domain_config(seafrac=["zos"]), fail=True)
+  with pytest.raises(ValidationError, match="8 values found outside mask seafrac for variable zos"):
+    ds.arcomake.validate(no_nans_config(exact=True, seafrac=["thetao", "zos"]), fail=True)
 
 
-def test_fraction_domain_checks_a_variable_against_each_of_its_fractions(ocean_ds, static_ds):
-  """A variable under two fractions is checked against both: the second does not replace the
-  first's counts."""
-  ds = with_seafrac(ocean_ds, static_ds)
+def test_a_variable_under_two_masks_is_checked_against_each(ocean_ds):
+  """The second mask does not replace the first: thetao is missing below the sea floor, inside
+  `everywhere`, whichever order the masks come in."""
+  ds = with_seafrac(ocean_ds)
   ds["everywhere"] = xr.ones_like(ds.seafrac)
-  with pytest.raises(ValidationError, match="thetao: .* values missing inside everywhere"):
-    ds.arcomake.validate(domain_config(seafrac=["thetao"], everywhere=["thetao"]), fail=True)
-  with pytest.raises(ValidationError, match="thetao: .* values missing inside everywhere"):
-    ds.arcomake.validate(domain_config(everywhere=["thetao"], seafrac=["thetao"]), fail=True)
+  for masks in (
+    {"seafrac": ["thetao"], "everywhere": ["thetao"]},
+    {"everywhere": ["thetao"], "seafrac": ["thetao"]},
+  ):
+    with pytest.raises(ValidationError, match="NaN values found for variable thetao"):
+      checks.ensure_no_nans(ds[["thetao", "seafrac", "everywhere"]], **masks)
+  checks.ensure_no_nans(ds[["thetao", "seafrac"]], seafrac=["thetao"])
 
 
-def test_fraction_domain_refuses_inclusive_at_zero():
+def test_inclusive_at_zero_is_refused():
   """Every cell, land included, would be inside."""
   with pytest.raises(pydantic.ValidationError, match="not inclusive at 0"):
-    domain_config(seafrac=["thetao"], inclusive=True)
+    no_nans_config(seafrac=["thetao"], inclusive=True)
 
 
-def test_fraction_domain_needs_a_static_fraction(ocean_ds, static_ds):
-  ds = with_seafrac(ocean_ds, static_ds)
-  ds["seafrac"] = ds.seafrac.expand_dims(time=ds.time)
-  with pytest.raises(ValidationError, match="must be static"):
-    ds.arcomake.validate(domain_config(seafrac=["thetao"]), fail=True)
+def test_a_mask_with_time_is_read_at_each_time_step(ocean_ds):
+  ds = with_seafrac(ocean_ds)
+  ds["seafrac"] = ds.seafrac.expand_dims(time=ds.time).copy()
+  ds["seafrac"][3] = 0.0  # nothing inside on the fourth day: its values are outside
+  with pytest.raises(ValidationError) as raised:
+    ds.arcomake.validate(no_nans_config(exact=True, seafrac=["thetao", "zos"]), fail=True)
+  assert str(ds.time.to_index()[3]) in str(raised.value)
+  assert len(str(raised.value).splitlines()) == 1
 
 
-def test_fraction_domain_computes_once(ocean_ds, static_ds):
-  """One computation for every variable and time step; the report lists static variables
-  first, one line each, then per time step the variables wrong at it."""
-  ds = with_seafrac(ocean_ds, static_ds)
+def test_exact_computes_once(ocean_ds, static_ds):
+  """One computation for every variable and time step; the report lists the static variables,
+  then per time step the variables wrong at it."""
+  ds = with_seafrac(ocean_ds)
   ds["deptho"] = static_ds.deptho.fillna(0.0)  # values on land
   thetao = ds.thetao.values.copy()
   thetao[1, 0, 3, 4] = np.nan  # a sea cell
@@ -264,16 +295,16 @@ def test_fraction_domain_computes_once(ocean_ds, static_ds):
     return dask.get(dsk, keys, **kwargs)
 
   with dask.config.set(scheduler=counting), pytest.raises(ValidationError) as raised:
-    checks.fraction_domain(ds.chunk(time=1), seafrac=["deptho", "thetao", "zos"])
+    checks.ensure_no_nans(ds.chunk(time=1), exact=True, seafrac=["deptho", "thetao", "zos"])
   assert len(calls) == 1
   land = int((ds.seafrac.isel(depth=0) == 0).sum())
   sea = int(ds.seafrac.isel(depth=0).sum())
   times = ds.time.to_index()
   assert str(raised.value).splitlines() == [
-    f"deptho: {land} values present outside seafrac",
-    f"{times[1]}: thetao: 1 values missing inside seafrac",
-    f"{times[3]}: thetao: 1 values present outside seafrac, zos: {sea} values missing inside"
-    " seafrac",
+    f"1 errors found without time: {land} values found outside mask seafrac for variable deptho",
+    f"1 errors found for time {times[1]}: 1 NaN values found for variable thetao inside mask seafrac",
+    f"2 errors found for time {times[3]}: 1 values found outside mask seafrac for variable"
+    f" thetao, {sea} NaN values found for variable zos inside mask seafrac",
   ]
 
 
@@ -287,11 +318,46 @@ def test_ensure_no_nans_reports_a_missing_mask(ocean_ds: xr.Dataset):
 
 
 def test_ensure_no_nans_fails_on_a_missing_variable(ocean_ds: xr.Dataset, static_ds: xr.Dataset):
-  """A listed variable missing from the dataset (a typo, a variable dropped upstream) fails, as in
-  `fraction_domain`: with only a warning, the check passed without checking it."""
+  """A listed variable missing from the dataset (a typo, a variable dropped upstream) fails: with
+  only a warning, the check passed without checking it."""
   ds = xr.merge([ocean_ds, static_ds])
   ds["m"] = ds.deptho.notnull()
   ds = ds.assign(zos=ds.zos.fillna(0.0).where(ds.m))[["zos", "m"]]
   checks.ensure_no_nans(ds, m=["zos"])
   with pytest.raises(ValidationError, match="variable 'zoss' of mask 'm' not found"):
     checks.ensure_no_nans(ds, m=["zos", "zoss"])
+
+
+def test_exact_for_some_masks_only(ocean_ds):
+  """`exact` lists the masks whose outside must be empty: values outside the others are allowed
+  (a river mask, say, next to the sea fraction)."""
+  ds = with_seafrac(ocean_ds)
+  ds["zos"] = ds.zos.fillna(0.0)  # values on land
+  ds["wet"] = ds.seafrac.isel(depth=0, drop=True)
+  ds = ds.assign(zos2=ds.zos)
+  config = {"seafrac": ["thetao"], "wet": ["zos", "zos2"]}
+  ds.arcomake.validate(no_nans_config(exact=["seafrac"], **config), fail=True)
+  with pytest.raises(ValidationError, match="outside mask wet for variable zos"):
+    ds.arcomake.validate(no_nans_config(exact=["seafrac", "wet"], **config), fail=True)
+  with pytest.raises(ValidationError, match="exact: 'sea' is not one of the masks"):
+    ds.arcomake.validate(no_nans_config(exact=["sea"], **config), fail=True)
+
+
+def test_a_static_variable_under_a_time_varying_mask_is_refused(ocean_ds, static_ds):
+  """Checked against the mask's first time step only, it would look checked at every step."""
+  ds = with_seafrac(ocean_ds).assign(deptho=static_ds.deptho)
+  ds["ice"] = xr.ones_like(ds.zos)
+  with pytest.raises(ValidationError, match="'deptho' has no 'time' but its mask 'ice' has"):
+    checks.ensure_no_nans(ds[["deptho", "ice"]], ice=["deptho"])
+
+
+def test_messages_name_the_mask_of_each_count(ocean_ds):
+  """A variable under two masks: each count says which mask it belongs to."""
+  ds = with_seafrac(ocean_ds)
+  ds["everywhere"] = xr.ones_like(ds.seafrac)
+  with pytest.raises(ValidationError) as raised:
+    checks.ensure_no_nans(
+      ds[["thetao", "seafrac", "everywhere"]], seafrac=["thetao"], everywhere=["thetao"]
+    )
+  assert "inside mask everywhere" in str(raised.value)
+  assert "inside mask seafrac" not in str(raised.value)

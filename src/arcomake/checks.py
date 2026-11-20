@@ -42,11 +42,20 @@ class ValidTimeCoordinateCheck(BaseModel):
 
 
 class EnsureNoNansCheck(BaseModel):
-  """`time_dim`, and one key per mask: `MASK = ["variable", ...]` checks those variables inside it."""
+  """`time_dim`, `threshold`, `inclusive`, `exact` (all masks, or a list of them), and one key
+  per mask: `MASK = ["variable", ...]` checks those variables inside it."""
 
   model_config = ConfigDict(extra="allow")
 
   time_dim: str | None = None
+  threshold: float = 0.0
+  inclusive: bool = False
+  exact: bool | list[str] = False
+
+  @model_validator(mode="after")
+  def _threshold_leaves_cells_in_and_out(self) -> Self:
+    check_fraction_threshold(self.threshold, self.inclusive)  # as the `fraction_mask` step
+    return self
 
   @model_validator(mode="after")
   def _masks_map_to_variable_lists(self) -> Self:
@@ -57,36 +66,12 @@ class EnsureNoNansCheck(BaseModel):
     return self
 
 
-class FractionDomainCheck(BaseModel):
-  """`time_dim`, `threshold`, `inclusive`, and one key per fraction:
-  `FRACTION = ["variable", ...]` checks those variables against it."""
-
-  model_config = ConfigDict(extra="allow")
-
-  time_dim: str = "time"
-  threshold: float = 0.0
-  inclusive: bool = False
-
-  @model_validator(mode="after")
-  def _threshold_leaves_cells_in_and_out(self) -> Self:
-    check_fraction_threshold(self.threshold, self.inclusive)  # as the `fraction_mask` step
-    return self
-
-  @model_validator(mode="after")
-  def _fractions_map_to_variable_lists(self) -> Self:
-    for fraction, variables in (self.model_extra or {}).items():
-      if not (isinstance(variables, list) and all(isinstance(v, str) for v in variables)):
-        raise ValueError(f"fraction {fraction!r} must map to a list of variable names")
-    return self
-
-
 class ChecksConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   valid_global_ecmwf_coordinates: ValidGlobalECMWFCoordinatesCheck | None = None
   valid_time_coordinate: ValidTimeCoordinateCheck | None = None
   ensure_no_nans: EnsureNoNansCheck | None = None
-  fraction_domain: FractionDomainCheck | None = None
 
 
 def _report_by_time[K: Hashable](
@@ -123,20 +108,33 @@ def _report_by_time[K: Hashable](
 def ensure_no_nans(
   dataset: xr.Dataset,
   time_dim: str = "time",
+  threshold: float = 0.0,
+  inclusive: bool = False,
+  exact: bool | list[str] = False,
   **kwargs: list[str],
 ) -> None:
-  """Check that variables have no missing value, inside their mask if one is given.
+  """Check that variables have no missing value: inside their masks, or everywhere.
 
   Each extra argument maps a mask to the variables it applies to, e.g.
-  `glorys_mask = ["thetao", "so"]`: those are checked only where the mask is True (the first
-  level of a 3D mask for 2D variables). Other variables are checked everywhere. A mask or a listed
-  variable missing from the dataset is a failure; the variables of a missing mask are not checked.
+  `seafrac = ["thetao", "so"]`: those are checked only inside it, where it is above `threshold`
+  (at least `threshold` with `inclusive`): by default where a boolean mask is True or a fraction
+  positive. Missing values of a mask count as outside; the mask itself is checked like any other
+  variable. Variables without one of the mask's dimensions are checked against its first index
+  along it (the surface level, for 2D fields); a mask with the time dimension needs it in its
+  variables. With `exact` (true, or a list of masks), values outside those masks are failures
+  too: their variables have values exactly inside. A variable under several masks is checked
+  against each. Other variables are checked everywhere. A mask or a listed variable missing from
+  the dataset is a failure; the variables of a missing mask are not checked.
 
   Raises:
-    ValidationError: listing, per time step, the variables with missing values.
+    ValidationError: listing, per time step, the variables with missing values inside their
+      masks (or anywhere) and, with `exact`, with values outside.
   """
   dataset_errors: list[str] = []
-  variable_mask_mapping: dict[Hashable, str] = {}
+  exact_masks = set(kwargs) if exact is True else set(exact or [])
+  for mask_name in sorted(exact_masks - set(kwargs)):
+    dataset_errors.append(f"exact: {mask_name!r} is not one of the masks")
+  masks_of: dict[Hashable, list[Hashable]] = {}
   unchecked: set[Hashable] = set()
   for mask_name, variable_names in kwargs.items():
     if mask_name not in dataset.variables:
@@ -146,27 +144,44 @@ def ensure_no_nans(
       continue
     for variable_name in variable_names:
       if variable_name in dataset.data_vars:
-        variable_mask_mapping[variable_name] = mask_name
+        masks_of.setdefault(variable_name, []).append(mask_name)
       else:
         dataset_errors.append(f"variable {variable_name!r} of mask {mask_name!r} not found")
 
-  # Missing values inside the masks.
-  invalid: dict[Hashable, xr.DataArray] = {}
+  # Per variable and mask: missing values inside it and, with `exact`, values outside.
+  wrong: dict[tuple[Hashable, Hashable | None, str], xr.DataArray] = {}
+  # Each mask is compared with the threshold once, then reduced to the dimensions of each variable.
+  inside_all = {
+    name: dataset[name] >= threshold if inclusive else dataset[name] > threshold
+    for name in {m for masks in masks_of.values() for m in masks}
+  }
   for variable_name, da in dataset.data_vars.items():
-    if variable_name in unchecked and variable_name not in variable_mask_mapping:
+    if variable_name in unchecked and variable_name not in masks_of:
       continue
-    invalid[variable_name] = da.isnull()
-    if variable_name in variable_mask_mapping:
-      mask_da = dataset[variable_mask_mapping[variable_name]]
-      # A variable without a dimension of its mask (surface data, 3D mask) is checked against the
-      # mask's first entry along it (the first depth level).
-      mask_da = mask_da.isel({dim: 0 for dim in mask_da.dims if dim not in da.dims}, drop=True)
-      invalid[variable_name] = invalid[variable_name] & mask_da.astype(bool)
+    missing = da.isnull()
+    if variable_name not in masks_of:
+      wrong[(variable_name, None, "missing")] = missing
+    for mask_name in masks_of.get(variable_name, []):
+      inside = inside_all[mask_name]
+      if time_dim in inside.dims and time_dim not in da.dims:
+        dataset_errors.append(
+          f"variable {variable_name!r} has no {time_dim!r} but its mask {mask_name!r} has"
+        )
+        continue
+      inside = inside.isel({dim: 0 for dim in inside.dims if dim not in da.dims}, drop=True)
+      wrong[(variable_name, mask_name, "missing")] = missing & inside
+      if mask_name in exact_masks:
+        wrong[(variable_name, mask_name, "outside")] = da.notnull() & ~inside
+
+  def describe(key: tuple[Hashable, Hashable | None, str], n: int) -> str:
+    variable, mask_name, kind = key
+    if kind == "outside":
+      return f"{n} values found outside mask {mask_name} for variable {variable}"
+    inside = "" if mask_name is None else f" inside mask {mask_name}"
+    return f"{n} NaN values found for variable {variable}{inside}"
 
   logger.info("Checking for Nans.")
-  static, per_time = _report_by_time(
-    dataset, invalid, time_dim, lambda name, n: f"{n} NaN values found for variable {name}"
-  )
+  static, per_time = _report_by_time(dataset, wrong, time_dim, describe)
   if static:
     dataset_errors.append(f"{len(static)} errors found without time: " + ", ".join(static))
   dataset_errors += [
@@ -174,57 +189,6 @@ def ensure_no_nans(
   ]
   if dataset_errors:
     raise ValidationError("\n".join(dataset_errors))
-
-
-def fraction_domain(
-  dataset: xr.Dataset,
-  time_dim: str = "time",
-  threshold: float = 0.0,
-  inclusive: bool = False,
-  **kwargs: list[str],
-) -> None:
-  """Check that variables have values exactly where a static fraction says the domain is.
-
-  Each extra argument maps a fraction (e.g. of sea, without the time dimension) to the variables
-  it decides: inside (fraction above `threshold`, or at least with `inclusive`) no value may be
-  missing, outside every value must be. Variables without one of the fraction's dimensions are
-  checked against its first index along it (the surface level, for 2D fields). A fraction with
-  the time dimension fails: the domain is static.
-
-  Raises:
-    ValidationError: listing, per time step, the variables with missing values inside or values
-      outside.
-  """
-  errors: list[str] = []
-  wrong: dict[tuple[str, str, str], xr.DataArray] = {}
-  for fraction_name, variable_names in kwargs.items():
-    if fraction_name not in dataset.variables:
-      errors.append(f"fraction {fraction_name!r} not found")
-      continue
-    fraction = dataset[fraction_name]
-    if time_dim in fraction.dims:
-      errors.append(f"fraction {fraction_name!r} has the time dimension: it must be static")
-      continue
-    inside_all = fraction >= threshold if inclusive else fraction > threshold
-    for name in variable_names:
-      if name not in dataset.data_vars:
-        errors.append(f"variable {name!r} of fraction {fraction_name!r} not found")
-        continue
-      da = dataset[name]
-      inside = inside_all.isel({d: 0 for d in inside_all.dims if d not in da.dims}, drop=True)
-      wrong[(fraction_name, name, "missing inside")] = da.isnull() & inside
-      wrong[(fraction_name, name, "present outside")] = da.notnull() & ~inside
-
-  def describe(key: tuple[str, str, str], n: int) -> str:
-    of_fraction, variable, kind = key
-    return f"{variable}: {n} values {kind} {of_fraction}"
-
-  logger.info("Checking variables against their fractions' domains.")
-  static, per_time = _report_by_time(dataset, wrong, time_dim, describe)
-  errors += static
-  errors += [f"{stamp}: " + ", ".join(found) for stamp, found in per_time]
-  if errors:
-    raise ValidationError("\n".join(errors))
 
 
 def valid_global_ecmwf_coordinates(
@@ -369,6 +333,5 @@ CHECKS: dict[str, Callable[..., None]] = {
   "valid_global_ecmwf_coordinates": valid_global_ecmwf_coordinates,
   "valid_time_coordinate": valid_time_coordinate,
   "ensure_no_nans": ensure_no_nans,
-  "fraction_domain": fraction_domain,
 }
 assert set(CHECKS) == set(ChecksConfig.model_fields)

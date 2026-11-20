@@ -399,7 +399,7 @@ Findings, measured on 1 Mar and 15 Sep 2013 (`docs/coarsen_analysis.py`, section
 | `siconc`, `sivol`, `usic`, `vsic` | time, lat, lon | over the sea part (section 10) |
 | `dis24_outlets` | time, lat, lon | river input, metres per day over the cell (section 11) |
 
-Values exist exactly where `seafrac > 0` (the `fraction_domain` check). Volumes and heat contents
+Values exist exactly where `seafrac > 0` (`ensure_no_nans` with `exact`). Volumes and heat contents
 are sums of value × `seafrac` × layer thickness × area, not of the mask; a model's loss is best
 weighted the same way (water volume), so that cells barely touched by the sea weigh little.
 
