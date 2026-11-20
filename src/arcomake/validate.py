@@ -80,6 +80,11 @@ def validate(
   given = {key: value for key, value in bounds.items() if value is not None}
   inject = {"checks": {"valid_time_coordinate": given}} if given else None
   configs = read_configs(configs_path, schema=ValidateConfig, inject=inject)
+  time_check = configs.checks.valid_time_coordinate if configs.checks else None
+  if time_check is not None and (time_check.start is None or time_check.end is None):
+    raise click.ClickException(
+      "valid_time_coordinate needs start and end: give --start and --end (or put them in its table)"
+    )
   check_aws_profile(input_path)
 
   # Validate the dataset

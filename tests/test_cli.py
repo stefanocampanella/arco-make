@@ -109,6 +109,21 @@ def test_validate_takes_the_dates_of_the_download(
   assert only_start.exit_code != 0 and "end" in only_start.output
 
 
+def test_validate_without_dates_fails_before_reading(
+  tmp_path: pathlib.Path, downloaded: pathlib.Path, recipes
+):
+  """A time check without dates (the recipe's or the command's) fails at once, also without
+  `--fail`: as a warning, the time axis went unchecked and validate exited 0."""
+  text = recipes["validate"].read_text()
+  undated = tmp_path / "undated.toml"
+  undated.write_text(
+    text.replace("start = 2020-02-26T00:00:00\n", "").replace("end = 2020-03-02T00:00:00\n", "")
+  )
+  assert "start =" not in undated.read_text()
+  result = run("validate", str(undated), str(downloaded))
+  assert result.exit_code != 0 and "give --start and --end" in result.output
+
+
 def test_process_sample_dataset(tmp_path: pathlib.Path, downloaded: pathlib.Path, recipes):
   """`process` applies the recipe steps (here a time mean of the dynamic variables)."""
   output = tmp_path / "mean.zarr"
