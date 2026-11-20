@@ -1,23 +1,25 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import datetime
+import itertools
 import logging
 import os
 import threading
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, override
 from urllib.parse import urlparse
 from zipfile import ZipFile
 
 import cdsapi
+import numpy as np
 import requests
 import xarray as xr
 from xarray.backends import AbstractDataStore, BackendEntrypoint
 from xarray.core.types import ReadBuffer
 
-from arcomake import hdf5_lock
+from arcomake import chunk_plan, hdf5_lock
 from arcomake.datetime_utils import DateInterval
 from arcomake.temporary_utils import get_current_temp_registry, set_current_temp_registry
 
@@ -34,14 +36,30 @@ def _drop_variables(dataset: xr.Dataset, names: str | Iterable[str] | None) -> x
   return dataset.drop_vars([names] if isinstance(names, str) else list(names), errors="ignore")
 
 
+POOL_VARIABLE = "COPERNICUSMARINE_MAX_POOL_CONNECTIONS"
+
+
 def _copernicusmarine() -> Any:
   """The toolbox, imported at first use, with its log handlers removed.
 
   The toolbox reads some settings (COPERNICUSMARINE_MAX_POOL_CONNECTIONS) when it is imported.
   xarray imports this module whenever it lists its backends, possibly before the settings file
   is applied (library use, tests): importing the toolbox here would fix those settings early.
+
+  Unless set, the pool is as large as Dask's thread count (at least the toolbox's 10): with 10
+  connections for 32 threads, connections were discarded and opened again all the time (TLS
+  handshakes were 29 % of the reading time), and an 8-day block took 37 % longer to compute,
+  with 13 GiB more memory (logbook, 18 Nov 2026). The variable is set only for the import: the
+  toolbox has read it then, and child processes or later code do not inherit it.
   """
-  import copernicusmarine
+  given = POOL_VARIABLE in os.environ
+  if not given:
+    os.environ[POOL_VARIABLE] = str(max(10, chunk_plan.dask_threads()))
+  try:
+    import copernicusmarine
+  finally:
+    if not given:
+      del os.environ[POOL_VARIABLE]
 
   # Avoid annoying copernicusmarine log handling (its handlers are installed at import).
   cm_logger = logging.getLogger("copernicus_marine_root_logger")
@@ -146,8 +164,8 @@ class NetCDFOverHTTP(BackendEntrypoint):
     # server outage after the first block no longer fails the others (as on 16 Nov for GloFAS).
     temp_path = registry.cached_file(filename_or_obj, "downloaded.nc", fetch)
 
-    # Under arco-make's HDF5 lock: blocks run at once (`download --blocks`) open this file at the
-    # same moment, and netCDF4 is not thread-safe.
+    # Under arco-make's HDF5 lock: netCDF4 is not thread-safe, and Dask's threads read other
+    # netCDF files meanwhile.
     return hdf5_lock.open_dataset(temp_path, engine="netcdf4", drop_variables=drop_variables)
 
   @override
@@ -217,31 +235,24 @@ class EarlyWarningDataStore(BackendEntrypoint):
     registry = get_current_temp_registry()
     if registry is None:
       raise ValueError("No temporary directory registry available.")
-    consecutive_dates = self._consecutive_dates_by_month(start_datetime, end_datetime)
-
-    requests = [
-      {
-        "system_version": [system_version],
-        "hydrological_model": [hydrological_model],
-        "product_type": [product_type],
-        "timespan": [timespan],
-        "variable": [variable] if isinstance(variable, str) else variable,
-        "year": f"{dates[0].year}",
-        "month": [f"{dates[0].month:02}"],
-        "day": [f"{date.day:02}" for date in dates],
-        "data_format": "grib2",
-        "download_format": "zip",
-      }
-      for dates in consecutive_dates
-    ]
-
+    base = {
+      "system_version": [system_version],
+      "hydrological_model": [hydrological_model],
+      "product_type": [product_type],
+      "timespan": [timespan],
+      "variable": [variable] if isinstance(variable, str) else variable,
+      "data_format": "grib2",
+      "download_format": "zip",
+    }
     client_options = {} if timeout is None else {"timeout": timeout}
+    groups = self._request_groups(dataset_name, base, start_datetime, end_datetime, client_options)
+    requests = [base | self._year_request(dates) for dates in groups]
     raw_datasets = self._process_requests(
       dataset_name, requests, max_workers=max_workers, **client_options
     )
 
     datasets: list[xr.Dataset] = []
-    for dates, dataset in zip(consecutive_dates, raw_datasets, strict=True):
+    for dates, dataset in zip(groups, raw_datasets, strict=True):
       # TODO:
       #  Unfortunately, it was impossible to get documentation on `valid_time` for historical GLOFAS data, hence
       #  the provider documentation should clarify the difference between the two, e.g., if renaming the time
@@ -251,40 +262,103 @@ class EarlyWarningDataStore(BackendEntrypoint):
         name for name in dataset.coords if name not in [latitude_dim, longitude_dim, time_dim]
       ]:
         dataset = dataset.drop_vars(extra_coords)
-      # _process_request drops the time dimension if of length one
+      # A one-day request (one month, one day) gives no time dimension.
       if len(dates) == 1:
         dataset = dataset.expand_dims(dim=time_dim, axis=0)
         dataset = dataset.assign_coords({time_dim: dates})
+      else:  # the request's months x days: keep only the interval's days
+        given = dataset[time_dim].values.astype("datetime64[D]")
+        wanted = np.array([date.date() for date in dates], dtype="datetime64[D]")
+        if missing := sorted(set(wanted.tolist()) - set(given.tolist())):
+          # The service leaves out dates not published yet, if others of the request are.
+          raise ValueError(
+            f"EWDS gave no data for {len(missing)} day(s) of {dataset_name}, from {missing[0]}"
+            f" to {missing[-1]}: not published yet?"
+          )
+        dataset = dataset.isel({time_dim: np.isin(given, wanted)})
       datasets.append(dataset)
 
     return _drop_variables(xr.concat(datasets, dim=time_dim), drop_variables)
 
+  def _request_groups(
+    self,
+    dataset_name: str,
+    base: dict[str, Any],
+    start_datetime: datetime.datetime,
+    end_datetime: datetime.datetime,
+    client_options: dict[str, Any],
+  ) -> list[list[datetime.datetime]]:
+    """The interval's days, one group per request: per year (see `_dates_by_year`) where the
+    service accepts the request, else per month, as exact as before.
+
+    A request over several months asks for every date of its months x days: the service refuses
+    it whole if some are not published yet (near the end of the record), and refuses requests
+    above its limit (500 fields: days x variables, so a year of two variables). Its cost
+    estimate tells, before any wait in the queue.
+    """
+    groups: list[list[datetime.datetime]] = []
+    client = None
+    for dates in self._dates_by_year(start_datetime, end_datetime):
+      months = [list(g) for _, g in itertools.groupby(dates, key=lambda day: day.month)]
+      if len(months) > 1:
+        client = client or self.get_cdsapi_client(
+          progress=False, client_logger=self.client_logger, **client_options
+        )
+        if not self._accepted(client, dataset_name, base | self._year_request(dates)):
+          groups.extend(months)
+          continue
+      groups.append(dates)
+    return groups
+
   @staticmethod
-  def _consecutive_dates_by_month(
+  def _accepted(client: Any, dataset_name: str, request: dict[str, Any]) -> bool:
+    """Whether the service's cost estimate accepts `request` (valid, within the limit). False if
+    the estimate is unavailable (an older client, an error): requests per month then, as before."""
+    datastores = getattr(client, "client", None)  # the legacy cdsapi client's datastores client
+    if datastores is None:
+      return False
+    try:
+      costs = datastores.estimate_costs(dataset_name, request)
+    except Exception as error:
+      logger.warning(f"EWDS cost estimate failed ({error}): one request per month")
+      return False
+    accepted = costs.get("request_is_valid", True) and costs["cost"] <= costs["limit"]
+    if not accepted:
+      reason = str(costs.get("invalid_reason") or f"cost {costs['cost']} > {costs['limit']}")
+      logger.info(
+        f"EWDS refuses {request['year']} in one request ({reason.splitlines()[0]}):"
+        " one request per month"
+      )
+    return bool(accepted)
+
+  @staticmethod
+  def _dates_by_year(
     start_datetime: datetime.datetime,
     end_datetime: datetime.datetime,
   ) -> list[list[datetime.datetime]]:
-    date_interval = DateInterval(start=start_datetime, end=end_datetime)
-    days = date_interval.to_list(freq=datetime.timedelta(days=1))
+    """The interval's days, grouped by year: one request each.
 
-    def partition[T](f: Callable[[T, T], bool], sequence: Iterable[T]) -> list[list[T]]:
-      part: list[list[T]] = []
-      subseq: list[T] = []
-      last: T | None = None
-      for current in sequence:
-        if (last is None) or (not subseq) or f(last, current):
-          subseq.append(current)
-        else:
-          part.append(subseq)
-          subseq = [current]
-        last = current
-      part.append(subseq)
-      return part
+    The EWDS runs one request of a user at a time, about two minutes apart (measured 18 Nov
+    2026): a request per month cost a 32-day block, usually spanning two months, an extra wait.
+    """
+    days = DateInterval(start=start_datetime, end=end_datetime).to_list(
+      freq=datetime.timedelta(days=1)
+    )
+    return [list(group) for _, group in itertools.groupby(days, key=lambda day: day.year)]
 
-    def same_month_and_year(x: datetime.datetime, y: datetime.datetime) -> bool:
-      return x.month == y.month and x.year == y.year
+  @staticmethod
+  def _year_request(dates: list[datetime.datetime]) -> dict[str, Any]:
+    """The `year`, `month` and `day` of a request for the given days of one year.
 
-    return partition(same_month_and_year, days)
+    The service gives every valid date of months x days, so days spanning two months partly also
+    bring days outside them (at most about a month's worth for a 32-day block); `open_dataset`
+    drops them.
+    """
+    return {
+      "year": f"{dates[0].year}",
+      "month": sorted({f"{date.month:02}" for date in dates}),
+      "day": sorted({f"{date.day:02}" for date in dates}),
+    }
 
   def _process_requests(
     self,

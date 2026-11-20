@@ -69,7 +69,7 @@ settings are ignored with a warning naming the key; a file other users can read,
 named by `ARCOMAKE_RC`, is reported. Also accepted: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_ENDPOINT_URL`, the `ECCODES_*`
 paths, and `COPERNICUSMARINE_MAX_POOL_CONNECTIONS` (connections per Copernicus Marine client, a
-positive integer; the toolbox's default, 10, is fewer than Dask's threads on a large machine), and
+positive integer; by default Dask's thread count, at least the toolbox's own default of 10), and
 `ARCOMAKE_MEMORY_LIMIT` (the memory `download` plans its chunks for, e.g. `100GB`: see
 `--memory-limit`). A
 recipe's `storage_options` (e.g. `profile`) override `AWS_PROFILE`. Runs with `s3://`
@@ -142,17 +142,17 @@ records its interval and a fingerprint of the recipe; `--resume` refuses another
 checkpointing and `[retries]` may change), or a run that started before `main` last moved. A plain rerun refuses to start beside a failed run it could continue;
 `--replace` starts over. Do not resume a run that is still going.
 
-`--blocks N` reads and processes N blocks at once (default 1), each in a thread of its own: a
-block's values are staged on local disk (`TMPDIR`) and the blocks are committed in order, so the output
-is the same as with one block at a time. Memory and disk use grow with N; the first block to fail, in
-order, stops the run (blocks before it are committed, `--resume` continues).
+Long blocks are much faster than short ones (each block opens its sources and recomputes what
+static fields the steps need, and a long block gives Dask more work to overlap), and memory levels
+off with block length: on the project machine, a 32-day block of the 0.25 deg recipe took half the
+time of 8-day blocks, at 63 GiB (logbook, 18 Nov).
 
 Download recipes give no chunk sizes (part `chunks`, `chunk` steps and regrid `output_chunks` are
 refused): each part of each block is chunked as planned from the shapes and dtypes of its variables,
 what the dataset's steps need (whole latitude and longitude for `regrid`, whole bins for `resample`,
 whole columns for `get_bottom`) and a memory budget. The budget is `--memory-limit` (or
 `ARCOMAKE_MEMORY_LIMIT`), by default the memory the process may use (its cgroup's or Slurm job's
-limit included), shared among Dask's threads and the blocks at once: a task holds about four chunks,
+limit included), shared among Dask's threads: a task holds about four chunks,
 and chunks aim at Dask's `array.chunk-size` (128 MiB) at most. Space stays whole unless one time step
 is above that; then outer dimensions (depth) are split, and time grows in whole bins. The plan of each
 part is logged, with what does not fit; a task that cannot fit the budget fails the block. Writes
@@ -186,6 +186,11 @@ cannot honour are an error, before any download. In `[save]`:
   fewer, larger objects, while readers still fetch single chunks. Without `shards`, every chunk is an
   object. Dask chunks may not straddle shards when writing (`download` rechunks them; `process` and
   `compute-climatology` refuse them).
+- `shard_order` is the order of the chunks inside each shard: `"morton"` (zarr's default),
+  `"lexicographic"` (C order over the chunk grid: with chunks of one time step and one level,
+  a time step's levels lie next to each other, so a whole depth profile is read in few requests)
+  or `"colexicographic"` (Fortran order). It is not part of the array metadata: readers need no
+  setting, and find chunks through each shard's index whatever the order.
 - `compressors` is a list of Zarr v3 codecs, `{name, configuration}` as in Zarr's array metadata
   (e.g. `blosc`, `zstd`, `gzip`); an empty list stores the data uncompressed, and without it zarr's
   default (zstd) applies. `[save.encoding.VARIABLE]` can override chunks, shards and compressors per

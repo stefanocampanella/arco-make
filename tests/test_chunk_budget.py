@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 """The memory budget of planned chunks: given (`download --memory-limit`, `ARCOMAKE_MEMORY_LIMIT`)
-or detected, shared among Dask's threads and the blocks at once."""
+or detected, shared among Dask's threads."""
 
 import importlib
 import logging
@@ -20,9 +20,9 @@ from tests.conftest import render_recipe
 GB = 10**9
 
 
-def test_a_given_limit_is_shared_among_threads_and_blocks():
+def test_a_given_limit_is_shared_among_threads():
   with dask.config.set(scheduler="threads", num_workers=5):
-    assert detect_budget(8 * GB, blocks=2) == Budget(8 * GB, 5, 2, "given")
+    assert detect_budget(8 * GB) == Budget(8 * GB, 5, "given")
 
 
 def test_the_limit_is_detected(monkeypatch: pytest.MonkeyPatch):
@@ -31,7 +31,7 @@ def test_the_limit_is_detected(monkeypatch: pytest.MonkeyPatch):
   monkeypatch.setattr(distributed.system, "MEMORY_LIMIT", 64 * GB)
   monkeypatch.setattr(dask.system, "CPU_COUNT", 12)
   with dask.config.set(scheduler="threads", num_workers=None):
-    assert detect_budget() == Budget(64 * GB, 12, 1, "detected")
+    assert detect_budget() == Budget(64 * GB, 12, "detected")
 
 
 def test_the_synchronous_scheduler_is_one_thread():

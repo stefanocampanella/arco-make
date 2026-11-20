@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: MIT
 """Remote backends, with the network replaced by fakes (no credentials needed)."""
 
+import calendar
 import functools
 import http.server
+import os
 import pathlib
 import subprocess
 import sys
@@ -22,12 +24,132 @@ from arcomake.backends import CopernicusMarine, EarlyWarningDataStore
 from arcomake.temporary_utils import TempDirectoryRegistry
 
 
-def test_ewds_requests_split_by_month():
-  """EWDS requests group consecutive days of the same month and year (one request each)."""
-  groups = EarlyWarningDataStore._consecutive_dates_by_month(
-    datetime(2020, 2, 27), datetime(2020, 3, 2)
+def test_ewds_requests_one_per_year():
+  """The EWDS runs a user's requests one at a time, minutes apart: an interval makes one request
+  per year it touches, of its months x its days."""
+  groups = EarlyWarningDataStore._dates_by_year(datetime(2012, 12, 30), datetime(2013, 3, 2))
+  assert [(g[0], g[-1]) for g in groups] == [
+    (datetime(2012, 12, 30), datetime(2012, 12, 31)),
+    (datetime(2013, 1, 1), datetime(2013, 3, 1)),
+  ]
+  assert [EarlyWarningDataStore._year_request(g) for g in groups] == [
+    {"year": "2012", "month": ["12"], "day": ["30", "31"]},
+    {"year": "2013", "month": ["01", "02", "03"], "day": [f"{d:02}" for d in range(1, 32)]},
+  ]
+
+
+def _ewds_answers(requests: list[dict]) -> list[xr.Dataset]:
+  """What the service gives: one field per valid date of each request's months x days."""
+  answers = []
+  for request in requests:
+    year = int(request["year"])
+    dates = [
+      np.datetime64(f"{year}-{month}-{day}")
+      for month in request["month"]
+      for day in request["day"]
+      if int(day) <= calendar.monthrange(year, int(month))[1]
+    ]
+    answers.append(
+      xr.Dataset(
+        {"dis": (("time", "latitude", "longitude"), np.ones((len(dates), 2, 2)))},
+        coords={"time": dates, "latitude": [0.0, 1.0], "longitude": [0.0, 1.0]},
+      )
+    )
+  return answers
+
+
+@pytest.mark.parametrize("accepted", [True, False], ids=["one-request", "refused-per-month"])
+def test_ewds_requests_spanning_months(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, accepted: bool
+):
+  """Days 20 Jan to 21 Feb are requested as January and February x days 1-31, which brings all
+  of both months: only the interval's days are returned. If the service's cost estimate refuses
+  that request (unpublished dates, too many fields), one exact request per month is made."""
+  made: list[dict] = []
+
+  def answer(self, name, requests, **kwargs):
+    made.extend(requests)
+    return _ewds_answers(list(requests))
+
+  monkeypatch.setattr(EarlyWarningDataStore, "_process_requests", answer)
+  monkeypatch.setattr(EarlyWarningDataStore, "_accepted", staticmethod(lambda *a: accepted))
+  monkeypatch.setattr(
+    EarlyWarningDataStore, "get_cdsapi_client", staticmethod(lambda **kwargs: object())
   )
-  assert [[d.day for d in g] for g in groups] == [[27, 28, 29], [1]]
+  with TempDirectoryRegistry(base_dir=tmp_path):
+    out = EarlyWarningDataStore().open_dataset(
+      "ewds://cems-glofas-historical",
+      start_datetime=datetime(2020, 1, 20),
+      end_datetime=datetime(2020, 2, 22),
+      system_version="v",
+      hydrological_model="m",
+      product_type="p",
+      timespan="t",
+      variable="dis",
+    )
+  if accepted:
+    assert [(r["month"], len(r["day"])) for r in made] == [(["01", "02"], 31)]
+  else:
+    assert [(r["month"], r["day"][0], r["day"][-1]) for r in made] == [
+      (["01"], "20", "31"),
+      (["02"], "01", "21"),
+    ]
+  days = out["time"].values.astype("datetime64[D]")
+  assert days.tolist() == np.arange("2020-01-20", "2020-02-22", dtype="datetime64[D]").tolist()
+
+
+def test_ewds_days_left_out_fail_the_block(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+  """A request mixing published and unpublished months is valid (checked on 18 Nov 2026), and
+  the service leaves the unpublished days out: the block fails, naming them."""
+
+  def answer(self, name, requests, **kwargs):
+    return [a.isel(time=slice(0, -3)) for a in _ewds_answers(list(requests))]
+
+  monkeypatch.setattr(EarlyWarningDataStore, "_process_requests", answer)
+  monkeypatch.setattr(EarlyWarningDataStore, "_accepted", staticmethod(lambda *a: True))
+  monkeypatch.setattr(
+    EarlyWarningDataStore, "get_cdsapi_client", staticmethod(lambda **kwargs: object())
+  )
+  with TempDirectoryRegistry(base_dir=tmp_path), pytest.raises(ValueError, match="2020-02-2"):
+    EarlyWarningDataStore().open_dataset(
+      "ewds://cems-glofas-historical",
+      start_datetime=datetime(2020, 1, 20),
+      end_datetime=datetime(2020, 2, 29),
+      system_version="v",
+      hydrological_model="m",
+      product_type="p",
+      timespan="t",
+      variable="dis",
+    )
+
+
+@pytest.mark.parametrize(
+  ("costs", "accepted"),
+  [
+    ({"id": "size", "cost": 59.0, "limit": 500.0}, True),
+    ({"cost": 730.0, "limit": 500.0}, False),
+    ({"cost": 30.0, "limit": 500.0, "request_is_valid": False, "invalid_reason": "no data"}, False),
+    (RuntimeError("unreachable"), False),
+    (None, False),  # an older cdsapi client: no cost estimates
+  ],
+  ids=["valid", "above-the-limit", "unpublished-dates", "estimate-fails", "no-estimates"],
+)
+def test_ewds_cost_estimate_decides(costs, accepted):
+  """The answers of the service's cost estimate, as measured on 18 Nov 2026 (a year of two
+  variables costs 730 of 500; a month not published yet is not a valid combination)."""
+
+  class Datastores:
+    def estimate_costs(self, name, request):
+      if isinstance(costs, Exception):
+        raise costs
+      return costs
+
+  class Legacy:
+    client = Datastores()
+
+  client = object() if costs is None else Legacy()
+  request = {"year": "2020", "month": ["01", "02"], "day": ["01"]}
+  assert EarlyWarningDataStore._accepted(client, "cems-glofas-historical", request) is accepted
 
 
 def test_cdsapi_client_receives_explicit_url(monkeypatch: pytest.MonkeyPatch):
@@ -61,6 +183,31 @@ def test_listing_the_backends_does_not_import_the_toolbox():
   assert subprocess.run([sys.executable, "-c", code], check=False).returncode == 0
 
 
+@pytest.mark.parametrize(
+  ("given", "threads", "pool"),
+  [(None, 32, 32), (None, 4, 10), ("12", 32, 12)],
+  ids=["threads", "at-least-the-default", "given-wins"],
+)
+def test_copernicus_marine_pool_follows_dask_threads(given, threads, pool):
+  """Unless set, the toolbox's connection pool is as large as Dask's thread count, never below
+  its own default of 10: with 10 connections for 32 threads, connections were dropped and opened
+  again all the time, and reading took much longer. A default is set only for the import."""
+  code = (
+    "import dask, os, sys\n"
+    "from arcomake import backends\n"
+    f"dask.config.set(scheduler='threads', num_workers={threads})\n"
+    "backends._copernicusmarine()\n"
+    "from copernicusmarine.core_functions import sessions\n"
+    "print(sessions.MAX_POOL_CONNECTIONS, os.environ.get(backends.POOL_VARIABLE))\n"
+  )
+  env = {k: v for k, v in os.environ.items() if k != backends.POOL_VARIABLE}
+  if given is not None:
+    env[backends.POOL_VARIABLE] = given
+  out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+  assert out.returncode == 0, out.stderr
+  assert out.stdout.split()[-2:] == [str(pool), str(given)]
+
+
 def test_copernicus_marine_requires_dataset_id():
   """A `cm://` URL without a dataset id is rejected before any request."""
   with pytest.raises(ValueError, match="dataset ID"):
@@ -90,7 +237,8 @@ def test_ewds_download_stays_in_registry(tmp_path: pathlib.Path, monkeypatch: py
 def test_ewds_one_day_requests_use_time_dim(
   tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, time_dim: str
 ):
-  """A one-day request (no time dimension in the GRIB) is stamped along the recipe's time_dim."""
+  """A one-day request (no time dimension in the GRIB) is stamped along the recipe's time_dim:
+  an interval across New Year makes a request per year, here of one day each."""
   day = xr.Dataset(
     {"dis": (("latitude", "longitude"), np.ones((2, 2)))},
     coords={"latitude": [0.0, 1.0], "longitude": [0.0, 1.0]},
@@ -103,8 +251,8 @@ def test_ewds_one_day_requests_use_time_dim(
   with TempDirectoryRegistry(base_dir=tmp_path):
     out = EarlyWarningDataStore().open_dataset(
       "ewds://cems-glofas-historical",
-      start_datetime=datetime(2020, 2, 29),
-      end_datetime=datetime(2020, 3, 2),
+      start_datetime=datetime(2019, 12, 31),
+      end_datetime=datetime(2020, 1, 2),
       system_version="v",
       hydrological_model="m",
       product_type="p",
@@ -113,7 +261,7 @@ def test_ewds_one_day_requests_use_time_dim(
       time_dim=time_dim,
     )
   assert out.dis.dims == (time_dim, "latitude", "longitude")
-  assert [str(t)[:10] for t in out[time_dim].values] == ["2020-02-29", "2020-03-01"]
+  assert [str(t)[:10] for t in out[time_dim].values] == ["2019-12-31", "2020-01-01"]
 
 
 def test_ewds_requests_open_grib_files_one_at_a_time(

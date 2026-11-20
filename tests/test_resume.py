@@ -95,6 +95,22 @@ def test_resume_with_other_read_settings(recipe, reads, tmp_path: pathlib.Path):
   assert resumed.exit_code == 0, resumed.output
 
 
+def test_a_new_option_at_its_default_keeps_the_fingerprint(recipe):
+  """A recipe that does not use an option added by a later arco-make version (with a default that
+  keeps the earlier behaviour) has the same fingerprint: a run that failed before an upgrade
+  can be resumed after it."""
+  from arcomake.cli_utils import read_configs
+  from arcomake.download import DownloadConfig, recipe_fingerprint
+
+  class Later(DownloadConfig):
+    a_later_option: int = 3
+
+  inject = {"start": "2020-02-26T00:00:00", "end": "2020-03-01T00:00:00"}
+  now = read_configs(recipe, schema=DownloadConfig, inject=inject)
+  later = read_configs(recipe, schema=Later, inject=inject)
+  assert recipe_fingerprint(now) == recipe_fingerprint(later)
+
+
 def test_nothing_to_resume(recipe, tmp_path: pathlib.Path):
   result = run(recipe, tmp_path / "out.zarr", "--resume")
   assert result.exit_code != 0 and "Nothing to resume" in result.output

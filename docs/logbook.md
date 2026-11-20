@@ -928,3 +928,121 @@ Next:
   block length (128 days now) and decide whether `--blocks` stays;
 - profiling one 8-day block;
 - one commit per run (Icechunk's `Session.amend`).
+
+## 2026-11-18: performance: block length, connections, EWDS requests, shards
+
+Measured on the project VM (32 cores, 110 GB), one run at a time, 256 MiB chunks unless said,
+single runs with network noise; every output compared bit for bit (data variables) with its
+reference: all identical. "Computing" is from the first write to the commit of a block (log
+timestamps); "opening" is before it (sources, EWDS queue).
+
+**Block length** (window 30 Dec 2012 – 31 Jan 2013, GloFAS included, code `428d812`):
+
+| Blocks | Wall time | Opening | Computing | Peak RSS |
+|---|---|---|---|---|
+| 4 x 8 days | 32:47 | 16:00 (one EWDS wait of 11 min) | 16:40 (31 s/day) | 49.2 GiB |
+| 4 x 8 days, 128 MiB chunks | 28:13 | 8:03 | 20:03 (38 s/day) | 60.5 GiB |
+| 2 x 16 days | 22:54 | | | 66.8 GiB |
+| 1 x 32 days | 15:43 | 1:59 | 13:34 (25 s/day) | 63.3 GiB |
+| 2 x 16 days, `--blocks 2` | 17:38 | | | 87.3 GiB |
+| 4 x 8 days, `--blocks 2` | 17:46 | | | 55.5 GiB |
+| 1 x 64 days (to 4 Mar 2013) | 42:17 | 15:16 (EWDS) | 26:50 (25 s/day) | 73.6 GiB |
+
+Computing costs about 25 s per day from 32-day blocks on; memory levels off. `--blocks 2` gains
+on short blocks, but a longer block is faster, with less memory: `--blocks` was removed. The
+64-day output's first 32 days equal the 32-day run's. The maintainer chose 32-day blocks for
+production, without checkpointing. Chunk sizes do not depend on block length from 2-day blocks
+on: ERA5 grows in whole days (one hour of a variable is 4 MB) to 48 h, 190 MiB, the most below
+256 MiB.
+
+**Profile** (one 8-day block, py-spy as the parent process, `--idle`, and a Dask callback timing
+tasks by name): the processor averaged 3.4 of 32 cores. Dask's threads spent 81 % of their task
+time waiting for zarr reads; GLORYS 3D reads were 58 % of all task time, Icechunk writes 10 %,
+regridding 7 %, `get_bottom` 1.6 %, decoding and masking about 3 %. No step is worth a numba
+kernel (`get_bottom`'s own code: about 15 of 9,500 thread-seconds). 29 % of the Copernicus
+Marine reading time went into opening connections (DNS, TCP, TLS): the toolbox keeps 10 per
+client, Dask runs 32 threads, so connections were discarded ("Connection pool is full", 773 in a
+block) and opened again.
+
+**Copernicus Marine pool** (8-day block without GloFAS):
+
+| Pool | Computing | Peak RSS |
+|---|---|---|
+| 10 (the toolbox's default) | 4:21 | 48.3 GiB |
+| 32 | 2:45 | 35.2 GiB |
+| 64 | 2:45 | 35.8 GiB |
+
+On a 32-day block (GloFAS included) pool 32 computed in 12:11 instead of 13:34 and peaked at
+47 GiB instead of 63. arco-make now sets the pool to Dask's thread count (at least 10) unless
+given. With it, the 32-day block took 0:59 + 12:21 at 43.9 GiB. Network during that run: 62 GB
+received, 43 GB from Copernicus Marine (32 connections, 58 ms round trips: about 2 MB/s each),
+18 GB from Google Cloud Storage (13 ms); the interface averaged 77 MB/s and peaked at 328 MB/s,
+so the link is not the limit.
+
+**More requests in flight do not help** (8-day block without GloFAS):
+
+| Dask threads | zarr executor (pool alike) | Computing | Peak RSS |
+|---|---|---|---|
+| 32 | 36 (Python's default) | 2:53–2:59 | 37–39 GiB |
+| 64 | 36 | 4:45 | 49.3 GiB |
+| 96 (chunks shrink to 235 MiB) | 36 | 6:24 | 58.8 GiB |
+| 32 | 96 | 4:28 | 48.3 GiB |
+| 32 | 128 | 4:06 | 42.9 GiB |
+| 24 | 36 | 3:14 | 35.9 GiB |
+| 16 | 36 | 3:08 | 38.9 GiB |
+
+The toolbox's Zarr store runs its blocking requests on zarr's executor (36 threads by default),
+so about 36 requests are in flight at most. Raising that, or the threads, slowed the reads:
+Copernicus Marine seems to limit a client, and sends nothing for minutes now and then whatever
+the settings (151 s once while opening). Fewer threads do not save memory: it is mostly static
+fields, regridding weights and data waiting to be written. The defaults stay: 32 threads, pool
+alike, executor 36.
+
+**EWDS requests.** The EWDS runs a user's GloFAS requests one at a time, about two minutes apart.
+Measured on months no one in the project had requested (submitted together, server timestamps):
+
+| Request | Queued | Processing | Size |
+|---|---|---|---|
+| Jan + Feb 1985, one request | 14 s | 53 s | 303 MiB |
+| Jan 1986 | 195 s | 26 s | 162 MiB |
+| Feb 1986 | 357 s | 32 s | 145 MiB |
+| all of 1987 | 394 s | 298 s | 2,065 MiB |
+
+The service takes lists of `year`, `month` and `day` and gives every valid date of their product,
+up to 500 days per request; date ranges and the old `hyear`/`hmonth`/`hday` names are refused.
+The backend now makes one request per year of a block (its months x its days) and drops the days
+outside the block: a 32-day block across two months waits once instead of twice, for up to a
+month more data.
+
+**[Moby-Dick] Shards** (32-day block, chunks of 1 day x 1 level x the whole grid, shards of
+8 days x 50 levels; Morton order, the code then had no other):
+
+| Layout | Computing | Peak RSS | Objects | Size |
+|---|---|---|---|---|
+| chunks only | 12:21 | 43.9 GiB | 7,193 | 13 GB |
+| shards | 12:58 | 40.6 GiB | 116 | 13 GB |
+
+Each 3D shard (1.55 GiB) is written whole by one task, as warned. The maintainer chose this
+layout for all three resolutions, with `[save] shard_order = "lexicographic"`, new: a day's 50
+levels lie next to each other in a shard, so a whole depth profile is read in few requests (zarr
+merges ranges less than 1 MiB apart). The order is not in the metadata: readers need nothing,
+and find chunks through each shard's index.
+
+Next (maintainer, 18 Nov): the stack is merged before the production run, which uses the
+updated image; group 9 and the Moby-Dick findings PR come before it. One commit per run
+(Icechunk's `Session.amend`) is dropped from the plan: a TODO at `icechunk_utils.Run.write`.
+
+A high-effort review of the branch found five issues, fixed in five commits with tests (two
+checked to fail before): with `shard_order`, the first block's metadata write checked unaligned
+Dask chunks against the shards, so a download whose planned chunks straddle shards (ERA5's
+2-day chunks in 8-day shards) failed; the recipe fingerprint counted options at their default,
+so any new option blocked `--resume` across an upgrade; per-year EWDS requests could exceed the
+500-field limit (it counts days x variables: a year of two variables costs 730) or name months
+not published yet (refused whole; a request mixing published and unpublished months is accepted
+and the latter left out): the service's cost estimate is now asked first, with per-month
+requests as before when it refuses, and a block missing days fails naming them; the pool
+default stayed in the environment; a name from `--blocks`. Its claim that distributed workers
+keep the shard order was right: zarr pickles the order with the codec, so the warning saying
+otherwise was removed. On real data (8-day block without GloFAS, shards of 8 days x 50 levels,
+lexicographic): values identical to the unsharded run, the 400 chunks of each 3D shard in
+lexicographic order.

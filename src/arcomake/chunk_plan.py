@@ -69,25 +69,23 @@ class Budget:
 
   Attributes:
     memory_limit: bytes of memory of the process (see `detect_budget`).
-    threads: threads computing at once for one block.
-    blocks: blocks computed at once (`download --blocks`): each has its own threads.
+    threads: threads computing at once.
     source: where `memory_limit` comes from, for the log.
   """
 
   memory_limit: int
   threads: int
-  blocks: int = 1
   source: str = "given"
 
   @property
-  def per_block(self) -> int:
-    """Bytes for the tasks of one block."""
-    return int(self.memory_limit * USABLE / self.blocks)
+  def usable(self) -> int:
+    """Bytes the tasks may use, all threads together (`USABLE` of the limit)."""
+    return int(self.memory_limit * USABLE)
 
   @property
   def per_task(self) -> int:
     """Bytes of input chunk a task may hold (`COPIES` of it are held while it runs)."""
-    return self.per_block // (self.threads * COPIES)
+    return self.usable // (self.threads * COPIES)
 
   @property
   def target(self) -> int:
@@ -99,11 +97,11 @@ class Budget:
     return (
       f"target {format_bytes(self.target)} per chunk, at most {format_bytes(self.per_task)} per"
       f" task: {format_bytes(self.memory_limit)} ({self.source}) x {USABLE} /"
-      f" ({self.threads} threads x {self.blocks} block(s) x {COPIES})"
+      f" ({self.threads} threads x {COPIES})"
     )
 
 
-def _threads() -> int:
+def dask_threads() -> int:
   """Threads of Dask's local scheduler: one for the synchronous one, else `num_workers` or the
   CPUs this process may use."""
   if dask.config.get("scheduler", None) in ("synchronous", "sync", "single-threaded"):
@@ -111,15 +109,15 @@ def _threads() -> int:
   return int(dask.config.get("num_workers", None) or dask.system.CPU_COUNT)
 
 
-def detect_budget(memory_limit: int | None = None, blocks: int = 1) -> Budget:
+def detect_budget(memory_limit: int | None = None) -> Budget:
   """The budget of this process: `memory_limit` if given, else the memory it may use (the least
   of physical memory, its cgroup's limit, so a Slurm job's, and its RLIMIT_RSS), shared among
-  the threads of Dask's local scheduler and `blocks` blocks at once."""
+  the threads of Dask's local scheduler."""
   if memory_limit is not None:
-    return Budget(memory_limit, _threads(), blocks, "given")
+    return Budget(memory_limit, dask_threads(), "given")
   from distributed.system import MEMORY_LIMIT
 
-  return Budget(MEMORY_LIMIT, _threads(), blocks, "detected")
+  return Budget(MEMORY_LIMIT, dask_threads(), "detected")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -277,11 +275,11 @@ def plan(
       warnings.append(
         f"{name}: {what} of {format_bytes(size)}, above {format_bytes(budget.per_task)} per task"
       )
-    if size * COPIES > budget.per_block:
+    if size * COPIES > budget.usable:
       raise PlanError(
         f"{name}: a {what} of {format_bytes(size)} needs about {format_bytes(size * COPIES)}"
-        f" ({COPIES} copies), more than the {format_bytes(budget.per_block)} a block may use"
-        f" ({budget.describe()}): give more memory (--memory-limit), or fewer blocks at once"
+        f" ({COPIES} copies), more than the {format_bytes(budget.usable)} the tasks may use"
+        f" ({budget.describe()}): give more memory (--memory-limit)"
       )
   return Plan(chunks, largest, gathered, tuple(warnings))
 

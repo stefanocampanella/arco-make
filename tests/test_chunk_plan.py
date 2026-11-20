@@ -37,16 +37,16 @@ def era5(hours: int) -> dict:
   return {"t2m": Shape(("time", "latitude", "longitude"), (hours, 721, 1440), 4)}
 
 
-def test_budget_shares_the_memory_among_threads_and_blocks():
+def test_budget_shares_the_memory_among_threads():
   """Each task may hold its share of the usable memory, `COPIES` times its chunk."""
-  assert VM.per_block == int(110 * GB * USABLE)
-  assert VM.per_task == VM.per_block // (32 * COPIES)
+  assert VM.usable == int(110 * GB * USABLE)
+  assert VM.per_task == VM.usable // (32 * COPIES)
   assert VM.target == 128 * 2**20
-  two = Budget(memory_limit=110 * GB, threads=32, blocks=2)
+  two = Budget(memory_limit=110 * GB, threads=64)
   assert two.per_task == pytest.approx(VM.per_task / 2, abs=1)
   small = Budget(memory_limit=GB, threads=32)
   assert small.target == small.per_task < 128 * 2**20
-  assert "32 threads x 2 block(s)" in two.describe()
+  assert "(64 threads x 4)" in two.describe()
 
 
 def test_space_stays_whole_and_time_grows_to_whole_bins():
