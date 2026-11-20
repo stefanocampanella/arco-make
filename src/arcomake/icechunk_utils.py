@@ -28,7 +28,7 @@ import icechunk
 import xarray as xr
 from icechunk.xarray import to_icechunk
 
-from arcomake import sharding
+from arcomake import provenance, sharding
 
 logger = logging.getLogger(__name__)
 
@@ -214,14 +214,15 @@ def write(
   command: str = "write",
   align_chunks: bool = False,
   shard_order: sharding.ShardOrder = sharding.DEFAULT,
+  recipe: str | None = None,
 ) -> str:
-  """Write `dataset` in a run of `command` of a single commit (see `Run`); return the new tip of
-  `main`.
+  """Write `dataset` in a run of `command` of a single commit (see `Run`, `recipe` its
+  fingerprint); return the new tip of `main`.
 
   The repository is created if missing. Mode "w" replaces the content in the new version: earlier
   versions stay in the repository's history until `retention` expires them.
   """
-  run = Run(path, storage_options, run_label(command))
+  run = Run(path, storage_options, run_label(command), recipe=recipe)
   run.write(
     dataset,
     message=message,
@@ -328,10 +329,12 @@ class Run:
     label: str,
     *,
     waiting: "WaitingRun | None" = None,
+    recipe: str | None = None,
   ) -> None:
     """Start a run labelled `label`, or continue `waiting` (a run that failed, see
-    `waiting_run`) on its branch."""
+    `waiting_run`) on its branch. `recipe`: its fingerprint, in every commit's metadata."""
     self.path = str(path)
+    self.recipe = recipe
     self.repo = icechunk.Repository.open_or_create(storage(path, storage_options))
     if waiting is not None:
       self.label, self.branch, self.base = waiting.label, waiting.branch, waiting.base
@@ -349,9 +352,14 @@ class Run:
   def commit(
     self, session: icechunk.Session, message: str, metadata: Mapping[str, Any] | None = None
   ) -> str:
-    """Commit `session` on the run's branch; the run's label (and `metadata`) go in the commit's
-    metadata."""
-    snapshot = str(session.commit(message, metadata={**(metadata or {}), RUN_KEY: self.label}))
+    """Commit `session` on the run's branch. The commit's metadata hold the run's label, the
+    recipe's fingerprint, what made the output (`provenance.environment`), and `metadata`; the
+    message stays short."""
+    recorded: dict[str, Any] = {provenance.PROVENANCE_KEY: provenance.environment()}
+    if self.recipe is not None:
+      recorded[RECIPE_KEY] = self.recipe
+    recorded |= {**(metadata or {}), RUN_KEY: self.label}
+    snapshot = str(session.commit(message, metadata=recorded))
     logger.info(f"Committed {snapshot} to {self.path} ({self.branch}): {message}")
     return snapshot
 

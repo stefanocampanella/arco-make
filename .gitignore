@@ -14,6 +14,9 @@ htmlcov/
 *.key
 *.pem
 
+# Written by the image build (the commit it was built from)
+src/arcomake/BUILD_COMMIT
+
 # Run artefacts
 logs/
 *.log

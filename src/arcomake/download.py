@@ -1,8 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import functools
-import hashlib
-import json
 import logging
 import math
 import warnings
@@ -19,7 +17,7 @@ from dask.diagnostics import ProgressBar
 from dask.utils import format_bytes
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from arcomake import checks, icechunk_utils
+from arcomake import checks, icechunk_utils, provenance
 from arcomake.checks import ChecksConfig, ValidationError
 from arcomake.chunk_plan import Budget, PlanError, detect_budget, stored_warnings
 from arcomake.cli_utils import (
@@ -301,6 +299,7 @@ def download(
         configs.save.storage_options,
         icechunk_utils.run_label("download"),
         waiting=waiting if resume else None,
+        recipe=recipe,
       )
     except Exception as exc:
       raise click.ClickException(f"Could not start writing {output_path}: {exc}") from exc
@@ -680,8 +679,7 @@ def recipe_fingerprint(configs: DownloadConfig) -> str:
     dataset.pop("checkpointing", None)
     for part in dataset["parts"]:
       part.pop("timeout", None)
-  text = json.dumps(recipe, sort_keys=True)
-  return hashlib.sha256(text.encode()).hexdigest()[:16]
+  return provenance.hash_recipe(recipe)
 
 
 def _waiting_run(

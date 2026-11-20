@@ -1104,6 +1104,7 @@ def write_output(
   command: str = "write",
   metadata: Mapping[str, Any] | None = None,
   align_chunks: bool = False,
+  recipe: str | None = None,
 ) -> str:
   """Write a dataset with the layout of `[save]` (see `prepare_for_writing`) in one commit.
 
@@ -1146,6 +1147,7 @@ def write_output(
     command=command,
     align_chunks=align_chunks,
     shard_order=configs.shard_order,
+    recipe=recipe,
   )
 
 
@@ -1190,7 +1192,11 @@ def _local_scheduler() -> str:
 
 
 def write_outputs_together(
-  outputs: list[tuple[xr.Dataset, str | pathlib.Path]], configs: SaveConfig, *, label: str
+  outputs: list[tuple[xr.Dataset, str | pathlib.Path]],
+  configs: SaveConfig,
+  *,
+  label: str,
+  recipe: str | None = None,
 ) -> list[str]:
   """Write datasets that share a computation to their repositories, each in a run named `label`
   (`icechunk_utils.Run`); `main` moves in every repository only once all are written. Returns
@@ -1207,7 +1213,7 @@ def write_outputs_together(
       on its branch; repositories promoted before it keep the new version).
   """
   runs = [
-    icechunk_utils.Run(_check_output_path(path), configs.storage_options, label)
+    icechunk_utils.Run(_check_output_path(path), configs.storage_options, label, recipe=recipe)
     for _, path in outputs
   ]
   if _distributed_client():

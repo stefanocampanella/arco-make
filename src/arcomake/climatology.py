@@ -56,7 +56,7 @@ from dask.graph_manipulation import bind
 from icechunk.xarray import to_icechunk
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from arcomake import icechunk_utils, sharding
+from arcomake import icechunk_utils, provenance, sharding
 from arcomake.cli_utils import (
   check_aws_profile,
   check_destination,
@@ -300,6 +300,7 @@ def compute_climatology(
           [(climatology, climatology_output_path), (anomaly_std, anomaly_std_output_path)],
           configs.save,
           label=label,
+          recipe=provenance.fingerprint(configs, exclude={"read"}),
         )
         logger.info("Climatology and anomaly standard deviation committed.")
       logger.info("Input dataset closed; closing Dask client.")
@@ -778,7 +779,10 @@ def _compute_by_series(
   template = _output_template(dataset, configs.period, configs.time_dim)
   # One run per output (its own branch) and one session on it, committed once every series is
   # written: an interrupted run commits nothing, and `main` is untouched until both are written.
-  runs = [icechunk_utils.Run(path, save.storage_options, label) for path, _ in outputs]
+  recipe = provenance.fingerprint(configs, exclude={"read"})
+  runs = [
+    icechunk_utils.Run(path, save.storage_options, label, recipe=recipe) for path, _ in outputs
+  ]
   sessions = [run.session() for run in runs]
   for (_, steps), session in zip(outputs, sessions, strict=True):
     # Metadata only: the data of the template are never computed.
