@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-from typing import get_args
+from typing import Any, get_args
 
 import click
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from arcomake import icechunk_utils
 from arcomake.cli_utils import (
@@ -15,7 +15,7 @@ from arcomake.cli_utils import (
   set_default_logger,
 )
 from arcomake.dask_utils import DaskSetupType, get_client
-from arcomake.dataset_utils import ReadConfig, SaveConfig, open_input, write_output
+from arcomake.dataset_utils import ReadConfig, SaveConfig, inline_grids, open_input, write_output
 from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,13 @@ class ProcessConfig(BaseModel):
   read: ReadConfig = Field(default_factory=ReadConfig)
   process: list[ProcessingStepConfig] = Field(default_factory=list)
   save: SaveConfig = Field(default_factory=SaveConfig)
+  # Target grids of `regrid` steps, by name (see `dataset_utils.inline_grids`).
+  grids: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+  @model_validator(mode="before")
+  @classmethod
+  def _inline_grids(cls, data: Any) -> Any:
+    return inline_grids(data)
 
 
 @click.command()

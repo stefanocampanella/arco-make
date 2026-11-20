@@ -29,6 +29,7 @@ STEPS = {
   "assign_var_attrs": {"zos": {"units": "cm"}},
   "astype": {"dtype": "float32", "casting": "same_kind"},
   "clip_negative": {"variables": ["zos"]},
+  "coverage_attrs": {"latitude_dim": "latitude", "longitude_dim": "longitude"},
   "drop_static_vars": {},
   "drop_var_attrs": {"variables": ["thetao"]},
   "flip": {"dim": "latitude"},
@@ -44,6 +45,7 @@ STEPS = {
   "rescale": {"zos": 2.0},
   "sel": {"latitude": {"start": 0.0, "stop": 1.0}},
   "select_variables": {"variables": ["zos"]},
+  "sin_cos": {"variable": "zos", "sin_name": "zs", "cos_name": "zc"},
   "transpose": {"dims": ["longitude", "latitude", "depth", "time"]},
 }
 

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Recipe loading and command options: a recipe either runs as written or fails (intents 3, 4)."""
 
+import datetime
 import pathlib
 
 import click
@@ -29,6 +30,62 @@ def test_read_configs_injects_cli_dates(tmp_path: pathlib.Path, sources: pathlib
   path = render_recipe("sample_download.toml", tmp_path, SOURCES=str(sources))
   configs = read_configs(str(path), schema=DownloadConfig, inject={"end": "2020-02-27T00:00:00"})
   assert configs.end.day == 27
+
+
+def test_grids_are_named_once(tmp_path: pathlib.Path, sources: pathlib.Path):
+  """`regrid` steps name a grid of the recipe's `[grids]` table (the sample recipe does, three
+  times): the recipe loads as if each step gave the grid itself; an unknown name says where."""
+  path = render_recipe("sample_download.toml", tmp_path, SOURCES=str(sources))
+  text = path.read_text()
+  assert text.count('grid = "one_degree"') == 3
+  inline = (
+    "grid = {south = -1.5, north = 1.5, west = 0.5, east = 3.5,"
+    " resolution_lat = 1.0, resolution_lon = 1.0}"
+  )
+  path.with_name("inline.toml").write_text(text.replace('grid = "one_degree"', inline))
+  named = read_configs(str(path), schema=DownloadConfig)
+  written = read_configs(str(path.with_name("inline.toml")), schema=DownloadConfig)
+  assert named.model_dump(exclude={"grids"}) == written.model_dump(exclude={"grids"})
+  path.with_name("typo.toml").write_text(
+    text.replace('grid = "one_degree"', 'grid = "one_degre"', 1)
+  )
+  with pytest.raises(
+    click.ClickException, match="atmosphere.postprocess step 3: no grid 'one_degre'"
+  ):
+    read_configs(str(path.with_name("typo.toml")), schema=DownloadConfig)
+  process = ProcessConfig.model_validate(
+    {
+      "grids": {"g": {"south": 0.0, "north": 1.0, "west": 0.0, "east": 1.0}},
+      "process": [{"name": "regrid", "grid": "g"}],
+    }
+  )
+  not_a_table = path.with_name("not_a_table.toml")
+  not_a_table.write_text(
+    text.replace('grid = "one_degree"', 'grid = "quarter"', 1)
+    .replace("[grids.one_degree]", "[unused]")
+    .replace('step = "2D"\n', 'step = "2D"\ngrids = {quarter = 0.25}\n', 1)
+  )
+  with pytest.raises(click.ClickException, match="grids.quarter is not a table"):
+    read_configs(str(not_a_table), schema=DownloadConfig)
+  assert process.process[0].model_dump()["grid"] == {
+    "south": 0.0,
+    "north": 1.0,
+    "west": 0.0,
+    "east": 1.0,
+  }
+
+
+def test_injected_tables_are_merged(tmp_path: pathlib.Path):
+  """An injected table keeps the keys of the recipe's that it does not give (`validate --end`
+  sets one bound of the time check, the recipe's start and frequency stay)."""
+  path = tmp_path / "recipe.toml"
+  path.write_text('[checks.valid_time_coordinate]\nstart = 2020-01-01\nfreq = "1D"\n')
+  configs = read_configs(str(path), inject={"checks": {"valid_time_coordinate": {"end": 1}}})
+  assert configs["checks"]["valid_time_coordinate"] == {
+    "start": datetime.date(2020, 1, 1),
+    "freq": "1D",
+    "end": 1,
+  }
 
 
 def test_read_configs_reports_invalid_recipes(tmp_path: pathlib.Path):

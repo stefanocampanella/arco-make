@@ -132,6 +132,31 @@ class PartTimeOffset(BaseModel):
     return may_parse_timedelta(value) if isinstance(value, str) else value
 
 
+class PartStaticTime(BaseModel):
+  """`static_time` of a part: its variables are read at this instant, without the time
+  dimension, instead of over each block.
+
+  For fields constant in time that a source stores as a time series, e.g. ERA5's geopotential at
+  the surface and land-sea mask: one field instead of every step of every block, the same in
+  every block, and none of the glitches some steps have. Give such variables a part
+  of their own (the time-varying ones of the same source in another part). The instant must be a
+  stamp of the source (after `time_offset`, if any).
+  """
+
+  static_time: datetime.datetime | None = None
+
+  @field_validator("static_time")
+  @classmethod
+  def _without_zone(cls, value: datetime.datetime | None) -> datetime.datetime | None:
+    # The sources' stamps have no zone and are read as UTC: a UTC time is that stamp, another
+    # offset would be converted to a different one than written.
+    if value is None or value.tzinfo is None:
+      return value
+    if value.utcoffset() != datetime.timedelta(0):
+      raise ValueError("static_time is a stamp of the source: without a time zone, or in UTC")
+    return value.replace(tzinfo=None)
+
+
 # Seconds a source may stay silent (no connection, no data) before the request fails. gcsfs
 # waits forever by default (N7): two downloads hung on a read from Google Cloud Storage.
 DEFAULT_TIMEOUT = 120.0
@@ -250,7 +275,7 @@ class CopernicusMarinePartConfig(PartTimeOffset):
   storage_options: dict[str, Any] | None = None
 
 
-class NetCDFOverHTTPPartConfig(PartTimeOffset, PartTimeout):
+class NetCDFOverHTTPPartConfig(PartTimeOffset, PartTimeout, PartStaticTime):
   model_config = ConfigDict(extra="forbid")
 
   filename_or_obj: str
@@ -288,7 +313,7 @@ class EarlyWarningDataStorePartConfig(PartTimeOffset, PartTimeout):
     return _engine_given_or_implied(data, lambda url: _has_scheme(url, "ewds"))
 
 
-class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout):
+class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout, PartStaticTime):
   """A Zarr part: the arguments of `xarray.open_dataset`, read through a strict store."""
 
   filename_or_obj: str
@@ -300,7 +325,7 @@ class ZarrPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout):
     return _engine_given_or_implied(data, lambda url: url.rstrip("/").endswith(".zarr"))
 
 
-class GenericPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout):
+class GenericPartConfig(OpenDatasetArguments, PartTimeOffset, PartTimeout, PartStaticTime):
   """A part read by any other xarray engine, with the arguments of `xarray.open_dataset`."""
 
   filename_or_obj: str
@@ -572,6 +597,63 @@ class DatasetConfig(BaseModel):
   def _no_chunk_steps(cls, steps: list[ProcessingStepConfig]) -> list[ProcessingStepConfig]:
     return refuse_chunk_steps(steps)
 
+  @field_validator("postprocess")
+  @classmethod
+  def _no_output_attrs(cls, steps: list[ProcessingStepConfig]) -> list[ProcessingStepConfig]:
+    # Datasets are merged with identical attributes: the output's extent belongs after merging.
+    for number, config in enumerate(steps, start=1):
+      if config.name == "coverage_attrs":
+        raise ValueError(
+          f"step {number}: coverage_attrs describes the output: give it in the recipe's"
+          " [[postprocess]], after merging"
+        )
+    return steps
+
+
+# The step lists of a recipe: its own steps (download, process) and each dataset's.
+_STEP_LISTS = ("postprocess", "process")
+
+
+def inline_grids(data: Any) -> Any:
+  """A recipe whose `regrid` steps name a grid of its `[grids]` table (`grid = "quarter"`), with
+  the table's arguments in their place: a grid is written once per recipe.
+
+  Raises:
+    ValueError: for a name the table lacks.
+  """
+  if not isinstance(data, Mapping):
+    return data
+  grids = data.get("grids") or {}
+  if not isinstance(grids, Mapping):
+    raise ValueError("[grids] is a table of grids, each a table of xarray_regrid.Grid arguments")
+
+  def inlined(steps: Any, where: str) -> Any:
+    if not isinstance(steps, list):
+      return steps
+    result = []
+    for number, step in enumerate(steps, start=1):
+      named = isinstance(step, Mapping) and step.get("name") == "regrid"
+      if named and isinstance(step.get("grid"), str):
+        if step["grid"] not in grids:
+          known = ", ".join(sorted(grids)) or "none"
+          raise ValueError(f"{where} step {number}: no grid {step['grid']!r} in [grids] ({known})")
+        if not isinstance(grid := grids[step["grid"]], Mapping):
+          raise ValueError(f"grids.{step['grid']} is not a table of xarray_regrid.Grid arguments")
+        step = {**step, "grid": dict(grid)}
+      result.append(step)
+    return result
+
+  data = {key: inlined(value, key) if key in _STEP_LISTS else value for key, value in data.items()}
+  datasets = data.get("datasets")
+  if isinstance(datasets, Mapping):
+    data["datasets"] = {
+      name: {**dataset, "postprocess": inlined(dataset["postprocess"], f"{name}.postprocess")}
+      if isinstance(dataset, Mapping) and "postprocess" in dataset
+      else dataset
+      for name, dataset in datasets.items()
+    }
+  return data
+
 
 def _shift_time(part: xr.Dataset, offset: datetime.timedelta, time_dim: str) -> xr.Dataset:
   """`part` with `offset` added to its time coordinate (attributes and encoding kept)."""
@@ -579,6 +661,17 @@ def _shift_time(part: xr.Dataset, offset: datetime.timedelta, time_dim: str) -> 
     raise ValueError(f"time_offset needs a {time_dim!r} coordinate, which the part lacks")
   time = part[time_dim].variable
   return part.assign_coords({time_dim: time.copy(data=time.values + np.timedelta64(offset))})
+
+
+def _static_at(part: xr.Dataset, instant: datetime.datetime, time_dim: str) -> xr.Dataset:
+  """`part` at `instant`, without the time dimension (`static_time`)."""
+  if time_dim not in part.coords:
+    raise ValueError(f"static_time needs a {time_dim!r} coordinate, which the part lacks")
+  try:
+    static = part.sel({time_dim: np.datetime64(instant, "ns")})
+  except KeyError:
+    raise ValueError(f"static_time {instant} is not a stamp of the part") from None
+  return static.drop_vars(time_dim)
 
 
 def _source_chunks(dataset: xr.Dataset) -> dict[Hashable, int]:
@@ -666,7 +759,10 @@ def download_and_process(
   opened: list[tuple[str, xr.Dataset]] = []
   for raw_part in configs.parts:
     offset = raw_part.time_offset or datetime.timedelta(0)
-    part_conf = raw_part.model_dump(exclude_unset=True, exclude={"time_offset", "timeout"})
+    static_time = getattr(raw_part, "static_time", None)
+    part_conf = raw_part.model_dump(
+      exclude_unset=True, exclude={"time_offset", "timeout", "static_time"}
+    )
     engine = getattr(raw_part, "engine", None) or part_conf.get("engine")
     if engine is not None:
       part_conf["engine"] = engine
@@ -677,7 +773,10 @@ def download_and_process(
     part = open_input(**part_conf)
     if offset:
       part = _shift_time(part, offset, time_dim)
-    part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
+    if static_time is not None:
+      part = _static_at(part, static_time, time_dim)
+    else:
+      part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
     opened.append((tokenize(repr(raw_part), start_datetime, end_datetime), part))
   if not opened:
     raise ValueError("No parts found in the dataset configuration")

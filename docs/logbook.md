@@ -1046,3 +1046,47 @@ keep the shard order was right: zarr pickles the order with the codec, so the wa
 otherwise was removed. On real data (8-day block without GloFAS, shards of 8 days x 50 levels,
 lexicographic): values identical to the unsharded run, the 400 chunks of each 3D shard in
 lexicographic order.
+
+## 2026-11-18: group 9, general capabilities for the recipes
+
+Six capabilities the arco-ocean recipes need, each general, with a synthetic test; none changes
+the output of an unchanged recipe:
+- **`ensure_no_nans` in one computation** (S3): it looped over every day (11,322 in the published
+  dataset) and variable, two computations each. Now one Dask computation counts the missing
+  values inside each mask per day; the report is the same, static variables once. On the 32-day
+  output (hyperfine, 2 runs each): 0.5 min against 1.4-3.9 min; both found no missing value.
+- **`validate --start/--end`** (C11): the time check's bounds as given to `download`; the
+  arco-ocean validate recipe ended years before the data.
+- **`sin_cos`** (C1, 5.3): an angle replaced by its sine and cosine before regridding and daily
+  means (350 and 10 degrees averaged to 180 as numbers). The maintainer chose the names `mwd_sin`
+  and `mwd_cos` for the wave direction.
+- **`static_time`** (C5, findings 3 and 4): a part read at one stamp, without time: ERA5's `z` and
+  `lsm` once instead of 24 times a day, and without the glitches of a few days.
+- **`[grids]`** (A4): a target grid written once per recipe and named by its regrid steps.
+- **`coverage_attrs`** (C13, finding 15): ACDD extent attributes from the coordinates. xarray
+  replaces a store's attributes with each appended block's, so `download` sets the time coverage
+  of the whole output (stored stamps and the block's) for each block.
+
+Masking after regridding needs nothing new: `apply_mask` does it; the arco-ocean recipes will use
+it in the Moby-Dick findings PR (NaN outside the masks).
+
+A high-effort review found nine issues, fixed in five commits (tests checked to fail before where
+the fix changes behaviour): the time coverage was per block (no resolution with one-stamp blocks,
+removed by a short last block; a checkpointed dataset's start), now the whole output's; grid
+resolutions of 0.1 and float32 1/12 degree were missing; `[grids]` changed the resume
+fingerprint, and a grid that is not a table raised a traceback; a zoned `static_time` was
+converted; two comments named one dataset's data; `validate` repeated `read_configs`. Its claim
+that `ensure_no_nans` lost an exact join was checked and dropped: variables of one Dataset share
+its indexes, so a variable and its mask cannot be misaligned.
+
+A second high-effort review, of the fixes, found six more, fixed in three commits (tests checked
+to fail before): `coverage_attrs` in a dataset's steps fails the merge of the datasets (they need
+identical attributes), so it is refused there; fine float32 grids far from zero (0.01 degree to
+360) still lacked a resolution (the tolerance now follows the type's rounding); download dropped
+every `time_coverage_*` attribute, not only those it computes; `validate` read its recipe twice
+(`read_configs` now merges injected tables); a UTC `static_time` was refused; this entry counted
+six fix commits. The earlier fix had said the whole-output coverage also fixed a checkpointed
+dataset: it did not need to, the recipe's steps run on the reopened block. Left as they are: no
+`output:` prefix (no recipe could use `coverage_attrs` before this branch), the fingerprint
+change for runs of older code (unreleased), and reading the output's time coordinate for each
+block (about 380 blocks in production).

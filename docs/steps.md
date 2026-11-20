@@ -67,6 +67,31 @@ Set negative values of the listed variables to 0 (e.g. accumulated precipitation
 |---|---|---|
 | `variables` | `Iterable[Hashable]` | required |
 
+## `coverage_attrs`
+
+Set the ACDD attributes of the dataset's extent from its coordinates.
+
+`geospatial_lat_*` and `geospatial_lon_*` (min, max, units, and resolution if the spacing is
+regular), `geospatial_vertical_*` (min, max, and the coordinate's `units` and `positive`) if
+`vertical_dim` is given, and `time_coverage_start`, `_end` (the first and last stamps) and
+`_resolution` (an ISO 8601 duration). Attributes typed by hand drift from the data, e.g.
+longitudes -180 to 180 over coordinates 0 to 359.75. In `download`, the time coverage is that
+of the whole output (the stored stamps and the block's), not of the block. It describes the
+output: give it in a recipe's steps after merging, not in a dataset's (they are merged with
+identical attributes):
+
+```toml
+name = "coverage_attrs"
+vertical_dim = "depth"
+```
+
+| Argument | Type | Default |
+|---|---|---|
+| `latitude_dim` | `Hashable` | `'lat'` |
+| `longitude_dim` | `Hashable` | `'lon'` |
+| `vertical_dim` | `Hashable &#124; None` | `None` |
+| `time_dim` | `Hashable &#124; None` | `'time'` |
+
 ## `drop_static_vars`
 
 Drop the data variables without the time dimension (masks, bathymetry...).
@@ -208,7 +233,7 @@ where its valid fraction is below `1 - nan_threshold`.
 
 Arguments:
 
-- `grid`: Arguments of `xarray_regrid.Grid` (`north`, `east`, `south`, `west`, `resolution_lat`, `resolution_lon`).
+- `grid`: Arguments of `xarray_regrid.Grid` (`north`, `east`, `south`, `west`, `resolution_lat`, `resolution_lon`). In a download or process recipe, also the name of a grid of its `[grids]` table, to write a grid once for several steps.
 - `latitude_dim, longitude_dim`: Names of the horizontal dimensions.
 - `method`: The xarray-regrid method (default "nearest").
 - `kwargs`: Further arguments of that method (e.g. `skipna`, `nan_threshold`; `output_chunks` only outside download recipes, whose chunks are planned).
@@ -282,6 +307,36 @@ Keep only the listed data variables (and the coordinates of their dimensions).
 | Argument | Type | Default |
 |---|---|---|
 | `variables` | `Iterable[Hashable]` | required |
+
+## `sin_cos`
+
+Replace an angle by its sine and cosine, two ordinary fields to regrid and average.
+
+An angle cannot be averaged as a number: 350 and 10 degrees give 180. Its sine and cosine can,
+and the averaged pair gives the mean direction (`atan2(sin, cos)`) and, by its length (0 to
+1), how steady the direction was. Apply it before any regridding or time mean, e.g. to a mean
+wave direction:
+
+```toml
+name = "sin_cos"
+variable = "VMDR"
+sin_name = "mwd_sin"
+cos_name = "mwd_cos"
+```
+
+Arguments:
+  variable: The angle, in `unit`.
+  sin_name, cos_name: Names of the new variables (units "1"); missing values stay missing.
+  unit: "degrees" or "radians".
+  keep: Keep the angle too (dropped by default).
+
+| Argument | Type | Default |
+|---|---|---|
+| `variable` | `Hashable` | required |
+| `sin_name` | `Hashable` | required |
+| `cos_name` | `Hashable` | required |
+| `unit` | `Literal['degrees', 'radians']` | `'degrees'` |
+| `keep` | `bool` | `False` |
 
 ## `transpose`
 

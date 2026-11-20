@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 import logging
 import tomllib
+from collections.abc import Mapping
 from typing import Any, TypeVar, overload
 
 import click
@@ -45,6 +46,18 @@ def read_configs(
 ) -> dict[str, Any]: ...
 
 
+def _merged(base: dict[str, Any], update: Mapping[str, Any]) -> dict[str, Any]:
+  """`base` with the values of `update`, tables merged key by key (CLI options injected into a
+  recipe, e.g. one bound of a check, keep the rest of its table)."""
+  merged = dict(base)
+  for key, value in update.items():
+    if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+      merged[key] = _merged(merged[key], value)
+    else:
+      merged[key] = value
+  return merged
+
+
 def read_configs(
   path: str,
   schema: type[ModelT] | None = None,
@@ -55,7 +68,7 @@ def read_configs(
     configs = tomllib.load(config_file)
   if inject is not None:
     logger.info(f"Updating configs with {inject}")
-    configs.update(inject)
+    configs = _merged(configs, inject)
   if schema is not None:
     try:
       return schema.model_validate(configs)

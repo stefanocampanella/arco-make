@@ -33,7 +33,7 @@ apptainer exec oras://ghcr.io/stefanocampanella/arco-make:latest arco-make downl
 | Command | What it does |
 |---|---|
 | `arco-make download RECIPE OUTPUT` | Downloads, processes and merges the datasets of a recipe into one Icechunk repository |
-| `arco-make validate RECIPE INPUT` | Checks a dataset: time axis, grid, missing values inside masks |
+| `arco-make validate RECIPE INPUT` | Checks a dataset: time axis, grid, missing values inside masks; `--start`/`--end` give the expected time axis, as to `download` |
 | `arco-make process RECIPE INPUT OUTPUT` | Applies recipe steps to a dataset (e.g. a time mean) |
 | `arco-make compute-climatology RECIPE INPUT CLIMATOLOGY ANOMALY_STD` | Computes a periodic climatology and the standard deviation of the anomalies |
 | `arco-make steps` | Prints the reference of the processing steps ([docs/steps.md](docs/steps.md)) |
@@ -98,8 +98,16 @@ engine = "zarr"
 [[datasets.ocean.postprocess]] # steps applied to this dataset, in order
 name = "regrid"
 method = "conservative"
-grid = {south = -1.5, north = 1.5, west = 0.5, east = 3.5, resolution_lat = 1.0, resolution_lon = 1.0}
+grid = "one_degree"            # a grid of [grids], or the table itself
 kwargs = {skipna = true, nan_threshold = 1.0}
+
+[grids.one_degree]             # optional: a grid written once, named by regrid steps
+south = -1.5
+north = 1.5
+west = 0.5
+east = 3.5
+resolution_lat = 1.0
+resolution_lon = 1.0
 
 [[postprocess]]                # steps applied after merging all datasets
 name = "masked_fill"
@@ -123,6 +131,12 @@ Day D is the interval from 00:00 of D to 00:00 of D+1, stamped D 00:00 (`resampl
 accumulations (the value stamped 00:00 covers the last hour of the previous day), take a part option
 `time_offset = "-1h"`: the time coordinate is moved before each block is selected, and the part is
 read over the block moved the other way, so that every day holds its own hours.
+
+Fields constant in time that a source stores as a time series (ERA5's geopotential at the surface
+and land-sea mask) take a part of their own with `static_time = 2000-01-01T00:00:00`, a stamp of the
+source: the part is read at that instant, without the time dimension, the same in every block.
+Zarr, NetCDF-over-HTTP and generic parts take it; Copernicus Marine and EWDS parts are read over the
+block's range.
 
 Every request to a source times out: a part's `timeout` (seconds a source may stay silent, default 120)
 applies to Zarr stores on Google Cloud Storage (gcsfs waits forever otherwise), NetCDF files over HTTP

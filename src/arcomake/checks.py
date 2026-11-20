@@ -4,8 +4,10 @@ import logging
 import warnings
 from collections.abc import Callable, Hashable
 from datetime import datetime
-from typing import Literal, Self
+from typing import Literal, Self, cast
 
+import dask
+import numpy as np
 import pandas as pd
 import xarray as xr
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -84,35 +86,44 @@ def ensure_no_nans(
       else:
         warnings.warn(f"Variable {variable_name} not found in dataset")
 
-  def _get_nan_errors(ds: xr.Dataset):
-    errors = []
-    for variable_name, da in ds.data_vars.items():
-      if variable_name in variable_mask_mapping:
-        mask_name = variable_mask_mapping[variable_name]
-        mask_da = ds[mask_name]
-        # ensure_no_nans assumes that if data does not have a mask dimension, then the 0th component of the mask along
-        # that dimension is the proper mask (e.g., surface data should be masked using the first depth level)
-        mask_da = mask_da.isel({dim: 0 for dim in mask_da.dims if dim not in da.dims}, drop=True)
-        masked_data = da.where(mask_da, 0.0)
-        invalid_values = masked_data.isnull()
-      else:
-        invalid_values = da.isnull()
-      if invalid_values.any():
-        errors.append(
-          f"{invalid_values.sum().values} NaN values found for variable {variable_name}"
-        )
-    return errors
+  # Missing values inside the masks, counted per time step in one computation, not two per day
+  # and variable: a check over decades looped over thousands of days.
+  counts: dict[Hashable, xr.DataArray] = {}
+  for variable_name, da in dataset.data_vars.items():
+    invalid = da.isnull()
+    if variable_name in variable_mask_mapping:
+      mask_da = dataset[variable_mask_mapping[variable_name]]
+      # A variable without a dimension of its mask (surface data, 3D mask) is checked against the
+      # mask's first entry along it (the first depth level).
+      mask_da = mask_da.isel({dim: 0 for dim in mask_da.dims if dim not in da.dims}, drop=True)
+      invalid = invalid & mask_da.astype(bool)
+    counts[variable_name] = invalid.sum([dim for dim in invalid.dims if dim != time_dim])
 
   logger.info("Checking for Nans.")
-  dataset_errors = []
-  datetimes = dataset[time_dim].to_index()
-  for d in datetimes:
-    errors_on_datetime = _get_nan_errors(dataset.sel({time_dim: d}))
-    if errors_on_datetime:
-      message = f"{len(errors_on_datetime)} errors found for time {d}: " + ", ".join(
-        errors_on_datetime
+  computed = cast(dict[Hashable, xr.DataArray], dask.compute(counts)[0])
+  per_time: dict[int, list[str]] = {}
+  static_errors = []
+  for variable_name, count in computed.items():
+    if time_dim not in count.dims:
+      if int(count) > 0:
+        static_errors.append(f"{int(count)} NaN values found for variable {variable_name}")
+      continue
+    for index in np.flatnonzero(count.values):
+      per_time.setdefault(int(index), []).append(
+        f"{int(count.values[index])} NaN values found for variable {variable_name}"
       )
-      dataset_errors.append(message)
+  dataset_errors = []
+  if static_errors:
+    dataset_errors.append(
+      f"{len(static_errors)} errors found without time: " + ", ".join(static_errors)
+    )
+  datetimes = dataset[time_dim].to_index()
+  for index in sorted(per_time):
+    errors_on_datetime = per_time[index]
+    dataset_errors.append(
+      f"{len(errors_on_datetime)} errors found for time {datetimes[index]}: "
+      + ", ".join(errors_on_datetime)
+    )
   if dataset_errors:
     raise ValidationError("\n".join(dataset_errors))
 

@@ -88,6 +88,27 @@ def test_validate_sample_dataset(downloaded: pathlib.Path, recipes):
   assert result.exit_code == 0, result.output
 
 
+def test_validate_takes_the_dates_of_the_download(
+  tmp_path: pathlib.Path, downloaded: pathlib.Path, recipes
+):
+  """`--start` and `--end` set the time check's bounds, so that a script passes the same dates to
+  `download` and `validate` (the arco-ocean recipe had an end typed years too early, C11); a
+  recipe without the check gets it from them."""
+  args = ("validate", "--fail", str(recipes["validate"]), str(downloaded))
+  late = run(*args[:2], "--end", "2020-03-03", *args[2:])
+  assert late.exit_code != 0 and "Validation failed" in late.output
+  without = tmp_path / "no_time_check.toml"
+  text = recipes["validate"].read_text()
+  without.write_text(
+    text.split("[checks.valid_time_coordinate]")[0] + text.split('freq = "1D"\n')[1]
+  )
+  assert "valid_time_coordinate" not in without.read_text()
+  dates = ("--start", "2020-02-26", "--end", "2020-03-02")
+  assert run("validate", "--fail", *dates, str(without), str(downloaded)).exit_code == 0
+  only_start = run("validate", "--fail", "--start", "2020-02-26", str(without), str(downloaded))
+  assert only_start.exit_code != 0 and "end" in only_start.output
+
+
 def test_process_sample_dataset(tmp_path: pathlib.Path, downloaded: pathlib.Path, recipes):
   """`process` applies the recipe steps (here a time mean of the dynamic variables)."""
   output = tmp_path / "mean.zarr"

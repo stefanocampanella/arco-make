@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
+import datetime
 import logging
 
 import click
@@ -32,6 +33,20 @@ class ValidateConfig(BaseModel):
   type=str,
   callback=check_path(),
 )
+@click.option(
+  "--start",
+  "start_datetime",
+  default=None,
+  type=click.DateTime(),
+  help="Start of the expected time axis (`valid_time_coordinate`), as given to download.",
+)
+@click.option(
+  "--end",
+  "end_datetime",
+  default=None,
+  type=click.DateTime(),
+  help="End of the expected time axis (excluded), as given to download.",
+)
 @click.option("--fail/--no-fail", default=False)
 @click.option(
   "--log-level",
@@ -41,6 +56,8 @@ class ValidateConfig(BaseModel):
 def validate(
   configs_path: str,
   input_path: str,
+  start_datetime: datetime.datetime | None = None,
+  end_datetime: datetime.datetime | None = None,
   fail: bool = False,
   log_level: str = "info",
 ):
@@ -49,13 +66,18 @@ def validate(
   Checks: `valid_time_coordinate` (complete, sorted, without duplicates, between `start` and
   `end` excluded), `valid_global_ecmwf_coordinates` (latitudes increasing within [-90, 90],
   longitudes within [0, 360)) and `ensure_no_nans` (no missing value inside each mask).
-  Failed checks are warnings, or an error with --fail.
+  Failed checks are warnings, or an error with --fail. `--start` and `--end` give the bounds
+  of `valid_time_coordinate` (over the recipe's), so that a script passes the same dates to
+  `download` and `validate`.
   """
   # Set up logging.
   set_default_logger(log_level)
 
-  # Read configs
-  configs = read_configs(configs_path, schema=ValidateConfig)
+  # Read configs; --start and --end set the bounds of the time check.
+  bounds = {"start": start_datetime, "end": end_datetime}
+  given = {key: value for key, value in bounds.items() if value is not None}
+  inject = {"checks": {"valid_time_coordinate": given}} if given else None
+  configs = read_configs(configs_path, schema=ValidateConfig, inject=inject)
   check_aws_profile(input_path)
 
   # Validate the dataset

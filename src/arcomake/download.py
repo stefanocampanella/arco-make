@@ -9,9 +9,10 @@ import warnings
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timedelta
-from typing import Self, get_args, override
+from typing import Any, Self, get_args, override
 
 import click
+import numpy as np
 import xarray as xr
 from dask.diagnostics import ProgressBar
 from dask.utils import format_bytes
@@ -31,13 +32,14 @@ from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
   download_and_process,
+  inline_grids,
   maybe_checkpointing_download_and_process,
   prepare_for_writing,
   refuse_chunk_steps,
   write_output,
 )
 from arcomake.datetime_utils import DateInterval, IterableDateInterval, may_parse_timedelta
-from arcomake.processing_utils import ProcessingStepConfig
+from arcomake.processing_utils import ProcessingStepConfig, time_coverage
 from arcomake.retries import RetryConfig, with_retries
 from arcomake.settings import parse_memory
 from arcomake.temporary_utils import TempDirectoryRegistry
@@ -72,6 +74,13 @@ class DownloadConfig(BaseModel):
   save: SaveConfig
   # How often a block is redone after a transient error (see `retries.RetryConfig`).
   retries: RetryConfig = Field(default_factory=RetryConfig)
+  # Target grids of `regrid` steps, by name (see `dataset_utils.inline_grids`).
+  grids: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+  @model_validator(mode="before")
+  @classmethod
+  def _inline_grids(cls, data: Any) -> Any:
+    return inline_grids(data)
 
   @field_validator("step", mode="before")
   @classmethod
@@ -446,6 +455,7 @@ def _write_block(
     _processed_block(configs, date_interval, progress=progress, budget=budget) as dataset,
     ProgressBar() if progress else nullcontext(),
   ):
+    dataset = _with_output_coverage(dataset, run, configs.save.group, configs.time_dim, first)
     write_output(
       dataset,
       run,
@@ -457,6 +467,30 @@ def _write_block(
       # Chunks are planned for reading; the stored layout is the recipe's.
       align_chunks=True,
     )
+
+
+# The attributes `processing_utils.time_coverage` computes (a one-stamp output has no resolution).
+TIME_COVERAGE = ("time_coverage_start", "time_coverage_end", "time_coverage_resolution")
+
+
+def _with_output_coverage(
+  dataset: xr.Dataset, run: icechunk_utils.Run, group: str | None, time_dim: str, first: bool
+) -> xr.Dataset:
+  """`dataset` with the time coverage of the whole output, if it has one (`coverage_attrs`).
+
+  xarray replaces a store's attributes with each appended block's: the coverage is computed here
+  from the output's stamps (those stored on the run's branch, then the block's), for every block.
+  """
+  if "time_coverage_start" not in dataset.attrs:
+    return dataset
+  stamps = dataset[time_dim].values
+  if not first:
+    store = run.repo.readonly_session(branch=run.branch).store
+    with xr.open_zarr(store, group=group, consolidated=False) as stored:
+      stamps = np.concatenate([stored[time_dim].values, stamps])
+  computed = time_coverage(stamps)
+  attrs = {k: v for k, v in dataset.attrs.items() if k not in TIME_COVERAGE}
+  return dataset.drop_attrs(deep=False).assign_attrs(attrs | computed)
 
 
 def _committed(run: icechunk_utils.Run, interval: DateInterval) -> bool:
@@ -478,8 +512,9 @@ def recipe_fingerprint(configs: DownloadConfig) -> str:
   is resumed only with the same. Settings that only change how blocks are read are left out
   (`[retries]`, parts' `timeout`, `checkpointing`): a run that failed on timeouts can resume with
   longer ones. Options at their default are left out too: an option a later version adds, with a
-  default keeping the earlier behaviour, does not change the fingerprint of recipes without it."""
-  recipe = configs.model_dump(mode="json", exclude={"retries"}, exclude_defaults=True)
+  default keeping the earlier behaviour, does not change the fingerprint of recipes without it.
+  `[grids]` is left out: the regrid steps carry the grids they name."""
+  recipe = configs.model_dump(mode="json", exclude={"retries", "grids"}, exclude_defaults=True)
   for dataset in recipe["datasets"].values():
     dataset.pop("checkpointing", None)
     for part in dataset["parts"]:
