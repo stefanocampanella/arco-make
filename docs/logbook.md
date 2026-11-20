@@ -1169,3 +1169,37 @@ A third review, of these commits, found a defect in older code, fixed: `ensure_n
 KeyError on a mask missing from the dataset, stopping `validate`. Left to the maintainer, since
 they change what existing recipes accept: a listed variable missing from the dataset only warns
 in `ensure_no_nans` (an error in `fraction_domain`), and a mask with NaN counts them as inside.
+Both were decided on 20 Nov (below).
+
+### 20 Nov: cell measures, one check for masks
+
+Maintainer's decisions: GLORYS's sea and ERA5's grid stay separate domains (the grids do not
+overlap, and users may postprocess them differently; no routing of outlets to the sea); ERA5's
+`z` and `lsm` stay as they are; the dataset publishes cell bounds, areas and sea volumes, with
+areas on the sphere of GLORYS12's static product; `ensure_no_nans` absorbs `fraction_domain`
+and fails on a listed variable missing from the dataset.
+
+- GLORYS12's static `e1t` and `e2t` are spherical (`e1t` = R cos(lat) dlon) with R = 6,378,100 m,
+  not NEMO's 6,371,229 m nor the mean radius. Any sphere is off the WGS84 ellipsoid by +0.45 %
+  (cells at the equator) to -0.89 % (near the poles); the geoid's departures (about 100 m) are
+  negligible. The static product's two parts (`bathy`, `coords`) give depths differing by float32
+  rounding (at most 0.5 mm): the `e3t` part takes `coordinate_tolerance`.
+- New: `regrid` passes variables without the horizontal dimensions through (the conservative
+  method failed on them, linear and nearest gave them a latitude dimension: `output:`); steps
+  `cell_bounds` (CF bounds as coordinates; depth from thicknesses) and `cell_area`; a resumed
+  download compares static coordinates too; `ensure_no_nans` reads masks as `mask > threshold`
+  (boolean masks and fractions alike, NaN and negative round-off outside), takes `exact` (true or
+  a list of masks), names the mask of each count, and refuses a static variable under a
+  time-varying mask.
+- At 1 deg (1-2 Mar 2013, the fork recipe): the total of `volcello` equals GLORYS12's own volume
+  (sum of `e1t` x `e2t` x `e3t` x `mask`, levels 0-48, 1.330e18 m3) to 1.8e-7, every level to
+  3e-7; the sea area at the surface agrees; the river total rebuilt with `areacello` equals the
+  pits' (1,079,448.71 m3/s); `areacello` sums to 4 pi R^2 to 7e-10; `validate --fail` passes.
+- **[Moby-Dick]** The recipes kept GLORYS12's attributes on `thetao`, `so`, `uo`, `vo`, `zos`:
+  `cell_methods = "area: mean"` (the coarse values are means over the sea part) and the
+  `valid_min`/`valid_max` of GLORYS12's packed int16 values (thetao: -32766 to 21306), meaningless
+  on unpacked floats. The new recipes replace them; the published dataset probably carries them
+  (not checked).
+- A high-effort review of these commits found nine points; eight were fixed before pushing.
+  Left: a mask whose inside is negative (-1 for sea, say) is now all outside (the maintainer's
+  `mask > threshold` rule).
