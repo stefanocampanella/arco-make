@@ -157,11 +157,12 @@ checkpointing and `[retries]` may change), or a run that started before `main` l
 `--replace` starts over. Do not resume a run that is still going.
 
 A download recipe may give `[checks]`, the tables of a `validate` recipe, run on each block before its
-commit, like pre-commit hooks: `valid_time_coordinate` over the block (its table needs no dates),
-`valid_global_ecmwf_coordinates`, and `ensure_no_nans`, checked while the block is written (no second
-reading). A block that fails is not committed: the run stops, naming the check, the variable and the
-first day wrong, and `--resume` continues once the cause or the check is fixed (`[checks]` is not part
-of the recipe's fingerprint). `validate` still reports everything wrong in a whole output.
+commit, like pre-commit hooks: `valid_time_coordinate` over the block (its table takes no dates),
+`valid_global_ecmwf_coordinates` and `attributes` before writing, and `ensure_no_nans` while the block
+is written (no second reading). A block that fails is not committed: the run stops, naming the check
+and, for `ensure_no_nans`, the variable, the mask and the first day wrong in the chunk that failed
+(not necessarily the first in the block); `--resume` continues once the cause or the check is fixed
+(`[checks]` is not part of the recipe's fingerprint). `validate` still reports everything wrong in a whole output.
 
 Long blocks are much faster than short ones (each block opens its sources and recomputes what
 static fields the steps need, and a long block gives Dask more work to overlap), and memory levels

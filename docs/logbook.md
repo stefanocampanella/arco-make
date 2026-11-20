@@ -1222,7 +1222,8 @@ The Moby-Dick findings plan (maintainer, 17 Nov), with what the coarsening alrea
   while the block is written: `checks.guard_no_nans` wraps each variable in a pass-through
   `apply_ufunc` that raises on a chunk breaking the rule, so nothing is read twice (reading a
   32-day block back from the output would mean about 13 GB at 0.25 deg). A failing block is not
-  committed; the message names the variable, the mask and the first day wrong; `[checks]` is out
+  committed; the message names the check, the variable, the mask and the first day wrong in the
+  chunk that failed (chunks fail in any order); `[checks]` is out
   of the fingerprint, so the run resumes once the cause or the check is fixed. On the 1 deg fork
   recipe (1-9 Mar 2013) the block passed; the run took 5 min (its cost against a run without
   checks was not measured).

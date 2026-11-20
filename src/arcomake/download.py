@@ -6,7 +6,7 @@ import json
 import logging
 import math
 import warnings
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -89,10 +89,16 @@ class DownloadConfig(BaseModel):
   @model_validator(mode="before")
   @classmethod
   def _time_check_over_the_recipe(cls, data: Any) -> Any:
-    # Each block's time axis is checked over the block; the table needs no dates of its own.
+    # Each block's time axis is checked over the block: the table takes no dates (they would go
+    # unused), and gets the recipe's to satisfy the model.
     if isinstance(data, dict) and isinstance(data.get("checks"), dict):
       table = data["checks"].get("valid_time_coordinate")
       if isinstance(table, dict):
+        if "start" in table or "end" in table:
+          raise ValueError(
+            "checks.valid_time_coordinate: a download checks each block's time axis over the"
+            " block: remove start and end"
+          )
         data["checks"]["valid_time_coordinate"] = {
           "start": data.get("start"),
           "end": data.get("end"),
@@ -521,7 +527,7 @@ def _write_block(
       static.checked = True
     dataset = _with_output_coverage(dataset, run, configs.save.group, configs.time_dim, first)
     if configs.checks is not None:
-      dataset = _checked_block(dataset, configs.checks, date_interval)
+      dataset = _checked_block(dataset, configs.checks, date_interval, configs.time_dim)
     write_output(
       dataset,
       run,
@@ -536,28 +542,40 @@ def _write_block(
 
 
 def _checked_block(
-  dataset: xr.Dataset, config: ChecksConfig, date_interval: DateInterval
+  dataset: xr.Dataset, config: ChecksConfig, date_interval: DateInterval, time_dim: str
 ) -> xr.Dataset:
   """`dataset` checked by the recipe's `[checks]`, like pre-commit hooks: the time axis over the
-  block, the coordinates and the attributes now, missing values while the block is written
-  (`guard_no_nans`, no second reading). A failure raises `ValidationError`, so the block is not
-  committed.
+  block, and the checks reading only coordinates and attributes (`checks.METADATA_CHECKS`), now;
+  missing values while the block is written (`guard_no_nans`, no second reading). Tables without
+  a `time_dim` take the recipe's. A failure raises `ValidationError` naming the check, so the
+  block is not committed.
   """
   if (time_check := config.valid_time_coordinate) is not None:
-    checks.valid_time_coordinate(
+    _named(
+      "valid_time_coordinate",
+      checks.valid_time_coordinate,
       dataset,
       date_interval.start,
       date_interval.end,
       freq=time_check.freq,
-      time_dim=time_check.time_dim,
+      time_dim=time_check.time_dim if "time_dim" in time_check.model_fields_set else time_dim,
     )
-  # The other checks read coordinates and attributes only.
-  for name, table in config.model_dump(exclude_none=True).items():
-    if name not in ("valid_time_coordinate", "ensure_no_nans"):
-      checks.CHECKS[name](dataset, **table)
+  for name in sorted(checks.METADATA_CHECKS):
+    if (table := getattr(config, name)) is not None:
+      _named(name, checks.CHECKS[name], dataset, **table.model_dump())
   if (no_nans := config.ensure_no_nans) is not None:
-    dataset = checks.guard_no_nans(dataset, **no_nans.model_dump(exclude_none=True))
+    table = no_nans.model_dump(exclude_none=True)
+    table.setdefault("time_dim", time_dim)
+    dataset = checks.guard_no_nans(dataset, **table)
   return dataset
+
+
+def _named(name: str, check: Callable[..., None], *args: Any, **kwargs: Any) -> None:
+  """Run `check`; its `ValidationError` names it."""
+  try:
+    check(*args, **kwargs)
+  except ValidationError as exc:
+    raise ValidationError(f"{name}: {exc}") from exc
 
 
 def _check_static(

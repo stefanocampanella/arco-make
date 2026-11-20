@@ -384,11 +384,11 @@ def test_guard_no_nans_passes_values_through_lazily(ocean_ds):
   [
     (
       "missing",
-      "NaN values found for variable thetao inside mask seafrac in a block, first at 2020-02-28",
+      "NaN values found for variable thetao inside mask seafrac in a block, first in its chunk at 2020-02-28",
     ),
     (
       "outside",
-      "values found outside mask seafrac for variable thetao in a block, first at 2020-02-28",
+      "values found outside mask seafrac for variable thetao in a block, first in its chunk at 2020-02-28",
     ),
   ],
 )
@@ -433,6 +433,32 @@ def test_attributes_required_and_distinct(ocean_ds):
   with pytest.raises(ValidationError, match="without units: zos"):
     checks.attributes(ds)
   checks.attributes(ds, required=["long_name"])
+
+
+def test_guard_no_nans_on_a_cftime_axis(ocean_ds):
+  """cftime dates are objects Dask cannot chunk: the guard passes day positions instead."""
+  times = xr.date_range(
+    "2020-02-26", periods=ocean_ds.sizes["time"], calendar="noleap", use_cftime=True
+  )
+  ds = with_seafrac(ocean_ds).assign_coords(time=times)
+  checks.guard_no_nans(ds.chunk(time=2), exact=True, seafrac=["thetao", "zos"]).compute()
+  ds["zos"] = ds.zos.fillna(0.0)
+  guarded = checks.guard_no_nans(ds.chunk(time=2), exact=True, seafrac=["thetao", "zos"])
+  with pytest.raises(
+    ValidationError, match="outside mask seafrac for variable zos .*first in its chunk at 2020-"
+  ):
+    guarded.compute()
+
+
+def test_guard_no_nans_keeps_the_variables_chunks(ocean_ds):
+  """A mask chunked otherwise is aligned to the variable, not the variable to the mask."""
+  ds = with_seafrac(ocean_ds)
+  ds = ds[["thetao", "seafrac"]]
+  ds = ds.assign(thetao=ds.thetao.chunk(time=2), seafrac=ds.seafrac.chunk(latitude=1))
+  ds.encoding["source"] = "kept"
+  guarded = checks.guard_no_nans(ds, exact=True, seafrac=["thetao"])
+  assert guarded.thetao.chunks == ds.thetao.chunks
+  assert guarded.encoding == {"source": "kept"}
 
 
 def test_attributes_check_in_a_recipe(ocean_ds):

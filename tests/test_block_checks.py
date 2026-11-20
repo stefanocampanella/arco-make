@@ -10,6 +10,7 @@ import re
 import tomllib
 
 import numpy as np
+import pydantic
 import pytest
 import xarray as xr
 from click.testing import CliRunner, Result
@@ -67,10 +68,11 @@ def test_a_failing_block_is_not_committed_and_the_run_resumes(tmp_path, sources)
   output = tmp_path / "out"
   failed = run(recipe_with(tmp_path, sources, CHECKS), output)
   assert failed.exit_code != 0
-  assert "the block was not committed" in failed.output
+  assert "the block was not committed: ensure_no_nans:" in failed.output
   # The first chunk to fail is reported: thetao (inside the mask) or thetao_bottom (everywhere).
   assert re.search(
-    r"NaN values found for variable thetao\S* .*in a block, first at 2020-02-28", failed.output
+    r"NaN values found for variable thetao\S* .*in a block, first in its chunk at 2020-02-28",
+    failed.output,
   )
   waiting = icechunk_utils.waiting_run(output, None, "download")
   assert waiting is not None and len(waiting.blocks) == 1
@@ -94,9 +96,9 @@ def test_the_time_check_needs_no_dates_and_checks_each_block():
   assert config.checks is not None and config.checks.valid_time_coordinate is not None
   block = DateInterval(datetime.datetime(2020, 2, 28), datetime.datetime(2020, 3, 1))
   days = xr.Dataset(coords={"time": np.array(["2020-02-28", "2020-02-29"], "datetime64[ns]")})
-  download_module._checked_block(days, config.checks, block)
-  with pytest.raises(ValidationError, match="Missing"):
-    download_module._checked_block(days.isel(time=[0]), config.checks, block)
+  download_module._checked_block(days, config.checks, block, "time")
+  with pytest.raises(ValidationError, match="valid_time_coordinate: .*Missing"):
+    download_module._checked_block(days.isel(time=[0]), config.checks, block, "time")
 
 
 def test_checks_are_not_part_of_the_fingerprint(tmp_path, sources):
@@ -108,3 +110,39 @@ def test_checks_are_not_part_of_the_fingerprint(tmp_path, sources):
     without
   )
   assert isinstance(with_checks.checks, ChecksConfig)
+
+
+def test_the_time_check_takes_no_dates():
+  """They would go unused: each block is checked over the block."""
+  recipe = {
+    "start": datetime.datetime(2020, 2, 26),
+    "end": datetime.datetime(2020, 3, 2),
+    "step": "2D",
+    "datasets": {},
+    "save": {"chunks": {"time": 1}},
+    "checks": {"valid_time_coordinate": {"start": datetime.datetime(2020, 2, 26)}},
+  }
+  with pytest.raises(pydantic.ValidationError, match="remove start and end"):
+    download_module.DownloadConfig.model_validate(recipe)
+
+
+def test_block_checks_take_the_recipes_time_dimension():
+  """Tables without `time_dim` use the recipe's: here a static variable under a mask that varies
+  in time is refused, and the time axis is checked along `valid_time`."""
+  config = ChecksConfig.model_validate(
+    {
+      "valid_time_coordinate": {
+        "start": datetime.datetime(2020, 2, 28),
+        "end": datetime.datetime(2020, 3, 1),
+      },
+      "ensure_no_nans": {"ice": ["depth"]},
+    }
+  )
+  stamps = np.array(["2020-02-28", "2020-02-29"], "datetime64[ns]")
+  ds = xr.Dataset(
+    {"ice": (("valid_time", "x"), np.ones((2, 3))), "depth": ("x", np.ones(3))},
+    coords={"valid_time": stamps},
+  )
+  block = DateInterval(datetime.datetime(2020, 2, 28), datetime.datetime(2020, 3, 1))
+  with pytest.raises(ValidationError, match="'depth' has no 'valid_time' but its mask 'ice' has"):
+    download_module._checked_block(ds, config, block, "valid_time")
