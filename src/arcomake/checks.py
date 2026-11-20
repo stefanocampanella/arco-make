@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from datetime import datetime
 from typing import Literal, Self, cast
 
@@ -9,7 +9,7 @@ import dask
 import numpy as np
 import pandas as pd
 import xarray as xr
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from arcomake.processing_utils import check_fraction_threshold
 
@@ -66,12 +66,23 @@ class EnsureNoNansCheck(BaseModel):
     return self
 
 
+class AttributesCheck(BaseModel):
+  """`required`: attributes every data variable must have (not empty); `distinct`: attributes
+  whose values must differ between data variables."""
+
+  model_config = ConfigDict(extra="forbid")
+
+  required: list[str] = Field(default_factory=lambda: ["long_name", "units"])
+  distinct: list[str] = Field(default_factory=lambda: ["long_name"])
+
+
 class ChecksConfig(BaseModel):
   model_config = ConfigDict(extra="forbid")
 
   valid_global_ecmwf_coordinates: ValidGlobalECMWFCoordinatesCheck | None = None
   valid_time_coordinate: ValidTimeCoordinateCheck | None = None
   ensure_no_nans: EnsureNoNansCheck | None = None
+  attributes: AttributesCheck | None = None
 
 
 def _report_by_time[K: Hashable](
@@ -409,9 +420,41 @@ def valid_cftime_index(
 
 
 # The checks a recipe may name: each field of `ChecksConfig` maps to its function.
+def attributes(
+  dataset: xr.Dataset,
+  required: Sequence[str] = ("long_name", "units"),
+  distinct: Sequence[str] = ("long_name",),
+) -> None:
+  """Check the data variables' attributes: each has every `required` one, not empty, and the
+  values of each `distinct` one differ between variables (two `long_name`s alike tell a reader
+  nothing, as a mask named after the variable it was made from).
+
+  Raises:
+    ValidationError: naming the variables without an attribute, and those sharing a value.
+  """
+  errors = []
+  for attribute in required:
+    lacking = [
+      str(name) for name, da in dataset.data_vars.items() if not str(da.attrs.get(attribute, ""))
+    ]
+    if lacking:
+      errors.append(f"without {attribute}: {', '.join(lacking)}")
+  for attribute in distinct:
+    holders: dict[str, list[str]] = {}
+    for name, da in dataset.data_vars.items():
+      if (value := str(da.attrs.get(attribute, ""))) != "":
+        holders.setdefault(value, []).append(str(name))
+    for value, names in holders.items():
+      if len(names) > 1:
+        errors.append(f"same {attribute} {value!r}: {', '.join(names)}")
+  if errors:
+    raise ValidationError("\n".join(errors))
+
+
 CHECKS: dict[str, Callable[..., None]] = {
   "valid_global_ecmwf_coordinates": valid_global_ecmwf_coordinates,
   "valid_time_coordinate": valid_time_coordinate,
   "ensure_no_nans": ensure_no_nans,
+  "attributes": attributes,
 }
 assert set(CHECKS) == set(ChecksConfig.model_fields)

@@ -539,8 +539,9 @@ def _checked_block(
   dataset: xr.Dataset, config: ChecksConfig, date_interval: DateInterval
 ) -> xr.Dataset:
   """`dataset` checked by the recipe's `[checks]`, like pre-commit hooks: the time axis over the
-  block and the coordinates now, missing values while the block is written (`guard_no_nans`, no
-  second reading). A failure raises `ValidationError`, so the block is not committed.
+  block, the coordinates and the attributes now, missing values while the block is written
+  (`guard_no_nans`, no second reading). A failure raises `ValidationError`, so the block is not
+  committed.
   """
   if (time_check := config.valid_time_coordinate) is not None:
     checks.valid_time_coordinate(
@@ -550,8 +551,10 @@ def _checked_block(
       freq=time_check.freq,
       time_dim=time_check.time_dim,
     )
-  if (coordinates := config.valid_global_ecmwf_coordinates) is not None:
-    checks.valid_global_ecmwf_coordinates(dataset, **coordinates.model_dump())
+  # The other checks read coordinates and attributes only.
+  for name, table in config.model_dump(exclude_none=True).items():
+    if name not in ("valid_time_coordinate", "ensure_no_nans"):
+      checks.CHECKS[name](dataset, **table)
   if (no_nans := config.ensure_no_nans) is not None:
     dataset = checks.guard_no_nans(dataset, **no_nans.model_dump(exclude_none=True))
   return dataset

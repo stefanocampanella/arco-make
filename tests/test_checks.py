@@ -412,3 +412,30 @@ def test_guard_no_nans_fails_when_computed(ocean_ds, kind: str, message: str):
 def test_guard_no_nans_refuses_missing_masks_at_once(ocean_ds):
   with pytest.raises(ValidationError, match="mask 'sea' not found"):
     checks.guard_no_nans(ocean_ds.chunk(time=1), sea=["thetao"])
+
+
+def test_attributes_required_and_distinct(ocean_ds):
+  """The Moby-Dick notes (item 18): masks carried the long_name of the field they came from, and
+  bottom values the long_name of the full field."""
+  ds = ocean_ds.assign(
+    thetao_bottom=ocean_ds.thetao.isel(depth=-1, drop=True).assign_attrs(
+      long_name="Temperature", units="degC"
+    )
+  )
+  ds["thetao"].attrs.update(long_name="Temperature")
+  ds["zos"].attrs.update(long_name="Sea surface height")
+  with pytest.raises(ValidationError) as raised:
+    checks.attributes(ds)
+  assert str(raised.value).splitlines() == ["same long_name 'Temperature': thetao, thetao_bottom"]
+  ds["thetao_bottom"].attrs["long_name"] = "Temperature at the sea floor"
+  checks.attributes(ds)
+  del ds["zos"].attrs["units"]
+  with pytest.raises(ValidationError, match="without units: zos"):
+    checks.attributes(ds)
+  checks.attributes(ds, required=["long_name"])
+
+
+def test_attributes_check_in_a_recipe(ocean_ds):
+  config = ChecksConfig.model_validate({"attributes": {"required": ["long_name"]}})
+  with pytest.raises(ValidationError, match="without long_name: thetao, zos"):
+    ocean_ds.arcomake.validate(config, fail=True)
