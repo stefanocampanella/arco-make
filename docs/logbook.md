@@ -1203,3 +1203,10 @@ and fails on a listed variable missing from the dataset.
 - A high-effort review of these commits found nine points; eight were fixed before pushing.
   Left: a mask whose inside is negative (-1 for sea, say) is now all outside (the maintainer's
   `mask > threshold` rule).
+- Correction (maintainer, later on 20 Nov): "`z` and `lsm` stay" meant that they stay in the
+  dataset, as static data. The fork recipes had never adopted `static_time` and still stored them
+  as daily means; they now read them at 2000-01-01T00:00, once per run, without time. The
+  source's values at that stamp equal those of 1993-01-01, 2010-07-01 and 2021-06-30; `z`
+  differs from 2022-10-01 on at the two polar rows (2,880 cells, up to 364 m2 s-2). At 1 deg the
+  static fields differ from the old daily means by float32 rounding only; the statistics leave
+  them out (Moby-Dick notes, item 3: their z-scores were rounding noise).
