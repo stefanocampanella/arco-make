@@ -361,3 +361,54 @@ def test_messages_name_the_mask_of_each_count(ocean_ds):
     )
   assert "inside mask everywhere" in str(raised.value)
   assert "inside mask seafrac" not in str(raised.value)
+
+
+def test_guard_no_nans_passes_values_through_lazily(ocean_ds):
+  """Nothing is computed until the dataset is; values, attributes and encodings are unchanged."""
+  ds = with_seafrac(ocean_ds).chunk(time=1)
+  calls = []
+
+  def counting(dsk, keys, **kwargs):
+    calls.append(1)
+    return dask.get(dsk, keys, **kwargs)
+
+  with dask.config.set(scheduler=counting):
+    guarded = checks.guard_no_nans(ds, exact=True, seafrac=["thetao", "zos"])
+  assert calls == []
+  xr.testing.assert_identical(guarded.compute(), ds.compute())
+  assert guarded.thetao.encoding == ds.thetao.encoding
+
+
+@pytest.mark.parametrize(
+  ("kind", "message"),
+  [
+    (
+      "missing",
+      "NaN values found for variable thetao inside mask seafrac in a block, first at 2020-02-28",
+    ),
+    (
+      "outside",
+      "values found outside mask seafrac for variable thetao in a block, first at 2020-02-28",
+    ),
+  ],
+)
+def test_guard_no_nans_fails_when_computed(ocean_ds, kind: str, message: str):
+  """The rule of `ensure_no_nans`, checked chunk by chunk: the error names the first time step
+  wrong."""
+  ds = with_seafrac(ocean_ds)
+  thetao = ds.thetao.values.copy()
+  if kind == "missing":
+    thetao[2, 0, 3, 4] = np.nan
+    thetao[4, 0, 3, 4] = np.nan
+  else:
+    thetao[2, 2, 3, 1] = 1.0
+  ds["thetao"] = (ds.thetao.dims, thetao)
+  # One chunk over all days: the first day wrong in it is named (chunks fail in any order).
+  guarded = checks.guard_no_nans(ds.chunk(time=-1), exact=True, seafrac=["thetao", "zos"])
+  with pytest.raises(ValidationError, match=message):
+    guarded.compute()
+
+
+def test_guard_no_nans_refuses_missing_masks_at_once(ocean_ds):
+  with pytest.raises(ValidationError, match="mask 'sea' not found"):
+    checks.guard_no_nans(ocean_ds.chunk(time=1), sea=["thetao"])

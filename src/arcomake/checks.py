@@ -105,6 +105,73 @@ def _report_by_time[K: Hashable](
   return static, [(stamps[index], per_time[index]) for index in sorted(per_time)]
 
 
+type _Key = tuple[Hashable, Hashable | None, str]
+
+
+def _wrong(
+  dataset: xr.Dataset,
+  time_dim: str,
+  threshold: float,
+  inclusive: bool,
+  exact: bool | list[str],
+  masks: Mapping[str, list[str]],
+) -> tuple[list[str], dict[_Key, xr.DataArray]]:
+  """The rule of `ensure_no_nans`: errors found without computing (missing masks or variables),
+  and per (variable, mask, kind) the lazy flags of its wrong cells."""
+  dataset_errors: list[str] = []
+  exact_masks = set(masks) if exact is True else set(exact or [])
+  for mask_name in sorted(exact_masks - set(masks)):
+    dataset_errors.append(f"exact: {mask_name!r} is not one of the masks")
+  masks_of: dict[Hashable, list[Hashable]] = {}
+  unchecked: set[Hashable] = set()
+  for mask_name, variable_names in masks.items():
+    if mask_name not in dataset.variables:
+      # Its variables are not checked: everywhere, they would be reported missing on land.
+      dataset_errors.append(f"mask {mask_name!r} not found")
+      unchecked.update(variable_names)
+      continue
+    for variable_name in variable_names:
+      if variable_name in dataset.data_vars:
+        masks_of.setdefault(variable_name, []).append(mask_name)
+      else:
+        dataset_errors.append(f"variable {variable_name!r} of mask {mask_name!r} not found")
+
+  # Per variable and mask: missing values inside it and, with `exact`, values outside.
+  wrong: dict[_Key, xr.DataArray] = {}
+  # Each mask is compared with the threshold once, then reduced to the dimensions of each variable.
+  inside_all = {
+    name: dataset[name] >= threshold if inclusive else dataset[name] > threshold
+    for name in {m for masks in masks_of.values() for m in masks}
+  }
+  for variable_name, da in dataset.data_vars.items():
+    if variable_name in unchecked and variable_name not in masks_of:
+      continue
+    missing = da.isnull()
+    if variable_name not in masks_of:
+      wrong[(variable_name, None, "missing")] = missing
+    for mask_name in masks_of.get(variable_name, []):
+      inside = inside_all[mask_name]
+      if time_dim in inside.dims and time_dim not in da.dims:
+        dataset_errors.append(
+          f"variable {variable_name!r} has no {time_dim!r} but its mask {mask_name!r} has"
+        )
+        continue
+      inside = inside.isel({dim: 0 for dim in inside.dims if dim not in da.dims}, drop=True)
+      wrong[(variable_name, mask_name, "missing")] = missing & inside
+      if mask_name in exact_masks:
+        wrong[(variable_name, mask_name, "outside")] = da.notnull() & ~inside
+
+  return dataset_errors, wrong
+
+
+def _describe(key: _Key, n: int) -> str:
+  variable, mask_name, kind = key
+  if kind == "outside":
+    return f"{n} values found outside mask {mask_name} for variable {variable}"
+  inside = "" if mask_name is None else f" inside mask {mask_name}"
+  return f"{n} NaN values found for variable {variable}{inside}"
+
+
 def ensure_no_nans(
   dataset: xr.Dataset,
   time_dim: str = "time",
@@ -130,58 +197,10 @@ def ensure_no_nans(
     ValidationError: listing, per time step, the variables with missing values inside their
       masks (or anywhere) and, with `exact`, with values outside.
   """
-  dataset_errors: list[str] = []
-  exact_masks = set(kwargs) if exact is True else set(exact or [])
-  for mask_name in sorted(exact_masks - set(kwargs)):
-    dataset_errors.append(f"exact: {mask_name!r} is not one of the masks")
-  masks_of: dict[Hashable, list[Hashable]] = {}
-  unchecked: set[Hashable] = set()
-  for mask_name, variable_names in kwargs.items():
-    if mask_name not in dataset.variables:
-      # Its variables are not checked: everywhere, they would be reported missing on land.
-      dataset_errors.append(f"mask {mask_name!r} not found")
-      unchecked.update(variable_names)
-      continue
-    for variable_name in variable_names:
-      if variable_name in dataset.data_vars:
-        masks_of.setdefault(variable_name, []).append(mask_name)
-      else:
-        dataset_errors.append(f"variable {variable_name!r} of mask {mask_name!r} not found")
-
-  # Per variable and mask: missing values inside it and, with `exact`, values outside.
-  wrong: dict[tuple[Hashable, Hashable | None, str], xr.DataArray] = {}
-  # Each mask is compared with the threshold once, then reduced to the dimensions of each variable.
-  inside_all = {
-    name: dataset[name] >= threshold if inclusive else dataset[name] > threshold
-    for name in {m for masks in masks_of.values() for m in masks}
-  }
-  for variable_name, da in dataset.data_vars.items():
-    if variable_name in unchecked and variable_name not in masks_of:
-      continue
-    missing = da.isnull()
-    if variable_name not in masks_of:
-      wrong[(variable_name, None, "missing")] = missing
-    for mask_name in masks_of.get(variable_name, []):
-      inside = inside_all[mask_name]
-      if time_dim in inside.dims and time_dim not in da.dims:
-        dataset_errors.append(
-          f"variable {variable_name!r} has no {time_dim!r} but its mask {mask_name!r} has"
-        )
-        continue
-      inside = inside.isel({dim: 0 for dim in inside.dims if dim not in da.dims}, drop=True)
-      wrong[(variable_name, mask_name, "missing")] = missing & inside
-      if mask_name in exact_masks:
-        wrong[(variable_name, mask_name, "outside")] = da.notnull() & ~inside
-
-  def describe(key: tuple[Hashable, Hashable | None, str], n: int) -> str:
-    variable, mask_name, kind = key
-    if kind == "outside":
-      return f"{n} values found outside mask {mask_name} for variable {variable}"
-    inside = "" if mask_name is None else f" inside mask {mask_name}"
-    return f"{n} NaN values found for variable {variable}{inside}"
+  dataset_errors, wrong = _wrong(dataset, time_dim, threshold, inclusive, exact, kwargs)
 
   logger.info("Checking for Nans.")
-  static, per_time = _report_by_time(dataset, wrong, time_dim, describe)
+  static, per_time = _report_by_time(dataset, wrong, time_dim, _describe)
   if static:
     dataset_errors.append(f"{len(static)} errors found without time: " + ", ".join(static))
   dataset_errors += [
@@ -189,6 +208,67 @@ def ensure_no_nans(
   ]
   if dataset_errors:
     raise ValidationError("\n".join(dataset_errors))
+
+
+def guard_no_nans(
+  dataset: xr.Dataset,
+  time_dim: str = "time",
+  threshold: float = 0.0,
+  inclusive: bool = False,
+  exact: bool | list[str] = False,
+  **kwargs: list[str],
+) -> xr.Dataset:
+  """`dataset` whose variables fail when computed if they break the rule of `ensure_no_nans`
+  (same arguments): checked while the dataset is computed (written, say), without reading it
+  again. Each variable passes through unchanged, chunk by chunk; the first chunk breaking the rule
+  raises, naming the variable, the mask and its first time step wrong. Missing masks or variables
+  fail at once.
+
+  Raises:
+    ValidationError: at once, for missing masks or variables; when computed, for wrong values.
+  """
+  errors, wrong = _wrong(dataset, time_dim, threshold, inclusive, exact, kwargs)
+  if errors:
+    raise ValidationError("\n".join(errors))
+  flags_of: dict[Hashable, list[tuple[_Key, xr.DataArray]]] = {}
+  for key, flags in wrong.items():
+    flags_of.setdefault(key[0], []).append((key, flags))
+  data_vars = dict(dataset.data_vars)
+  for name, keyed in flags_of.items():
+    da = dataset[name]
+    timed = time_dim in da.dims
+    inputs = [da, *(flags for _, flags in keyed)] + ([da[time_dim]] if timed else [])
+    guarded = xr.apply_ufunc(
+      _pass_if_right,
+      *inputs,
+      dask="parallelized",
+      output_dtypes=[da.dtype],
+      join="exact",
+      keep_attrs="drop_conflicts",
+      kwargs={"keys": [key for key, _ in keyed], "timed": timed},
+    ).transpose(*da.dims)
+    guarded.attrs = dict(da.attrs)
+    guarded.encoding = dict(da.encoding)
+    data_vars[name] = guarded
+  return xr.Dataset(data_vars=data_vars, coords=dataset.coords, attrs=dataset.attrs)
+
+
+def _pass_if_right(
+  values: np.ndarray, *flags_and_stamps: np.ndarray, keys: list[_Key], timed: bool
+) -> np.ndarray:
+  """`values`, unchanged, if none of the flags (one per key, broadcast to `values`) is set; else
+  ValidationError naming the key, its count in this chunk and its first time stamp wrong."""
+  flags = flags_and_stamps[:-1] if timed else flags_and_stamps
+  for key, flag in zip(keys, flags, strict=True):
+    flag = np.broadcast_to(flag, values.shape)
+    if not flag.any():
+      continue
+    message = _describe(key, int(flag.sum())) + " in a block"
+    if timed:
+      stamps = np.broadcast_to(flags_and_stamps[-1], values.shape)
+      message += f", first at {pd.Timestamp(stamps[flag].min())}"
+    raise ValidationError(message)
+  return values
 
 
 def valid_global_ecmwf_coordinates(
