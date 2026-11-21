@@ -12,7 +12,7 @@ import xarray as xr
 from pydantic import ValidationError
 
 from arcomake import dataset_utils, icechunk_utils
-from arcomake.dataset_utils import SaveConfig, write_output, write_outputs_together
+from arcomake.dataset_utils import SaveConfig, write_output
 from tests.conftest import open_output, output_group
 
 
@@ -92,24 +92,6 @@ def test_safe_to_zarr_append(ocean_ds: xr.Dataset, tmp_path: pathlib.Path):
   save(ocean_ds.isel(time=slice(0, 3)), path, configs=SAVE, mode="w")
   save(ocean_ds.isel(time=slice(3, None)), path, configs=SAVE, mode="a-", append_dim="time")
   xr.testing.assert_allclose(open_output(path).load(), ocean_ds)
-
-
-@pytest.mark.parametrize("one_variable", [False, True])
-def test_outputs_written_together_share_one_computation(ocean_ds, tmp_path, one_variable):
-  """`write_outputs_together` computes datasets that share inputs once, then commits each
-  repository (with a local scheduler; see its docstring for distributed ones). With one
-  variable, as the climatology's window feeds one variable of each output, Dask fused the shared
-  step into each output's write and computed it twice."""
-  calls = []
-  chunked = (ocean_ds[["thetao"]] if one_variable else ocean_ds).chunk(time=1)
-  shared = chunked.map_blocks(lambda block: calls.append(1) or block, template=chunked)
-  snapshots = write_outputs_together(
-    [(shared, tmp_path / "a.zarr"), (shared * 2, tmp_path / "b.zarr")], SAVE, label="both"
-  )
-  assert len(snapshots) == 2
-  xr.testing.assert_allclose(open_output(tmp_path / "a.zarr").load(), chunked.load())
-  xr.testing.assert_allclose(open_output(tmp_path / "b.zarr").load(), chunked.load() * 2)
-  assert len(calls) == ocean_ds.sizes["time"]  # each block once, not once per output
 
 
 def test_outputs_are_repositories_with_one_commit_per_write(ocean_ds, tmp_path):

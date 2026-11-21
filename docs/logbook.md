@@ -1323,3 +1323,16 @@ each buffer counted once, and RSS), on synthetic data and the 1 deg test output:
   disk, 32 threads: 6 years 23 s and 6.5 GiB against 34 s and 2.4 GiB; 12 years 27 s and 8.7 GiB
   against 38 s and 3.3 GiB. Streaming reads one block at a time per series; the graph reads in
   parallel, which should matter more from S3 (not measured).
+- **Checkpoint** (maintainer's suggestion, accepted): the graph path computes both outputs once
+  into a temporary plain Zarr v3 store (a DataTree, one group each; unsharded, Dask's chunks, and
+  along time whole stored units up to Dask's chunk size), then copies each into its repository,
+  one task per group of stored units. The shared session writer (`write_into_sessions`, on
+  xarray's private API) is gone: writes computed together share no work, so the outputs are
+  written in turn, with any scheduler. The 1 deg test output (4 threads): without shards 80 s
+  and 4.1 GiB -> 97 s and 4.0 GiB; with shards of 8 bins and all levels 74 s and 18.3 GiB ->
+  104 s and 4.1 GiB; outputs identical bit for bit (values, attributes, encodings, array
+  metadata). With one-bin units the temporary store first had a chunk per bin and level (224 s:
+  small files); whole units up to Dask's chunk size fixed it. Temporary disk at 0.25 deg: about
+  150 GB per 3D variable for both outputs, before compression (warned about if the disk has less
+  free). On a distributed client every worker must see the store (checked: a chunk written where
+  the copy does not look would be read as NaN).

@@ -9,7 +9,7 @@ import pytest
 import xarray as xr
 from click.testing import CliRunner
 
-from arcomake import cli, dataset_utils, icechunk_utils
+from arcomake import cli, icechunk_utils
 from arcomake.dataset_utils import SaveConfig, open_input, write_output, write_outputs_together
 from tests.conftest import open_output, render_recipe
 
@@ -47,11 +47,17 @@ def test_the_icechunk_engine_reads_any_version(ocean_ds: xr.Dataset, tmp_path: p
   open_input(str(path), engine="icechunk", consolidated=True).close()
 
 
-def test_outputs_written_in_turn_on_a_distributed_scheduler(ocean_ds, tmp_path, monkeypatch):
-  """On a distributed client each output is written (and computed) in its own commit."""
-  monkeypatch.setattr(dataset_utils, "_distributed_client", lambda: True)
+@pytest.mark.parametrize("scheduler", ["synchronous", "threads", "processes"])
+def test_outputs_written_together_with_any_local_scheduler(ocean_ds, tmp_path, scheduler):
+  """Each output is written in its own commit, whatever the scheduler: Icechunk's writer
+  collects the writes of other processes too (they once went through this process's sessions,
+  with threads instead of processes)."""
+  import dask
+
   outputs = [(ocean_ds, tmp_path / "a.zarr"), (ocean_ds * 2, tmp_path / "b.zarr")]
-  assert len(write_outputs_together(outputs, SaveConfig(), label="both")) == 2
+  with dask.config.set(scheduler=scheduler):
+    assert len(write_outputs_together(outputs, SaveConfig(), label="both")) == 2
+  xr.testing.assert_allclose(open_output(tmp_path / "a.zarr").load(), ocean_ds)
   xr.testing.assert_allclose(open_output(tmp_path / "b.zarr").load(), ocean_ds * 2)
 
 
@@ -162,19 +168,6 @@ def test_gcs_tokens(tmp_path: pathlib.Path):
   assert isinstance(icechunk_utils.storage("gs://b/p", {"token": str(account)}), icechunk.Storage)
   with pytest.raises(ValueError, match="service account file"):
     icechunk_utils.storage("gs://b/p", {"token": "google_default"})
-
-
-@pytest.mark.parametrize(
-  ("scheduler", "expected"),
-  [("synchronous", "synchronous"), ("processes", "threads"), ("threads", "threads")],
-)
-def test_writes_into_sessions_keep_a_synchronous_scheduler(scheduler: str, expected: str):
-  """Writes into sessions run in this process: synchronous stays (debugging), processes become
-  threads (logged)."""
-  import dask
-
-  with dask.config.set(scheduler=scheduler):
-    assert dataset_utils._local_scheduler() == expected
 
 
 @pytest.mark.parametrize("split", ["", 'split_dims = ["lat"]\n'], ids=["graph", "series"])

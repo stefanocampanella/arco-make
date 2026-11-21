@@ -296,10 +296,61 @@ def test_zip_outputs_are_refused_before_any_work(recipes, tmp_path: pathlib.Path
   assert not output.exists()
 
 
-def test_climatology_writes_shards_its_chunks_straddle(tmp_path: pathlib.Path):
+def test_climatology_series_need_no_temporary_store(tmp_path: pathlib.Path, monkeypatch):
+  """Only the graph path has a temporary store: computing one series at a time makes no
+  temporary directory."""
+  from arcomake import climatology
+
+  def refused(*args, **kwargs):
+    raise AssertionError("a temporary directory registry")
+
+  monkeypatch.setattr(climatology, "TempDirectoryRegistry", refused)
+  time = pd.date_range("2019-01-01", "2020-01-01", freq="1D", inclusive="left")
+  values = np.zeros((time.size, 2, 3), dtype="float32")
+  source = tmp_path / "in.zarr"
+  xr.Dataset({"t": (("time", "lat", "lon"), values)}, coords={"time": time}).to_zarr(source)
+  recipe = tmp_path / "climatology.toml"
+  recipe.write_text(
+    'period = 365\nbins = "day_of_year"\nwindow = 3\nweighting = "constant"\n'
+    'split_dims = ["lat"]\n[read]\nengine = "zarr"\n[save]\nchunks = {time = 1}\n'
+  )
+  clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
+  result = run("compute-climatology", *THREADS, str(recipe), str(source), str(clim), str(std))
+  assert result.exit_code == 0, result.output
+
+
+def test_climatology_writes_shards_its_chunks_straddle(tmp_path: pathlib.Path, monkeypatch):
   """Read one level per chunk, stored in shards of all levels (the layout of the historical
   datasets, used by the statistics too): the writes are aligned to the stored layout, as in
-  download; xarray refused Dask chunks overlapping a shard."""
+  download; xarray refused Dask chunks overlapping a shard.
+
+  The outputs are computed into a temporary store, then copied: the window runs once per chunk
+  (it ran once per output), and the store is removed at the end."""
+  import tempfile
+
+  from arcomake import climatology
+  from arcomake.temporary_utils import TempDirectoryRegistry
+
+  windows = []
+  window = climatology._window_bins_last
+
+  def counted(*args, **kwargs):
+    windows.append(1)
+    return window(*args, **kwargs)
+
+  monkeypatch.setattr(climatology, "_window_bins_last", counted)
+  scratch = tmp_path / "scratch"
+  scratch.mkdir()
+  monkeypatch.setenv("TMPDIR", str(scratch))
+  monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+  stores = []
+  create = TempDirectoryRegistry.create_temp_dir
+
+  def recorded(self, *args, **kwargs):
+    stores.append(create(self, *args, **kwargs))
+    return stores[-1]
+
+  monkeypatch.setattr(TempDirectoryRegistry, "create_temp_dir", recorded)
   time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
   values = np.random.default_rng(0).standard_normal((time.size, 3, 4, 4)).astype("float32")
   coords = {"time": time, "depth": [0.5, 1.5, 2.5], "lat": np.arange(4.0), "lon": np.arange(4.0)}
@@ -318,3 +369,12 @@ def test_climatology_writes_shards_its_chunks_straddle(tmp_path: pathlib.Path):
   stored = output_group(clim)["t3"]
   assert stored.shards == (8, 3, 4, 4) and stored.chunks == (1, 1, 4, 4)
   assert open_output(clim).t3.shape == (365, 3, 4, 4)
+  assert len(windows) == 3  # one per level: once, not once per output
+  ds = xr.Dataset({"t3": (("time", "depth", "lat", "lon"), values)}, coords=coords)
+  mean, var = climatology._compute_climatology(
+    ds, 365, 5, "gaussian", 2.0, "time", False, "day_of_year"
+  )
+  xr.testing.assert_allclose(open_output(clim).t3.load(), mean.t3, rtol=1e-6)
+  xr.testing.assert_allclose(open_output(std).t3.load(), np.sqrt(var.t3.clip(min=0)), rtol=1e-6)
+  (store,) = stores
+  assert store.is_relative_to(scratch) and not store.exists()  # removed at the end

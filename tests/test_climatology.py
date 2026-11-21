@@ -17,6 +17,7 @@ from arcomake.climatology import (
   _compute_climatology,
   _compute_series,
   _read_block,
+  _staging_chunks,
   _window_weights,
 )
 
@@ -349,3 +350,79 @@ def test_variables_chunked_differently_share_the_window_tiles():
     (lat,) = tilings
     assert len(lat) > 1 and len(set(lat[:-1])) == 1  # tiled, regularly: no intersections
     xr.testing.assert_allclose(out.compute(), reference)
+
+
+DIMS = ("time", "depth", "lat", "lon")
+MIB = 2**20
+
+
+def test_staging_one_bin_chunks_are_grouped_and_split_by_level():
+  """One-bin, one-level stored chunks at 0.25 deg: the copy takes 32 bins of a level per task
+  (128 MiB), and the store the same, by level even where Dask holds all levels (each of its
+  chunks read once, not once per level)."""
+  stored, copy = _staging_chunks(
+    DIMS, (365, 49, 721, 1440), (365, 49, 92, 1440), (1, 1, 721, 1440), 4, "time", 128 * MIB
+  )
+  assert copy == (32, 1, 721, 1440)
+  assert stored == (32, 1, 92, 1440)
+
+
+def test_staging_shards_spanning_levels_are_copied_one_per_task():
+  """Shards of 8 bins and all levels (1.6 GB at 0.25 deg) are copied one per task; the store
+  keeps Dask's level and tiles (they do not divide the shard's)."""
+  stored, copy = _staging_chunks(
+    DIMS, (365, 49, 721, 1440), (365, 1, 92, 1440), (8, 49, 721, 1440), 4, "time", 128 * MIB
+  )
+  assert copy == (8, 49, 721, 1440)
+  assert stored == (8, 1, 92, 1440)
+  # Without a stored layout, Dask's chunks throughout.
+  assert _staging_chunks(DIMS, (365, 3, 4, 4), (365, 1, 4, 4), None, 4, "time", MIB) == (
+    (365, 1, 4, 4),
+    None,
+  )
+
+
+def test_temporary_store_seen_by_every_worker(monkeypatch, tmp_path):
+  """On a distributed client, a temporary store some worker does not see is refused: its chunks
+  would be written where the copy does not read them, and read as NaN."""
+  import distributed
+
+  from arcomake import climatology
+
+  class Client:
+    def __init__(self, seen: dict[str, bool]):
+      self.seen = seen
+
+    def run(self, function, path):
+      return {worker: seen and function(path) for worker, seen in self.seen.items()}
+
+  monkeypatch.setattr(distributed, "default_client", lambda: Client({"tcp://a": True}))
+  climatology._check_workers_reach(tmp_path)
+  monkeypatch.setattr(
+    distributed, "default_client", lambda: Client({"tcp://a": True, "tcp://b": False})
+  )
+  with pytest.raises(RuntimeError, match="tcp://b do not see the temporary store"):
+    climatology._check_workers_reach(tmp_path)
+
+
+def test_temporary_store_warns_about_memory_and_disk(monkeypatch, caplog):
+  """Stored units above a task's share of memory, and a store larger than the free disk, are
+  warned about before computing."""
+  import collections
+  import logging
+
+  from arcomake import climatology
+  from arcomake.chunk_plan import Budget
+  from arcomake.dataset_utils import SaveConfig
+  from arcomake.temporary_utils import TempDirectoryRegistry
+
+  monkeypatch.setattr(climatology, "detect_budget", lambda: Budget(64 * 1024, 1))
+  usage = collections.namedtuple("usage", "total used free")
+  monkeypatch.setattr(climatology.shutil, "disk_usage", lambda path: usage(1, 1, 0))
+  time = np.arange(8)
+  ds = xr.Dataset({"t": (("time", "x"), np.zeros((8, 1000), "float32"))}, coords={"time": time})
+  save = SaveConfig.model_validate({"chunks": {"time": 8, "x": -1}})
+  with caplog.at_level(logging.WARNING), TempDirectoryRegistry():
+    (copy,) = climatology._checkpointed([ds.chunk()], save, "time")
+    xr.testing.assert_equal(copy.load(), ds)
+  assert "may not fit" in caplog.text and "chunks" in caplog.text

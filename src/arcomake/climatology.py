@@ -41,7 +41,10 @@ import datetime
 import functools
 import itertools
 import logging
+import math
 import os
+import pathlib
+import shutil
 import threading
 import time
 from collections.abc import Callable, Hashable, Sequence
@@ -58,6 +61,7 @@ from icechunk.xarray import to_icechunk
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from arcomake import icechunk_utils, provenance, sharding
+from arcomake.chunk_plan import detect_budget, stored_warnings
 from arcomake.cli_utils import (
   check_aws_profile,
   check_destination,
@@ -70,10 +74,12 @@ from arcomake.dataset_utils import (
   ReadConfig,
   SaveConfig,
   open_input,
+  prepare_for_writing,
   write_into_session,
   write_outputs_together,
 )
 from arcomake.processing_utils import ProcessingStepConfig
+from arcomake.temporary_utils import TempDirectoryRegistry, get_current_temp_registry
 
 logger = logging.getLogger(__name__)
 
@@ -295,14 +301,19 @@ def compute_climatology(
         assert isinstance(anomaly_std, xr.Dataset)
         if configs.postprocess_anomaly_std:
           anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
-        # Compute and save the climatology and anomaly std together (see write_outputs_together).
+        # Computed once into a temporary store (removed with the registry), then copied into
+        # each repository.
         logger.info("Processing climatology and anomaly standard deviation.")
-        write_outputs_together(
-          [(climatology, climatology_output_path), (anomaly_std, anomaly_std_output_path)],
-          configs.save,
-          label=label,
-          recipe=provenance.fingerprint(configs, exclude={"read"}),
-        )
+        with TempDirectoryRegistry():
+          climatology, anomaly_std = _checkpointed(
+            [climatology, anomaly_std], configs.save, configs.time_dim
+          )
+          write_outputs_together(
+            [(climatology, climatology_output_path), (anomaly_std, anomaly_std_output_path)],
+            configs.save,
+            label=label,
+            recipe=provenance.fingerprint(configs, exclude={"read"}),
+          )
         logger.info("Climatology and anomaly standard deviation committed.")
       logger.info("Input dataset closed; closing Dask client.")
     except click.ClickException:
@@ -555,6 +566,127 @@ def _chunked_for_the_window(folded: xr.Dataset, time_dim: str) -> xr.Dataset:
       chunks[dim] = 1 if split else "auto"
   # "auto" tiles follow each variable's data type: unified, all variables share them.
   return folded.chunk(chunks).unify_chunks()
+
+
+def _staging_chunks(
+  dims: tuple[Hashable, ...],
+  shape: tuple[int, ...],
+  dask_chunks: tuple[int, ...],
+  unit: tuple[int, ...] | None,
+  itemsize: int,
+  time_dim: str,
+  target: int,
+) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+  """The chunks of a variable in the temporary store, and the Dask chunks of its copy (None:
+  those of the store).
+
+  The copy's chunks are the stored units (`unit`: shards, else chunks), with along `time_dim` as
+  many whole units as `target` bytes hold (at least one). The store's chunks are Dask's (the
+  first of each dimension), with the copy's along `time_dim` and the units' where they divide
+  Dask's: copying reads each chunk of the store once, and one-bin units do not make a store of
+  tiny files.
+  """
+  if unit is None or time_dim not in dims:
+    return dask_chunks, None
+  copy = [min(u, n) for u, n in zip(unit, shape, strict=True)]
+  axis = dims.index(time_dim)
+  units = max(1, target // (math.prod(copy) * itemsize))
+  copy[axis] = min(shape[axis], copy[axis] * units)
+  stored = [
+    c if axis_ == axis or d % c == 0 else d
+    for axis_, (d, c) in enumerate(zip(dask_chunks, copy, strict=True))
+  ]
+  return tuple(stored), tuple(copy)
+
+
+def _check_workers_reach(path: pathlib.Path) -> None:
+  """On a distributed client, fail unless every worker sees `path`: chunks a worker writes
+  where the reader does not look would be read as missing, the fill value (NaN), silently."""
+  try:
+    from distributed import default_client
+
+    client = default_client()
+  except (ImportError, ValueError):
+    return
+  blind = sorted(w for w, seen in client.run(os.path.isdir, str(path)).items() if not seen)
+  if blind:
+    raise RuntimeError(
+      f"Dask workers {', '.join(blind)} do not see the temporary store {path}: set TMPDIR to a"
+      " filesystem every worker reaches"
+    )
+
+
+def _checkpointed(outputs: list[xr.Dataset], save: SaveConfig, time_dim: str) -> list[xr.Dataset]:
+  """`outputs` computed into a temporary plain Zarr v3 store, and opened again in Dask chunks of
+  their stored units (the shards of `save`, else its chunks).
+
+  All outputs are written at once (a DataTree, one group each), so what they share, the window
+  and everything before it, is computed once. The store has no shards (its chunks:
+  `_staging_chunks`). Writing it needs the memory of a few levels' statistics; written
+  directly, shards spanning all levels held every level's statistics until the last window
+  (logbook, 21 Nov). The copies compute nothing: they read, one task per group of stored units
+  (a shard of 8 bins, 49 levels and the 0.25 deg grid, 1.6 GB, is alone; units above a task's
+  share of memory are warned about).
+
+  The store is in the temporary directory of the current registry (`TMPDIR`), checked to be
+  seen by every worker of a distributed client.
+  """
+  registry = get_current_temp_registry()
+  if registry is None:
+    raise RuntimeError("the climatology's temporary store needs a TempDirectoryRegistry")
+  path = registry.create_temp_dir(suffix=".zarr")
+  _check_workers_reach(path)
+  budget = detect_budget()
+  copies: list[dict[Hashable, tuple[int, ...] | None]] = []
+  groups: dict[str, xr.Dataset] = {}
+  size = 0
+  for index, dataset in enumerate(outputs):
+    prepared = prepare_for_writing(dataset, save)
+    for warning in stored_warnings(prepared, budget):
+      logger.warning(warning)
+    staged = dataset.drop_encoding()
+    copies.append({})
+    for name, var in staged.data_vars.items():
+      stored, copies[-1][name] = _staging_chunks(
+        var.dims,
+        var.shape,
+        tuple(sizes[0] for sizes in var.chunks or [(n,) for n in var.shape]),
+        prepared[name].encoding.get("shards") or prepared[name].encoding.get("chunks"),
+        var.dtype.itemsize,
+        time_dim,
+        budget.target,
+      )
+      var.encoding["chunks"] = stored
+      size += var.nbytes
+    groups[str(index)] = staged
+  free = shutil.disk_usage(path).free
+  if free < size:
+    logger.warning(
+      f"The temporary store may not fit in {path}: {size / 2**30:.1f} GiB before compression,"
+      f" {free / 2**30:.1f} GiB free"
+    )
+  logger.info(f"Computing the outputs into {path} ({size / 2**30:.1f} GiB before compression)")
+  xr.DataTree.from_dict(groups).to_zarr(
+    path, mode="w", consolidated=False, zarr_format=3, align_chunks=True
+  )
+  opened: list[xr.Dataset] = []
+  for index, dataset in enumerate(outputs):
+    copy = xr.open_zarr(path, group=str(index), consolidated=False, chunks=None)
+    copy = copy.assign(
+      {
+        name: var.chunk(
+          dict(zip(var.dims, copies[index][name] or var.encoding["chunks"], strict=True))
+        )
+        for name, var in copy.data_vars.items()
+      }
+    )
+    # As computed: the copy is written as the outputs would have been.
+    for name, var in dataset.variables.items():
+      copy[name].attrs = dict(var.attrs)
+      copy[name].encoding = dict(var.encoding)
+    copy.attrs = dict(dataset.attrs)
+    opened.append(copy)
+  return opened
 
 
 def _compute_climatology(
