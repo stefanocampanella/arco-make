@@ -1345,3 +1345,31 @@ each buffer counted once, and RSS), on synthetic data and the 1 deg test output:
   whole chunks of 365 bins for 8). Memory 26.5-28.5 GiB in all six runs (it follows the threads:
   4.1 GiB with 4). Shards in the temporary store bring nothing: unsharded chunks of whole units
   are kept.
+- **Projection for the 0.25 deg statistics on the project VM** (maintainer's question, 21 Nov).
+  Workload: 18 time-varying variables (4 x 49 levels + 14 surface), 210 series of 11,323 days
+  (1993-2023), about 9.9 TB raw, about 3.6 TB stored (scaled from the published dataset's 3.86 TB
+  for 223 series). Icechunk reads from S3 with 32 threads: 150-185 MB/s stored, 330-400 MB/s
+  decoded (the format benchmark's repository; s3fs reached 136 MB/s on 16 Nov): reading alone
+  takes 5.4-6.7 h. Synthetic 0.25 deg input on local disk (one variable, 4 levels, 4 years, LZ4,
+  production layout), 32 threads:
+
+  | | 2 years | 4 years |
+  |---|---|---|
+  | graph, two passes (committed) | 79 s, 37.0 GiB | 95 s, 62.1 GiB |
+  | graph, two passes, `split_every = 2` | 82 s, 31.4 GiB | 95 s, 48.7 GiB |
+  | graph, one pass (Dask's variance) | 91 s, 67.6 GiB | killed above 84 GiB |
+  | graph, one pass, `split_every = 2` | 90 s, 65.6 GiB | 106 s, 79.1 GiB |
+  | graph, lean one pass, `split_every = 2` | 90 s, 72.5 GiB | 99 s, 75.3 GiB |
+  | graph, flox | 110 s, 50.2 GiB | killed above 84 GiB |
+  | streaming (shards of one level) | 67 s, 21.8 GiB | 80 s, 21.3 GiB |
+
+  The graph path's memory grows with the years at 0.25 deg (two passes: about 2.2-3 GiB per
+  level and year in flight, each level's folded data held between the passes; Dask's default
+  `split_every` of 4 combines the years of a tile in one task); the one-pass reductions grow less
+  but start near 70 GiB (their per-chunk intermediates, with 32 threads). None extrapolates safely
+  to 31 years within 110 GB. Streaming stays at 21 GiB: per series, reading and binning about
+  2.3 s per year from local disk, the window 7 s, the write overlapped. Projected: streaming
+  6-9 h (S3 reads of about 17 GB stored per series at 150-185 MB/s, plus the window; the upper
+  end from S1's measurement of 16 Nov, 122 s per series for 26 years with s3fs), memory 21-32 GB;
+  the graph path would be reading-bound at 6-7.5 h if its memory allowed. Streaming stores the
+  split dimension one index per shard, not in shards of all levels.
