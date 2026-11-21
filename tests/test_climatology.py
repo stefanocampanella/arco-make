@@ -5,6 +5,7 @@
 import datetime
 
 import dask
+import dask.array
 import numpy as np
 import pandas as pd
 import pydantic
@@ -170,6 +171,8 @@ def test_in_memory_series_equal_the_lazy_statistics():
   values = rng.standard_normal((time.size, 70, 3)).astype("float32")
   values[10:40, :5] = np.nan  # gaps
   values[:, 7] = np.nan  # a row without data
+  assert time[365] == pd.Timestamp("2020-02-29")
+  values[365, 20:30] = np.nan  # Feb 29 missing where Feb 28 has values
   ds = xr.Dataset({"x": (("time", "lat", "lon"), values)}, coords={"time": time}).chunk(time=50)
   args = {"period": 365, "window": 7, "weighting": "gaussian", "weighting_scale": 2.0}
   mean, var = _compute_climatology(ds, bins="day_of_year", **args)
@@ -265,6 +268,29 @@ def test_the_window_does_not_tile_the_grid():
   mean, _ = _compute_climatology(ds, 365, 29, "gaussian", 7.0, "time", False, "day_of_year")
   assert mean.t.chunks == ((365,), (1, 1, 1), (181,), (360,))
   assert len(mean.t.__dask_graph__()) < 3000
+
+
+def test_the_statistics_of_a_level_read_only_that_level():
+  """Each level's statistics need only that level's values, so levels are computed one after the
+  other. A two-pass variance tied to a checkpoint of every level's mean
+  (`dask.graph_manipulation.bind`) computed the statistics of all levels before any window and
+  held them (3.5 GiB for 10 levels of 8 days at 1 deg, against 0.44 GiB now)."""
+  read = set()
+
+  def tagged(block: np.ndarray, block_info: dict | None = None) -> np.ndarray:
+    if block_info is not None:
+      read.add(block_info[None]["chunk-location"][1])
+    return block
+
+  values = dask.array.zeros((400, 2, 4), chunks=(50, 1, 4), dtype="float32")
+  values = values.map_blocks(tagged, meta=np.array((), dtype="float32"))
+  time = pd.date_range("2019-01-01", periods=400, freq="1D")
+  ds = xr.Dataset({"t": (("time", "depth", "x"), values)}, coords={"time": time})
+  mean, var = _compute_climatology(ds, 365, 7, "gaussian", 2.0, "time", False, "day_of_year")
+  for statistic in (mean, var):
+    read.clear()
+    statistic.t.isel(depth=0).compute()
+    assert read == {0}
 
 
 def test_variables_chunked_differently_share_the_window_tiles():

@@ -52,7 +52,6 @@ import dask
 import dask.array
 import numpy as np
 import xarray as xr
-from dask.graph_manipulation import bind
 from icechunk.xarray import to_icechunk
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -425,10 +424,16 @@ def _day_of_year_positions(time: xr.DataArray, period: int) -> tuple[np.ndarray,
 
 
 def _fold_statistics(folded: xr.Dataset) -> BinStatistics:
-  """Count, mean and sum of squared deviations over `_period`, skipping NaN."""
+  """Count, mean and sum of squared deviations over `_period`, skipping NaN (0 without values).
+
+  Two passes, each level from its own chunks. They were tied with `bind` to a checkpoint of
+  every chunk's mean, which kept Dask from reusing the folded data (read again from the input)
+  but made every level wait for all levels' means: the statistics of all levels were computed
+  first and held until their windows. Dask's one-pass variance was slower and needed more memory
+  over several years (its per-chunk intermediates; logbook, 21 Nov)."""
   count = folded.count("_period")
   mean = folded.mean("_period", skipna=True)
-  m2 = ((bind(folded, mean) - mean) ** 2).sum("_period", skipna=True)
+  m2 = ((folded - mean) ** 2).sum("_period", skipna=True)
   return count, mean, m2
 
 
