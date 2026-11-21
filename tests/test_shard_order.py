@@ -126,7 +126,8 @@ def test_climatology_shards_follow_the_order(tmp_path: pathlib.Path, split: str)
   )
   clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
   args = [str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)]
-  result = CliRunner().invoke(cli, ["compute-climatology", "--dask-setup", "threads", *args])
+  path = ["--streaming"] if split else []
+  result = CliRunner().invoke(cli, ["compute-climatology", *path, "--dask-setup", "threads", *args])
   assert result.exit_code == 0, result.output
   for path in (clim, std):
     assert icechunk.Repository.exists(icechunk_utils.storage(path))

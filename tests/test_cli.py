@@ -187,8 +187,8 @@ def test_climatology_reference_period_and_day_of_year(tmp_path: pathlib.Path):
   ids=["chunks", "shards"],
 )
 def test_climatology_one_series_at_a_time(tmp_path: pathlib.Path, save: str, chunks, shards):
-  """`split_dims` (S1) writes the same outputs as one Dask graph, series by series; shards along
-  the split dimensions are 1, like chunks."""
+  """`--streaming` writes the same outputs as one Dask graph, series by series (`split_dims`);
+  shards along the split dimensions are 1, like chunks."""
   time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
   rng = np.random.default_rng(0)
   ds = xr.Dataset(
@@ -206,12 +206,13 @@ def test_climatology_one_series_at_a_time(tmp_path: pathlib.Path, save: str, chu
     "[save]\n" + save
   )
   outputs = {}
-  for label, split in [("graph", ""), ("series", 'split_dims = ["depth"]')]:
+  for label, split, path in [("graph", "", "--graph"), ("series", 'split_dims = ["depth"]', "")]:
     recipe = tmp_path / f"{label}.toml"
     recipe.write_text(common.format(split=split))
     clim, std = tmp_path / f"{label}_clim.zarr", tmp_path / f"{label}_std.zarr"
+    flags = [path or "--streaming", *THREADS]
     result = run(
-      "compute-climatology", *THREADS, str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)
+      "compute-climatology", *flags, str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)
     )
     assert result.exit_code == 0, result.output
     outputs[label] = (open_output(clim).load(), open_output(std).load())
@@ -235,21 +236,58 @@ def climatology_input(tmp_path: pathlib.Path, depth_coordinate: bool = True) -> 
   return path
 
 
-def run_climatology(tmp_path: pathlib.Path, source: pathlib.Path, label: str, extra: str):
+def run_climatology(
+  tmp_path: pathlib.Path, source: pathlib.Path, label: str, extra: str, streaming: bool = True
+):
   recipe = tmp_path / f"{label}.toml"
   recipe.write_text(
     f'period = 365\nbins = "day_of_year"\nwindow = 3\nweighting = "constant"\n{extra}\n'
     '[read]\nengine = "zarr"\n'
   )
   clim, std = tmp_path / f"{label}_clim.zarr", tmp_path / f"{label}_std.zarr"
-  return run("compute-climatology", *THREADS, str(recipe), str(source), str(clim), str(std)), clim
+  path = "--streaming" if streaming else "--graph"
+  return run(
+    "compute-climatology", path, *THREADS, str(recipe), str(source), str(clim), str(std)
+  ), clim
+
+
+def test_the_command_line_chooses_the_path(monkeypatch, caplog):
+  """`--streaming` computes one series at a time, else one graph; `split_dims` only says how to
+  split, and is warned about without `--streaming`."""
+  import logging
+
+  from arcomake import climatology
+
+  calls = []
+  monkeypatch.setattr(climatology, "_compute_graph", lambda *a, **k: calls.append("graph"))
+  monkeypatch.setattr(climatology, "_compute_streaming", lambda *a, **k: calls.append("series"))
+  configs = climatology.ClimatologyConfig.model_validate(
+    {"period": 365, "window": 1, "weighting": "constant", "split_dims": ["depth"], "read": {}}
+    | {"save": {}}
+  )
+  with caplog.at_level(logging.WARNING):
+    climatology._compute_and_write(xr.Dataset(), configs, ("c", "s"), label="x", streaming=True)
+    assert "ignored" not in caplog.text
+    climatology._compute_and_write(xr.Dataset(), configs, ("c", "s"), label="x", streaming=False)
+  assert calls == ["series", "graph"] and "split_dims ['depth'] ignored" in caplog.text
+
+
+def test_streaming_without_split_dims_computes_each_variable(tmp_path: pathlib.Path):
+  """Without `split_dims`, `--streaming` computes one series per variable, as the graph."""
+  source = climatology_input(tmp_path)
+  graph, graph_clim = run_climatology(tmp_path, source, "graph", "\n[save]\n", streaming=False)
+  series, series_clim = run_climatology(tmp_path, source, "series", "\n[save]\n")
+  assert graph.exit_code == 0 and series.exit_code == 0, series.output
+  xr.testing.assert_allclose(
+    open_output(series_clim).load(), open_output(graph_clim).load(), atol=1e-6
+  )
 
 
 def test_one_series_at_a_time_without_coordinates_or_save_chunks(tmp_path: pathlib.Path):
   """A split dimension without coordinate is written index by index (region "auto" mapped every
   series to index 0); without [save] chunks, the split dimension is stored one index per chunk."""
   source = climatology_input(tmp_path, depth_coordinate=False)
-  graph, graph_clim = run_climatology(tmp_path, source, "graph", "\n[save]\n")
+  graph, graph_clim = run_climatology(tmp_path, source, "graph", "\n[save]\n", streaming=False)
   series, series_clim = run_climatology(
     tmp_path, source, "series", 'split_dims = ["depth"]\n[save]\n'
   )
@@ -315,7 +353,8 @@ def test_climatology_series_need_no_temporary_store(tmp_path: pathlib.Path, monk
     'split_dims = ["lat"]\n[read]\nengine = "zarr"\n[save]\nchunks = {time = 1}\n'
   )
   clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
-  result = run("compute-climatology", *THREADS, str(recipe), str(source), str(clim), str(std))
+  args = [str(recipe), str(source), str(clim), str(std)]
+  result = run("compute-climatology", "--streaming", *THREADS, *args)
   assert result.exit_code == 0, result.output
 
 

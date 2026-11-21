@@ -131,12 +131,11 @@ class ClimatologyConfig(BaseModel):
   use_flox: bool = Field(
     default=False, description="Whether to use flox for grouped periodic reductions"
   )
-  split_dims: list[str] | None = Field(
-    default=None,
+  split_dims: list[str] = Field(
+    default_factory=list,
     description=(
-      "Compute one series at a time (in memory, written region by region): each data variable,"
-      ' and each index along these dimensions (e.g. ["depth"]; [] for one series per variable).'
-      " Default: all variables in one Dask graph."
+      "With --streaming (one series at a time): each data variable, and each index along these"
+      ' dimensions, is a series (e.g. ["depth"]; default: one series per variable)'
     ),
   )
   read: ReadConfig
@@ -147,7 +146,7 @@ class ClimatologyConfig(BaseModel):
 
   @model_validator(mode="after")
   def _split_dims_not_time(self) -> "ClimatologyConfig":
-    if self.split_dims is not None and self.time_dim in self.split_dims:
+    if self.time_dim in self.split_dims:
       raise ValueError(f"split_dims cannot include the time dimension {self.time_dim!r}")
     return self
 
@@ -192,6 +191,14 @@ class ClimatologyConfig(BaseModel):
   is_flag=True,
 )
 @click.option(
+  "--streaming/--graph",
+  default=False,
+  help=(
+    "Compute one series at a time (each variable, and each index of the recipe's `split_dims`),"
+    " streaming over time, instead of everything in one Dask graph (the default)"
+  ),
+)
+@click.option(
   "--dask-setup",
   default="mpi",
   type=click.Choice(
@@ -219,6 +226,7 @@ def compute_climatology(
   climatology_output_path: str,
   anomaly_std_output_path: str,
   replace: bool = False,
+  streaming: bool = False,
   dask_setup: DaskSetupType = "mpi",
   use_frisky: bool = False,
   log_level: str = "info",
@@ -274,47 +282,15 @@ def compute_climatology(
           )
           if dataset.sizes[configs.time_dim] == 0:
             raise ValueError(f"No data in the reference period {configs.reference_period}")
-        # Compute the climatological mean and the unbiased sample variance
-        # of the anomalies using vectorized reductions across periods and window smoothing.
         if not dataset.data_vars:
           raise ValueError("Input dataset contains no data variables.")
-        if configs.split_dims is not None:
-          _compute_by_series(
-            dataset, configs, climatology_output_path, anomaly_std_output_path, label=label
-          )
-          logger.info("Climatology writes completed, one series at a time.")
-          return
-        climatology, anomaly_var = _compute_climatology(
+        _compute_and_write(
           dataset,
-          time_dim=configs.time_dim,
-          period=configs.period,
-          window=configs.window,
-          weighting=configs.weighting,
-          weighting_scale=configs.weighting_scale,
-          use_flox=configs.use_flox,
-          bins=configs.bins,
+          configs,
+          (climatology_output_path, anomaly_std_output_path),
+          label=label,
+          streaming=streaming,
         )
-        # Postprocess climatology and anomaly standard deviation.
-        if configs.postprocess_climatology:
-          climatology = climatology.arcomake.process(steps=configs.postprocess_climatology)
-        anomaly_std = np.sqrt(anomaly_var.clip(min=0.0))
-        assert isinstance(anomaly_std, xr.Dataset)
-        if configs.postprocess_anomaly_std:
-          anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
-        # Computed once into a temporary store (removed with the registry), then copied into
-        # each repository.
-        logger.info("Processing climatology and anomaly standard deviation.")
-        with TempDirectoryRegistry():
-          climatology, anomaly_std = _checkpointed(
-            [climatology, anomaly_std], configs.save, configs.time_dim
-          )
-          write_outputs_together(
-            [(climatology, climatology_output_path), (anomaly_std, anomaly_std_output_path)],
-            configs.save,
-            label=label,
-            recipe=provenance.fingerprint(configs, exclude={"read"}),
-          )
-        logger.info("Climatology and anomaly standard deviation committed.")
       logger.info("Input dataset closed; closing Dask client.")
     except click.ClickException:
       raise
@@ -324,6 +300,59 @@ def compute_climatology(
       logger.exception("An error occurred while processing the climatology and anomaly std.")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
   logger.info("Climatology complete; Dask client closed.")
+
+
+def _compute_and_write(
+  dataset: xr.Dataset,
+  configs: ClimatologyConfig,
+  outputs: tuple[str, str],
+  *,
+  label: str,
+  streaming: bool,
+) -> None:
+  """Compute the climatology and anomaly std of `dataset` and write them to `outputs`, one
+  series at a time (`_compute_streaming`) or in one Dask graph (`_compute_graph`)."""
+  if streaming:
+    _compute_streaming(dataset, configs, outputs, label=label)
+  else:
+    if configs.split_dims:
+      logger.warning(f"split_dims {configs.split_dims} ignored: they apply to --streaming only")
+    _compute_graph(dataset, configs, outputs, label=label)
+
+
+def _compute_graph(
+  dataset: xr.Dataset, configs: ClimatologyConfig, outputs: tuple[str, str], *, label: str
+) -> None:
+  """Everything in one Dask graph (`_compute_climatology`), computed into a temporary store and
+  copied into the outputs (`_checkpointed`)."""
+  climatology, anomaly_var = _compute_climatology(
+    dataset,
+    time_dim=configs.time_dim,
+    period=configs.period,
+    window=configs.window,
+    weighting=configs.weighting,
+    weighting_scale=configs.weighting_scale,
+    use_flox=configs.use_flox,
+    bins=configs.bins,
+  )
+  if configs.postprocess_climatology:
+    climatology = climatology.arcomake.process(steps=configs.postprocess_climatology)
+  anomaly_std = np.sqrt(anomaly_var.clip(min=0.0))
+  assert isinstance(anomaly_std, xr.Dataset)
+  if configs.postprocess_anomaly_std:
+    anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
+  # Computed once into a temporary store (removed with the registry), then copied.
+  with TempDirectoryRegistry():
+    climatology, anomaly_std = _checkpointed(
+      [climatology, anomaly_std], configs.save, configs.time_dim
+    )
+    write_outputs_together(
+      list(zip((climatology, anomaly_std), outputs, strict=True)),
+      configs.save,
+      label=label,
+      recipe=provenance.fingerprint(configs, exclude={"read"}),
+    )
+  logger.info("Climatology and anomaly standard deviation committed.")
 
 
 def balanced_tree_reduce[T](
@@ -955,24 +984,18 @@ def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Data
   return xr.Dataset(data_vars, coords=coords)
 
 
-def _compute_by_series(
-  dataset: xr.Dataset,
-  configs: ClimatologyConfig,
-  climatology_output_path: str,
-  anomaly_std_output_path: str,
-  *,
-  label: str,
+def _compute_streaming(
+  dataset: xr.Dataset, configs: ClimatologyConfig, paths: tuple[str, str], *, label: str
 ) -> None:
-  """S1: one series (variable, index of `split_dims`) at a time, written into its region.
+  """One series (variable, index of `split_dims`) at a time, written into its region.
 
   The outputs' metadata are written first, from a template with the postprocess steps applied;
   then every series is computed in memory (`_compute_series`), postprocessed and written into its
   region. Postprocess steps therefore have to work on one series (attributes, renames, chunking).
   """
-  assert configs.split_dims is not None
   outputs = (
-    (climatology_output_path, configs.postprocess_climatology),
-    (anomaly_std_output_path, configs.postprocess_anomaly_std),
+    (paths[0], configs.postprocess_climatology),
+    (paths[1], configs.postprocess_anomaly_std),
   )
   if configs.save.group is not None:
     raise ValueError("split_dims writes region by region: [save] group is not supported")
@@ -1062,6 +1085,7 @@ def _compute_by_series(
   # Both outputs are written: only now does `main` move, in one repository after the other.
   for run in runs:
     run.finish(configs.save.retention())
+  logger.info("Climatology writes completed, one series at a time.")
 
 
 def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:

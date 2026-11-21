@@ -101,7 +101,8 @@ def test_climatology_outputs_record_provenance_and_recipe(tmp_path: pathlib.Path
     + '\n[read]\nengine = "zarr"\n\n[save]\n'
   )
   clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
-  args = ["compute-climatology", "--dask-setup", "threads", str(recipe), str(source)]
+  path = ["--streaming"] if split else []
+  args = ["compute-climatology", *path, "--dask-setup", "threads", str(recipe), str(source)]
   result = CliRunner().invoke(cli, [*args, str(clim), str(std)])
   assert result.exit_code == 0, result.output
   for output in (clim, std):

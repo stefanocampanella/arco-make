@@ -187,7 +187,8 @@ def test_climatology_outputs_share_their_commit_message(tmp_path: pathlib.Path, 
   )
   clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
   args = [str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)]
-  result = CliRunner().invoke(cli, ["compute-climatology", "--dask-setup", "threads", *args])
+  path = ["--streaming"] if split else []
+  result = CliRunner().invoke(cli, ["compute-climatology", *path, "--dask-setup", "threads", *args])
   assert result.exit_code == 0, result.output
   messages = [
     next(iter(icechunk.Repository.open(icechunk_utils.storage(p)).ancestry(branch="main"))).message
