@@ -37,6 +37,7 @@
 # Finally, the dataset might not start on the 1st of January or end before the 31 of December,
 # which would further distort the results. However, the quantities computed here are aimed at standardizing the input
 # features in a deep-learning model, and therefore such approximations are reasonably acceptable.
+import dataclasses
 import datetime
 import functools
 import itertools
@@ -47,7 +48,7 @@ import pathlib
 import shutil
 import threading
 import time
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Literal, get_args
 
@@ -57,11 +58,10 @@ import dask.array
 import numpy as np
 import numpy.typing as npt
 import xarray as xr
-from icechunk.xarray import to_icechunk
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from arcomake import icechunk_utils, provenance, sharding
-from arcomake.chunk_plan import detect_budget, stored_warnings
+from arcomake import icechunk_utils, provenance
+from arcomake.chunk_plan import COPIES, Budget, detect_budget, stored_warnings
 from arcomake.cli_utils import (
   check_aws_profile,
   check_destination,
@@ -75,7 +75,6 @@ from arcomake.dataset_utils import (
   SaveConfig,
   open_input,
   prepare_for_writing,
-  write_into_session,
   write_tree,
 )
 from arcomake.processing_utils import ProcessingStepConfig
@@ -331,7 +330,15 @@ def _compute_graph(
   dataset: xr.Dataset, configs: ClimatologyConfig, output_path: str, *, label: str
 ) -> None:
   """Everything in one Dask graph (`_compute_climatology`), computed into a temporary store and
-  copied into the output's groups (`_checkpointed`)."""
+  copied into the output's groups (`_stage`, `_copy`)."""
+  # Opened first: a version of `main` promoted while computing is not replaced.
+  run = icechunk_utils.Run(
+    output_path,
+    configs.save.storage_options,
+    label,
+    # `split_dims` is ignored here.
+    recipe=provenance.fingerprint(configs, exclude={"read", "split_dims"}),
+  )
   climatology, anomaly_var = _compute_climatology(
     dataset,
     time_dim=configs.time_dim,
@@ -348,20 +355,14 @@ def _compute_graph(
   assert isinstance(anomaly_std, xr.Dataset)
   if configs.postprocess_anomaly_std:
     anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
-  # Computed once into a temporary store (removed with the registry), then copied.
+  # Computed once into a temporary store (removed with the registry; both groups at once, so
+  # what they share is computed once), then copied.
   with TempDirectoryRegistry():
-    climatology, anomaly_std = _checkpointed(
-      [climatology, anomaly_std], configs.save, configs.time_dim
+    stage = _stage(
+      dict(zip(GROUPS, (climatology, anomaly_std), strict=True)), configs.save, configs.time_dim
     )
-    write_tree(
-      dict(zip(GROUPS, (climatology, anomaly_std), strict=True)),
-      output_path,
-      configs.save,
-      label=label,
-      # `split_dims` is ignored here.
-      recipe=provenance.fingerprint(configs, exclude={"read", "split_dims"}),
-      metadata={METHOD_KEY: "graph"},
-    )
+    stage.write()
+    _copy(stage, run, configs.save, label=label, metadata={METHOD_KEY: "graph"})
   logger.info("Climatology and anomaly standard deviation committed.")
 
 
@@ -655,38 +656,56 @@ def _check_workers_reach(path: pathlib.Path) -> None:
     )
 
 
-def _checkpointed(outputs: list[xr.Dataset], save: SaveConfig, time_dim: str) -> list[xr.Dataset]:
-  """`outputs` computed into a temporary plain Zarr v3 store, and opened again in Dask chunks of
-  their stored units (the shards of `save`, else its chunks).
+@dataclasses.dataclass
+class _Stage:
+  """A temporary plain Zarr v3 store for the groups of the output (a DataTree), unsharded, and how
+  to copy them into the repository with the layout of `[save]` (`_stage`, `_copy`)."""
 
-  All outputs are written at once (a DataTree, one group each), so what they share, the window
-  and everything before it, is computed once. The store has no shards (its chunks:
-  `_staging_chunks`). Writing it needs the memory of a few levels' statistics; written
-  directly, shards spanning all levels held every level's statistics until the last window
-  (logbook, 21 Nov). The copies compute nothing: they read, one task per group of stored units
-  (a shard of 8 bins, 49 levels and the 0.25 deg grid, 1.6 GB, is alone; units above a task's
-  share of memory are warned about).
+  path: pathlib.Path
+  staged: dict[str, xr.Dataset]  # the groups with the store's chunks as encodings, for writing
+  copies: dict[str, dict[Hashable, tuple[int, ...] | None]]  # the copy's chunks per variable
+  # Per group, the attributes, and every variable's attributes and encoding, as computed: the
+  # copy takes them back (the computed datasets themselves are not kept).
+  restored: dict[
+    str, tuple[dict[Hashable, Any], dict[Hashable, tuple[dict[Hashable, Any], dict[str, Any]]]]
+  ]
+  threads: int | None  # threads of the copy (None: Dask's)
 
-  The store is in the temporary directory of the current registry (`TMPDIR`), checked to be
-  seen by every worker of a distributed client.
+  def write(self, compute: bool = True) -> None:
+    """Write the groups into the store (with `compute=False`, their metadata only)."""
+    xr.DataTree.from_dict(self.staged).to_zarr(
+      self.path, mode="w", compute=compute, consolidated=False, zarr_format=3, align_chunks=True
+    )
+
+
+def _stage(
+  groups: Mapping[str, xr.Dataset], save: SaveConfig, time_dim: str, *, workers: bool = True
+) -> _Stage:
+  """A temporary store for `groups` (in the current registry's directory, `TMPDIR`; with
+  `workers`, checked to be seen by every worker of a distributed client, which write into it).
+
+  Its chunks are `_staging_chunks`: Dask's, and along `time_dim` whole stored units. Writing into
+  it needs the memory of the series being computed; written directly, shards spanning all levels
+  held every level's statistics until the last window (logbook, 21 Nov). The copy reads one
+  group of stored units per task: tasks holding more than their share of memory are warned
+  about, and the copy runs with as many threads as hold their units (`_copy_threads`).
   """
   registry = get_current_temp_registry()
   if registry is None:
     raise RuntimeError("the climatology's temporary store needs a TempDirectoryRegistry")
   path = registry.create_temp_dir(suffix=".zarr")
-  _check_workers_reach(path)
+  if workers:
+    _check_workers_reach(path)
   budget = detect_budget()
-  copies: list[dict[Hashable, tuple[int, ...] | None]] = []
-  groups: dict[str, xr.Dataset] = {}
-  size = 0
-  for index, dataset in enumerate(outputs):
+  staged, copies, units, size = {}, {}, [], 0
+  for group, dataset in groups.items():
     prepared = prepare_for_writing(dataset, save)
     for warning in stored_warnings(prepared, budget):
       logger.warning(warning)
-    staged = dataset.drop_encoding()
-    copies.append({})
-    for name, var in staged.data_vars.items():
-      stored, copies[-1][name] = _staging_chunks(
+    staged[group] = dataset.drop_encoding()
+    copies[group] = {}
+    for name, var in staged[group].data_vars.items():
+      stored, copy = _staging_chunks(
         var.dims,
         var.shape,
         tuple(sizes[0] for sizes in var.chunks or [(n,) for n in var.shape]),
@@ -696,36 +715,73 @@ def _checkpointed(outputs: list[xr.Dataset], save: SaveConfig, time_dim: str) ->
         budget.target,
       )
       var.encoding["chunks"] = stored
+      copies[group][name] = copy
+      # A copy task reads whole chunks of the store: it holds the larger of each.
+      held = stored if copy is None else tuple(map(max, stored, copy))
+      units.append(math.prod(held) * var.dtype.itemsize)
       size += var.nbytes
-    groups[str(index)] = staged
   free = shutil.disk_usage(path).free
   if free < size:
     logger.warning(
       f"The temporary store may not fit in {path}: {size / 2**30:.1f} GiB before compression,"
       f" {free / 2**30:.1f} GiB free"
     )
-  logger.info(f"Computing the outputs into {path} ({size / 2**30:.1f} GiB before compression)")
-  xr.DataTree.from_dict(groups).to_zarr(
-    path, mode="w", consolidated=False, zarr_format=3, align_chunks=True
-  )
-  opened: list[xr.Dataset] = []
-  for index, dataset in enumerate(outputs):
-    copy = xr.open_zarr(path, group=str(index), consolidated=False, chunks=None)
+  logger.info(f"Temporary store {path} ({size / 2**30:.1f} GiB before compression)")
+  restored = {
+    group: (
+      dict(dataset.attrs),
+      {name: (dict(var.attrs), dict(var.encoding)) for name, var in dataset.variables.items()},
+    )
+    for group, dataset in groups.items()
+  }
+  return _Stage(path, staged, copies, restored, _copy_threads(units, budget))
+
+
+def _copy_threads(units: list[int], budget: Budget) -> int | None:
+  """Threads for the copy: as many as hold `COPIES` times the largest unit each within the
+  budget's memory, at least one (None: all of Dask's). Each copy task holds its unit, the pieces
+  read for it and its encoded form: 3.1 GiB for a shard of 8 bins, 49 levels and the 0.25 deg
+  grid (1.6 GB); 32 of them did not fit in 110 GB, and 8 copied as fast as 16 (logbook, 21 Nov)."""
+  largest = max(units, default=0)
+  fits = budget.usable // (COPIES * largest) if largest else budget.threads
+  return None if fits >= budget.threads else max(1, int(fits))
+
+
+def _copy(
+  stage: _Stage,
+  run: icechunk_utils.Run,
+  save: SaveConfig,
+  *,
+  label: str,
+  metadata: Mapping[str, Any],
+) -> None:
+  """The groups of `stage`, opened lazily in Dask chunks of their copies, written into `run`'s
+  repository in one commit (`write_tree`), with their encodings and attributes as computed.
+
+  The copy runs in this process, on local threads, at most `stage.threads`: Dask's distributed
+  schedulers have no such setting, and every copy task holds a whole stored unit."""
+  groups = {}
+  for group, (attrs, variables) in stage.restored.items():
+    copy = xr.open_zarr(stage.path, group=group, consolidated=False, chunks=None)
     copy = copy.assign(
       {
         name: var.chunk(
-          dict(zip(var.dims, copies[index][name] or var.encoding["chunks"], strict=True))
+          dict(zip(var.dims, stage.copies[group][name] or var.encoding["chunks"], strict=True))
         )
         for name, var in copy.data_vars.items()
       }
     )
-    # As computed: the copy is written as the outputs would have been.
-    for name, var in dataset.variables.items():
-      copy[name].attrs = dict(var.attrs)
-      copy[name].encoding = dict(var.encoding)
-    copy.attrs = dict(dataset.attrs)
-    opened.append(copy)
-  return opened
+    for name, (var_attrs, encoding) in variables.items():
+      copy[name].attrs = dict(var_attrs)
+      copy[name].encoding = dict(encoding)
+    copy.attrs = dict(attrs)
+    groups[group] = copy
+  local: dict[str, Any] = {"scheduler": "threads"}
+  if stage.threads is not None:
+    logger.info(f"Copying with {stage.threads} threads (each holds a whole stored unit)")
+    local["num_workers"] = stage.threads
+  with dask.config.set(local):
+    write_tree(groups, run, save, label=label, metadata=metadata)
 
 
 def _compute_climatology(
@@ -957,29 +1013,6 @@ def _compute_series(
   return climatology, variance
 
 
-def _one_index_per_chunk(save: SaveConfig, split_dims: list[str]) -> SaveConfig:
-  """`save` with stored chunks (and shards, if any) of 1 along the split dimensions, which each
-  series writes alone.
-
-  Raises:
-    ValueError: if `[save] chunks` or `shards` ask for another size along a split dimension.
-  """
-  update = {}
-  for key in ("chunks", "shards"):
-    sizes = getattr(save, key)
-    if key == "shards" and sizes is None:
-      continue
-    if sizes is not None and not isinstance(sizes, dict):
-      raise ValueError(f"with split_dims, [save] {key} must be a table of sizes per dimension")
-    sizes = dict(sizes or {})
-    for dim in split_dims:
-      if sizes.get(dim, 1) != 1:
-        raise ValueError(f"with split_dims, [save] {key} along {dim!r} must be 1 (one series each)")
-      sizes[dim] = 1
-    update[key] = sizes
-  return save.model_copy(update=update)
-
-
 def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Dataset:
   """The outputs' layout, lazily (never computed): `period` bins along time, other dims kept."""
   data_vars = {}
@@ -997,50 +1030,53 @@ def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Data
 def _compute_streaming(
   dataset: xr.Dataset, configs: ClimatologyConfig, output_path: str, *, label: str
 ) -> None:
-  """One series (variable, index of `split_dims`) at a time, written into its region.
+  """`_stream` in a temporary directory registry (its store is removed at the end)."""
+  with TempDirectoryRegistry():
+    _stream(dataset, configs, output_path, label=label)
+
+
+def _stream(
+  dataset: xr.Dataset, configs: ClimatologyConfig, output_path: str, *, label: str
+) -> None:
+  """One series (variable, index of `split_dims`) at a time, written into its region of a
+  temporary store, then copied into the output with the layout of `[save]` (`_stage`, `_copy`).
 
   The groups' metadata are written first, from a template with the postprocess steps applied;
   then every series is computed in memory (`_compute_series`), postprocessed and written into its
   region. Postprocess steps therefore have to work on one series (attributes, renames, chunking).
   """
-  outputs = tuple(
+  steps_of = dict(
     zip(GROUPS, (configs.postprocess_climatology, configs.postprocess_anomaly_std), strict=True)
   )
   split_dims = configs.split_dims or []
   unknown = [d for d in split_dims if d not in dataset.dims]
   if unknown:
     raise ValueError(f"split_dims {unknown} are not dimensions of the input: {list(dataset.dims)}")
-  save = _one_index_per_chunk(configs.save, split_dims)
-  template = _output_template(dataset, configs.period, configs.time_dim)
-  # One run (its own branch) and one session on it, committed once every series is written:
-  # an interrupted run commits nothing, and `main` is untouched.
+  # Opened first: a version of `main` promoted while computing is not replaced.
   run = icechunk_utils.Run(
     output_path,
-    save.storage_options,
+    configs.save.storage_options,
     label,
     recipe=provenance.fingerprint(configs, exclude={"read"}),
   )
-  session = run.session()
-  icechunk_utils.empty(session)  # what an existing repository held (--replace) goes
-  for group, steps in outputs:
-    # Metadata only: the data of the template are never computed.
-    write_into_session(
-      template.arcomake.process(steps=steps) if steps else template,
-      session,
-      save.model_copy(update={"group": group}),
-      compute=False,
-    )
-  # Stored chunks (shards, if any: the units of writing) of every variable: results are chunked
-  # alike, so that Dask writes the chunks of a region in parallel.
-  stored_chunks = [
-    {
-      name: var.encoding.get("shards") or var.encoding["chunks"]
-      for name, var in xr.open_zarr(
-        session.store, group=group, consolidated=False
-      ).data_vars.items()
-    }
-    for group, _ in outputs
-  ]
+  template = _output_template(dataset, configs.period, configs.time_dim)
+  groups = {
+    group: template.arcomake.process(steps=steps) if steps else template
+    for group, steps in steps_of.items()
+  }
+  # One index of the split dimensions per chunk of the store (after the postprocess steps, which
+  # may chunk): each series writes its region alone. Everything runs in this process.
+  groups = {
+    group: dataset.chunk({d: 1 for d in split_dims if d in dataset.dims})
+    for group, dataset in groups.items()
+  }
+  stage = _stage(groups, configs.save, configs.time_dim, workers=False)
+  stage.write(compute=False)  # metadata only: the template's data are never computed
+  # Results are chunked as the store, so that Dask writes the chunks of a region in parallel.
+  stored_chunks = {
+    group: {name: var.encoding["chunks"] for name, var in staged.data_vars.items()}
+    for group, staged in stage.staged.items()
+  }
 
   def write(results: tuple[xr.Dataset, xr.Dataset], index: dict[str, int], label: str) -> None:
     writing = time.monotonic()
@@ -1048,21 +1084,27 @@ def _compute_streaming(
     region = {configs.time_dim: slice(0, configs.period)} | {
       d: slice(i, i + 1) for d, i in index.items()
     }
-    for (group, steps), result, chunks in zip(outputs, results, stored_chunks, strict=True):
+    for (group, steps), result in zip(steps_of.items(), results, strict=True):
       if steps:
         result = result.arcomake.process(steps=steps)
-      result = result.drop_attrs().chunk(
-        {
-          dim: size
-          for name in result.data_vars
-          for dim, size in zip(result[name].dims, chunks[str(name)], strict=True)
-        }
+      chunks = stored_chunks[group]
+      result = (
+        result.drop_attrs()
+        .drop_encoding()
+        .chunk(
+          {
+            dim: size
+            for name in result.data_vars
+            for dim, size in zip(result[name].dims, chunks[str(name)], strict=True)
+          }
+        )
       )
       result = result.drop_vars(
         [name for name, var in result.variables.items() if not set(var.dims) & set(region)]
       )
-      with sharding.write_order(save.shard_order):  # arrays opened here: shards in that order
-        to_icechunk(result, session, region=region, mode="r+", group=group)
+      result.to_zarr(
+        stage.path, group=group, region=region, mode="r+", consolidated=False, zarr_format=3
+      )
     logger.info(f"{label} written in {time.monotonic() - writing:.0f} s")
 
   series = _series(dataset, split_dims)
@@ -1094,8 +1136,8 @@ def _compute_streaming(
       )
     if pending is not None:
       pending.result()
-  run.commit(session, f"{label}: {len(series)} series", {METHOD_KEY: "streaming"})
-  run.finish(configs.save.retention())
+  logger.info(f"{len(series)} series computed; copying into {output_path}")
+  _copy(stage, run, configs.save, label=label, metadata={METHOD_KEY: "streaming"})
   logger.info("Climatology writes completed, one series at a time.")
 
 

@@ -423,6 +423,62 @@ def test_temporary_store_warns_about_memory_and_disk(monkeypatch, caplog):
   ds = xr.Dataset({"t": (("time", "x"), np.zeros((8, 1000), "float32"))}, coords={"time": time})
   save = SaveConfig.model_validate({"chunks": {"time": 8, "x": -1}})
   with caplog.at_level(logging.WARNING), TempDirectoryRegistry():
-    (copy,) = climatology._checkpointed([ds.chunk()], save, "time")
-    xr.testing.assert_equal(copy.load(), ds)
+    climatology._stage({"g": ds.chunk()}, save, "time")
   assert "may not fit" in caplog.text and "chunks" in caplog.text
+
+
+def test_copies_run_on_local_threads_at_most_their_cap(monkeypatch):
+  """The copy runs in this process on local threads, capped: Dask's distributed schedulers ignore
+  `num_workers`, and every copy task holds a whole stored unit."""
+  from arcomake import climatology
+  from arcomake.dataset_utils import SaveConfig
+  from arcomake.temporary_utils import TempDirectoryRegistry
+
+  seen = {}
+
+  def write_tree(groups, run, save, **kwargs):
+    seen["scheduler"] = dask.config.get("scheduler")
+    seen["threads"] = dask.config.get("num_workers")
+
+  monkeypatch.setattr(climatology, "write_tree", write_tree)
+  ds = xr.Dataset({"t": (("time", "x"), np.zeros((8, 10), "float32"))}, coords={"time": range(8)})
+  with TempDirectoryRegistry(), dask.config.set(scheduler="processes"):
+    stage = climatology._stage({"g": ds.chunk()}, SaveConfig(), "time")
+    stage.write()
+    stage.threads = 3
+    climatology._copy(stage, None, SaveConfig(), label="x", metadata={})  # type: ignore[arg-type]
+  assert seen == {"scheduler": "threads", "threads": 3}
+
+
+def test_copy_threads_count_the_chunks_a_task_reads(monkeypatch):
+  """A copy task reads whole chunks of the store: where they are larger than the stored unit (it
+  does not divide Dask's chunks), the threads are counted for them."""
+  from arcomake import climatology
+  from arcomake.chunk_plan import COPIES, Budget
+  from arcomake.dataset_utils import SaveConfig
+  from arcomake.temporary_utils import TempDirectoryRegistry
+
+  ds = xr.Dataset({"t": (("time", "x"), np.zeros((8, 1000), "float32"))}, coords={"time": range(8)})
+  save = SaveConfig.model_validate({"chunks": {"time": 8, "x": 300}})  # 300 does not divide 1000
+  whole = 8 * 1000 * 4  # the store's chunk: Dask's, the whole of x
+  # Room for 2 tasks holding the store's chunks (5 holding the stored units of 300).
+  budget = Budget(int(2.5 * COPIES * whole / 0.8), 32)
+  monkeypatch.setattr(climatology, "detect_budget", lambda: budget)
+  with TempDirectoryRegistry():
+    stage = climatology._stage({"g": ds.chunk()}, save, "time")
+  assert stage.threads == 2
+
+
+def test_copy_threads_hold_their_units():
+  """The copy runs with as many threads as hold `COPIES` times their stored unit within the
+  budget (32 copy tasks of 1.6 GB shards did not fit in 110 GB), at least one."""
+  from arcomake import climatology
+  from arcomake.chunk_plan import COPIES, Budget
+
+  shard = 8 * 49 * 721 * 1440 * 4  # 1.6 GB
+  budget = Budget(110 * 2**30, 32)
+  threads = climatology._copy_threads([shard], budget)
+  assert threads is not None and 1 <= threads < 32
+  assert threads * COPIES * shard <= budget.usable
+  assert climatology._copy_threads([2**20], budget) is None  # small units: all of Dask's
+  assert climatology._copy_threads([budget.usable], budget) == 1

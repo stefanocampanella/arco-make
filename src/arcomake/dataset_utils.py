@@ -1155,34 +1155,9 @@ def write_output(
   )
 
 
-def write_into_session(
-  dataset: xr.Dataset, session: Any, configs: SaveConfig, *, compute: bool = True
-) -> Delayed | None:
-  """Write `dataset` (with the layout of `[save]`) into a writable Icechunk session, from this
-  process: its threads may write, but no other process or worker (their writes would not reach
-  the session). With `compute=False`, only the metadata are written; returns the data's task
-  (with a `shard_order` other than zarr's, its arrays write their shards in that order). Dask
-  chunks straddling the stored chunks or shards are rechunked to fit them (`align_chunks`, as in
-  download): statistics computed level by level are stored in shards of all levels."""
-  prepared = prepare_for_writing(dataset, configs)
-  options: dict[str, Any] = {
-    "consolidated": False,
-    "zarr_format": 3,
-    "group": configs.group,
-    "align_chunks": True,
-  }
-  with sharding.write_order(configs.shard_order):
-    if sharding.creates_arrays(configs.shard_order, "w"):
-      sharding.create_arrays(prepared, session.store, mode="w", group=configs.group)
-      written = prepared.to_zarr(session.store, mode="r+", compute=compute, **options)
-    else:
-      written = prepared.to_zarr(session.store, mode="w", compute=compute, **options)
-  return written if isinstance(written, Delayed) else None
-
-
 def write_tree(
   groups: Mapping[str, xr.Dataset],
-  destination: str | pathlib.Path,
+  destination: "str | pathlib.Path | icechunk_utils.Run",
   configs: SaveConfig,
   *,
   label: str,
@@ -1192,7 +1167,9 @@ def write_tree(
   """Write datasets into the groups of one repository (a DataTree; under `[save] group`, if
   set), each with the layout of `[save]`, in one commit of a run named `label`
   (`icechunk_utils.Run`; with `metadata`), which replaces what the repository held; `main` moves
-  to it once all are written. Returns the new tip of `main`.
+  to it once all are written. Returns the new tip of `main`. `destination` is a repository's
+  path, or a run opened before the data were computed (it carries the recipe's fingerprint), so
+  that a version promoted meanwhile is not replaced (`PromotionError`).
 
   Each group is computed by its own write: work they share is done again for each (Dask
   optimizes each write on its own and fuses a shared task into each), so compute it first (the
@@ -1201,9 +1178,14 @@ def write_tree(
   Raises:
     icechunk_utils.PromotionError: if `main` changed meanwhile (the run stays on its branch).
   """
-  path = _check_output_path(destination)
-  run = icechunk_utils.Run(path, configs.storage_options, label, recipe=recipe)
-  logger.info(f"Writing groups {list(groups)} to {path} ({label}) with {configs}")
+  if isinstance(destination, icechunk_utils.Run):
+    if recipe is not None:
+      raise ValueError("write_tree: a run carries its recipe's fingerprint (`Run(recipe=...)`)")
+    run = destination
+  else:
+    path = _check_output_path(destination)
+    run = icechunk_utils.Run(path, configs.storage_options, label, recipe=recipe)
+  logger.info(f"Writing groups {list(groups)} to {run.path} ({label}) with {configs}")
   parent = "" if configs.group is None else f"{configs.group}/"
   run.write_groups(
     {f"{parent}{name}": prepare_for_writing(dataset, configs) for name, dataset in groups.items()},

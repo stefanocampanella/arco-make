@@ -10,7 +10,6 @@ import pickle
 import subprocess
 import sys
 
-import dask
 import icechunk
 import numpy as np
 import pandas as pd
@@ -22,7 +21,7 @@ from click.testing import CliRunner
 from zarr.core.buffer import default_buffer_prototype
 
 from arcomake import cli, icechunk_utils, sharding
-from arcomake.dataset_utils import SaveConfig, write_into_session, write_output
+from arcomake.dataset_utils import SaveConfig, write_output
 
 LAYOUT = {"chunks": {"time": 1, "depth": 1}, "shards": {"time": 4, "depth": -1}}
 
@@ -86,26 +85,6 @@ def test_shards_of_created_and_appended_arrays_follow_the_order(tmp_path: pathli
     for k, p in outputs.items()
   }
   assert metadata["morton"] == metadata[order]
-
-
-def test_writes_into_sessions_follow_the_order(tmp_path: pathlib.Path):
-  """As the climatology writes its outputs: metadata now, values computed later."""
-  configs = SaveConfig.model_validate({**LAYOUT, "shard_order": "lexicographic"})
-  path = tmp_path / "out.zarr"
-  run = icechunk_utils.Run(path, None, "test")
-  session = run.session()
-  write = write_into_session(ocean(8), session, configs, compute=False)
-  with dask.config.set(scheduler="threads"):
-    dask.compute(write)
-  run.commit(session, "test")
-  run.finish()
-  assert np.array_equal(
-    physical_order(path, "thetao", (1, 0, 0, 0)), expected("lexicographic", (4, 5, 1, 1))
-  )
-  xr.testing.assert_equal(
-    xr.open_zarr(icechunk_utils.readonly_store(path), consolidated=False).thetao.load(),
-    ocean(8).thetao.load(),
-  )
 
 
 @pytest.mark.parametrize("split", ["", 'split_dims = ["lat"]\n'], ids=["graph", "series"])
