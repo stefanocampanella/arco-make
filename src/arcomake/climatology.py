@@ -49,7 +49,7 @@ import shutil
 import threading
 import time
 from collections.abc import Callable, Hashable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Literal, get_args
 
 import click
@@ -137,7 +137,7 @@ class ClimatologyConfig(BaseModel):
   split_dims: list[str] | None = Field(
     default=None,
     description=(
-      "With --streaming (one series at a time): each data variable, and each index along these"
+      "With --streaming (series computed apart): each data variable, and each index along these"
       ' dimensions, is a series (e.g. ["depth"]; default: one series per variable). Warned'
       " about without --streaming"
     ),
@@ -199,8 +199,9 @@ class ClimatologyConfig(BaseModel):
   "--streaming/--graph",
   default=False,
   help=(
-    "Compute one series at a time (each variable, and each index of the recipe's `split_dims`),"
-    " streaming over time, instead of everything in one Dask graph (the default)"
+    "Compute each series apart (each variable, and each index of the recipe's `split_dims`),"
+    " streaming over time, as many at a time as fit in memory, instead of everything in one Dask"
+    " graph (the default)"
   ),
 )
 @click.option(
@@ -309,7 +310,7 @@ def _compute_and_write(
   streaming: bool,
 ) -> None:
   """Compute the climatology and anomaly std of `dataset` and write them into the groups of
-  `output_path` (`GROUPS`), one series at a time (`_compute_streaming`) or in one Dask graph
+  `output_path` (`GROUPS`), series by series (`_compute_streaming`) or in one Dask graph
   (`_compute_graph`)."""
   if streaming:
     _compute_streaming(dataset, configs, output_path, label=label)
@@ -1047,12 +1048,13 @@ def _compute_streaming(
 def _stream(
   dataset: xr.Dataset, configs: ClimatologyConfig, output_path: str, *, label: str
 ) -> None:
-  """One series (variable, index of `split_dims`) at a time, written into its region of a
+  """Every series (variable, index of `split_dims`) apart, written into its region of a
   temporary store, then copied into the output with the layout of `[save]` (`_stage`, `_copy`).
 
   The groups' metadata and coordinates are written first, from a template with the postprocess
   steps applied; then every series is computed in memory (`_compute_series`), postprocessed and
-  written into its region (its data variable only). Postprocess steps therefore have to work on one series (attributes, renames, chunking).
+  written into its region, as many at a time as fit in memory (`_series_at_once`). Postprocess
+  steps therefore have to work on one series (attributes, renames, chunking).
   """
   steps_of = dict(
     zip(GROUPS, (configs.postprocess_climatology, configs.postprocess_anomaly_std), strict=True)
@@ -1075,12 +1077,12 @@ def _stream(
   }
   # One index of the split dimensions per chunk of the store (after the postprocess steps, which
   # may chunk): each series writes its region alone. Coordinates are written with the metadata
-  # (in memory: chunked, they were never computed, and the series do not carry them). Everything
-  # runs in this process.
+  # (in memory, not chunked), so that series computed at once never write the same chunk.
+  # Everything runs in this process.
   groups = {
-    group: (
-      chunked := dataset.chunk({d: 1 for d in split_dims if d in dataset.dims})
-    ).assign_coords({name: coord.compute() for name, coord in chunked.coords.items()})
+    group: dataset.chunk({d: 1 for d in split_dims if d in dataset.dims}).assign_coords(
+      {name: coord.compute() for name, coord in dataset.coords.items()}
+    )
     for group, dataset in groups.items()
   }
   stage = _stage(groups, configs.save, configs.time_dim, workers=False)
@@ -1118,38 +1120,84 @@ def _stream(
       )
     logger.info(f"{label} written in {time.monotonic() - writing:.0f} s")
 
+  def compute_and_write(name: str, index: dict[str, int]) -> None:
+    piece = dataset[[name]].isel({d: slice(i, i + 1) for d, i in index.items()})
+    climatology, variance = _compute_series(
+      piece,
+      period=configs.period,
+      window=configs.window,
+      weighting=configs.weighting,
+      weighting_scale=configs.weighting_scale,
+      time_dim=configs.time_dim,
+      bins=configs.bins,
+    )
+    anomaly_std = np.sqrt(variance.clip(min=0.0))
+    assert isinstance(anomaly_std, xr.Dataset)
+    write((climatology, anomaly_std), index, f"{name} {index}")
+
   series = _series(dataset, split_dims)
+  at_once = _series_at_once(dataset, series, configs.period, configs.time_dim, detect_budget())
   started = time.monotonic()
-  # Each series is written in the background while the next one is read. Reads and writes use
-  # local threads whatever --dask-setup says: results live in this process.
-  with dask.config.set(scheduler="threads"), ThreadPoolExecutor(max_workers=1) as writer:
-    pending = None
-    for number, (name, index) in enumerate(series, start=1):
-      piece = dataset[[name]].isel({d: slice(i, i + 1) for d, i in index.items()})
-      climatology, variance = _compute_series(
-        piece,
-        period=configs.period,
-        window=configs.window,
-        weighting=configs.weighting,
-        weighting_scale=configs.weighting_scale,
-        time_dim=configs.time_dim,
-        bins=configs.bins,
-      )
-      anomaly_std = np.sqrt(variance.clip(min=0.0))
-      assert isinstance(anomaly_std, xr.Dataset)
-      if pending is not None:
-        pending.result()  # one write at a time; errors surface here
-      pending = writer.submit(write, (climatology, anomaly_std), index, f"{name} {index}")
-      elapsed = time.monotonic() - started
-      logger.info(
-        f"Series {number}/{len(series)} ({name} {index}) computed; {elapsed / number:.0f} s per"
-        f" series, {elapsed / number * (len(series) - number) / 60:.0f} min left"
-      )
-    if pending is not None:
-      pending.result()
+  # Reads and writes use local threads whatever --dask-setup says: results live in this process.
+  # Each worker computes a series and writes it; series run apart, so a series' accumulators are
+  # freed before the next one of its worker starts.
+  # Dask's threads mostly wait for reads (S3 latency): each series keeps its own pool of them.
+  pool = ThreadPoolExecutor(max_workers=at_once)
+  try:
+    with dask.config.set(scheduler="threads"):
+      futures = {
+        pool.submit(compute_and_write, name, index): (name, index) for name, index in series
+      }
+      for done, future in enumerate(as_completed(futures), start=1):
+        future.result()  # the first error ends the run
+        name, index = futures[future]
+        elapsed = time.monotonic() - started
+        logger.info(
+          f"Series {done}/{len(series)} ({name} {index}) written; {elapsed / done:.0f} s per"
+          f" series, {elapsed / done * (len(series) - done) / 60:.0f} min left"
+        )
+  finally:
+    # On an error or an interrupt, series not started are cancelled; running ones finish.
+    pool.shutdown(wait=True, cancel_futures=True)
   logger.info(f"{len(series)} series computed; copying into {output_path}")
   _copy(stage, run, configs.save, label=label, metadata={METHOD_KEY: "streaming"})
-  logger.info("Climatology writes completed, one series at a time.")
+  logger.info("Climatology writes completed, series by series.")
+
+
+def _series_bytes(var: xr.DataArray, index: Mapping[str, int], period: int, time_dim: str) -> int:
+  """Memory one series of `var` (at `index` of its split dimensions) holds while it is computed
+  and written: the per-bin count, mean and m2 (20 bytes per bin and point), four arrays of
+  results per bin and point (climatology, variance, its clip and square root), and three blocks
+  read (the one added, the next one being read, and Dask's pieces of it)."""
+  piece = var.isel({d: slice(i, i + 1) for d, i in index.items()})
+  points = math.prod(n for d, n in piece.sizes.items() if d != time_dim)
+  out = var.dtype.itemsize if np.issubdtype(var.dtype, np.floating) else 8
+  steps = min(_read_block(piece, time_dim), piece.sizes[time_dim])
+  block = steps * points * var.dtype.itemsize
+  return period * points * (20 + 4 * out) + 3 * block
+
+
+def _series_at_once(
+  dataset: xr.Dataset,
+  series: Sequence[tuple[str, dict[str, int]]],
+  period: int,
+  time_dim: str,
+  budget: Budget,
+) -> int:
+  """Series computed at a time: as many of the largest as fit in the budget's memory
+  (`_series_bytes`), at least one, at most the series and the budget's threads.
+
+  Each series reads on its own, so more series keep more reads in flight; their Welford updates
+  take turns (`_WELFORD_LOCK`)."""
+  largest = max(
+    (_series_bytes(dataset[name], index, period, time_dim) for name, index in series), default=1
+  )
+  at_once = max(1, min(len(series), budget.threads, budget.usable // largest))
+  logger.info(
+    f"{len(series)} series, {at_once} at a time (up to {largest / 2**30:.1f} GiB each;"
+    f" {budget.usable / 2**30:.1f} GiB usable, {budget.source})"
+  )
+  return at_once
 
 
 def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:
@@ -1205,15 +1253,23 @@ def _stream_bin_statistics(
       values = pending.result()
       if k + 1 < len(starts):
         pending = prefetch.submit(read, starts[k + 1])
-      _welford_kernel()(
-        count.reshape(period, -1),
-        mean.reshape(period, -1),
-        m2.reshape(period, -1),
-        values.reshape(len(values), -1),
-        labels[start : start + len(values)],
-      )
+      with _WELFORD_LOCK:
+        _welford_kernel()(
+          count.reshape(period, -1),
+          mean.reshape(period, -1),
+          m2.reshape(period, -1),
+          values.reshape(len(values), -1),
+          labels[start : start + len(values)],
+        )
   mean[count == 0] = np.nan
   return count, mean, m2
+
+
+# Series computed at once take turns in the Welford kernel: it is parallel already, and numba's
+# workqueue threading layer (used where neither TBB nor OpenMP is installed) aborts when parallel
+# kernels are launched from several threads at once. Updating a block takes a small part of the
+# time reading it.
+_WELFORD_LOCK = threading.Lock()
 
 
 @functools.cache

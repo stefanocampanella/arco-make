@@ -226,6 +226,38 @@ def test_climatology_recipes_are_checked_when_loaded(table: dict, message: str):
     ClimatologyConfig.model_validate(base | table)
 
 
+def test_series_at_once_fit_in_memory():
+  """As many series at a time as the largest fits in the budget's memory, at least one, at most
+  the series and the threads; a series holds its accumulators, results and blocks read."""
+  from arcomake.chunk_plan import USABLE, Budget
+  from arcomake.climatology import _read_block, _series, _series_at_once, _series_bytes
+
+  time = pd.date_range("2001-01-01", periods=730, freq="1D")
+  ds = xr.Dataset(
+    {
+      "t3": (
+        ("time", "depth", "x"),
+        dask.array.zeros((730, 3, 1000), dtype="float32", chunks=(10, 3, -1)),
+      ),
+      "t2": (("time", "x"), dask.array.zeros((730, 1000), dtype="float64", chunks=(10, -1))),
+    },
+    coords={"time": time},
+  )
+  series = _series(ds, ["depth"])
+  assert len(series) == 4
+  t3 = _series_bytes(ds.t3, {"depth": 0}, 365, "time")
+  t2 = _series_bytes(ds.t2, {}, 365, "time")
+  assert _read_block(ds.t3.isel(depth=slice(0, 1)), "time") > 730  # about 1 GB: the whole series
+  blocks = 3 * 730 * 1000 * 4
+  assert t3 == 365 * 1000 * (20 + 4 * 4) + blocks
+  assert t2 > t3  # float64: larger results and blocks
+  at_once = [
+    _series_at_once(ds, series, 365, "time", Budget(int(usable / USABLE) + 1, threads))
+    for usable, threads in [(t2 // 2, 32), (2 * t2, 32), (100 * t2, 32), (100 * t2, 3)]
+  ]
+  assert at_once == [1, 2, 4, 3]
+
+
 def test_in_memory_series_reject_sub_daily_data():
   """The per-series path checks day-of-year bins like the Dask path (one step per day)."""
   hourly = xr.Dataset(

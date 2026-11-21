@@ -35,7 +35,7 @@ apptainer exec oras://ghcr.io/stefanocampanella/arco-make:latest arco-make downl
 | `arco-make download RECIPE OUTPUT` | Downloads, processes and merges the datasets of a recipe into one Icechunk repository |
 | `arco-make validate RECIPE INPUT` | Checks a dataset: time axis, grid, missing values inside masks; `--start`/`--end` give the expected time axis, as to `download` |
 | `arco-make process RECIPE INPUT OUTPUT` | Applies recipe steps to a dataset (e.g. a time mean) |
-| `arco-make compute-climatology RECIPE INPUT OUTPUT` | Computes a periodic climatology and the standard deviation of the anomalies, the groups `climatology` and `anomaly_std` of one repository (`--streaming`: one series at a time) |
+| `arco-make compute-climatology RECIPE INPUT OUTPUT` | Computes a periodic climatology and the standard deviation of the anomalies, the groups `climatology` and `anomaly_std` of one repository (`--streaming`: series apart, as many at a time as fit in memory) |
 | `arco-make steps` | Prints the reference of the processing steps ([docs/steps.md](docs/steps.md)) |
 
 Every command documents its options with `--help`. Paths may be local or fsspec URLs (e.g. `s3://`, `gs://`).

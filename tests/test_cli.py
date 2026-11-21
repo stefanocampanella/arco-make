@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+import zarr
 from click.testing import CliRunner, Result
 
 from arcomake import cli
@@ -383,6 +384,134 @@ def test_statistics_keep_every_coordinate(tmp_path: pathlib.Path, streaming: boo
   for group in statistics(output):
     np.testing.assert_array_equal(group.thickness, [1.0, 1.0, 2.0])
     np.testing.assert_array_equal(group.lat_bnds, bounds)
+
+
+@pytest.mark.parametrize("split", ['split_dims = ["depth"]', ""], ids=["depth", "variables"])
+def test_series_at_once_write_what_one_at_a_time_writes(
+  tmp_path: pathlib.Path, monkeypatch, split: str
+):
+  """Series computed at once write the same output, bit for bit, as one at a time; coordinates
+  along a split dimension (written with the metadata) included."""
+  from arcomake import climatology
+
+  time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
+  rng = np.random.default_rng(3)
+  ds = xr.Dataset(
+    {
+      "t3": (("time", "depth", "lat"), rng.standard_normal((time.size, 3, 4)).astype("float32")),
+      "s3": (("time", "depth", "lat"), rng.standard_normal((time.size, 3, 4)).astype("float32")),
+      "t2": (("time", "lat"), rng.standard_normal((time.size, 4)).astype("float32")),
+    },
+    coords={
+      "time": time,
+      "depth": [0.5, 1.5, 2.5],
+      "thickness": ("depth", [1.0, 1.0, 2.0]),
+      "lat": [0.0, 1.0, 2.0, 3.0],
+    },
+  )
+  ds.to_zarr(tmp_path / "in.zarr")
+  outputs = []
+  for at_once in (1, 4):
+    monkeypatch.setattr(climatology, "_series_at_once", lambda *args, n=at_once: n)
+    result, output = run_climatology(
+      tmp_path, tmp_path / "in.zarr", f"at_once_{at_once}", f"{split}\n[save]\n"
+    )
+    assert result.exit_code == 0, result.output
+    outputs.append(tuple(group.load() for group in statistics(output)))
+  for one, several in zip(*outputs, strict=True):
+    xr.testing.assert_identical(several, one)
+  np.testing.assert_array_equal(outputs[1][0].thickness, [1.0, 1.0, 2.0])
+
+
+def test_series_are_reported_as_they_are_written(tmp_path: pathlib.Path, monkeypatch):
+  """Progress is logged when each series is written, not once all are (a long run reports how
+  far it is): the last series waits until the first ones are reported."""
+  import threading
+
+  from arcomake import climatology
+
+  reported = threading.Event()
+  seen = []
+  compute, info = climatology._compute_series, climatology.logger.info
+
+  def last_waits(piece, **kwargs):
+    if piece.depth.item() == 2.5:
+      seen.append(reported.wait(timeout=20))
+    return compute(piece, **kwargs)
+
+  def logged(message, *args, **kwargs):
+    if str(message).startswith("Series "):
+      reported.set()
+    return info(message, *args, **kwargs)
+
+  monkeypatch.setattr(climatology, "_compute_series", last_waits)
+  monkeypatch.setattr(climatology.logger, "info", logged)
+  monkeypatch.setattr(climatology, "_series_at_once", lambda *args: 1)
+  result, _ = run_climatology(
+    tmp_path, climatology_input(tmp_path), "progress", 'split_dims = ["depth"]\n[save]\n'
+  )
+  assert result.exit_code == 0, result.output
+  assert seen == [True]
+
+
+def test_a_failing_series_fails_the_run(tmp_path: pathlib.Path, monkeypatch):
+  """A series that fails fails the run (the others not started are cancelled): `main` is not
+  moved."""
+  from arcomake import climatology
+
+  compute = climatology._compute_series
+
+  def failing(piece, **kwargs):
+    if piece.depth.item() == 1.5:
+      raise RuntimeError("series failed")
+    return compute(piece, **kwargs)
+
+  monkeypatch.setattr(climatology, "_compute_series", failing)
+  monkeypatch.setattr(climatology, "_series_at_once", lambda *args: 2)
+  result, output = run_climatology(
+    tmp_path, climatology_input(tmp_path), "failing", 'split_dims = ["depth"]\n[save]\n'
+  )
+  assert result.exit_code != 0 and "RuntimeError" in result.output
+  with pytest.raises(zarr.errors.GroupNotFoundError):  # `main` still at the repository's creation
+    output_group(output)
+
+
+def test_an_error_outside_the_series_cancels_those_not_started(tmp_path: pathlib.Path, monkeypatch):
+  """Any error leaving the loop (an interrupt, here the progress log) cancels the series not
+  started: the pool waited for every queued series (hours) before the error surfaced."""
+  from arcomake import climatology
+
+  time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
+  rng = np.random.default_rng(5)
+  shape = (time.size, 3, 4)
+  ds = xr.Dataset(
+    {
+      name: (("time", "depth", "lat"), rng.standard_normal(shape).astype("float32"))
+      for name in "ab"
+    },
+    coords={"time": time, "depth": [0.5, 1.5, 2.5], "lat": np.arange(4.0)},
+  )
+  ds.to_zarr(tmp_path / "in.zarr")
+  computed = []
+  compute, info = climatology._compute_series, climatology.logger.info
+
+  def counted(piece, **kwargs):
+    computed.append(piece)
+    return compute(piece, **kwargs)
+
+  def interrupted(message, *args, **kwargs):
+    if str(message).startswith("Series "):
+      raise KeyboardInterrupt
+    return info(message, *args, **kwargs)
+
+  monkeypatch.setattr(climatology, "_compute_series", counted)
+  monkeypatch.setattr(climatology.logger, "info", interrupted)
+  monkeypatch.setattr(climatology, "_series_at_once", lambda *args: 1)
+  result, _ = run_climatology(
+    tmp_path, tmp_path / "in.zarr", "stop", 'split_dims = ["depth"]\n[save]\n'
+  )
+  assert result.exit_code != 0  # click: "Aborted!"
+  assert len(computed) <= 2  # of 6: the first, and at most one its worker had started
 
 
 def test_streaming_without_split_dims_computes_each_variable(tmp_path: pathlib.Path):
