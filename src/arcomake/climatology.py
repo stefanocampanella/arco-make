@@ -42,6 +42,7 @@ import functools
 import itertools
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable, Hashable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -51,6 +52,7 @@ import click
 import dask
 import dask.array
 import numpy as np
+import numpy.typing as npt
 import xarray as xr
 from icechunk.xarray import to_icechunk
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -606,40 +608,49 @@ def _compute_climatology(
   offsets = list(range(-half, window - half))
   weights = _window_weights(offsets, weighting, scale=weighting_scale)
 
-  def window_block(n: np.ndarray, mu: np.ndarray, s2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    # apply_ufunc puts the bins (the core dimension) last; the window wants them first.
-    c, v = _window_statistics_in_memory(
-      np.moveaxis(n, -1, 0), np.moveaxis(mu, -1, 0), np.moveaxis(s2, -1, 0), offsets, weights, 1
-    )
-    return np.moveaxis(c, 0, -1), np.moveaxis(v, 0, -1)
-
   results: tuple[dict[str, xr.DataArray], dict[str, xr.DataArray]] = ({}, {})
   for name, var in mean.data_vars.items():
-    # One implementation of the window for both paths: the in-memory one, block by block.
+    dtype = dataset[name].dtype if np.issubdtype(dataset[name].dtype, np.floating) else np.float64
+    # One implementation of the window for both paths, chunk by chunk (bins last, as apply_ufunc
+    # puts the core dimension), in the output's type.
     statistics = xr.apply_ufunc(
-      window_block,
+      functools.partial(_window_bins_last, offsets=offsets, weights=weights, dtype=dtype),
       count[name],
       var,
       m2[name],
       input_core_dims=[[time_dim]] * 3,
       output_core_dims=[[time_dim]] * 2,
       dask="parallelized",
-      output_dtypes=[np.float64, np.float64],
+      output_dtypes=[dtype, dtype],
       dask_gufunc_kwargs={"allow_rechunk": True},
     )
-    dtype = dataset[name].dtype if np.issubdtype(dataset[name].dtype, np.floating) else np.float64
     for out, value in zip(results, statistics, strict=True):
-      out[str(name)] = value.transpose(*var.dims).astype(dtype)
+      out[str(name)] = value.transpose(*var.dims)
   return xr.Dataset(results[0]), xr.Dataset(results[1])
 
 
-def _rolled_into(out: np.ndarray, src: np.ndarray, shift: int) -> np.ndarray:
-  """`out[i] = src[(i + shift) % n]` along axis 0, into a preallocated array (no rolled copy)."""
-  n = src.shape[0]
-  k = shift % n
-  out[: n - k] = src[k:]
-  out[n - k :] = src[:k]
-  return out
+def _window_bins_last(
+  count: np.ndarray,
+  mean: np.ndarray,
+  m2: np.ndarray,
+  offsets: list[int],
+  weights: np.ndarray,
+  dtype: npt.DTypeLike = np.float64,
+) -> tuple[np.ndarray, np.ndarray]:
+  """The window step on per-bin statistics with the bins on the last axis, by the numba kernel
+  (`_window_kernel`): climatology and variance in `dtype`, computed in float64."""
+  shape = mean.shape
+  bins = shape[-1]
+  climatology = np.empty((mean.size // max(bins, 1), bins), dtype=dtype)
+  variance = np.empty_like(climatology)
+  _window_kernel()(
+    *(np.ascontiguousarray(a.reshape(-1, bins)) for a in (count, mean, m2)),
+    np.asarray(offsets, dtype=np.int64),
+    np.asarray(weights, dtype=np.float64),
+    climatology,
+    variance,
+  )
+  return climatology.reshape(shape), variance.reshape(shape)
 
 
 def _window_statistics_in_memory(
@@ -650,53 +661,84 @@ def _window_statistics_in_memory(
   weights: np.ndarray,
   workers: int | None = None,
   band: int = 1 << 15,
+  dtype: npt.DTypeLike = np.float64,
 ) -> tuple[np.ndarray, np.ndarray]:
-  """The window step of `_compute_climatology` on in-memory per-bin statistics (bins on axis 0).
+  """The window step of `_compute_climatology` on in-memory per-bin statistics (bins on axis 0),
+  in `dtype`.
 
-  Same formulas as the lazy path, accumulated in place in float64 over bands of `band` points
-  (all axes after the bins, flattened), in parallel, so that memory stays a few times the size of
-  one band per thread whatever the dimensions.
+  Same kernel as the lazy path, over bands of `band` points (all axes after the bins, flattened),
+  in parallel, so that memory stays a few times the size of one band per thread.
   """
   shape = mean.shape
   count, mean, m2 = (a.reshape(shape[0], -1) for a in (count, mean, m2))
-  climatology = np.empty(mean.shape, dtype=np.float64)
-  variance = np.empty(mean.shape, dtype=np.float64)
-  rows = mean.shape[1]
+  climatology = np.empty(mean.shape, dtype=dtype)
+  variance = np.empty(mean.shape, dtype=dtype)
 
   def window_band(start: int) -> None:
     part = (slice(None), slice(start, start + band))
-    n = count[part].astype(np.float64)
-    mean0 = np.nan_to_num(mean[part].astype(np.float64), nan=0.0)
-    m2_part = np.nan_to_num(m2[part].astype(np.float64), nan=0.0)
-    n_mean = n * mean0
-    v1, v2, total = np.zeros_like(n), np.zeros_like(n), np.zeros_like(n)
-    weighted_sum = np.zeros_like(n)
-    a, b = np.empty_like(n), np.empty_like(n)
-    for offset, w in zip(offsets, weights, strict=True):
-      _rolled_into(a, n, offset)
-      v1 += w * a
-      v2 += w * w * a
-      weighted_sum += w * _rolled_into(b, n_mean, offset)
-    with np.errstate(invalid="ignore", divide="ignore"):
-      clim = np.where(v1 > 0, weighted_sum / v1, np.nan)
-    clim0 = np.nan_to_num(clim, nan=0.0)
-    for offset, w in zip(offsets, weights, strict=True):
-      _rolled_into(b, mean0, offset)
-      b -= clim0
-      b *= b
-      b *= _rolled_into(a, n, offset)
-      b += _rolled_into(a, m2_part, offset)
-      total += w * b
-    with np.errstate(invalid="ignore", divide="ignore"):
-      denominator = v1 - np.where(v1 > 0, v2 / v1, np.nan)
-      var = np.where(denominator > 0, total / denominator, np.nan)
-    climatology[part] = clim
-    variance[part] = var
+    c, v = _window_bins_last(count[part].T, mean[part].T, m2[part].T, offsets, weights, dtype)
+    climatology[part] = c.T
+    variance[part] = v.T
 
-  # Bands are independent, and NumPy releases the GIL: compute them in parallel.
+  # Bands are independent, and the kernel releases the GIL: compute them in parallel.
   with ThreadPoolExecutor(max_workers=workers or min(16, os.cpu_count() or 1)) as pool:
-    list(pool.map(window_band, range(0, rows, band)))
+    list(pool.map(window_band, range(0, mean.shape[1], band)))
   return climatology.reshape(shape), variance.reshape(shape)
+
+
+_WINDOW_KERNEL_LOCK = threading.Lock()
+
+
+def _window_kernel():
+  """The numba window kernel (one for all threads: numba compiles it once, at its first call).
+
+  Dask's threads ask for it at once on their first chunks: `functools.cache` alone let each of
+  them make (and compile) its own."""
+  with _WINDOW_KERNEL_LOCK:
+    return _new_window_kernel()
+
+
+@functools.cache
+def _new_window_kernel():
+  """The numba window kernel, made on first use (importing numba is slow)."""
+  import numba
+
+  @numba.njit(nogil=True)
+  def window_rows(count, mean, m2, offsets, weights, climatology, variance):  # pragma: no cover
+    """Row by row (a point's bins): bin i pools bins i + offsets[j] (wrapping around), weighted
+    by weights[j], skipping empty bins; reliability-weights variance. In float64, in the order
+    of the former NumPy implementation (same bits)."""
+    points, bins = mean.shape
+    for p in range(points):
+      for i in range(bins):
+        v1 = 0.0
+        v2 = 0.0
+        total = 0.0
+        for j in range(offsets.shape[0]):
+          b = (i + offsets[j]) % bins
+          n = np.float64(count[p, b])
+          if n > 0:
+            w = weights[j]
+            v1 += w * n
+            v2 += w * w * n
+            total += w * (n * np.float64(mean[p, b]))
+        if v1 > 0:
+          c = total / v1
+          total = 0.0
+          for j in range(offsets.shape[0]):
+            b = (i + offsets[j]) % bins
+            n = np.float64(count[p, b])
+            if n > 0:
+              d = np.float64(mean[p, b]) - c
+              total += weights[j] * (d * d * n + np.float64(m2[p, b]))
+          denominator = v1 - v2 / v1
+          climatology[p, i] = c
+          variance[p, i] = total / denominator if denominator > 0 else np.nan
+        else:
+          climatology[p, i] = np.nan
+          variance[p, i] = np.nan
+
+  return window_rows
 
 
 def _series(dataset: xr.Dataset, split_dims: list[str]) -> list[tuple[str, dict[str, int]]]:
@@ -730,17 +772,15 @@ def _compute_series(
     started = time.monotonic()
     count, mean, m2 = _stream_bin_statistics(var, period, bins, time_dim)
     read = time.monotonic()
-    statistics = _window_statistics_in_memory(count, mean, m2, offsets, weights)
+    dtype = var.dtype if np.issubdtype(var.dtype, np.floating) else np.float64
+    statistics = _window_statistics_in_memory(count, mean, m2, offsets, weights, dtype=dtype)
     logger.info(
       f"{name}: read and binned in {read - started:.0f} s, window in {time.monotonic() - read:.0f} s"
     )
-    dtype = var.dtype if np.issubdtype(var.dtype, np.floating) else np.float64
     coords: dict[Hashable, Any] = {d: var[d] for d in order[1:] if d in var.coords}
     coords[time_dim] = np.arange(period)
     for out, values in zip(results, statistics, strict=True):
-      out[str(name)] = xr.DataArray(values.astype(dtype), dims=order, coords=coords).transpose(
-        *var.dims
-      )
+      out[str(name)] = xr.DataArray(values, dims=order, coords=coords).transpose(*var.dims)
   climatology, variance = xr.Dataset(results[0]), xr.Dataset(results[1])
   assert isinstance(climatology, xr.Dataset) and isinstance(variance, xr.Dataset)
   return climatology, variance

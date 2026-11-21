@@ -293,6 +293,42 @@ def test_the_statistics_of_a_level_read_only_that_level():
     assert read == {0}
 
 
+def test_threads_share_one_window_kernel(monkeypatch):
+  """Threads asking for the kernel at once (Dask's, on their first chunks) get the same one,
+  made (and so compiled) once."""
+  import threading
+  import time
+
+  import numba
+
+  from arcomake import climatology
+
+  made = []
+  njit = numba.njit
+
+  def slow_njit(*args, **kwargs):
+    made.append(1)
+    time.sleep(0.05)  # widens the window in which other threads miss the cache
+    return njit(*args, **kwargs)
+
+  monkeypatch.setattr(numba, "njit", slow_njit)
+  climatology._new_window_kernel.cache_clear()
+  start = threading.Barrier(8)
+  kernels = []
+
+  def ask() -> None:
+    start.wait()
+    kernels.append(climatology._window_kernel())
+
+  threads = [threading.Thread(target=ask) for _ in range(8)]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+  climatology._new_window_kernel.cache_clear()  # later tests make their own, with numba's njit
+  assert len(made) == 1 and len({id(kernel) for kernel in kernels}) == 1
+
+
 def test_variables_chunked_differently_share_the_window_tiles():
   """Variables chunked differently (`Dataset.chunks` raised for them) or of different types get
   the same tiles for the window, and so do Feb 29's statistics (combining them in the input's
