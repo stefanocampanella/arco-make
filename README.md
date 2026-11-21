@@ -187,7 +187,11 @@ is written whole by one task.
 Every output is an [Icechunk](https://icechunk.io) repository (Zarr format 3 with versions): a local
 directory, an `s3://` or a `gs://` URL. Every run writes on a branch of its own (`run/<command>-<start
 time>`), in commits: one per block for `download` (its message names the block's interval), one for
-`process` and for each output of `compute-climatology`. Only when the run succeeds does branch `main`,
+`process` and for each output of `compute-climatology`. Each commit's metadata (not its message)
+record what made it: `arcomake_recipe`, a hash of the recipe, and `arcomake_provenance`, arco-make's
+version and commit, the Python and operating system, the machine's CPUs and memory, the versions of
+the packages that decide the values and a hash of every installed package (no host name nor path);
+`repo.ancestry(branch="main")` lists them. Only when the run succeeds does branch `main`,
 the version readers see, move to the run's output (if `main` changed meanwhile, the run stays on its
 branch); a failed run leaves `main` as it was. An existing output is written only with `--replace`,
 which keeps the version it replaces in the history and refuses anything at the path that is not a

@@ -6,7 +6,7 @@ from typing import Any, get_args
 import click
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from arcomake import icechunk_utils
+from arcomake import icechunk_utils, provenance
 from arcomake.cli_utils import (
   check_aws_profile,
   check_destination,
@@ -120,7 +120,12 @@ def process(
           dataset = dataset.arcomake.process(steps=configs.process)
         # Save stats
         write_output(
-          dataset, output_path, configs.save, message=f"process {input_path}", command="process"
+          dataset,
+          output_path,
+          configs.save,
+          message=f"process {input_path}",
+          command="process",
+          recipe=provenance.fingerprint(configs, exclude={"read"}),
         )
     except click.ClickException:
       raise

@@ -22,6 +22,11 @@ jobs:
       - name: Check out code for the container builds
         uses: actions/checkout@v6
 
+      - name: Record the commit
+        # The image has no repository history: arco-make reads its commit from this file, and
+        # records it in the metadata of every commit it writes (`provenance`).
+        run: echo "${GITHUB_SHA}" > src/arcomake/BUILD_COMMIT
+
       - name: Build Container
         run: |
            apptainer build container.sif Apptainer
