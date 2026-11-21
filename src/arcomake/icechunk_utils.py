@@ -6,10 +6,11 @@ A path names a repository on a local filesystem (a directory, or a `file://` URL
 (`s3://bucket/prefix`) or on Google Cloud Storage (`gs://bucket/prefix`). Recipes give its options
 in `storage_options`, as for fsspec, but only these are understood (others are an error):
 - S3: `profile` (else `AWS_PROFILE`), `region` (else the bucket's, asked to S3 at the endpoint;
-  else the profile's), `endpoint_url`, `anon`, `network_stream_timeout_seconds` (default 20, see
-  `STREAM_TIMEOUT`); credentials come from botocore, as for every other
-  S3 access of arco-make (icechunk's own AWS client cannot use some profiles), refreshed before
-  they expire.
+  else the profile's), `endpoint_url`, `anon`, `network_stream_timeout_seconds` (default 5, see
+  `STREAM_TIMEOUT`; repositories opened to read get connect and read timeouts too, so a read
+  waiting for its answer is retried: `open_repository`); credentials come from botocore, as for
+  every other S3 access of arco-make (icechunk's own AWS client cannot use some profiles),
+  refreshed before they expire.
 - GCS: `token = "anon"` for anonymous access, or the path of a service account file; otherwise
   the environment's credentials.
 """
@@ -39,8 +40,21 @@ RUN_KEY = "arcomake_run"
 S3_OPTIONS = {"profile", "region", "endpoint_url", "anon", "network_stream_timeout_seconds"}
 # Seconds without progress before an S3 request is retried (icechunk's default: 60). Requests
 # stall now and then: on the project bucket, whole reads that take 6-7 s took up to 107 s with
-# 60 s, at most 22 s with 10 s. The timeout is reset by progress, so it only cuts stalls.
-STREAM_TIMEOUT = 20
+# 60 s, at most 22 s with 10 s; reading one level of 4 years took 35 s on average with 5 s (and
+# `READ_TIMEOUT_MS` of 5 s), 80 s with 20 s (logbook, 21 Nov). The timeout is reset by progress,
+# so it only cuts stalls; uploads of 1.6 GB shards pass with 5 s.
+STREAM_TIMEOUT = 5
+# Milliseconds a read may wait for a connection, and for its answer to begin, before it is
+# retried (`MAX_TRIES` tries in all, icechunk's default, with growing waits). The stream timeout
+# only covers answers in progress: without these, a read of the climatology's input waited 985 s
+# for an answer, and one to a server that never answers waits forever. Only for repositories
+# opened to read (`open_repository`): an upload's answer begins once its body is sent, so a read
+# timeout cut every try of a 1.6 GB shard (logbook, 21 Nov). Repositories opened to write (their
+# runs read too) bound each attempt instead, long enough for any upload of a shard.
+CONNECT_TIMEOUT_MS = 10_000
+READ_TIMEOUT_MS = 5_000
+WRITE_ATTEMPT_TIMEOUT_MS = 600_000
+MAX_TRIES = 10
 GCS_OPTIONS = {"token"}
 
 
@@ -183,6 +197,30 @@ def storage(
   )
 
 
+def open_repository(
+  repository_storage: icechunk.Storage, *, create: bool = False
+) -> icechunk.Repository:
+  """The repository at `repository_storage`, its requests tried `MAX_TRIES` times, each try
+  bounded: opened to read, by `CONNECT_TIMEOUT_MS` and `READ_TIMEOUT_MS`; with `create`, to write
+  (created if there is none), by `CONNECT_TIMEOUT_MS` and `WRITE_ATTEMPT_TIMEOUT_MS` (a read
+  timeout would cut uploads)."""
+  if create:
+    timeouts = icechunk.StorageTimeoutSettings(
+      connect_timeout_ms=CONNECT_TIMEOUT_MS, operation_attempt_timeout_ms=WRITE_ATTEMPT_TIMEOUT_MS
+    )
+  else:
+    timeouts = icechunk.StorageTimeoutSettings(
+      connect_timeout_ms=CONNECT_TIMEOUT_MS, read_timeout_ms=READ_TIMEOUT_MS
+    )
+  retries = icechunk.StorageRetriesSettings(max_tries=MAX_TRIES)
+  config = icechunk.RepositoryConfig(
+    storage=icechunk.StorageSettings(timeouts=timeouts, retries=retries)
+  )
+  if create:
+    return icechunk.Repository.open_or_create(repository_storage, config=config)
+  return icechunk.Repository.open(repository_storage, config=config)
+
+
 def is_repository(
   path: str | pathlib.Path, storage_options: Mapping[str, Any] | None = None
 ) -> bool:
@@ -192,7 +230,7 @@ def is_repository(
 
 def has_no_version(repository_storage: icechunk.Storage) -> bool:
   """Whether `main` of the repository is still its first snapshot (no run finished there)."""
-  tip = next(iter(icechunk.Repository.open(repository_storage).ancestry(branch=BRANCH)))
+  tip = next(iter(open_repository(repository_storage).ancestry(branch=BRANCH)))
   return tip.parent_id is None
 
 
@@ -246,7 +284,7 @@ class Tip:
 
 def main_tip(path: str | pathlib.Path, storage_options: Mapping[str, Any] | None = None) -> Tip:
   """The commit `main` points to."""
-  repo = icechunk.Repository.open(storage(path, storage_options))
+  repo = open_repository(storage(path, storage_options))
   info = next(iter(repo.ancestry(branch=BRANCH)))
   return Tip(snapshot=str(info.id), metadata=dict(info.metadata or {}))
 
@@ -260,7 +298,7 @@ def readonly_store(
   snapshot_id: str | None = None,
 ) -> icechunk.IcechunkStore:
   """The Zarr store of a version of the repository at `path` (by default, the tip of `main`)."""
-  repo = icechunk.Repository.open(storage(path, storage_options))
+  repo = open_repository(storage(path, storage_options))
   if tag is None and snapshot_id is None:
     branch = branch or BRANCH
   return repo.readonly_session(branch=branch, tag=tag, snapshot_id=snapshot_id).store
@@ -302,7 +340,7 @@ def waiting_run(
   repository_storage = storage(path, storage_options)
   if not icechunk.Repository.exists(repository_storage):
     return None
-  repo = icechunk.Repository.open(repository_storage)
+  repo = open_repository(repository_storage)
   # The newest by start time (the label's last part): extension runs share the prefix.
   branches = sorted(
     (b for b in repo.list_branches() if b.startswith(f"run/{command}-")),
@@ -381,7 +419,7 @@ class Run:
     self.path = str(path)
     self.recipe = recipe
     provenance.environment()  # what made the output, read when the run starts
-    self.repo = icechunk.Repository.open_or_create(storage(path, storage_options))
+    self.repo = open_repository(storage(path, storage_options), create=True)
     if waiting is not None:
       self.label, self.branch, self.base = waiting.label, waiting.branch, waiting.base
       logger.info(f"Continuing {self.path} on branch {self.branch} (from {self.base})")

@@ -210,8 +210,8 @@ uses any more is deleted, once it is older than a week (another run may still be
 repository); without them, every version is kept. Read outputs with
 `engine = "icechunk"`, or with Icechunk and xarray directly. `[save] storage_options` for an S3
 repository: `profile`, `region` (by default the bucket's, asked to S3, else the profile's),
-`endpoint_url`, `anon`, `network_stream_timeout_seconds` (default 20: a request without progress for
-that long is retried); credentials come from botocore, as for the rest of arco-make. For GCS: `token`
+`endpoint_url`, `anon`, `network_stream_timeout_seconds` (default 5: a request without progress for
+that long is retried; reads also retry a request whose answer has not begun after 5 s); credentials come from botocore, as for the rest of arco-make. For GCS: `token`
 is `"anon"` or a service account file (by default, the environment's credentials). Options Icechunk
 cannot honour are an error, before any download. In `[save]`:
 - `chunks` set the stored chunks, per dimension (-1, or a dimension not listed: the whole dimension);

@@ -246,3 +246,53 @@ def test_s3_stream_timeout_option(fake_s3):
   options = {"region": "eu-south-1", "anon": True, "network_stream_timeout_seconds": 5}
   assert isinstance(icechunk_utils.storage("s3://b/p", options), icechunk.Storage)
   assert icechunk_utils.STREAM_TIMEOUT < 60
+
+
+@pytest.mark.parametrize("create", [False, True], ids=["read", "write"])
+def test_requests_waiting_for_an_answer_are_retried_then_fail(monkeypatch, create: bool):
+  """A server that accepts connections and never answers fails an open, to read or to write,
+  after the retries (`open_repository`'s read timeout, or its per-attempt one for writing runs);
+  with icechunk's defaults it waited forever (the stream timeout only covers answers in
+  progress), and a read from S3 once waited 985 s."""
+  import socket
+  import threading
+
+  server = socket.socket()
+  server.bind(("127.0.0.1", 0))
+  server.listen(64)
+  held = []
+
+  def accept():
+    while True:
+      try:
+        held.append(server.accept()[0])  # never answered
+      except OSError:
+        return
+
+  threading.Thread(target=accept, daemon=True).start()
+  monkeypatch.setattr(icechunk_utils, "READ_TIMEOUT_MS", 300)
+  monkeypatch.setattr(icechunk_utils, "MAX_TRIES", 2)
+  monkeypatch.setattr(icechunk_utils, "WRITE_ATTEMPT_TIMEOUT_MS", 300)
+  storage = icechunk.s3_storage(
+    bucket="b",
+    prefix="p",
+    region="us-east-1",
+    endpoint_url=f"http://127.0.0.1:{server.getsockname()[1]}",
+    allow_http=True,
+    access_key_id="x",
+    secret_access_key="y",
+  )
+  outcome = []
+
+  def open_it():
+    try:
+      icechunk_utils.open_repository(storage, create=create)
+    except icechunk.IcechunkError as exc:
+      outcome.append(exc)
+
+  opening = threading.Thread(target=open_it, daemon=True)
+  opening.start()
+  opening.join(60)
+  server.close()
+  assert outcome and "timeout" in str(outcome[0])
+  assert len(held) > 1  # retried
