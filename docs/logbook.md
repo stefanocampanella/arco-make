@@ -1396,3 +1396,101 @@ each buffer counted once, and RSS), on synthetic data and the 1 deg test output:
     parallel form of streaming. Not done: the patch is kept outside the repository.
 - **Option 1, streaming into the temporary store** (shards of all levels), synthetic 0.25 deg, 4
   levels, 32 threads: 85 s and 20.9 GiB over 2 years, 100 s and 20.9 GiB over 4 (flat).
+- **Parallel streaming** (maintainer's choice for option 3, 21 Nov): `--streaming` computes as
+  many series at once as fit in the memory budget (`_series_at_once`; per series the
+  accumulators, four result arrays and three read blocks: 15.3 GiB estimated for a 0.25 deg level,
+  11-14 GiB measured). Each worker computes a series and writes its region; the Welford updates
+  take turns (numba's workqueue layer aborts on concurrent parallel kernels). Same output, bit for
+  bit, whatever the number at once (tested). 4 levels x 4 years of `thetao` at 0.25 deg, series
+  phase (before the copy), 32 threads:
+
+  | at once | synthetic, local disk | real, published Zarr v2 via s3fs | real, Icechunk on S3 |
+  |---|---|---|---|
+  | 1 | 88 s, 17.0 GiB | 266 s, 15.1 GiB | 301 s, 17.8 GiB |
+  | 2 | 57 s, 31.1 GiB | | 166 s, 27.1 GiB |
+  | 4 | 44 s, 48.5 GiB | 204 s, 45.5 GiB | 130 s, 45.0 GiB |
+
+  The Icechunk input is a copy of the published `thetao` (levels 0-3, 1993-1996) in the production
+  layout, under `experiments/` (these runs with 20 s read and stream timeouts; with the 5 s
+  ones adopted below, 4 at once took 86 s, 48.7 GiB). s3fs reads saturate at about 65 MB/s
+  stored (its pool of 10 connections), so 4 series gained only the overlap of the window and the
+  writes with reads. From Icechunk one series reads 4 years in about 30 s without stalls
+  (200 MB/s decoded) and up to 99 s with them; series computed at once overlap their stalls. On
+  the project VM the estimate gives 5 at once.
+- **Icechunk reads waited up to 985 s for an answer.** The first Icechunk run above read one
+  series in 1101 s. A trace of every read task (one level, 4 years, 99 tasks of 32 days) showed one
+  task of 985 s and the others under 10 s. icechunk's `network_stream_timeout_seconds` covers
+  answers in progress only: a request waiting for its answer waits as long as the server and TCP
+  let it (with icechunk's defaults, more than 90 s on a local server that accepts connections and
+  never answers; forever, presumably). Repositories opened to read now set icechunk's
+  `connect_timeout_ms` (10 s) and `read_timeout_ms`, with its 10 tries
+  (`icechunk_utils.open_repository`). Not for writing runs: an upload's answer begins once its
+  body is sent, so a 20 s read timeout cut every try of 1.6 GB shards; they upload with the
+  defaults (310 s for 4 shards). Similar to N7 (gcsfs without timeouts). **[Moby-Dick]** consumers
+  reading from S3 should set icechunk's read timeout as well as a short stream timeout.
+- **Shorter timeouts** (same level reads, interleaved; seconds per level of 4 years, eight reads
+  each, four for the mixed settings; no read failed):
+
+  | read timeout, stream timeout | mean | range |
+  |---|---|---|
+  | 20 s, 20 s | 80 s | 48-128 s |
+  | 5 s, 20 s | 63 s | 27-93 s |
+  | 20 s, 5 s | 71 s | 34-93 s |
+  | 5 s, 5 s | 35 s | 23-56 s |
+
+  Stalls come both before and during answers. Both are now 5 s (the stream timeout for every
+  repository: 1.6 GB shards still upload, 291 s). Stall-free, a level reads in 23-26 s (230-265
+  MB/s decoded).
+- **Partial shard reads**: zarr reads the chunks a task needs from one shard one after another, so
+  reading one level out of shards of all levels gets its parallelism from Dask's tasks. 256 days of
+  one level: one shard per task (8 days), 35 MB/s decoded; one chunk per task, 224 MB/s;
+  streaming's blocks of 32-day tasks, about 300 MB/s without stalls; whole shards of the 4 levels,
+  135 MB/s.
+- **Statistics lost their coordinates other than indexes**: streaming (since 3c97c2b) wrote them as
+  zeros (lazy in the template, so never computed; absent from the series), and the graph path
+  dropped those on dimensions of no variable (cell bounds, along `bnds`), leaving `bounds`
+  attributes naming missing variables. Both now keep every coordinate of the input without time.
+  The historical datasets have `lat_bnds`, `lon_bnds`, `depth_bnds` (`cell_bounds`).
+- **Dask `bind` regression**: `bind(da.ones(800, chunks=100)[500:800], parent).compute()` fails
+  with "Missing dependency" for any sliced child (Dask 2025.5.0 to 2026.8.0, the latest; 2025.4.1
+  and earlier work); unsliced children work and hold their roots back. A report is drafted for the
+  maintainer to post.
+- **Projection for the 0.25 deg statistics, revised**: with 4 series at once and 5 s timeouts the
+  reads ran at about 400 MB/s decoded (about 145 MB/s stored, the VM's network ceiling measured
+  before: 136-185 MB/s), 280 MB/s over the whole series phase. For 9.9 TB decoded: about 7-9 h,
+  plus the copy (about 20 min); more series at once would not read faster. Memory: 5 at once by
+  the estimate, about 60 GiB.
+- **The graph path on a distributed scheduler** (does root-task queuing bound what grows with the
+  threaded scheduler?): synthetic 0.25 deg, 4 levels x 4 years, memory of every process of the run:
+  threaded 85 s, 52.5 GiB; `localcluster` with its defaults 90 s, 62.3 GiB; one worker of 32 threads
+  134 s, 39.6 GiB. Not bounded: the graph path stays unfit for 31 years at 0.25 deg on the VM.
+- **Writing runs' requests** (code review): the repository a run writes to serves reads too
+  (stored stamps and static variables on resume or extension, ancestry, retention), and had no
+  bound on a request waiting for its answer. It now gets icechunk's connect timeout (10 s) and a
+  bound per attempt of 10 minutes (`operation_attempt_timeout_ms`; a read timeout cuts uploads):
+  4 shards of 1.6 GB uploaded in 618 s (with a download sharing the network).
+- **The graph path with spilling to disk** (maintainer's question: a distributed cluster spills,
+  which might solve the graph path's memory). One `localcluster` worker of 32 threads with a
+  memory limit (`DASK_LOCALCLUSTER__MEMORY_LIMIT` is ignored: arco-make's env options pass only
+  `LocalCluster`'s named parameters, and `memory_limit` is a worker keyword), synthetic 0.25 deg,
+  1 level x 8 years, memory of every process:
+
+  | scheduler, worker limit | time | peak |
+  |---|---|---|
+  | threaded | 39 s | 54.5 GiB |
+  | 100 GiB (no spilling) | 60 s | 47.6 GiB |
+  | 30 GiB | 139 s | 22.7 GiB |
+  | 24 GiB | 347 s | 22.3 GiB (a worker restarted) |
+  | 12 GiB | failed: workers killed again and again (`KilledWorker`) | |
+
+  4 levels x 4 years with 16 GiB failed the same way (259 s). Spilling bounds what the results
+  pile up, at 2.3-5.8 times the time here, but not what 32 running tasks hold (about 12-16 GiB at
+  these chunk sizes). At 31 years and 49 levels the excess is hundreds of GiB per level: on the
+  VM, far slower than streaming. Several nodes (`mpi`) add memory rather than disk.
+- **Download on a distributed scheduler** (maintainer's question; the command warned it was not
+  compatible): the 1 deg recipe, 2 days (Copernicus Marine, ERA5 on GCS, GloFAS from the EWDS,
+  the GloFAS static file over HTTP), with `localcluster` (default workers): exit 0, output
+  identical to the threaded run's (values, attributes, encodings), 415 s against 207 s. The
+  workers print the `RuntimeWarning`s download filters (the filter is set in the main process
+  only). Not tried: several nodes (temporary files, the EWDS's GRIB and the HTTP file, are read by
+  path: they need a `TMPDIR` every node sees).
