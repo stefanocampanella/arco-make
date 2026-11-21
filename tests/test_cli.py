@@ -357,6 +357,34 @@ def test_replacing_statistics_keeps_nothing_else(tmp_path: pathlib.Path, streami
   assert dict(root.attrs) == {}
 
 
+@pytest.mark.parametrize("streaming", [False, True], ids=["graph", "streaming"])
+def test_statistics_keep_every_coordinate(tmp_path: pathlib.Path, streaming: bool):
+  """Coordinates other than indexes, along a split dimension or not, are written as read
+  (streaming wrote them as zeros: neither its template's nor its series' carried them)."""
+  time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
+  values = np.random.default_rng(4).standard_normal((time.size, 3, 4)).astype("float32")
+  bounds = np.stack([np.arange(4.0) - 0.5, np.arange(4.0) + 0.5], axis=1)
+  ds = xr.Dataset(
+    {"t3": (("time", "depth", "lat"), values)},
+    coords={
+      "time": time,
+      "depth": [0.5, 1.5, 2.5],
+      "lat": np.arange(4.0),
+      "thickness": ("depth", [1.0, 1.0, 2.0]),
+      "lat_bnds": (("lat", "bnds"), bounds),
+    },
+  )
+  ds.to_zarr(tmp_path / "in.zarr")
+  split = 'split_dims = ["depth"]' if streaming else ""
+  result, output = run_climatology(
+    tmp_path, tmp_path / "in.zarr", "coords", f"{split}\n[save]\n", streaming=streaming
+  )
+  assert result.exit_code == 0, result.output
+  for group in statistics(output):
+    np.testing.assert_array_equal(group.thickness, [1.0, 1.0, 2.0])
+    np.testing.assert_array_equal(group.lat_bnds, bounds)
+
+
 def test_streaming_without_split_dims_computes_each_variable(tmp_path: pathlib.Path):
   """Without `split_dims`, `--streaming` computes one series per variable, as the graph."""
   source = climatology_input(tmp_path)

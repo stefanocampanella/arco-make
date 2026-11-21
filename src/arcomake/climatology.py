@@ -349,6 +349,15 @@ def _compute_graph(
     use_flox=configs.use_flox,
     bins=configs.bins,
   )
+  # Every coordinate without time, as streaming's template has them: the reductions drop those
+  # on dimensions of no output variable (cell bounds, along their `bnds` dimension).
+  static = {
+    name: coord for name, coord in dataset.coords.items() if configs.time_dim not in coord.dims
+  }
+  climatology, anomaly_var = (
+    result.assign_coords({name: c for name, c in static.items() if name not in result.coords})
+    for result in (climatology, anomaly_var)
+  )
   if configs.postprocess_climatology:
     climatology = climatology.arcomake.process(steps=configs.postprocess_climatology)
   anomaly_std = np.sqrt(anomaly_var.clip(min=0.0))
@@ -1041,9 +1050,9 @@ def _stream(
   """One series (variable, index of `split_dims`) at a time, written into its region of a
   temporary store, then copied into the output with the layout of `[save]` (`_stage`, `_copy`).
 
-  The groups' metadata are written first, from a template with the postprocess steps applied;
-  then every series is computed in memory (`_compute_series`), postprocessed and written into its
-  region. Postprocess steps therefore have to work on one series (attributes, renames, chunking).
+  The groups' metadata and coordinates are written first, from a template with the postprocess
+  steps applied; then every series is computed in memory (`_compute_series`), postprocessed and
+  written into its region (its data variable only). Postprocess steps therefore have to work on one series (attributes, renames, chunking).
   """
   steps_of = dict(
     zip(GROUPS, (configs.postprocess_climatology, configs.postprocess_anomaly_std), strict=True)
@@ -1065,9 +1074,13 @@ def _stream(
     for group, steps in steps_of.items()
   }
   # One index of the split dimensions per chunk of the store (after the postprocess steps, which
-  # may chunk): each series writes its region alone. Everything runs in this process.
+  # may chunk): each series writes its region alone. Coordinates are written with the metadata
+  # (in memory: chunked, they were never computed, and the series do not carry them). Everything
+  # runs in this process.
   groups = {
-    group: dataset.chunk({d: 1 for d in split_dims if d in dataset.dims})
+    group: (
+      chunked := dataset.chunk({d: 1 for d in split_dims if d in dataset.dims})
+    ).assign_coords({name: coord.compute() for name, coord in chunked.coords.items()})
     for group, dataset in groups.items()
   }
   stage = _stage(groups, configs.save, configs.time_dim, workers=False)
@@ -1099,9 +1112,7 @@ def _stream(
           }
         )
       )
-      result = result.drop_vars(
-        [name for name, var in result.variables.items() if not set(var.dims) & set(region)]
-      )
+      result = result.drop_vars(list(result.coords))  # written with the metadata
       result.to_zarr(
         stage.path, group=group, region=region, mode="r+", consolidated=False, zarr_format=3
       )
