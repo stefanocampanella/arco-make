@@ -1373,3 +1373,26 @@ each buffer counted once, and RSS), on synthetic data and the 1 deg test output:
   end from S1's measurement of 16 Nov, 122 s per series for 26 years with s3fs), memory 21-32 GB;
   the graph path would be reading-bound at 6-7.5 h if its memory allowed. Streaming stores the
   split dimension one index per shard, not in shards of all levels.
+- **Why the graph path's memory grows with the years** (maintainer's question; traced on the
+  synthetic 0.25 deg input, one level, 4 threads, the results alive in Dask's cache):
+  - committed two passes: 2 years 9.2 GiB alive, 8 years 34.7 GiB (about 4.3 GiB per year). At the
+    peak with 4 years: every year's partial means (8.7 GiB) and partial counts (8.7 GiB) of every
+    tile, and the folded data of every year (4.3 GiB). Dask reads the input in time order, so a
+    tile's statistics finish only with its last year; its reductions combine up to 4 years per
+    task (`split_every`); the second pass of the variance needs every year's folded data.
+  - one pass, binary tree (`split_every = 2`): about log2(years) accumulators per tile (16.1 GiB
+    at 4 years).
+  - sequential accumulation (Welford, year after year, per tile): 4.8 GiB at 2 years, 11.5 at 8;
+    what grew was folded years waiting (Dask reads and folds ahead with its free threads,
+    without backpressure). Tying year p to the accumulator of year p - 2 (`bind`): the peak at 8
+    years is the accumulators themselves (7.2 GiB: count, mean and m2 for 365 bins and the grid)
+    plus two years.
+  - The floor is one accumulator per series in flight, as for streaming. But the local scheduler
+    has no backpressure, and `dask.graph_manipulation.bind` is unreliable in Dask 2026.8: on a
+    sliced child its optimized graph lacks a dependency ("Missing dependency", minimal repro), and
+    in the climatology it did not hold reads back (tested). With 4 levels at 32 threads every
+    level starts at once (43 GiB at 2 years, 66 GiB at 4). A memory-bounded graph path needs its
+    reads scheduled from Python (batches of series, accumulators kept between computations): a
+    parallel form of streaming. Not done: the patch is kept outside the repository.
+- **Option 1, streaming into the temporary store** (shards of all levels), synthetic 0.25 deg, 4
+  levels, 32 threads: 85 s and 20.9 GiB over 2 years, 100 s and 20.9 GiB over 4 (flat).
