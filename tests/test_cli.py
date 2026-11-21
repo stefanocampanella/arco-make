@@ -109,6 +109,21 @@ def test_validate_takes_the_dates_of_the_download(
   assert only_start.exit_code != 0 and "end" in only_start.output
 
 
+def test_validate_without_dates_fails_before_reading(
+  tmp_path: pathlib.Path, downloaded: pathlib.Path, recipes
+):
+  """A time check without dates (the recipe's or the command's) fails at once, also without
+  `--fail`: as a warning, the time axis went unchecked and validate exited 0."""
+  text = recipes["validate"].read_text()
+  undated = tmp_path / "undated.toml"
+  undated.write_text(
+    text.replace("start = 2020-02-26T00:00:00\n", "").replace("end = 2020-03-02T00:00:00\n", "")
+  )
+  assert "start =" not in undated.read_text()
+  result = run("validate", str(undated), str(downloaded))
+  assert result.exit_code != 0 and "give --start and --end" in result.output
+
+
 def test_process_sample_dataset(tmp_path: pathlib.Path, downloaded: pathlib.Path, recipes):
   """`process` applies the recipe steps (here a time mean of the dynamic variables)."""
   output = tmp_path / "mean.zarr"
@@ -120,23 +135,22 @@ def test_process_sample_dataset(tmp_path: pathlib.Path, downloaded: pathlib.Path
   assert "sea_mask" not in mean
 
 
+def statistics(path: pathlib.Path) -> tuple[xr.Dataset, xr.Dataset]:
+  """The groups of a `compute-climatology` output: the climatology and the anomaly std."""
+  return open_output(path, "climatology"), open_output(path, "anomaly_std")
+
+
 def test_climatology_sample_dataset(tmp_path: pathlib.Path, downloaded: pathlib.Path, recipes):
   """`compute-climatology` writes the per-bin mean and the anomaly standard deviation."""
-  clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
+  output = tmp_path / "statistics.zarr"
   result = run(
-    "compute-climatology",
-    *THREADS,
-    str(recipes["climatology"]),
-    str(downloaded),
-    str(clim),
-    str(std),
+    "compute-climatology", *THREADS, str(recipes["climatology"]), str(downloaded), str(output)
   )
   assert result.exit_code == 0, result.output
+  clim, std = statistics(output)
   t2m = open_output(downloaded).t2m.isel(time=slice(0, 4)).values
-  np.testing.assert_allclose(open_output(clim).t2m.values[0], (t2m[0] + t2m[2]) / 2, rtol=1e-6)
-  np.testing.assert_allclose(
-    open_output(std).t2m.values[1], np.abs(t2m[1] - t2m[3]) / np.sqrt(2), rtol=1e-5
-  )
+  np.testing.assert_allclose(clim.t2m.values[0], (t2m[0] + t2m[2]) / 2, rtol=1e-6)
+  np.testing.assert_allclose(std.t2m.values[1], np.abs(t2m[1] - t2m[3]) / np.sqrt(2), rtol=1e-5)
 
 
 def test_climatology_reference_period_and_day_of_year(tmp_path: pathlib.Path):
@@ -151,29 +165,29 @@ def test_climatology_reference_period_and_day_of_year(tmp_path: pathlib.Path):
     "reference_period = {start = 2020-01-01, end = 2021-01-01}\n\n"
     '[read]\nengine = "zarr"\n\n[save]\n'
   )
-  clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
-  args = [str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)]
-  result = run("compute-climatology", *THREADS, *args)
+  output = tmp_path / "statistics.zarr"
+  result = run("compute-climatology", *THREADS, str(recipe), str(tmp_path / "in.zarr"), str(output))
   assert result.exit_code == 0, result.output
-  out = open_output(clim).x.values
+  clim, std = statistics(output)
+  out = clim.x.values
   in_2020 = values[time.year == 2020]
   np.testing.assert_array_equal(out[:58], in_2020[:58])  # Jan 1 to Feb 27 of 2020 only
   np.testing.assert_allclose(out[58], in_2020[58:60].mean(), rtol=1e-6)  # Feb 28 and 29
   np.testing.assert_array_equal(out[59:], in_2020[60:])
-  assert np.isnan(open_output(std).x.values[0])  # one value: no variance
+  assert np.isnan(std.x.values[0])  # one value: no variance
 
 
 @pytest.mark.parametrize(
   ("save", "chunks", "shards"),
   [
     ("chunks = {{time = 1, depth = 1, lat = -1}}\n", (1, 1, 4), None),
-    ("chunks = {{time = 1, depth = 1, lat = 2}}\nshards = {{time = 73}}\n", (1, 1, 2), (73, 1, 4)),
+    ("chunks = {{time = 1, depth = 1, lat = 2}}\nshards = {{time = 73}}\n", (1, 1, 2), (73, 3, 4)),
   ],
   ids=["chunks", "shards"],
 )
 def test_climatology_one_series_at_a_time(tmp_path: pathlib.Path, save: str, chunks, shards):
-  """`split_dims` (S1) writes the same outputs as one Dask graph, series by series; shards along
-  the split dimensions are 1, like chunks."""
+  """`--streaming` writes the same outputs as one Dask graph, series by series (`split_dims`);
+  shards along the split dimensions are 1, like chunks."""
   time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
   rng = np.random.default_rng(0)
   ds = xr.Dataset(
@@ -191,20 +205,19 @@ def test_climatology_one_series_at_a_time(tmp_path: pathlib.Path, save: str, chu
     "[save]\n" + save
   )
   outputs = {}
-  for label, split in [("graph", ""), ("series", 'split_dims = ["depth"]')]:
+  for label, split, path in [("graph", "", "--graph"), ("series", 'split_dims = ["depth"]', "")]:
     recipe = tmp_path / f"{label}.toml"
     recipe.write_text(common.format(split=split))
-    clim, std = tmp_path / f"{label}_clim.zarr", tmp_path / f"{label}_std.zarr"
-    result = run(
-      "compute-climatology", *THREADS, str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)
-    )
+    output = tmp_path / f"{label}.zarr"
+    flags = [path or "--streaming", *THREADS]
+    result = run("compute-climatology", *flags, str(recipe), str(tmp_path / "in.zarr"), str(output))
     assert result.exit_code == 0, result.output
-    outputs[label] = (open_output(clim).load(), open_output(std).load())
+    outputs[label] = tuple(group.load() for group in statistics(output))
   for graph, series in zip(outputs["graph"], outputs["series"], strict=True):
     xr.testing.assert_allclose(series, graph, rtol=1e-5)
     assert series.attrs == graph.attrs
   assert outputs["series"][0].attrs["title"] == "clim"
-  stored = open_output(tmp_path / "series_clim.zarr").t3.encoding
+  stored = open_output(tmp_path / "series.zarr", "climatology").t3.encoding
   assert stored["chunks"] == chunks and stored["shards"] == shards
 
 
@@ -220,37 +233,160 @@ def climatology_input(tmp_path: pathlib.Path, depth_coordinate: bool = True) -> 
   return path
 
 
-def run_climatology(tmp_path: pathlib.Path, source: pathlib.Path, label: str, extra: str):
+def run_climatology(
+  tmp_path: pathlib.Path, source: pathlib.Path, label: str, extra: str, streaming: bool = True
+):
   recipe = tmp_path / f"{label}.toml"
   recipe.write_text(
     f'period = 365\nbins = "day_of_year"\nwindow = 3\nweighting = "constant"\n{extra}\n'
     '[read]\nengine = "zarr"\n'
   )
-  clim, std = tmp_path / f"{label}_clim.zarr", tmp_path / f"{label}_std.zarr"
-  return run("compute-climatology", *THREADS, str(recipe), str(source), str(clim), str(std)), clim
+  output = tmp_path / f"{label}.zarr"
+  path = "--streaming" if streaming else "--graph"
+  result = run("compute-climatology", path, *THREADS, str(recipe), str(source), str(output))
+  return result, output
+
+
+@pytest.mark.parametrize("split_dims", [["depth"], []])
+def test_the_command_line_chooses_the_path(monkeypatch, caplog, split_dims):
+  """`--streaming` computes one series at a time, else one graph; `split_dims` only says how to
+  split, and is warned about without `--streaming` (`[]` too: it selected streaming before)."""
+  import logging
+
+  from arcomake import climatology
+
+  calls = []
+  monkeypatch.setattr(climatology, "_compute_graph", lambda *a, **k: calls.append("graph"))
+  monkeypatch.setattr(climatology, "_compute_streaming", lambda *a, **k: calls.append("series"))
+  configs = climatology.ClimatologyConfig.model_validate(
+    {"period": 365, "window": 1, "weighting": "constant", "split_dims": split_dims, "read": {}}
+    | {"save": {}}
+  )
+  climatology._compute_and_write(xr.Dataset(), configs, "out", label="x", streaming=True)
+  climatology._compute_and_write(xr.Dataset(), configs, "out", label="x", streaming=False)
+  assert calls == ["series", "graph"]
+  with caplog.at_level(logging.WARNING):
+    climatology._warn_ignored_split_dims(configs, streaming=True)
+    assert "ignored" not in caplog.text
+    climatology._warn_ignored_split_dims(configs, streaming=False)
+  assert f"split_dims {split_dims} ignored" in caplog.text
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["graph", "streaming"])
+def test_statistics_do_not_replace_a_version_promoted_meanwhile(
+  tmp_path: pathlib.Path, monkeypatch, streaming: bool
+):
+  """The run is opened before computing: a version of `main` promoted while the statistics are
+  computed is not replaced (streaming opened its run only at the copy, hours later)."""
+  from arcomake import climatology
+  from arcomake.dataset_utils import write_output
+
+  source = climatology_input(tmp_path)
+  output = tmp_path / "statistics.zarr"
+  write_output(xr.Dataset({"old": ("x", np.arange(3.0))}), output, message="first")
+  stage = climatology._stage
+
+  def meanwhile(*args, **kwargs):
+    write_output(xr.Dataset({"other": ("x", np.arange(2.0))}), output, message="meanwhile")
+    return stage(*args, **kwargs)
+
+  monkeypatch.setattr(climatology, "_stage", meanwhile)
+  recipe = tmp_path / "promoted.toml"
+  recipe.write_text(
+    'period = 365\nbins = "day_of_year"\nwindow = 3\nweighting = "constant"\n'
+    + ('split_dims = ["depth"]\n' if streaming else "")
+    + '[read]\nengine = "zarr"\n[save]\n'
+  )
+  path = "--streaming" if streaming else "--graph"
+  args = [str(recipe), str(source), str(output)]
+  result = run("compute-climatology", path, "--replace", *THREADS, *args)
+  assert result.exit_code != 0 and "changed" in result.output
+  assert list(open_output(output).data_vars) == ["other"]
+
+
+def test_streaming_needs_no_worker_to_see_its_store(tmp_path: pathlib.Path, monkeypatch):
+  """Streaming computes and copies in this process: its temporary store is not checked against
+  a distributed client's workers (a node-local TMPDIR refused it under `mpi`)."""
+  from arcomake import climatology
+
+  def blind(path):
+    raise RuntimeError("Dask workers tcp://b do not see the temporary store")
+
+  monkeypatch.setattr(climatology, "_check_workers_reach", blind)
+  source = climatology_input(tmp_path)
+  series, _ = run_climatology(tmp_path, source, "series", 'split_dims = ["depth"]\n[save]\n')
+  assert series.exit_code == 0, series.output
+  graph, _ = run_climatology(tmp_path, source, "graph", "\n[save]\n", streaming=False)
+  assert graph.exit_code != 0 and "do not see the temporary store" in graph.output
+
+
+def test_streaming_stores_one_index_per_chunk_whatever_the_postprocess(tmp_path: pathlib.Path):
+  """A postprocess step chunking a split dimension does not make the temporary store's chunks
+  span several series (each series writes its region alone)."""
+  source = climatology_input(tmp_path)
+  extra = (
+    'split_dims = ["depth"]\n[[postprocess_climatology]]\nname = "chunk"\n'
+    "chunks = {depth = -1}\n[save]\nchunks = {time = 1, depth = 1}\nshards = {time = 5}\n"
+  )
+  result, output = run_climatology(tmp_path, source, "series", extra)
+  assert result.exit_code == 0, result.output
+  assert output_group(output)["climatology/t3"].shards == (5, 3, 4)
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["graph", "streaming"])
+def test_replacing_statistics_keeps_nothing_else(tmp_path: pathlib.Path, streaming: bool):
+  """`--replace` writes a repository holding only the two groups: what it held before (here
+  variables at its root, as the former layout had) goes, on both paths."""
+  from arcomake.dataset_utils import write_output
+
+  source = climatology_input(tmp_path)
+  output = tmp_path / "series.zarr" if streaming else tmp_path / "graph.zarr"
+  old = xr.Dataset({"old": ("x", np.arange(3.0))}, attrs={"title": "former layout"})
+  write_output(old, output, message="former")
+  recipe = tmp_path / "replace.toml"
+  recipe.write_text(
+    'period = 365\nbins = "day_of_year"\nwindow = 3\nweighting = "constant"\n'
+    '[read]\nengine = "zarr"\n[save]\n'
+  )
+  path = "--streaming" if streaming else "--graph"
+  args = [str(recipe), str(source), str(output)]
+  result = run("compute-climatology", path, "--replace", *THREADS, *args)
+  assert result.exit_code == 0, result.output
+  root = output_group(output)
+  assert sorted(name for name, _ in root.members()) == ["anomaly_std", "climatology"]
+  assert dict(root.attrs) == {}
+
+
+def test_streaming_without_split_dims_computes_each_variable(tmp_path: pathlib.Path):
+  """Without `split_dims`, `--streaming` computes one series per variable, as the graph."""
+  source = climatology_input(tmp_path)
+  graph, graph_clim = run_climatology(tmp_path, source, "graph", "\n[save]\n", streaming=False)
+  series, series_clim = run_climatology(tmp_path, source, "series", "\n[save]\n")
+  assert graph.exit_code == 0 and series.exit_code == 0, series.output
+  xr.testing.assert_allclose(
+    statistics(series_clim)[0].load(), statistics(graph_clim)[0].load(), atol=1e-6
+  )
 
 
 def test_one_series_at_a_time_without_coordinates_or_save_chunks(tmp_path: pathlib.Path):
   """A split dimension without coordinate is written index by index (region "auto" mapped every
   series to index 0); without [save] chunks, the split dimension is stored one index per chunk."""
   source = climatology_input(tmp_path, depth_coordinate=False)
-  graph, graph_clim = run_climatology(tmp_path, source, "graph", "\n[save]\n")
+  graph, graph_clim = run_climatology(tmp_path, source, "graph", "\n[save]\n", streaming=False)
   series, series_clim = run_climatology(
     tmp_path, source, "series", 'split_dims = ["depth"]\n[save]\n'
   )
   assert graph.exit_code == 0 and series.exit_code == 0, series.output
   # Float32 rounding differs between the paths (one unit in the last place near zero).
   xr.testing.assert_allclose(
-    open_output(series_clim).load(), open_output(graph_clim).load(), atol=1e-6
+    statistics(series_clim)[0].load(), statistics(graph_clim)[0].load(), atol=1e-6
   )
-  assert open_output(series_clim).t3.encoding["chunks"][1] == 1
+  assert statistics(series_clim)[0].t3.encoding["chunks"][1] == 1
 
 
 @pytest.mark.parametrize(
   ("extra", "message"),
   [
-    ('split_dims = ["depth"]\n[save]\nchunks = {depth = 3}\n', "must be 1"),
-    ('split_dims = ["depth"]\n[save]\nchunks = {depth = 1}\nshards = {depth = 3}\n', "must be 1"),
     ('split_dims = ["depth"]\n[save]\ngroup = "g"\n', "group is not supported"),
     ('split_dims = ["detph"]\n[save]\n', "not dimensions of the input"),
     ('split_dims = ["time"]\n[save]\n', "cannot include the time dimension"),
@@ -269,7 +405,7 @@ def test_one_series_at_a_time_with_storage_options_on_a_local_output(tmp_path: p
   extra = 'split_dims = ["depth"]\n[save]\nstorage_options = {anon = true}\n'
   result, clim = run_climatology(tmp_path, source, "series", extra)
   assert result.exit_code == 0, result.output
-  assert open_output(clim).t3.notnull().all()
+  assert statistics(clim)[0].t3.notnull().all()
 
 
 def test_zip_outputs_are_refused_before_any_work(recipes, tmp_path: pathlib.Path):
@@ -279,3 +415,73 @@ def test_zip_outputs_are_refused_before_any_work(recipes, tmp_path: pathlib.Path
   result = CliRunner().invoke(cli, ["download", *THREADS, str(recipes["download"]), str(output)])
   assert result.exit_code != 0 and "zip outputs are not supported" in result.output
   assert not output.exists()
+
+
+@pytest.mark.parametrize("streaming", [False, True], ids=["graph", "streaming"])
+def test_climatology_writes_shards_its_chunks_straddle(
+  tmp_path: pathlib.Path, monkeypatch, streaming: bool
+):
+  """Read one level per chunk, stored in shards of all levels (the layout of the historical
+  datasets, used by the statistics too): the writes are aligned to the stored layout, as in
+  download; xarray refused Dask chunks overlapping a shard. Streaming stored one level per shard
+  before it wrote into a temporary store too.
+
+  Both paths compute into a temporary store, then copy: the window runs once per level (it ran
+  once per output), and the store is removed at the end."""
+  import tempfile
+
+  from arcomake import climatology
+  from arcomake.temporary_utils import TempDirectoryRegistry
+
+  windows = []
+  window = climatology._window_bins_last
+
+  def counted(*args, **kwargs):
+    windows.append(1)
+    return window(*args, **kwargs)
+
+  monkeypatch.setattr(climatology, "_window_bins_last", counted)
+  scratch = tmp_path / "scratch"
+  scratch.mkdir()
+  monkeypatch.setenv("TMPDIR", str(scratch))
+  monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+  stores = []
+  create = TempDirectoryRegistry.create_temp_dir
+
+  def recorded(self, *args, **kwargs):
+    stores.append(create(self, *args, **kwargs))
+    return stores[-1]
+
+  monkeypatch.setattr(TempDirectoryRegistry, "create_temp_dir", recorded)
+  time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
+  values = np.random.default_rng(0).standard_normal((time.size, 3, 4, 4)).astype("float32")
+  coords = {"time": time, "depth": [0.5, 1.5, 2.5], "lat": np.arange(4.0), "lon": np.arange(4.0)}
+  source = tmp_path / "in.zarr"
+  xr.Dataset({"t3": (("time", "depth", "lat", "lon"), values)}, coords=coords).to_zarr(source)
+  recipe = tmp_path / "climatology.toml"
+  recipe.write_text(
+    'period = 365\nbins = "day_of_year"\nwindow = 5\nweighting = "gaussian"\nweighting_scale = 2\n'
+    + ('split_dims = ["depth"]\n' if streaming else "")
+    + '[read]\nengine = "zarr"\nchunks = {time = "auto", depth = 1, lat = -1, lon = -1}\n'
+    "[save]\nchunks = {time = 1, depth = 1, lat = -1, lon = -1}\n"
+    'shards = {time = 8, depth = -1, lat = -1, lon = -1}\nshard_order = "lexicographic"\n'
+  )
+  output = tmp_path / "statistics.zarr"
+  path = "--streaming" if streaming else "--graph"
+  result = run("compute-climatology", path, *THREADS, str(recipe), str(source), str(output))
+  assert result.exit_code == 0, result.output
+  stored = output_group(output)["climatology/t3"]
+  assert stored.shards == (8, 3, 4, 4) and stored.chunks == (1, 1, 4, 4)
+  clim, std = statistics(output)
+  assert clim.t3.shape == (365, 3, 4, 4)
+  assert len(windows) == 3  # one per level: once, not once per output
+  ds = xr.Dataset({"t3": (("time", "depth", "lat", "lon"), values)}, coords=coords)
+  mean, var = climatology._compute_climatology(
+    ds, 365, 5, "gaussian", 2.0, "time", False, "day_of_year"
+  )
+  # Streaming accumulates in float64, the graph in float32: equal to float32 precision.
+  tolerance = {"rtol": 1e-5, "atol": 1e-6} if streaming else {"rtol": 1e-6}
+  xr.testing.assert_allclose(clim.t3.load(), mean.t3, **tolerance)
+  xr.testing.assert_allclose(std.t3.load(), np.sqrt(var.t3.clip(min=0)), **tolerance)
+  (store,) = stores
+  assert store.is_relative_to(scratch) and not store.exists()  # removed at the end

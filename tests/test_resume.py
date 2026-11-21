@@ -74,8 +74,23 @@ def test_resume_needs_the_same_recipe(recipe, reads, tmp_path: pathlib.Path):
   reads["fail"] = SECOND_BLOCK
   assert run(recipe, output).exit_code != 0
   reads["fail"] = None
-  other = run(recipe, output, "--resume", "--end=2020-03-01T00:00:00")
+  recipe.write_text(recipe.read_text().replace('title = "Synthetic sample dataset"', 'title = "x"'))
+  other = run(recipe, output, "--resume")
   assert other.exit_code != 0 and "another recipe" in other.output
+
+
+def test_resume_to_another_end_but_not_from_another_start(recipe, reads, tmp_path: pathlib.Path):
+  """The dates are not part of the recipe's fingerprint: a resumed run may stop elsewhere, but
+  its first blocks must be those written."""
+  output = tmp_path / "out.zarr"
+  reads["fail"] = SECOND_BLOCK
+  assert run(recipe, output).exit_code != 0
+  reads["fail"] = None
+  shifted = run(recipe, output, "--resume", "--start=2020-02-27T00:00:00")
+  assert shifted.exit_code != 0 and "are not the first ones" in shifted.output
+  shorter = run(recipe, output, "--resume", "--end=2020-03-01T00:00:00")
+  assert shorter.exit_code == 0, shorter.output
+  assert open_output(output).sizes["time"] == 4
 
 
 def test_resume_with_other_read_settings(recipe, reads, tmp_path: pathlib.Path):

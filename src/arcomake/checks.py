@@ -28,15 +28,18 @@ class ValidGlobalECMWFCoordinatesCheck(BaseModel):
 
 
 class ValidTimeCoordinateCheck(BaseModel):
+  """`start` and `end` may come from the command (`validate --start/--end`); a download checks
+  each block over the block, without them."""
+
   model_config = ConfigDict(extra="forbid")
-  start: datetime
-  end: datetime
+  start: datetime | None = None
+  end: datetime | None = None
   freq: str = "1D"
   time_dim: str = "time"
 
   @model_validator(mode="after")
   def validate_date_range(self) -> Self:
-    if self.start > self.end:
+    if self.start is not None and self.end is not None and self.start > self.end:
       raise ValueError("start datetime must be before or equal to end datetime")
     return self
 
@@ -347,8 +350,8 @@ def valid_global_ecmwf_coordinates(
 
 def valid_time_coordinate(
   dataset: xr.Dataset,
-  start: datetime,
-  end: datetime,
+  start: datetime | None = None,
+  end: datetime | None = None,
   freq: str = "1D",
   inclusive: Literal["left", "right", "both", "neither"] = "left",
   time_dim="time",
@@ -366,8 +369,12 @@ def valid_time_coordinate(
     time_dim: Name of the time coordinate.
 
   Raises:
-    ValidationError: on disorder, duplicates, or missing or irregular stamps.
+    ValidationError: on disorder, duplicates, or missing or irregular stamps, or without bounds.
   """
+  if start is None or end is None:
+    raise ValidationError(
+      "valid_time_coordinate needs start and end: in its table, or validate --start/--end"
+    )
   logger.info(
     f"Checking that time coordinate contains all dates between {start} and {end}, with frequency {freq}."
   )

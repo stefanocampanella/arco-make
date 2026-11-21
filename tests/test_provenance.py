@@ -6,6 +6,7 @@ recipe's fingerprint; in the commit's metadata, without naming the machine or it
 import os
 import pathlib
 import socket
+import subprocess
 
 import icechunk
 import numpy as np
@@ -13,7 +14,7 @@ import pytest
 import xarray as xr
 from click.testing import CliRunner
 
-from arcomake import cli, icechunk_utils, provenance
+from arcomake import cli, climatology, icechunk_utils, provenance
 from arcomake.dataset_utils import write_output
 from tests.conftest import render_recipe
 
@@ -99,11 +100,49 @@ def test_climatology_outputs_record_provenance_and_recipe(tmp_path: pathlib.Path
     + ('split_dims = ["depth"]\n' if split else "")
     + '\n[read]\nengine = "zarr"\n\n[save]\n'
   )
-  clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
-  args = ["compute-climatology", "--dask-setup", "threads", str(recipe), str(source)]
-  result = CliRunner().invoke(cli, [*args, str(clim), str(std)])
+  output = tmp_path / "statistics.zarr"
+  path = ["--streaming"] if split else []
+  args = ["compute-climatology", *path, "--dask-setup", "threads", str(recipe), str(source)]
+  result = CliRunner().invoke(cli, [*args, str(output)])
   assert result.exit_code == 0, result.output
-  for output in (clim, std):
-    (snapshot,) = commits(output)
-    assert snapshot.metadata[provenance.PROVENANCE_KEY] == provenance.environment()
-    assert len(snapshot.metadata[icechunk_utils.RECIPE_KEY]) == 16
+  (snapshot,) = commits(output)
+  assert snapshot.metadata[provenance.PROVENANCE_KEY] == provenance.environment()
+  assert len(snapshot.metadata[icechunk_utils.RECIPE_KEY]) == 16
+  # How they were computed: the recipe does not say (--streaming does).
+  assert snapshot.metadata[climatology.METHOD_KEY] == ("streaming" if split else "graph")
+
+
+def test_no_commit_of_another_repository(monkeypatch, tmp_path):
+  """Installed (not editable) inside another project's checkout, git would name that project's
+  commit: only arco-make's own checkout counts."""
+  monkeypatch.delenv("ARCOMAKE_COMMIT", raising=False)
+  monkeypatch.setattr(provenance, "BUILD_COMMIT_FILE", tmp_path / "missing")
+  project = tmp_path / "project"
+  package = project / ".venv" / "lib" / "site-packages" / "arcomake"
+  package.mkdir(parents=True)
+  subprocess.run(["git", "init", "-q", str(project)], check=True)
+  subprocess.run(
+    [
+      "git",
+      "-C",
+      str(project),
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@t",
+      "commit",
+      "-q",
+      "--allow-empty",
+      "-m",
+      "x",
+    ],
+    check=True,
+  )
+  monkeypatch.setattr(provenance, "__file__", str(package / "provenance.py"))
+  assert provenance._commit() is None
+
+
+def test_a_run_carries_the_recipe_not_write_output(tmp_path):
+  run = icechunk_utils.Run(tmp_path / "out", None, "write-1", recipe="abc")
+  with pytest.raises(ValueError, match="carries its recipe"):
+    write_output(xr.Dataset({"x": ("t", [1.0])}), run, message="m", recipe="abc")

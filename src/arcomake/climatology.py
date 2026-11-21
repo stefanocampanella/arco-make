@@ -37,13 +37,18 @@
 # Finally, the dataset might not start on the 1st of January or end before the 31 of December,
 # which would further distort the results. However, the quantities computed here are aimed at standardizing the input
 # features in a deep-learning model, and therefore such approximations are reasonably acceptable.
+import dataclasses
 import datetime
 import functools
 import itertools
 import logging
+import math
 import os
+import pathlib
+import shutil
+import threading
 import time
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Literal, get_args
 
@@ -51,12 +56,12 @@ import click
 import dask
 import dask.array
 import numpy as np
+import numpy.typing as npt
 import xarray as xr
-from dask.graph_manipulation import bind
-from icechunk.xarray import to_icechunk
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from arcomake import icechunk_utils, provenance, sharding
+from arcomake import icechunk_utils, provenance
+from arcomake.chunk_plan import COPIES, Budget, detect_budget, stored_warnings
 from arcomake.cli_utils import (
   check_aws_profile,
   check_destination,
@@ -69,10 +74,11 @@ from arcomake.dataset_utils import (
   ReadConfig,
   SaveConfig,
   open_input,
-  write_into_session,
-  write_outputs_together,
+  prepare_for_writing,
+  write_tree,
 )
 from arcomake.processing_utils import ProcessingStepConfig
+from arcomake.temporary_utils import TempDirectoryRegistry, get_current_temp_registry
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +88,10 @@ logger = logging.getLogger(__name__)
 WeightingType = Literal["constant", "gaussian", "geometric"]
 # How time steps fall into bins: by position in each period, or by day of a 365-day year.
 BinningType = Literal["position", "day_of_year"]
+# The groups of the output repository: the climatology and the anomaly standard deviation.
+GROUPS = ("climatology", "anomaly_std")
+# Commit metadata: how the statistics were computed ("graph" or "streaming").
+METHOD_KEY = "arcomake_method"
 
 
 class ReferencePeriod(BaseModel):
@@ -127,9 +137,9 @@ class ClimatologyConfig(BaseModel):
   split_dims: list[str] | None = Field(
     default=None,
     description=(
-      "Compute one series at a time (in memory, written region by region): each data variable,"
-      ' and each index along these dimensions (e.g. ["depth"]; [] for one series per variable).'
-      " Default: all variables in one Dask graph."
+      "With --streaming (one series at a time): each data variable, and each index along these"
+      ' dimensions, is a series (e.g. ["depth"]; default: one series per variable). Warned'
+      " about without --streaming"
     ),
   )
   read: ReadConfig
@@ -137,6 +147,12 @@ class ClimatologyConfig(BaseModel):
   postprocess_climatology: list[ProcessingStepConfig] = Field(default_factory=list)
   postprocess_anomaly_std: list[ProcessingStepConfig] = Field(default_factory=list)
   save: SaveConfig
+
+  @model_validator(mode="after")
+  def _no_save_group(self) -> "ClimatologyConfig":
+    if self.save.group is not None:
+      raise ValueError(f"[save] group is not supported: the output's groups are {GROUPS}")
+    return self
 
   @model_validator(mode="after")
   def _split_dims_not_time(self) -> "ClimatologyConfig":
@@ -165,12 +181,7 @@ class ClimatologyConfig(BaseModel):
   callback=check_path(),
 )
 @click.argument(
-  "climatology_output_path",
-  required=True,
-  type=str,
-)
-@click.argument(
-  "anomaly_std_output_path",
+  "output_path",
   required=True,
   type=str,
 )
@@ -183,6 +194,14 @@ class ClimatologyConfig(BaseModel):
   ),
   default=False,
   is_flag=True,
+)
+@click.option(
+  "--streaming/--graph",
+  default=False,
+  help=(
+    "Compute one series at a time (each variable, and each index of the recipe's `split_dims`),"
+    " streaming over time, instead of everything in one Dask graph (the default)"
+  ),
 )
 @click.option(
   "--dask-setup",
@@ -209,9 +228,9 @@ class ClimatologyConfig(BaseModel):
 def compute_climatology(
   configs_path: str,
   input_path: str,
-  climatology_output_path: str,
-  anomaly_std_output_path: str,
+  output_path: str,
   replace: bool = False,
+  streaming: bool = False,
   dask_setup: DaskSetupType = "mpi",
   use_frisky: bool = False,
   log_level: str = "info",
@@ -226,9 +245,10 @@ def compute_climatology(
   the period), and the anomaly standard deviation is the unbiased weighted standard deviation of
   the same values. Missing values are skipped: each bin counts the values it has.
 
-  Assumed, not checked: the time axis is sorted and every data variable has the time dimension.
-  The two outputs have `period` steps along time, the bin index (0 is Jan 1 for day-of-year
-  bins).
+  The output is one Icechunk repository with two groups, `climatology` and `anomaly_std`
+  (xarray: `open_datatree`, or `open_zarr` with `group=`), written in one commit. Assumed, not
+  checked: the time axis is sorted and every data variable has the time dimension. Both groups
+  have `period` steps along time, the bin index (0 is Jan 1 for day-of-year bins).
 
   Example::
 
@@ -248,11 +268,10 @@ def compute_climatology(
     try:
       # Read configs, then check the output paths (with the recipe's storage options).
       configs = read_configs(configs_path, schema=ClimatologyConfig)
-      check_aws_profile(input_path, climatology_output_path, anomaly_std_output_path)
-      for path in (climatology_output_path, anomaly_std_output_path):
-        check_destination(path, replace=replace, save_configs=configs.save)
-      # Both outputs are written in runs with this label (branches, commit metadata, messages);
-      # `main` moves in each repository only once both are written.
+      _warn_ignored_split_dims(configs, streaming)
+      check_aws_profile(input_path, output_path)
+      check_destination(output_path, replace=replace, save_configs=configs.save)
+      # The run's label (its branch, commit metadata and message).
       label = icechunk_utils.run_label("compute-climatology")
       # Open input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
@@ -267,42 +286,9 @@ def compute_climatology(
           )
           if dataset.sizes[configs.time_dim] == 0:
             raise ValueError(f"No data in the reference period {configs.reference_period}")
-        # Compute the climatological mean and the unbiased sample variance
-        # of the anomalies using vectorized reductions across periods and window smoothing.
         if not dataset.data_vars:
           raise ValueError("Input dataset contains no data variables.")
-        if configs.split_dims is not None:
-          _compute_by_series(
-            dataset, configs, climatology_output_path, anomaly_std_output_path, label=label
-          )
-          logger.info("Climatology writes completed, one series at a time.")
-          return
-        climatology, anomaly_var = _compute_climatology(
-          dataset,
-          time_dim=configs.time_dim,
-          period=configs.period,
-          window=configs.window,
-          weighting=configs.weighting,
-          weighting_scale=configs.weighting_scale,
-          use_flox=configs.use_flox,
-          bins=configs.bins,
-        )
-        # Postprocess climatology and anomaly standard deviation.
-        if configs.postprocess_climatology:
-          climatology = climatology.arcomake.process(steps=configs.postprocess_climatology)
-        anomaly_std = np.sqrt(anomaly_var.clip(min=0.0))
-        assert isinstance(anomaly_std, xr.Dataset)
-        if configs.postprocess_anomaly_std:
-          anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
-        # Compute and save the climatology and anomaly std together (see write_outputs_together).
-        logger.info("Processing climatology and anomaly standard deviation.")
-        write_outputs_together(
-          [(climatology, climatology_output_path), (anomaly_std, anomaly_std_output_path)],
-          configs.save,
-          label=label,
-          recipe=provenance.fingerprint(configs, exclude={"read"}),
-        )
-        logger.info("Climatology and anomaly standard deviation committed.")
+        _compute_and_write(dataset, configs, output_path, label=label, streaming=streaming)
       logger.info("Input dataset closed; closing Dask client.")
     except click.ClickException:
       raise
@@ -312,6 +298,72 @@ def compute_climatology(
       logger.exception("An error occurred while processing the climatology and anomaly std.")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc
   logger.info("Climatology complete; Dask client closed.")
+
+
+def _compute_and_write(
+  dataset: xr.Dataset,
+  configs: ClimatologyConfig,
+  output_path: str,
+  *,
+  label: str,
+  streaming: bool,
+) -> None:
+  """Compute the climatology and anomaly std of `dataset` and write them into the groups of
+  `output_path` (`GROUPS`), one series at a time (`_compute_streaming`) or in one Dask graph
+  (`_compute_graph`)."""
+  if streaming:
+    _compute_streaming(dataset, configs, output_path, label=label)
+  else:
+    _compute_graph(dataset, configs, output_path, label=label)
+
+
+def _warn_ignored_split_dims(configs: ClimatologyConfig, streaming: bool) -> None:
+  """`split_dims` without `--streaming` (`[]` too: it selected streaming before the option)."""
+  if configs.split_dims is not None and not streaming:
+    logger.warning(
+      f"split_dims {configs.split_dims} ignored: they apply to --streaming only (without it,"
+      " everything is one Dask graph)"
+    )
+
+
+def _compute_graph(
+  dataset: xr.Dataset, configs: ClimatologyConfig, output_path: str, *, label: str
+) -> None:
+  """Everything in one Dask graph (`_compute_climatology`), computed into a temporary store and
+  copied into the output's groups (`_stage`, `_copy`)."""
+  # Opened first: a version of `main` promoted while computing is not replaced.
+  run = icechunk_utils.Run(
+    output_path,
+    configs.save.storage_options,
+    label,
+    # `split_dims` is ignored here.
+    recipe=provenance.fingerprint(configs, exclude={"read", "split_dims"}),
+  )
+  climatology, anomaly_var = _compute_climatology(
+    dataset,
+    time_dim=configs.time_dim,
+    period=configs.period,
+    window=configs.window,
+    weighting=configs.weighting,
+    weighting_scale=configs.weighting_scale,
+    use_flox=configs.use_flox,
+    bins=configs.bins,
+  )
+  if configs.postprocess_climatology:
+    climatology = climatology.arcomake.process(steps=configs.postprocess_climatology)
+  anomaly_std = np.sqrt(anomaly_var.clip(min=0.0))
+  assert isinstance(anomaly_std, xr.Dataset)
+  if configs.postprocess_anomaly_std:
+    anomaly_std = anomaly_std.arcomake.process(steps=configs.postprocess_anomaly_std)
+  # Computed once into a temporary store (removed with the registry; both groups at once, so
+  # what they share is computed once), then copied.
+  with TempDirectoryRegistry():
+    stage = _stage(
+      dict(zip(GROUPS, (climatology, anomaly_std), strict=True)), configs.save, configs.time_dim
+    )
+    stage.write()
+    _copy(stage, run, configs.save, label=label, metadata={METHOD_KEY: "graph"})
+  logger.info("Climatology and anomaly standard deviation committed.")
 
 
 def balanced_tree_reduce[T](
@@ -425,10 +477,16 @@ def _day_of_year_positions(time: xr.DataArray, period: int) -> tuple[np.ndarray,
 
 
 def _fold_statistics(folded: xr.Dataset) -> BinStatistics:
-  """Count, mean and sum of squared deviations over `_period`, skipping NaN."""
+  """Count, mean and sum of squared deviations over `_period`, skipping NaN (0 without values).
+
+  Two passes, each level from its own chunks. They were tied with `bind` to a checkpoint of
+  every chunk's mean, which kept Dask from reusing the folded data (read again from the input)
+  but made every level wait for all levels' means: the statistics of all levels were computed
+  first and held until their windows. Dask's one-pass variance was slower and needed more memory
+  over several years (its per-chunk intermediates; logbook, 21 Nov)."""
   count = folded.count("_period")
   mean = folded.mean("_period", skipna=True)
-  m2 = ((bind(folded, mean) - mean) ** 2).sum("_period", skipna=True)
+  m2 = ((folded - mean) ** 2).sum("_period", skipna=True)
   return count, mean, m2
 
 
@@ -505,9 +563,16 @@ def _bin_statistics(
     .construct({time_dim: ("_period", time_dim)})
     .assign_coords(bin_coords)
   )
+  folded = _chunked_for_the_window(folded, time_dim)
   count, mean, m2 = _fold_statistics(folded)
   if is_feb_29.any():
     leap = dataset.isel({time_dim: is_feb_29}).rename({time_dim: "_period"})
+    if folded.chunks:
+      # In the tiles of the other days, or combining them would cut every bin's statistics into
+      # the intersections of both tilings.
+      leap = leap.chunk(
+        {dim: folded.chunksizes[dim] for dim in leap.dims if dim not in ("_period", time_dim)}
+      )
     feb_28 = (
       count.isel({time_dim: FEB_29_BIN}),
       mean.isel({time_dim: FEB_29_BIN}),
@@ -521,6 +586,202 @@ def _bin_statistics(
   assert isinstance(count, xr.Dataset) and isinstance(mean, xr.Dataset)
   assert isinstance(m2, xr.Dataset)
   return count, mean, m2
+
+
+def _chunked_for_the_window(folded: xr.Dataset, time_dim: str) -> xr.Dataset:
+  """`folded` (periods x bins x ...) chunked once, before the statistics: one period per chunk and
+  every bin, so that the reduction over periods and the window over bins need no rechunk; the
+  other dimensions in "auto" tiles under Dask's chunk size, those split one index per chunk kept
+  so. Left to Dask, the window's rechunk to whole bins split the grid into small tiles and built
+  an all-to-all graph (747,727 tasks for one 3D variable at 1 deg; 26 GiB for three variables of
+  8 days)."""
+  # Per variable: variables may be chunked differently (`Dataset.chunks` would raise).
+  sizes = [var.chunksizes for var in folded.data_vars.values() if var.chunks is not None]
+  if not sizes:
+    return folded
+  chunks: dict[Hashable, Any] = {"_period": 1, time_dim: -1}
+  for dim in {dim for var_sizes in sizes for dim in var_sizes}:
+    if dim not in chunks:
+      split = all(set(var_sizes[dim]) == {1} for var_sizes in sizes if dim in var_sizes)
+      chunks[dim] = 1 if split else "auto"
+  # "auto" tiles follow each variable's data type: unified, all variables share them.
+  return folded.chunk(chunks).unify_chunks()
+
+
+def _staging_chunks(
+  dims: tuple[Hashable, ...],
+  shape: tuple[int, ...],
+  dask_chunks: tuple[int, ...],
+  unit: tuple[int, ...] | None,
+  itemsize: int,
+  time_dim: str,
+  target: int,
+) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+  """The chunks of a variable in the temporary store, and the Dask chunks of its copy (None:
+  those of the store).
+
+  The copy's chunks are the stored units (`unit`: shards, else chunks), with along `time_dim` as
+  many whole units as `target` bytes hold (at least one). The store's chunks are Dask's (the
+  first of each dimension), with the copy's along `time_dim` and the units' where they divide
+  Dask's: copying reads each chunk of the store once, and one-bin units do not make a store of
+  tiny files.
+  """
+  if unit is None or time_dim not in dims:
+    return dask_chunks, None
+  copy = [min(u, n) for u, n in zip(unit, shape, strict=True)]
+  axis = dims.index(time_dim)
+  units = max(1, target // (math.prod(copy) * itemsize))
+  copy[axis] = min(shape[axis], copy[axis] * units)
+  stored = [
+    c if axis_ == axis or d % c == 0 else d
+    for axis_, (d, c) in enumerate(zip(dask_chunks, copy, strict=True))
+  ]
+  return tuple(stored), tuple(copy)
+
+
+def _check_workers_reach(path: pathlib.Path) -> None:
+  """On a distributed client, fail unless every worker sees `path`: chunks a worker writes
+  where the reader does not look would be read as missing, the fill value (NaN), silently."""
+  try:
+    from distributed import default_client
+
+    client = default_client()
+  except (ImportError, ValueError):
+    return
+  blind = sorted(w for w, seen in client.run(os.path.isdir, str(path)).items() if not seen)
+  if blind:
+    raise RuntimeError(
+      f"Dask workers {', '.join(blind)} do not see the temporary store {path}: set TMPDIR to a"
+      " filesystem every worker reaches"
+    )
+
+
+@dataclasses.dataclass
+class _Stage:
+  """A temporary plain Zarr v3 store for the groups of the output (a DataTree), unsharded, and how
+  to copy them into the repository with the layout of `[save]` (`_stage`, `_copy`)."""
+
+  path: pathlib.Path
+  staged: dict[str, xr.Dataset]  # the groups with the store's chunks as encodings, for writing
+  copies: dict[str, dict[Hashable, tuple[int, ...] | None]]  # the copy's chunks per variable
+  # Per group, the attributes, and every variable's attributes and encoding, as computed: the
+  # copy takes them back (the computed datasets themselves are not kept).
+  restored: dict[
+    str, tuple[dict[Hashable, Any], dict[Hashable, tuple[dict[Hashable, Any], dict[str, Any]]]]
+  ]
+  threads: int | None  # threads of the copy (None: Dask's)
+
+  def write(self, compute: bool = True) -> None:
+    """Write the groups into the store (with `compute=False`, their metadata only)."""
+    xr.DataTree.from_dict(self.staged).to_zarr(
+      self.path, mode="w", compute=compute, consolidated=False, zarr_format=3, align_chunks=True
+    )
+
+
+def _stage(
+  groups: Mapping[str, xr.Dataset], save: SaveConfig, time_dim: str, *, workers: bool = True
+) -> _Stage:
+  """A temporary store for `groups` (in the current registry's directory, `TMPDIR`; with
+  `workers`, checked to be seen by every worker of a distributed client, which write into it).
+
+  Its chunks are `_staging_chunks`: Dask's, and along `time_dim` whole stored units. Writing into
+  it needs the memory of the series being computed; written directly, shards spanning all levels
+  held every level's statistics until the last window (logbook, 21 Nov). The copy reads one
+  group of stored units per task: tasks holding more than their share of memory are warned
+  about, and the copy runs with as many threads as hold their units (`_copy_threads`).
+  """
+  registry = get_current_temp_registry()
+  if registry is None:
+    raise RuntimeError("the climatology's temporary store needs a TempDirectoryRegistry")
+  path = registry.create_temp_dir(suffix=".zarr")
+  if workers:
+    _check_workers_reach(path)
+  budget = detect_budget()
+  staged, copies, units, size = {}, {}, [], 0
+  for group, dataset in groups.items():
+    prepared = prepare_for_writing(dataset, save)
+    for warning in stored_warnings(prepared, budget):
+      logger.warning(warning)
+    staged[group] = dataset.drop_encoding()
+    copies[group] = {}
+    for name, var in staged[group].data_vars.items():
+      stored, copy = _staging_chunks(
+        var.dims,
+        var.shape,
+        tuple(sizes[0] for sizes in var.chunks or [(n,) for n in var.shape]),
+        prepared[name].encoding.get("shards") or prepared[name].encoding.get("chunks"),
+        var.dtype.itemsize,
+        time_dim,
+        budget.target,
+      )
+      var.encoding["chunks"] = stored
+      copies[group][name] = copy
+      # A copy task reads whole chunks of the store: it holds the larger of each.
+      held = stored if copy is None else tuple(map(max, stored, copy))
+      units.append(math.prod(held) * var.dtype.itemsize)
+      size += var.nbytes
+  free = shutil.disk_usage(path).free
+  if free < size:
+    logger.warning(
+      f"The temporary store may not fit in {path}: {size / 2**30:.1f} GiB before compression,"
+      f" {free / 2**30:.1f} GiB free"
+    )
+  logger.info(f"Temporary store {path} ({size / 2**30:.1f} GiB before compression)")
+  restored = {
+    group: (
+      dict(dataset.attrs),
+      {name: (dict(var.attrs), dict(var.encoding)) for name, var in dataset.variables.items()},
+    )
+    for group, dataset in groups.items()
+  }
+  return _Stage(path, staged, copies, restored, _copy_threads(units, budget))
+
+
+def _copy_threads(units: list[int], budget: Budget) -> int | None:
+  """Threads for the copy: as many as hold `COPIES` times the largest unit each within the
+  budget's memory, at least one (None: all of Dask's). Each copy task holds its unit, the pieces
+  read for it and its encoded form: 3.1 GiB for a shard of 8 bins, 49 levels and the 0.25 deg
+  grid (1.6 GB); 32 of them did not fit in 110 GB, and 8 copied as fast as 16 (logbook, 21 Nov)."""
+  largest = max(units, default=0)
+  fits = budget.usable // (COPIES * largest) if largest else budget.threads
+  return None if fits >= budget.threads else max(1, int(fits))
+
+
+def _copy(
+  stage: _Stage,
+  run: icechunk_utils.Run,
+  save: SaveConfig,
+  *,
+  label: str,
+  metadata: Mapping[str, Any],
+) -> None:
+  """The groups of `stage`, opened lazily in Dask chunks of their copies, written into `run`'s
+  repository in one commit (`write_tree`), with their encodings and attributes as computed.
+
+  The copy runs in this process, on local threads, at most `stage.threads`: Dask's distributed
+  schedulers have no such setting, and every copy task holds a whole stored unit."""
+  groups = {}
+  for group, (attrs, variables) in stage.restored.items():
+    copy = xr.open_zarr(stage.path, group=group, consolidated=False, chunks=None)
+    copy = copy.assign(
+      {
+        name: var.chunk(
+          dict(zip(var.dims, stage.copies[group][name] or var.encoding["chunks"], strict=True))
+        )
+        for name, var in copy.data_vars.items()
+      }
+    )
+    for name, (var_attrs, encoding) in variables.items():
+      copy[name].attrs = dict(var_attrs)
+      copy[name].encoding = dict(encoding)
+    copy.attrs = dict(attrs)
+    groups[group] = copy
+  local: dict[str, Any] = {"scheduler": "threads"}
+  if stage.threads is not None:
+    logger.info(f"Copying with {stage.threads} threads (each holds a whole stored unit)")
+    local["num_workers"] = stage.threads
+  with dask.config.set(local):
+    write_tree(groups, run, save, label=label, metadata=metadata)
 
 
 def _compute_climatology(
@@ -574,40 +835,49 @@ def _compute_climatology(
   offsets = list(range(-half, window - half))
   weights = _window_weights(offsets, weighting, scale=weighting_scale)
 
-  def window_block(n: np.ndarray, mu: np.ndarray, s2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    # apply_ufunc puts the bins (the core dimension) last; the window wants them first.
-    c, v = _window_statistics_in_memory(
-      np.moveaxis(n, -1, 0), np.moveaxis(mu, -1, 0), np.moveaxis(s2, -1, 0), offsets, weights, 1
-    )
-    return np.moveaxis(c, 0, -1), np.moveaxis(v, 0, -1)
-
   results: tuple[dict[str, xr.DataArray], dict[str, xr.DataArray]] = ({}, {})
   for name, var in mean.data_vars.items():
-    # One implementation of the window for both paths: the in-memory one, block by block.
+    dtype = dataset[name].dtype if np.issubdtype(dataset[name].dtype, np.floating) else np.float64
+    # One implementation of the window for both paths, chunk by chunk (bins last, as apply_ufunc
+    # puts the core dimension), in the output's type.
     statistics = xr.apply_ufunc(
-      window_block,
+      functools.partial(_window_bins_last, offsets=offsets, weights=weights, dtype=dtype),
       count[name],
       var,
       m2[name],
       input_core_dims=[[time_dim]] * 3,
       output_core_dims=[[time_dim]] * 2,
       dask="parallelized",
-      output_dtypes=[np.float64, np.float64],
+      output_dtypes=[dtype, dtype],
       dask_gufunc_kwargs={"allow_rechunk": True},
     )
-    dtype = dataset[name].dtype if np.issubdtype(dataset[name].dtype, np.floating) else np.float64
     for out, value in zip(results, statistics, strict=True):
-      out[str(name)] = value.transpose(*var.dims).astype(dtype)
+      out[str(name)] = value.transpose(*var.dims)
   return xr.Dataset(results[0]), xr.Dataset(results[1])
 
 
-def _rolled_into(out: np.ndarray, src: np.ndarray, shift: int) -> np.ndarray:
-  """`out[i] = src[(i + shift) % n]` along axis 0, into a preallocated array (no rolled copy)."""
-  n = src.shape[0]
-  k = shift % n
-  out[: n - k] = src[k:]
-  out[n - k :] = src[:k]
-  return out
+def _window_bins_last(
+  count: np.ndarray,
+  mean: np.ndarray,
+  m2: np.ndarray,
+  offsets: list[int],
+  weights: np.ndarray,
+  dtype: npt.DTypeLike = np.float64,
+) -> tuple[np.ndarray, np.ndarray]:
+  """The window step on per-bin statistics with the bins on the last axis, by the numba kernel
+  (`_window_kernel`): climatology and variance in `dtype`, computed in float64."""
+  shape = mean.shape
+  bins = shape[-1]
+  climatology = np.empty((mean.size // max(bins, 1), bins), dtype=dtype)
+  variance = np.empty_like(climatology)
+  _window_kernel()(
+    *(np.ascontiguousarray(a.reshape(-1, bins)) for a in (count, mean, m2)),
+    np.asarray(offsets, dtype=np.int64),
+    np.asarray(weights, dtype=np.float64),
+    climatology,
+    variance,
+  )
+  return climatology.reshape(shape), variance.reshape(shape)
 
 
 def _window_statistics_in_memory(
@@ -618,53 +888,84 @@ def _window_statistics_in_memory(
   weights: np.ndarray,
   workers: int | None = None,
   band: int = 1 << 15,
+  dtype: npt.DTypeLike = np.float64,
 ) -> tuple[np.ndarray, np.ndarray]:
-  """The window step of `_compute_climatology` on in-memory per-bin statistics (bins on axis 0).
+  """The window step of `_compute_climatology` on in-memory per-bin statistics (bins on axis 0),
+  in `dtype`.
 
-  Same formulas as the lazy path, accumulated in place in float64 over bands of `band` points
-  (all axes after the bins, flattened), in parallel, so that memory stays a few times the size of
-  one band per thread whatever the dimensions.
+  Same kernel as the lazy path, over bands of `band` points (all axes after the bins, flattened),
+  in parallel, so that memory stays a few times the size of one band per thread.
   """
   shape = mean.shape
   count, mean, m2 = (a.reshape(shape[0], -1) for a in (count, mean, m2))
-  climatology = np.empty(mean.shape, dtype=np.float64)
-  variance = np.empty(mean.shape, dtype=np.float64)
-  rows = mean.shape[1]
+  climatology = np.empty(mean.shape, dtype=dtype)
+  variance = np.empty(mean.shape, dtype=dtype)
 
   def window_band(start: int) -> None:
     part = (slice(None), slice(start, start + band))
-    n = count[part].astype(np.float64)
-    mean0 = np.nan_to_num(mean[part].astype(np.float64), nan=0.0)
-    m2_part = np.nan_to_num(m2[part].astype(np.float64), nan=0.0)
-    n_mean = n * mean0
-    v1, v2, total = np.zeros_like(n), np.zeros_like(n), np.zeros_like(n)
-    weighted_sum = np.zeros_like(n)
-    a, b = np.empty_like(n), np.empty_like(n)
-    for offset, w in zip(offsets, weights, strict=True):
-      _rolled_into(a, n, offset)
-      v1 += w * a
-      v2 += w * w * a
-      weighted_sum += w * _rolled_into(b, n_mean, offset)
-    with np.errstate(invalid="ignore", divide="ignore"):
-      clim = np.where(v1 > 0, weighted_sum / v1, np.nan)
-    clim0 = np.nan_to_num(clim, nan=0.0)
-    for offset, w in zip(offsets, weights, strict=True):
-      _rolled_into(b, mean0, offset)
-      b -= clim0
-      b *= b
-      b *= _rolled_into(a, n, offset)
-      b += _rolled_into(a, m2_part, offset)
-      total += w * b
-    with np.errstate(invalid="ignore", divide="ignore"):
-      denominator = v1 - np.where(v1 > 0, v2 / v1, np.nan)
-      var = np.where(denominator > 0, total / denominator, np.nan)
-    climatology[part] = clim
-    variance[part] = var
+    c, v = _window_bins_last(count[part].T, mean[part].T, m2[part].T, offsets, weights, dtype)
+    climatology[part] = c.T
+    variance[part] = v.T
 
-  # Bands are independent, and NumPy releases the GIL: compute them in parallel.
+  # Bands are independent, and the kernel releases the GIL: compute them in parallel.
   with ThreadPoolExecutor(max_workers=workers or min(16, os.cpu_count() or 1)) as pool:
-    list(pool.map(window_band, range(0, rows, band)))
+    list(pool.map(window_band, range(0, mean.shape[1], band)))
   return climatology.reshape(shape), variance.reshape(shape)
+
+
+_WINDOW_KERNEL_LOCK = threading.Lock()
+
+
+def _window_kernel():
+  """The numba window kernel (one for all threads: numba compiles it once, at its first call).
+
+  Dask's threads ask for it at once on their first chunks: `functools.cache` alone let each of
+  them make (and compile) its own."""
+  with _WINDOW_KERNEL_LOCK:
+    return _new_window_kernel()
+
+
+@functools.cache
+def _new_window_kernel():
+  """The numba window kernel, made on first use (importing numba is slow)."""
+  import numba
+
+  @numba.njit(nogil=True)
+  def window_rows(count, mean, m2, offsets, weights, climatology, variance):  # pragma: no cover
+    """Row by row (a point's bins): bin i pools bins i + offsets[j] (wrapping around), weighted
+    by weights[j], skipping empty bins; reliability-weights variance. In float64, in the order
+    of the former NumPy implementation (same bits)."""
+    points, bins = mean.shape
+    for p in range(points):
+      for i in range(bins):
+        v1 = 0.0
+        v2 = 0.0
+        total = 0.0
+        for j in range(offsets.shape[0]):
+          b = (i + offsets[j]) % bins
+          n = np.float64(count[p, b])
+          if n > 0:
+            w = weights[j]
+            v1 += w * n
+            v2 += w * w * n
+            total += w * (n * np.float64(mean[p, b]))
+        if v1 > 0:
+          c = total / v1
+          total = 0.0
+          for j in range(offsets.shape[0]):
+            b = (i + offsets[j]) % bins
+            n = np.float64(count[p, b])
+            if n > 0:
+              d = np.float64(mean[p, b]) - c
+              total += weights[j] * (d * d * n + np.float64(m2[p, b]))
+          denominator = v1 - v2 / v1
+          climatology[p, i] = c
+          variance[p, i] = total / denominator if denominator > 0 else np.nan
+        else:
+          climatology[p, i] = np.nan
+          variance[p, i] = np.nan
+
+  return window_rows
 
 
 def _series(dataset: xr.Dataset, split_dims: list[str]) -> list[tuple[str, dict[str, int]]]:
@@ -698,43 +999,18 @@ def _compute_series(
     started = time.monotonic()
     count, mean, m2 = _stream_bin_statistics(var, period, bins, time_dim)
     read = time.monotonic()
-    statistics = _window_statistics_in_memory(count, mean, m2, offsets, weights)
+    dtype = var.dtype if np.issubdtype(var.dtype, np.floating) else np.float64
+    statistics = _window_statistics_in_memory(count, mean, m2, offsets, weights, dtype=dtype)
     logger.info(
       f"{name}: read and binned in {read - started:.0f} s, window in {time.monotonic() - read:.0f} s"
     )
-    dtype = var.dtype if np.issubdtype(var.dtype, np.floating) else np.float64
     coords: dict[Hashable, Any] = {d: var[d] for d in order[1:] if d in var.coords}
     coords[time_dim] = np.arange(period)
     for out, values in zip(results, statistics, strict=True):
-      out[str(name)] = xr.DataArray(values.astype(dtype), dims=order, coords=coords).transpose(
-        *var.dims
-      )
+      out[str(name)] = xr.DataArray(values, dims=order, coords=coords).transpose(*var.dims)
   climatology, variance = xr.Dataset(results[0]), xr.Dataset(results[1])
   assert isinstance(climatology, xr.Dataset) and isinstance(variance, xr.Dataset)
   return climatology, variance
-
-
-def _one_index_per_chunk(save: SaveConfig, split_dims: list[str]) -> SaveConfig:
-  """`save` with stored chunks (and shards, if any) of 1 along the split dimensions, which each
-  series writes alone.
-
-  Raises:
-    ValueError: if `[save] chunks` or `shards` ask for another size along a split dimension.
-  """
-  update = {}
-  for key in ("chunks", "shards"):
-    sizes = getattr(save, key)
-    if key == "shards" and sizes is None:
-      continue
-    if sizes is not None and not isinstance(sizes, dict):
-      raise ValueError(f"with split_dims, [save] {key} must be a table of sizes per dimension")
-    sizes = dict(sizes or {})
-    for dim in split_dims:
-      if sizes.get(dim, 1) != 1:
-        raise ValueError(f"with split_dims, [save] {key} along {dim!r} must be 1 (one series each)")
-      sizes[dim] = 1
-    update[key] = sizes
-  return save.model_copy(update=update)
 
 
 def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Dataset:
@@ -751,53 +1027,56 @@ def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Data
   return xr.Dataset(data_vars, coords=coords)
 
 
-def _compute_by_series(
-  dataset: xr.Dataset,
-  configs: ClimatologyConfig,
-  climatology_output_path: str,
-  anomaly_std_output_path: str,
-  *,
-  label: str,
+def _compute_streaming(
+  dataset: xr.Dataset, configs: ClimatologyConfig, output_path: str, *, label: str
 ) -> None:
-  """S1: one series (variable, index of `split_dims`) at a time, written into its region.
+  """`_stream` in a temporary directory registry (its store is removed at the end)."""
+  with TempDirectoryRegistry():
+    _stream(dataset, configs, output_path, label=label)
 
-  The outputs' metadata are written first, from a template with the postprocess steps applied;
+
+def _stream(
+  dataset: xr.Dataset, configs: ClimatologyConfig, output_path: str, *, label: str
+) -> None:
+  """One series (variable, index of `split_dims`) at a time, written into its region of a
+  temporary store, then copied into the output with the layout of `[save]` (`_stage`, `_copy`).
+
+  The groups' metadata are written first, from a template with the postprocess steps applied;
   then every series is computed in memory (`_compute_series`), postprocessed and written into its
   region. Postprocess steps therefore have to work on one series (attributes, renames, chunking).
   """
-  assert configs.split_dims is not None
-  outputs = (
-    (climatology_output_path, configs.postprocess_climatology),
-    (anomaly_std_output_path, configs.postprocess_anomaly_std),
+  steps_of = dict(
+    zip(GROUPS, (configs.postprocess_climatology, configs.postprocess_anomaly_std), strict=True)
   )
-  if configs.save.group is not None:
-    raise ValueError("split_dims writes region by region: [save] group is not supported")
-  unknown = [d for d in configs.split_dims if d not in dataset.dims]
+  split_dims = configs.split_dims or []
+  unknown = [d for d in split_dims if d not in dataset.dims]
   if unknown:
     raise ValueError(f"split_dims {unknown} are not dimensions of the input: {list(dataset.dims)}")
-  save = _one_index_per_chunk(configs.save, configs.split_dims)
+  # Opened first: a version of `main` promoted while computing is not replaced.
+  run = icechunk_utils.Run(
+    output_path,
+    configs.save.storage_options,
+    label,
+    recipe=provenance.fingerprint(configs, exclude={"read"}),
+  )
   template = _output_template(dataset, configs.period, configs.time_dim)
-  # One run per output (its own branch) and one session on it, committed once every series is
-  # written: an interrupted run commits nothing, and `main` is untouched until both are written.
-  recipe = provenance.fingerprint(configs, exclude={"read"})
-  runs = [
-    icechunk_utils.Run(path, save.storage_options, label, recipe=recipe) for path, _ in outputs
-  ]
-  sessions = [run.session() for run in runs]
-  for (_, steps), session in zip(outputs, sessions, strict=True):
-    # Metadata only: the data of the template are never computed.
-    write_into_session(
-      template.arcomake.process(steps=steps) if steps else template, session, save, compute=False
-    )
-  # Stored chunks (shards, if any: the units of writing) of every output variable: results are
-  # chunked alike, so that Dask writes the chunks of a region in parallel.
-  stored_chunks = [
-    {
-      name: var.encoding.get("shards") or var.encoding["chunks"]
-      for name, var in xr.open_zarr(session.store, consolidated=False).data_vars.items()
-    }
-    for session in sessions
-  ]
+  groups = {
+    group: template.arcomake.process(steps=steps) if steps else template
+    for group, steps in steps_of.items()
+  }
+  # One index of the split dimensions per chunk of the store (after the postprocess steps, which
+  # may chunk): each series writes its region alone. Everything runs in this process.
+  groups = {
+    group: dataset.chunk({d: 1 for d in split_dims if d in dataset.dims})
+    for group, dataset in groups.items()
+  }
+  stage = _stage(groups, configs.save, configs.time_dim, workers=False)
+  stage.write(compute=False)  # metadata only: the template's data are never computed
+  # Results are chunked as the store, so that Dask writes the chunks of a region in parallel.
+  stored_chunks = {
+    group: {name: var.encoding["chunks"] for name, var in staged.data_vars.items()}
+    for group, staged in stage.staged.items()
+  }
 
   def write(results: tuple[xr.Dataset, xr.Dataset], index: dict[str, int], label: str) -> None:
     writing = time.monotonic()
@@ -805,26 +1084,30 @@ def _compute_by_series(
     region = {configs.time_dim: slice(0, configs.period)} | {
       d: slice(i, i + 1) for d, i in index.items()
     }
-    for (_, steps), result, chunks, session in zip(
-      outputs, results, stored_chunks, sessions, strict=True
-    ):
+    for (group, steps), result in zip(steps_of.items(), results, strict=True):
       if steps:
         result = result.arcomake.process(steps=steps)
-      result = result.drop_attrs().chunk(
-        {
-          dim: size
-          for name in result.data_vars
-          for dim, size in zip(result[name].dims, chunks[str(name)], strict=True)
-        }
+      chunks = stored_chunks[group]
+      result = (
+        result.drop_attrs()
+        .drop_encoding()
+        .chunk(
+          {
+            dim: size
+            for name in result.data_vars
+            for dim, size in zip(result[name].dims, chunks[str(name)], strict=True)
+          }
+        )
       )
       result = result.drop_vars(
         [name for name, var in result.variables.items() if not set(var.dims) & set(region)]
       )
-      with sharding.write_order(save.shard_order):  # arrays opened here: shards in that order
-        to_icechunk(result, session, region=region, mode="r+")
+      result.to_zarr(
+        stage.path, group=group, region=region, mode="r+", consolidated=False, zarr_format=3
+      )
     logger.info(f"{label} written in {time.monotonic() - writing:.0f} s")
 
-  series = _series(dataset, configs.split_dims)
+  series = _series(dataset, split_dims)
   started = time.monotonic()
   # Each series is written in the background while the next one is read. Reads and writes use
   # local threads whatever --dask-setup says: results live in this process.
@@ -853,11 +1136,9 @@ def _compute_by_series(
       )
     if pending is not None:
       pending.result()
-  for run, session in zip(runs, sessions, strict=True):
-    run.commit(session, f"{label}: {len(series)} series")
-  # Both outputs are written: only now does `main` move, in one repository after the other.
-  for run in runs:
-    run.finish(configs.save.retention())
+  logger.info(f"{len(series)} series computed; copying into {output_path}")
+  _copy(stage, run, configs.save, label=label, metadata={METHOD_KEY: "streaming"})
+  logger.info("Climatology writes completed, one series at a time.")
 
 
 def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:

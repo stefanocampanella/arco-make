@@ -10,7 +10,6 @@ import pickle
 import subprocess
 import sys
 
-import dask
 import icechunk
 import numpy as np
 import pandas as pd
@@ -22,7 +21,7 @@ from click.testing import CliRunner
 from zarr.core.buffer import default_buffer_prototype
 
 from arcomake import cli, icechunk_utils, sharding
-from arcomake.dataset_utils import SaveConfig, write_into_session, write_output
+from arcomake.dataset_utils import SaveConfig, write_output
 
 LAYOUT = {"chunks": {"time": 1, "depth": 1}, "shards": {"time": 4, "depth": -1}}
 
@@ -88,26 +87,6 @@ def test_shards_of_created_and_appended_arrays_follow_the_order(tmp_path: pathli
   assert metadata["morton"] == metadata[order]
 
 
-def test_writes_into_sessions_follow_the_order(tmp_path: pathlib.Path):
-  """As the climatology writes its outputs: metadata now, values computed later."""
-  configs = SaveConfig.model_validate({**LAYOUT, "shard_order": "lexicographic"})
-  path = tmp_path / "out.zarr"
-  run = icechunk_utils.Run(path, None, "test")
-  session = run.session()
-  write = write_into_session(ocean(8), session, configs, compute=False)
-  with dask.config.set(scheduler="threads"):
-    dask.compute(write)
-  run.commit(session, "test")
-  run.finish()
-  assert np.array_equal(
-    physical_order(path, "thetao", (1, 0, 0, 0)), expected("lexicographic", (4, 5, 1, 1))
-  )
-  xr.testing.assert_equal(
-    xr.open_zarr(icechunk_utils.readonly_store(path), consolidated=False).thetao.load(),
-    ocean(8).thetao.load(),
-  )
-
-
 @pytest.mark.parametrize("split", ["", 'split_dims = ["lat"]\n'], ids=["graph", "series"])
 def test_climatology_shards_follow_the_order(tmp_path: pathlib.Path, split: str):
   """Both ways of `compute-climatology` (one graph, or series written region by region)."""
@@ -124,14 +103,15 @@ def test_climatology_shards_follow_the_order(tmp_path: pathlib.Path, split: str)
     "[save]\nchunks = {time = 73, lat = 1, lon = 1}\nshards = {time = -1, lat = 1, lon = -1}\n"
     'shard_order = "lexicographic"\n'
   )
-  clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
-  args = [str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)]
-  result = CliRunner().invoke(cli, ["compute-climatology", "--dask-setup", "threads", *args])
+  output = tmp_path / "statistics.zarr"
+  args = [str(recipe), str(tmp_path / "in.zarr"), str(output)]
+  path = ["--streaming"] if split else []
+  result = CliRunner().invoke(cli, ["compute-climatology", *path, "--dask-setup", "threads", *args])
   assert result.exit_code == 0, result.output
-  for path in (clim, std):
-    assert icechunk.Repository.exists(icechunk_utils.storage(path))
+  assert icechunk.Repository.exists(icechunk_utils.storage(output))
+  for group in ("climatology", "anomaly_std"):
     assert np.array_equal(
-      physical_order(path, "x", (0, 0, 0)), expected("lexicographic", (5, 1, 2))
+      physical_order(output, f"{group}/x", (0, 0, 0)), expected("lexicographic", (5, 1, 2))
     )
 
 

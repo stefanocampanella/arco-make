@@ -4,6 +4,8 @@
 
 import datetime
 
+import dask
+import dask.array
 import numpy as np
 import pandas as pd
 import pydantic
@@ -15,6 +17,7 @@ from arcomake.climatology import (
   _compute_climatology,
   _compute_series,
   _read_block,
+  _staging_chunks,
   _window_weights,
 )
 
@@ -169,6 +172,8 @@ def test_in_memory_series_equal_the_lazy_statistics():
   values = rng.standard_normal((time.size, 70, 3)).astype("float32")
   values[10:40, :5] = np.nan  # gaps
   values[:, 7] = np.nan  # a row without data
+  assert time[365] == pd.Timestamp("2020-02-29")
+  values[365, 20:30] = np.nan  # Feb 29 missing where Feb 28 has values
   ds = xr.Dataset({"x": (("time", "lat", "lon"), values)}, coords={"time": time}).chunk(time=50)
   args = {"period": 365, "window": 7, "weighting": "gaussian", "weighting_scale": 2.0}
   mean, var = _compute_climatology(ds, bins="day_of_year", **args)
@@ -244,3 +249,236 @@ def test_read_blocks_follow_stored_chunks_without_dask():
   da = xr.DataArray(np.zeros((1000, 721, 1440), dtype="float32"), dims=("time", "lat", "lon"))
   da.encoding["preferred_chunks"] = {"time": 50, "lat": 721, "lon": 1440}
   assert _read_block(da, "time") == 200
+
+
+def test_the_window_does_not_tile_the_grid():
+  """Folded data are chunked once, every bin in a chunk: the window needs no rechunk. Left to
+  Dask, its rechunk to whole bins cut the 1 deg grid into 7 x 7 tiles (747,727 tasks for one
+  variable of 49 levels)."""
+  time = pd.date_range("2013-03-01", periods=8, freq="1D")
+  values = np.zeros((8, 3, 181, 360), dtype="float32")
+  ds = xr.Dataset(
+    {"t": (("time", "depth", "lat", "lon"), values)},
+    coords={
+      "time": time,
+      "depth": [0.5, 1.5, 2.5],
+      "lat": np.arange(-90.0, 91.0),
+      "lon": np.arange(360.0),
+    },
+  ).chunk({"time": 8, "depth": 1, "lat": -1, "lon": -1})
+  mean, _ = _compute_climatology(ds, 365, 29, "gaussian", 7.0, "time", False, "day_of_year")
+  assert mean.t.chunks == ((365,), (1, 1, 1), (181,), (360,))
+  assert len(mean.t.__dask_graph__()) < 3000
+
+
+def test_the_statistics_of_a_level_read_only_that_level():
+  """Each level's statistics need only that level's values, so levels are computed one after the
+  other. A two-pass variance tied to a checkpoint of every level's mean
+  (`dask.graph_manipulation.bind`) computed the statistics of all levels before any window and
+  held them (3.5 GiB for 10 levels of 8 days at 1 deg, against 0.44 GiB now)."""
+  read = set()
+
+  def tagged(block: np.ndarray, block_info: dict | None = None) -> np.ndarray:
+    if block_info is not None:
+      read.add(block_info[None]["chunk-location"][1])
+    return block
+
+  values = dask.array.zeros((400, 2, 4), chunks=(50, 1, 4), dtype="float32")
+  values = values.map_blocks(tagged, meta=np.array((), dtype="float32"))
+  time = pd.date_range("2019-01-01", periods=400, freq="1D")
+  ds = xr.Dataset({"t": (("time", "depth", "x"), values)}, coords={"time": time})
+  mean, var = _compute_climatology(ds, 365, 7, "gaussian", 2.0, "time", False, "day_of_year")
+  for statistic in (mean, var):
+    read.clear()
+    statistic.t.isel(depth=0).compute()
+    assert read == {0}
+
+
+def test_threads_share_one_window_kernel(monkeypatch):
+  """Threads asking for the kernel at once (Dask's, on their first chunks) get the same one,
+  made (and so compiled) once."""
+  import threading
+  import time
+
+  import numba
+
+  from arcomake import climatology
+
+  made = []
+  njit = numba.njit
+
+  def slow_njit(*args, **kwargs):
+    made.append(1)
+    time.sleep(0.05)  # widens the window in which other threads miss the cache
+    return njit(*args, **kwargs)
+
+  monkeypatch.setattr(numba, "njit", slow_njit)
+  climatology._new_window_kernel.cache_clear()
+  start = threading.Barrier(8)
+  kernels = []
+
+  def ask() -> None:
+    start.wait()
+    kernels.append(climatology._window_kernel())
+
+  threads = [threading.Thread(target=ask) for _ in range(8)]
+  for thread in threads:
+    thread.start()
+  for thread in threads:
+    thread.join()
+  climatology._new_window_kernel.cache_clear()  # later tests make their own, with numba's njit
+  assert len(made) == 1 and len({id(kernel) for kernel in kernels}) == 1
+
+
+def test_variables_chunked_differently_share_the_window_tiles():
+  """Variables chunked differently (`Dataset.chunks` raised for them) or of different types get
+  the same tiles for the window, and so do Feb 29's statistics (combining them in the input's
+  tiles cut every bin's statistics into the intersections of both tilings)."""
+  time = pd.date_range("2019-03-01", "2021-03-01", freq="1D", inclusive="left")  # Feb 29, 2020
+  rng = np.random.default_rng(3)
+  t = rng.standard_normal((time.size, 30, 20)).astype("float32")
+  z = rng.standard_normal((time.size, 30, 20))  # float64: other "auto" tiles
+  dims = ("time", "lat", "lon")
+  source = xr.Dataset({"t": (dims, t), "z": (dims, z)}, coords={"time": time})
+  ds = source.assign(t=source.t.chunk(time=50, lat=7), z=source.z.chunk(time=50, lat=11))
+  with dask.config.set({"array.chunk-size": "64KiB"}):
+    statistics = _compute_climatology(ds, 365, 5, "gaussian", 2.0, "time", False, "day_of_year")
+  expected = _compute_climatology(source, 365, 5, "gaussian", 2.0, "time", False, "day_of_year")
+  for out, reference in zip(statistics, expected, strict=True):
+    tilings = {out[name].chunksizes["lat"] for name in out.data_vars}
+    assert len(tilings) == 1
+    (lat,) = tilings
+    assert len(lat) > 1 and len(set(lat[:-1])) == 1  # tiled, regularly: no intersections
+    xr.testing.assert_allclose(out.compute(), reference)
+
+
+DIMS = ("time", "depth", "lat", "lon")
+MIB = 2**20
+
+
+def test_staging_one_bin_chunks_are_grouped_and_split_by_level():
+  """One-bin, one-level stored chunks at 0.25 deg: the copy takes 32 bins of a level per task
+  (128 MiB), and the store the same, by level even where Dask holds all levels (each of its
+  chunks read once, not once per level)."""
+  stored, copy = _staging_chunks(
+    DIMS, (365, 49, 721, 1440), (365, 49, 92, 1440), (1, 1, 721, 1440), 4, "time", 128 * MIB
+  )
+  assert copy == (32, 1, 721, 1440)
+  assert stored == (32, 1, 92, 1440)
+
+
+def test_staging_shards_spanning_levels_are_copied_one_per_task():
+  """Shards of 8 bins and all levels (1.6 GB at 0.25 deg) are copied one per task; the store
+  keeps Dask's level and tiles (they do not divide the shard's)."""
+  stored, copy = _staging_chunks(
+    DIMS, (365, 49, 721, 1440), (365, 1, 92, 1440), (8, 49, 721, 1440), 4, "time", 128 * MIB
+  )
+  assert copy == (8, 49, 721, 1440)
+  assert stored == (8, 1, 92, 1440)
+  # Without a stored layout, Dask's chunks throughout.
+  assert _staging_chunks(DIMS, (365, 3, 4, 4), (365, 1, 4, 4), None, 4, "time", MIB) == (
+    (365, 1, 4, 4),
+    None,
+  )
+
+
+def test_temporary_store_seen_by_every_worker(monkeypatch, tmp_path):
+  """On a distributed client, a temporary store some worker does not see is refused: its chunks
+  would be written where the copy does not read them, and read as NaN."""
+  import distributed
+
+  from arcomake import climatology
+
+  class Client:
+    def __init__(self, seen: dict[str, bool]):
+      self.seen = seen
+
+    def run(self, function, path):
+      return {worker: seen and function(path) for worker, seen in self.seen.items()}
+
+  monkeypatch.setattr(distributed, "default_client", lambda: Client({"tcp://a": True}))
+  climatology._check_workers_reach(tmp_path)
+  monkeypatch.setattr(
+    distributed, "default_client", lambda: Client({"tcp://a": True, "tcp://b": False})
+  )
+  with pytest.raises(RuntimeError, match="tcp://b do not see the temporary store"):
+    climatology._check_workers_reach(tmp_path)
+
+
+def test_temporary_store_warns_about_memory_and_disk(monkeypatch, caplog):
+  """Stored units above a task's share of memory, and a store larger than the free disk, are
+  warned about before computing."""
+  import collections
+  import logging
+
+  from arcomake import climatology
+  from arcomake.chunk_plan import Budget
+  from arcomake.dataset_utils import SaveConfig
+  from arcomake.temporary_utils import TempDirectoryRegistry
+
+  monkeypatch.setattr(climatology, "detect_budget", lambda: Budget(64 * 1024, 1))
+  usage = collections.namedtuple("usage", "total used free")
+  monkeypatch.setattr(climatology.shutil, "disk_usage", lambda path: usage(1, 1, 0))
+  time = np.arange(8)
+  ds = xr.Dataset({"t": (("time", "x"), np.zeros((8, 1000), "float32"))}, coords={"time": time})
+  save = SaveConfig.model_validate({"chunks": {"time": 8, "x": -1}})
+  with caplog.at_level(logging.WARNING), TempDirectoryRegistry():
+    climatology._stage({"g": ds.chunk()}, save, "time")
+  assert "may not fit" in caplog.text and "chunks" in caplog.text
+
+
+def test_copies_run_on_local_threads_at_most_their_cap(monkeypatch):
+  """The copy runs in this process on local threads, capped: Dask's distributed schedulers ignore
+  `num_workers`, and every copy task holds a whole stored unit."""
+  from arcomake import climatology
+  from arcomake.dataset_utils import SaveConfig
+  from arcomake.temporary_utils import TempDirectoryRegistry
+
+  seen = {}
+
+  def write_tree(groups, run, save, **kwargs):
+    seen["scheduler"] = dask.config.get("scheduler")
+    seen["threads"] = dask.config.get("num_workers")
+
+  monkeypatch.setattr(climatology, "write_tree", write_tree)
+  ds = xr.Dataset({"t": (("time", "x"), np.zeros((8, 10), "float32"))}, coords={"time": range(8)})
+  with TempDirectoryRegistry(), dask.config.set(scheduler="processes"):
+    stage = climatology._stage({"g": ds.chunk()}, SaveConfig(), "time")
+    stage.write()
+    stage.threads = 3
+    climatology._copy(stage, None, SaveConfig(), label="x", metadata={})  # type: ignore[arg-type]
+  assert seen == {"scheduler": "threads", "threads": 3}
+
+
+def test_copy_threads_count_the_chunks_a_task_reads(monkeypatch):
+  """A copy task reads whole chunks of the store: where they are larger than the stored unit (it
+  does not divide Dask's chunks), the threads are counted for them."""
+  from arcomake import climatology
+  from arcomake.chunk_plan import COPIES, Budget
+  from arcomake.dataset_utils import SaveConfig
+  from arcomake.temporary_utils import TempDirectoryRegistry
+
+  ds = xr.Dataset({"t": (("time", "x"), np.zeros((8, 1000), "float32"))}, coords={"time": range(8)})
+  save = SaveConfig.model_validate({"chunks": {"time": 8, "x": 300}})  # 300 does not divide 1000
+  whole = 8 * 1000 * 4  # the store's chunk: Dask's, the whole of x
+  # Room for 2 tasks holding the store's chunks (5 holding the stored units of 300).
+  budget = Budget(int(2.5 * COPIES * whole / 0.8), 32)
+  monkeypatch.setattr(climatology, "detect_budget", lambda: budget)
+  with TempDirectoryRegistry():
+    stage = climatology._stage({"g": ds.chunk()}, save, "time")
+  assert stage.threads == 2
+
+
+def test_copy_threads_hold_their_units():
+  """The copy runs with as many threads as hold `COPIES` times their stored unit within the
+  budget (32 copy tasks of 1.6 GB shards did not fit in 110 GB), at least one."""
+  from arcomake import climatology
+  from arcomake.chunk_plan import COPIES, Budget
+
+  shard = 8 * 49 * 721 * 1440 * 4  # 1.6 GB
+  budget = Budget(110 * 2**30, 32)
+  threads = climatology._copy_threads([shard], budget)
+  assert threads is not None and 1 <= threads < 32
+  assert threads * COPIES * shard <= budget.usable
+  assert climatology._copy_threads([2**20], budget) is None  # small units: all of Dask's
+  assert climatology._copy_threads([budget.usable], budget) == 1

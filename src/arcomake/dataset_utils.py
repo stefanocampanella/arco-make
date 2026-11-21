@@ -14,7 +14,6 @@ from contextlib import contextmanager, nullcontext
 from typing import Annotated, Any, Literal, Self
 
 import aiohttp
-import dask
 import fsspec
 import fsspec.utils
 import numpy as np
@@ -83,6 +82,9 @@ class ReadConfig(OpenDatasetArguments):
 
   engine: EngineType | None = None
   chunks: ChunksConfig | None = None
+  # A group of the input (Zarr, Icechunk, netCDF), e.g. "climatology" of a compute-climatology
+  # output (its groups: `climatology.GROUPS`).
+  group: str | None = None
 
 
 class CodecConfig(BaseModel):
@@ -1119,6 +1121,8 @@ def write_output(
     ValueError: for a `.zip` destination (zip outputs were removed with Zarr v3), or a layout
       `prepare_for_writing` refuses.
   """
+  if isinstance(destination, icechunk_utils.Run) and recipe is not None:
+    raise ValueError("write_output: a run carries its recipe's fingerprint (`Run(recipe=...)`)")
   configs = configs or SaveConfig()
   prepared = prepare_for_writing(dataset, configs)
   if isinstance(destination, icechunk_utils.Run):
@@ -1151,87 +1155,43 @@ def write_output(
   )
 
 
-def _distributed_client() -> bool:
-  """Whether Dask computes on a distributed client (workers outside this process)."""
-  try:
-    from distributed import default_client
-
-    default_client()
-  except (ImportError, ValueError):
-    return False
-  return True
-
-
-def write_into_session(
-  dataset: xr.Dataset, session: Any, configs: SaveConfig, *, compute: bool = True
-) -> Delayed | None:
-  """Write `dataset` (with the layout of `[save]`) into a writable Icechunk session, from this
-  process: its threads may write, but no other process or worker (their writes would not reach
-  the session). With `compute=False`, only the metadata are written; returns the data's task
-  (with a `shard_order` other than zarr's, its arrays write their shards in that order)."""
-  prepared = prepare_for_writing(dataset, configs)
-  options: dict[str, Any] = {"consolidated": False, "zarr_format": 3, "group": configs.group}
-  with sharding.write_order(configs.shard_order):
-    if sharding.creates_arrays(configs.shard_order, "w"):
-      sharding.create_arrays(prepared, session.store, mode="w", group=configs.group)
-      written = prepared.to_zarr(session.store, mode="r+", compute=compute, **options)
-    else:
-      written = prepared.to_zarr(session.store, mode="w", compute=compute, **options)
-  return written if isinstance(written, Delayed) else None
-
-
-def _local_scheduler() -> str:
-  """The scheduler for writes into sessions: synchronous if chosen (debugging), else threads
-  (processes cannot write into this process's sessions)."""
-  scheduler = dask.config.get("scheduler", None)
-  if scheduler in ("synchronous", "sync", "single-threaded"):
-    return "synchronous"
-  if scheduler not in (None, "threads", "threading"):
-    logger.info(f"Writing with threads instead of the {scheduler!r} scheduler")
-  return "threads"
-
-
-def write_outputs_together(
-  outputs: list[tuple[xr.Dataset, str | pathlib.Path]],
+def write_tree(
+  groups: Mapping[str, xr.Dataset],
+  destination: "str | pathlib.Path | icechunk_utils.Run",
   configs: SaveConfig,
   *,
   label: str,
   recipe: str | None = None,
-) -> list[str]:
-  """Write datasets that share a computation to their repositories, each in a run named `label`
-  (`icechunk_utils.Run`); `main` moves in every repository only once all are written. Returns
-  the new tips of `main`.
+  metadata: Mapping[str, Any] | None = None,
+) -> str:
+  """Write datasets into the groups of one repository (a DataTree; under `[save] group`, if
+  set), each with the layout of `[save]`, in one commit of a run named `label`
+  (`icechunk_utils.Run`; with `metadata`), which replaces what the repository held; `main` moves
+  to it once all are written. Returns the new tip of `main`. `destination` is a repository's
+  path, or a run opened before the data were computed (it carries the recipe's fingerprint), so
+  that a version promoted meanwhile is not replaced (`PromotionError`).
 
-  With a local scheduler, all data are computed once and written into the runs' sessions from
-  this process (`write_into_session`). On a distributed client, writes run on the workers, and
-  icechunk collects them into a session by computing that session's writes (its Dask writer
-  merges their changesets as part of the computation, one session at a time): each dataset is
-  written in turn, and what they share is computed again (logged).
+  Each group is computed by its own write: work they share is done again for each (Dask
+  optimizes each write on its own and fuses a shared task into each), so compute it first (the
+  climatology writes its groups from a temporary store).
 
   Raises:
-    icechunk_utils.PromotionError: if `main` of a repository changed meanwhile (that run stays
-      on its branch; repositories promoted before it keep the new version).
+    icechunk_utils.PromotionError: if `main` changed meanwhile (the run stays on its branch).
   """
-  runs = [
-    icechunk_utils.Run(_check_output_path(path), configs.storage_options, label, recipe=recipe)
-    for _, path in outputs
-  ]
-  if _distributed_client():
-    logger.warning(
-      "Distributed scheduler: each output is computed separately, shared work is repeated"
-    )
-    for (dataset, _), run in zip(outputs, runs, strict=True):
-      write_output(dataset, run, configs, message=label)
+  if isinstance(destination, icechunk_utils.Run):
+    if recipe is not None:
+      raise ValueError("write_tree: a run carries its recipe's fingerprint (`Run(recipe=...)`)")
+    run = destination
   else:
-    sessions, writes = [], []
-    for (dataset, _), run in zip(outputs, runs, strict=True):
-      logger.info(f"Writing to {run.path} ({label}) with {configs}")
-      session = run.session()
-      writes.append(write_into_session(dataset, session, configs, compute=False))
-      sessions.append(session)
-    with dask.config.set(scheduler=_local_scheduler()), sharding.write_order(configs.shard_order):
-      dask.compute(*writes)
-    for run, session in zip(runs, sessions, strict=True):
-      run.commit(session, label)
-  # Every output is written: only now does `main` move, repository after repository.
-  return [run.finish(configs.retention()) for run in runs]
+    path = _check_output_path(destination)
+    run = icechunk_utils.Run(path, configs.storage_options, label, recipe=recipe)
+  logger.info(f"Writing groups {list(groups)} to {run.path} ({label}) with {configs}")
+  parent = "" if configs.group is None else f"{configs.group}/"
+  run.write_groups(
+    {f"{parent}{name}": prepare_for_writing(dataset, configs) for name, dataset in groups.items()},
+    message=label,
+    align_chunks=True,
+    shard_order=configs.shard_order,
+    metadata=metadata,
+  )
+  return run.finish(configs.retention())

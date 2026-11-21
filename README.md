@@ -35,7 +35,7 @@ apptainer exec oras://ghcr.io/stefanocampanella/arco-make:latest arco-make downl
 | `arco-make download RECIPE OUTPUT` | Downloads, processes and merges the datasets of a recipe into one Icechunk repository |
 | `arco-make validate RECIPE INPUT` | Checks a dataset: time axis, grid, missing values inside masks; `--start`/`--end` give the expected time axis, as to `download` |
 | `arco-make process RECIPE INPUT OUTPUT` | Applies recipe steps to a dataset (e.g. a time mean) |
-| `arco-make compute-climatology RECIPE INPUT CLIMATOLOGY ANOMALY_STD` | Computes a periodic climatology and the standard deviation of the anomalies |
+| `arco-make compute-climatology RECIPE INPUT OUTPUT` | Computes a periodic climatology and the standard deviation of the anomalies, the groups `climatology` and `anomaly_std` of one repository (`--streaming`: one series at a time) |
 | `arco-make steps` | Prints the reference of the processing steps ([docs/steps.md](docs/steps.md)) |
 
 Every command documents its options with `--help`. Paths may be local or fsspec URLs (e.g. `s3://`, `gs://`).
@@ -84,8 +84,8 @@ after merging, and the stored layout. A complete example, run by the tests on sy
 
 ```toml
 time_dim = "time"
-start = 2020-02-26T00:00:00
-end = 2020-03-02T00:00:00      # excluded: intervals are [start, end)
+start = 2020-02-26T00:00:00    # optional: or --start (the recipe is then the same for any period)
+end = 2020-03-02T00:00:00      # optional: or --end; excluded, intervals are [start, end)
 step = "2D"                    # blocks written (then appended) one at a time
 
 [datasets.ocean.checkpointing] # optional: process this source in sub-blocks saved to temporary Zarr
@@ -151,10 +151,18 @@ or throttling answer) is redone, after a wait that doubles each time: `[retries]
 log says which kind it was.
 
 A download that fails leaves `main` as it was and its committed blocks on its branch: rerun it with
-`--resume` (same recipe, `--start` and `--end`) to write only the missing blocks. Each block's commit
-records its interval and a fingerprint of the recipe; `--resume` refuses another recipe (request timeouts,
-checkpointing and `[retries]` may change), or a run that started before `main` last moved. A plain rerun refuses to start beside a failed run it could continue;
-`--replace` starts over. Do not resume a run that is still going.
+`--resume` (same recipe and `--start`) to write only the missing blocks. Each block's commit
+records its interval and a fingerprint of the recipe, its dates aside; `--resume` refuses another
+recipe (request timeouts, checkpointing and `[retries]` may change), blocks that are not the first
+ones of the interval, or a run that started before `main` last moved; it may stop at another `--end`.
+A plain rerun refuses to start beside a failed run it could continue; `--replace` starts over. Do not
+resume a run that is still going.
+
+`--extend` appends the days after an output's last stored day, up to `--end`, as a new version: with
+the recipe the output was written with (its dates aside), the static variables compared with the
+stored ones, every block appended. A failed extension continues with `--extend --resume`. With the
+dates left to the command, one recipe serves the first download and every extension:
+`download --start 1993-01-01 --end 2026-07-01 R OUT`, then `download --extend --end 2026-08-01 R OUT`.
 
 A download recipe may give `[checks]`, the tables of a `validate` recipe, run on each block before its
 commit, like pre-commit hooks: `valid_time_coordinate` over the block (its table takes no dates),
@@ -187,7 +195,7 @@ is written whole by one task.
 Every output is an [Icechunk](https://icechunk.io) repository (Zarr format 3 with versions): a local
 directory, an `s3://` or a `gs://` URL. Every run writes on a branch of its own (`run/<command>-<start
 time>`), in commits: one per block for `download` (its message names the block's interval), one for
-`process` and for each output of `compute-climatology`. Each commit's metadata (not its message)
+`process` and `compute-climatology` (both groups). Each commit's metadata (not its message)
 record what made it: `arcomake_recipe`, a hash of the recipe, and `arcomake_provenance`, arco-make's
 version and commit, the Python and operating system, the machine's CPUs and memory, the versions of
 the packages that decide the values and a hash of every installed package (no host name nor path);

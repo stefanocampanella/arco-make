@@ -9,8 +9,8 @@ import pytest
 import xarray as xr
 from click.testing import CliRunner
 
-from arcomake import cli, dataset_utils, icechunk_utils
-from arcomake.dataset_utils import SaveConfig, open_input, write_output, write_outputs_together
+from arcomake import cli, icechunk_utils
+from arcomake.dataset_utils import SaveConfig, open_input, write_output, write_tree
 from tests.conftest import open_output, render_recipe
 
 
@@ -47,12 +47,39 @@ def test_the_icechunk_engine_reads_any_version(ocean_ds: xr.Dataset, tmp_path: p
   open_input(str(path), engine="icechunk", consolidated=True).close()
 
 
-def test_outputs_written_in_turn_on_a_distributed_scheduler(ocean_ds, tmp_path, monkeypatch):
-  """On a distributed client each output is written (and computed) in its own commit."""
-  monkeypatch.setattr(dataset_utils, "_distributed_client", lambda: True)
-  outputs = [(ocean_ds, tmp_path / "a.zarr"), (ocean_ds * 2, tmp_path / "b.zarr")]
-  assert len(write_outputs_together(outputs, SaveConfig(), label="both")) == 2
-  xr.testing.assert_allclose(open_output(tmp_path / "b.zarr").load(), ocean_ds * 2)
+@pytest.mark.parametrize("scheduler", ["synchronous", "threads", "processes"])
+def test_groups_written_in_one_commit_with_any_local_scheduler(ocean_ds, tmp_path, scheduler):
+  """`write_tree` writes datasets into the groups of one repository in one commit, whatever the
+  scheduler: Icechunk's writer collects the writes of other processes too (they once went
+  through this process's sessions, with threads instead of processes)."""
+  import dask
+
+  path = tmp_path / "tree.zarr"
+  with dask.config.set(scheduler=scheduler):
+    tip = write_tree({"a": ocean_ds, "b": ocean_ds * 2}, path, SaveConfig(), label="both")
+  xr.testing.assert_allclose(open_output(path, "a").load(), ocean_ds)
+  xr.testing.assert_allclose(open_output(path, "b").load(), ocean_ds * 2)
+  history = list(icechunk.Repository.open(icechunk_utils.storage(path)).ancestry(branch="main"))
+  assert history[0].id == tip and history[0].message == "both" and len(history) == 2
+
+
+def test_groups_nest_under_the_save_group(ocean_ds, tmp_path):
+  """With `[save] group`, `write_tree`'s groups are under it, as `write_output` writes there."""
+  path = tmp_path / "tree.zarr"
+  write_tree({"a": ocean_ds}, path, SaveConfig.model_validate({"group": "g"}), label="x")
+  xr.testing.assert_allclose(open_output(path, "g/a").load(), ocean_ds)
+
+
+def test_read_tables_read_one_group(ocean_ds, tmp_path):
+  """`[read] group` reads one group of an input, e.g. the climatology of a statistics repository
+  (for `validate`, `process`), whose root holds no variables."""
+  from arcomake.dataset_utils import ReadConfig
+
+  path = tmp_path / "statistics.zarr"
+  write_tree({"climatology": ocean_ds, "anomaly_std": ocean_ds * 2}, path, SaveConfig(), label="x")
+  read = ReadConfig.model_validate({"engine": "icechunk", "group": "anomaly_std", "chunks": {}})
+  with open_input(str(path), **read.model_dump(exclude_unset=True)) as dataset:
+    xr.testing.assert_allclose(dataset.load(), ocean_ds * 2)
 
 
 def test_s3_and_gcs_storages_from_storage_options():
@@ -164,23 +191,10 @@ def test_gcs_tokens(tmp_path: pathlib.Path):
     icechunk_utils.storage("gs://b/p", {"token": "google_default"})
 
 
-@pytest.mark.parametrize(
-  ("scheduler", "expected"),
-  [("synchronous", "synchronous"), ("processes", "threads"), ("threads", "threads")],
-)
-def test_writes_into_sessions_keep_a_synchronous_scheduler(scheduler: str, expected: str):
-  """Writes into sessions run in this process: synchronous stays (debugging), processes become
-  threads (logged)."""
-  import dask
-
-  with dask.config.set(scheduler=scheduler):
-    assert dataset_utils._local_scheduler() == expected
-
-
 @pytest.mark.parametrize("split", ["", 'split_dims = ["lat"]\n'], ids=["graph", "series"])
-def test_climatology_outputs_share_their_commit_message(tmp_path: pathlib.Path, split: str):
-  """Both outputs of a compute-climatology run carry the same message: their commits are not
-  atomic together, and a run whose second commit failed shows."""
+def test_climatology_groups_are_one_commit(tmp_path: pathlib.Path, split: str):
+  """Both groups of a compute-climatology run are in one commit of one repository (both paths):
+  the climatology and the anomaly std always come from the same run."""
   import numpy as np
   import pandas as pd
 
@@ -192,15 +206,15 @@ def test_climatology_outputs_share_their_commit_message(tmp_path: pathlib.Path, 
   recipe.write_text(
     f'period = 365\nwindow = 1\nweighting = "constant"\n{split}[read]\nengine = "icechunk"\n\n[save]\n'
   )
-  clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
-  args = [str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)]
-  result = CliRunner().invoke(cli, ["compute-climatology", "--dask-setup", "threads", *args])
+  output = tmp_path / "statistics.zarr"
+  args = [str(recipe), str(tmp_path / "in.zarr"), str(output)]
+  path = ["--streaming"] if split else []
+  result = CliRunner().invoke(cli, ["compute-climatology", *path, "--dask-setup", "threads", *args])
   assert result.exit_code == 0, result.output
-  messages = [
-    next(iter(icechunk.Repository.open(icechunk_utils.storage(p)).ancestry(branch="main"))).message
-    for p in (clim, std)
-  ]
-  assert messages[0] == messages[1] and messages[0].startswith("compute-climatology-")
+  history = list(icechunk.Repository.open(icechunk_utils.storage(output)).ancestry(branch="main"))
+  assert len(history) == 2 and history[0].message.startswith("compute-climatology-")
+  tree = xr.open_datatree(icechunk_utils.readonly_store(output), engine="zarr", consolidated=False)
+  assert {"/climatology", "/anomaly_std"} <= set(tree.groups)
 
 
 def test_s3_credentials_are_resolved_once_while_valid(monkeypatch: pytest.MonkeyPatch):

@@ -1245,3 +1245,154 @@ and a fix: `scripts/download.sh` still passed `--blocks`, removed from arco-make
 once. Open for the maintainer: the recipes end on 2024-01-01 but GLORYS12's multi-year product
 ends on 2021-06-30 (end there, or add its interim product); how outputs record the arco-make
 version (A15: the version is a fixed "0.1.0").
+
+### 20 Nov: sources to mid-2026, statistics over 1993-2023, provenance, extensions
+
+Maintainer's decisions: statistics in the datasets' shard layout and over 1993-2023 (a 30-year
+normal, as climatological normals are; was 1993-2018 with later years held out); the time mean
+is no longer computed; the analysis/forecast recipe is removed, the Mediterranean one kept
+loadable but not run; the extent maximal; recipes without dates; provenance in the commits'
+metadata, not their messages.
+
+- **How far the sources reach** (20 Nov 2026): GLORYS12's multi-year dataset id
+  (`cmems_mod_glo_phy_my_0.083deg_P1D-m`, version 202311) continues past 2021-06-30 to
+  2026-10-06, values continuous across mid-2021 (no separate interim id is served); ERA5's ARCO
+  store has final data to 2026-06-30 and ERA5T, preliminary and revised within months, to
+  2026-11-04; GloFAS v5 consolidated to 2026-08-31 (the service's cost estimate, day by day; its
+  intermediate product refuses these requests, v4 and v5). The historical recipes end on
+  2026-07-01, the last day every source has as final data, so revisions stay out. An earlier
+  commit of the fork had set 2021-07-01 on the wrong belief that the multi-year id ends there.
+- **Provenance:** every commit's metadata hold `arcomake_provenance` (arco-make's version and
+  commit, Python and OS, CPUs and memory, the versions of the packages that decide the values, a
+  hash of every installed distribution; nothing naming the machine or its paths) and the
+  recipe's fingerprint, for `process` and `compute-climatology` too. The image build writes the
+  commit into `src/arcomake/BUILD_COMMIT` (the image has no history). Icechunk keeps nested
+  metadata (checked).
+- **Recipes without dates; `download --extend`:** the fingerprint leaves the dates out; a recipe
+  may omit them (the command gives them); `--extend` appends the days after `main`'s last stamp
+  as a new version, with the same recipe and the static variables compared; an extension equals
+  one download over the whole period (tested), and a failed one resumes. Estimated before:
+  about 100 lines in `download`; it took about 70 in `download` and `icechunk_utils` (the dates
+  made optional included), plus 125 of tests. Rewriting days already
+  stored (for revised data) is left out: ending at final data makes it unnecessary.
+- `coverage_attrs` takes `time_dim = false` (a recipe cannot give None), for statistics whose
+  time axis holds the bins of a year.
+- The xarray-regrid issue (`stat` on a Dataset beyond the source) still reproduces on 0.4.2 and
+  upstream main; posting it needs the maintainer (the VM's token cannot open issues elsewhere).
+
+### 21 Nov: the climatology's graph path, memory and time
+
+The statistics recipe (shards of 8 bins and all levels) ran out of memory on the graph path even
+at 1 deg over 8 days. Traced task by task on the local scheduler (results alive in Dask's cache,
+each buffer counted once, and RSS), on synthetic data and the 1 deg test output:
+
+- **Task explosion:** Dask's rechunk to whole bins for the window cut the grid into small tiles,
+  747,727 tasks for one 3D variable; folded data are now chunked once (33,384 tasks; 670 -> 531 s
+  on the 1 deg output, memory unchanged).
+- **All levels at once:** the variance's second pass was tied with `bind` to a checkpoint of every
+  chunk's mean, so every level waited for all levels' means: the statistics of all levels were
+  computed first and held until their windows (10 levels: 3.54 GiB alive instead of 0.44). Untied,
+  each level needs only its own chunks. Reading 4 levels at 1 deg from disk, window included:
+
+  | Fold statistics | 6 years, 1 thread | 6 years, 8 threads | 12 years, 1 thread | 12 years, 8 threads |
+  |---|---|---|---|---|
+  | two passes, `bind` (before) | 62 s, 5.5 GiB | 14 s, 7.7 GiB | 79 s, 8.6 GiB | 22 s, 10.2 GiB |
+  | two passes, untied (now) | 52 s, 2.8 GiB | 14 s, 8.1 GiB | 76 s, 4.4 GiB | 23 s, 8.1 GiB |
+  | Dask's one-pass variance | 85 s, 7.4 GiB | 21 s, 19.1 GiB | | |
+  | one pass, lean reduction | 68 s, 5.9 GiB | 18 s, 18.8 GiB | | |
+
+  `bind` never made the computation faster; it read the input twice and serialized the levels.
+  One-pass reductions keep larger per-chunk intermediates (counts and moments in 64 bits per
+  value of one period). Not measured on a distributed cluster.
+- **Shared work computed twice:** `write_outputs_together` computed the two outputs'
+  `to_zarr(compute=False)` tasks together, but `dask.delayed` optimizes each on its own (and
+  makes its keys unique), so a task with one consumer in each output was fused into both: the
+  window and everything before it ran once per output. Within one dataset, shared work runs once
+  (checked); download is not affected. Now one xarray `ArrayWriter` for both outputs (441 ->
+  216 s, 10 levels, 1 thread). A DataTree of two groups in one store, or one dataset with
+  suffixed variables, also share the work, with public API only (checked).
+- **The window** was NumPy over float64 temporaries (19.2 s per 1 deg level, 1.4 GB per band); a
+  numba kernel gives the same bits in 6.6 s, in the output's type. Both paths use it.
+- Together, writing 10 levels of 8 days at 1 deg (1 thread): 410 s and 6.35 GiB -> 43 s and
+  1.32 GiB. The 1 deg test output (3 variables, 49 levels, 4 threads): 670 s and 26.3 GiB ->
+  80 s and 4.1 GiB without shards; with shards of 8 bins and all levels 739 s and 35.1 GiB ->
+  74 s and 18.3 GiB: a shard spanning all levels and the grid can be written only once every
+  level's window is done, so all of a variable's statistics are held (about 150 GB for both
+  outputs of a 3D variable at 0.25 deg).
+- **Graph against streaming** (`split_dims`), `compute-climatology`, 4 levels at 1 deg from local
+  disk, 32 threads: 6 years 23 s and 6.5 GiB against 34 s and 2.4 GiB; 12 years 27 s and 8.7 GiB
+  against 38 s and 3.3 GiB. Streaming reads one block at a time per series; the graph reads in
+  parallel, which should matter more from S3 (not measured).
+- **Checkpoint** (maintainer's suggestion, accepted): the graph path computes both outputs once
+  into a temporary plain Zarr v3 store (a DataTree, one group each; unsharded, Dask's chunks, and
+  along time whole stored units up to Dask's chunk size), then copies each into its repository,
+  one task per group of stored units. The shared session writer (`write_into_sessions`, on
+  xarray's private API) is gone: writes computed together share no work, so the outputs are
+  written in turn, with any scheduler. The 1 deg test output (4 threads): without shards 80 s
+  and 4.1 GiB -> 97 s and 4.0 GiB; with shards of 8 bins and all levels 74 s and 18.3 GiB ->
+  104 s and 4.1 GiB; outputs identical bit for bit (values, attributes, encodings, array
+  metadata). With one-bin units the temporary store first had a chunk per bin and level (224 s:
+  small files); whole units up to Dask's chunk size fixed it. Temporary disk at 0.25 deg: about
+  150 GB per 3D variable for both outputs, before compression (warned about if the disk has less
+  free). On a distributed client every worker must see the store (checked: a chunk written where
+  the copy does not look would be read as NaN).
+- **Maintainer's decisions:** the statistics are one repository, a DataTree with the groups
+  `climatology` and `anomaly_std`, written in one commit (both paths); the streaming path is
+  chosen with `--streaming` (`split_dims` only says how it splits). The temporary store's layout,
+  measured on the 1 deg test output with 32 threads (without shards / with shards of 8 bins and
+  all levels in the output): chunks of whole stored units, unsharded, 66 s / 73 s; one shard per
+  Dask chunk with chunks of one unit, 80 s / 74 s; Dask's chunks, 68 s / 106 s (each copy reads
+  whole chunks of 365 bins for 8). Memory 26.5-28.5 GiB in all six runs (it follows the threads:
+  4.1 GiB with 4). Shards in the temporary store bring nothing: unsharded chunks of whole units
+  are kept.
+- **Projection for the 0.25 deg statistics on the project VM** (maintainer's question, 21 Nov).
+  Workload: 18 time-varying variables (4 x 49 levels + 14 surface), 210 series of 11,323 days
+  (1993-2023), about 9.9 TB raw, about 3.6 TB stored (scaled from the published dataset's 3.86 TB
+  for 223 series). Icechunk reads from S3 with 32 threads: 150-185 MB/s stored, 330-400 MB/s
+  decoded (the format benchmark's repository; s3fs reached 136 MB/s on 16 Nov): reading alone
+  takes 5.4-6.7 h. Synthetic 0.25 deg input on local disk (one variable, 4 levels, 4 years, LZ4,
+  production layout), 32 threads:
+
+  | | 2 years | 4 years |
+  |---|---|---|
+  | graph, two passes (committed) | 79 s, 37.0 GiB | 95 s, 62.1 GiB |
+  | graph, two passes, `split_every = 2` | 82 s, 31.4 GiB | 95 s, 48.7 GiB |
+  | graph, one pass (Dask's variance) | 91 s, 67.6 GiB | killed above 84 GiB |
+  | graph, one pass, `split_every = 2` | 90 s, 65.6 GiB | 106 s, 79.1 GiB |
+  | graph, lean one pass, `split_every = 2` | 90 s, 72.5 GiB | 99 s, 75.3 GiB |
+  | graph, flox | 110 s, 50.2 GiB | killed above 84 GiB |
+  | streaming (shards of one level) | 67 s, 21.8 GiB | 80 s, 21.3 GiB |
+
+  The graph path's memory grows with the years at 0.25 deg (two passes: about 2.2-3 GiB per
+  level and year in flight, each level's folded data held between the passes; Dask's default
+  `split_every` of 4 combines the years of a tile in one task); the one-pass reductions grow less
+  but start near 70 GiB (their per-chunk intermediates, with 32 threads). None extrapolates safely
+  to 31 years within 110 GB. Streaming stays at 21 GiB: per series, reading and binning about
+  2.3 s per year from local disk, the window 7 s, the write overlapped. Projected: streaming
+  6-9 h (S3 reads of about 17 GB stored per series at 150-185 MB/s, plus the window; the upper
+  end from S1's measurement of 16 Nov, 122 s per series for 26 years with s3fs), memory 21-32 GB;
+  the graph path would be reading-bound at 6-7.5 h if its memory allowed. Streaming stores the
+  split dimension one index per shard, not in shards of all levels.
+- **Why the graph path's memory grows with the years** (maintainer's question; traced on the
+  synthetic 0.25 deg input, one level, 4 threads, the results alive in Dask's cache):
+  - committed two passes: 2 years 9.2 GiB alive, 8 years 34.7 GiB (about 4.3 GiB per year). At the
+    peak with 4 years: every year's partial means (8.7 GiB) and partial counts (8.7 GiB) of every
+    tile, and the folded data of every year (4.3 GiB). Dask reads the input in time order, so a
+    tile's statistics finish only with its last year; its reductions combine up to 4 years per
+    task (`split_every`); the second pass of the variance needs every year's folded data.
+  - one pass, binary tree (`split_every = 2`): about log2(years) accumulators per tile (16.1 GiB
+    at 4 years).
+  - sequential accumulation (Welford, year after year, per tile): 4.8 GiB at 2 years, 11.5 at 8;
+    what grew was folded years waiting (Dask reads and folds ahead with its free threads,
+    without backpressure). Tying year p to the accumulator of year p - 2 (`bind`): the peak at 8
+    years is the accumulators themselves (7.2 GiB: count, mean and m2 for 365 bins and the grid)
+    plus two years.
+  - The floor is one accumulator per series in flight, as for streaming. But the local scheduler
+    has no backpressure, and `dask.graph_manipulation.bind` is unreliable in Dask 2026.8: on a
+    sliced child its optimized graph lacks a dependency ("Missing dependency", minimal repro), and
+    in the climatology it did not hold reads back (tested). With 4 levels at 32 threads every
+    level starts at once (43 GiB at 2 years, 66 GiB at 4). A memory-bounded graph path needs its
+    reads scheduled from Python (batches of series, accumulators kept between computations): a
+    parallel form of streaming. Not done: the patch is kept outside the repository.
+- **Option 1, streaming into the temporary store** (shards of all levels), synthetic 0.25 deg, 4
+  levels, 32 threads: 85 s and 20.9 GiB over 2 years, 100 s and 20.9 GiB over 4 (flat).
