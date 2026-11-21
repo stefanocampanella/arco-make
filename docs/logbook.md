@@ -1279,3 +1279,47 @@ metadata, not their messages.
   time axis holds the bins of a year.
 - The xarray-regrid issue (`stat` on a Dataset beyond the source) still reproduces on 0.4.2 and
   upstream main; posting it needs the maintainer (the VM's token cannot open issues elsewhere).
+
+### 21 Nov: the climatology's graph path, memory and time
+
+The statistics recipe (shards of 8 bins and all levels) ran out of memory on the graph path even
+at 1 deg over 8 days. Traced task by task on the local scheduler (results alive in Dask's cache,
+each buffer counted once, and RSS), on synthetic data and the 1 deg test output:
+
+- **Task explosion:** Dask's rechunk to whole bins for the window cut the grid into small tiles,
+  747,727 tasks for one 3D variable; folded data are now chunked once (33,384 tasks; 670 -> 531 s
+  on the 1 deg output, memory unchanged).
+- **All levels at once:** the variance's second pass was tied with `bind` to a checkpoint of every
+  chunk's mean, so every level waited for all levels' means: the statistics of all levels were
+  computed first and held until their windows (10 levels: 3.54 GiB alive instead of 0.44). Untied,
+  each level needs only its own chunks. Reading 4 levels at 1 deg from disk, window included:
+
+  | Fold statistics | 6 years, 1 thread | 6 years, 8 threads | 12 years, 1 thread | 12 years, 8 threads |
+  |---|---|---|---|---|
+  | two passes, `bind` (before) | 62 s, 5.5 GiB | 14 s, 7.7 GiB | 79 s, 8.6 GiB | 22 s, 10.2 GiB |
+  | two passes, untied (now) | 52 s, 2.8 GiB | 14 s, 8.1 GiB | 76 s, 4.4 GiB | 23 s, 8.1 GiB |
+  | Dask's one-pass variance | 85 s, 7.4 GiB | 21 s, 19.1 GiB | | |
+  | one pass, lean reduction | 68 s, 5.9 GiB | 18 s, 18.8 GiB | | |
+
+  `bind` never made the computation faster; it read the input twice and serialized the levels.
+  One-pass reductions keep larger per-chunk intermediates (counts and moments in 64 bits per
+  value of one period). Not measured on a distributed cluster.
+- **Shared work computed twice:** `write_outputs_together` computed the two outputs'
+  `to_zarr(compute=False)` tasks together, but `dask.delayed` optimizes each on its own (and
+  makes its keys unique), so a task with one consumer in each output was fused into both: the
+  window and everything before it ran once per output. Within one dataset, shared work runs once
+  (checked); download is not affected. Now one xarray `ArrayWriter` for both outputs (441 ->
+  216 s, 10 levels, 1 thread). A DataTree of two groups in one store, or one dataset with
+  suffixed variables, also share the work, with public API only (checked).
+- **The window** was NumPy over float64 temporaries (19.2 s per 1 deg level, 1.4 GB per band); a
+  numba kernel gives the same bits in 6.6 s, in the output's type. Both paths use it.
+- Together, writing 10 levels of 8 days at 1 deg (1 thread): 410 s and 6.35 GiB -> 43 s and
+  1.32 GiB. The 1 deg test output (3 variables, 49 levels, 4 threads): 670 s and 26.3 GiB ->
+  80 s and 4.1 GiB without shards; with shards of 8 bins and all levels 739 s and 35.1 GiB ->
+  74 s and 18.3 GiB: a shard spanning all levels and the grid can be written only once every
+  level's window is done, so all of a variable's statistics are held (about 150 GB for both
+  outputs of a 3D variable at 0.25 deg).
+- **Graph against streaming** (`split_dims`), `compute-climatology`, 4 levels at 1 deg from local
+  disk, 32 threads: 6 years 23 s and 6.5 GiB against 34 s and 2.4 GiB; 12 years 27 s and 8.7 GiB
+  against 38 s and 3.3 GiB. Streaming reads one block at a time per series; the graph reads in
+  parallel, which should matter more from S3 (not measured).
