@@ -214,8 +214,7 @@ def test_climatology_honours_use_flox(tmp_path: pathlib.Path, sources: pathlib.P
     climatology.compute_climatology.callback(  # type: ignore[misc]
       str(recipe),
       str(dataset),
-      str(tmp_path / "c.zarr"),
-      str(tmp_path / "s.zarr"),
+      str(tmp_path / "statistics.zarr"),
       dask_setup="threads",
     )
   assert seen.get("use_flox") is True

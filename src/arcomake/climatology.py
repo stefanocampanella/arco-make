@@ -76,7 +76,7 @@ from arcomake.dataset_utils import (
   open_input,
   prepare_for_writing,
   write_into_session,
-  write_outputs_together,
+  write_tree,
 )
 from arcomake.processing_utils import ProcessingStepConfig
 from arcomake.temporary_utils import TempDirectoryRegistry, get_current_temp_registry
@@ -89,6 +89,10 @@ logger = logging.getLogger(__name__)
 WeightingType = Literal["constant", "gaussian", "geometric"]
 # How time steps fall into bins: by position in each period, or by day of a 365-day year.
 BinningType = Literal["position", "day_of_year"]
+# The groups of the output repository: the climatology and the anomaly standard deviation.
+GROUPS = ("climatology", "anomaly_std")
+# Commit metadata: how the statistics were computed ("graph" or "streaming").
+METHOD_KEY = "arcomake_method"
 
 
 class ReferencePeriod(BaseModel):
@@ -131,11 +135,12 @@ class ClimatologyConfig(BaseModel):
   use_flox: bool = Field(
     default=False, description="Whether to use flox for grouped periodic reductions"
   )
-  split_dims: list[str] = Field(
-    default_factory=list,
+  split_dims: list[str] | None = Field(
+    default=None,
     description=(
       "With --streaming (one series at a time): each data variable, and each index along these"
-      ' dimensions, is a series (e.g. ["depth"]; default: one series per variable)'
+      ' dimensions, is a series (e.g. ["depth"]; default: one series per variable). Warned'
+      " about without --streaming"
     ),
   )
   read: ReadConfig
@@ -145,8 +150,14 @@ class ClimatologyConfig(BaseModel):
   save: SaveConfig
 
   @model_validator(mode="after")
+  def _no_save_group(self) -> "ClimatologyConfig":
+    if self.save.group is not None:
+      raise ValueError(f"[save] group is not supported: the output's groups are {GROUPS}")
+    return self
+
+  @model_validator(mode="after")
   def _split_dims_not_time(self) -> "ClimatologyConfig":
-    if self.time_dim in self.split_dims:
+    if self.split_dims is not None and self.time_dim in self.split_dims:
       raise ValueError(f"split_dims cannot include the time dimension {self.time_dim!r}")
     return self
 
@@ -171,12 +182,7 @@ class ClimatologyConfig(BaseModel):
   callback=check_path(),
 )
 @click.argument(
-  "climatology_output_path",
-  required=True,
-  type=str,
-)
-@click.argument(
-  "anomaly_std_output_path",
+  "output_path",
   required=True,
   type=str,
 )
@@ -223,8 +229,7 @@ class ClimatologyConfig(BaseModel):
 def compute_climatology(
   configs_path: str,
   input_path: str,
-  climatology_output_path: str,
-  anomaly_std_output_path: str,
+  output_path: str,
   replace: bool = False,
   streaming: bool = False,
   dask_setup: DaskSetupType = "mpi",
@@ -241,9 +246,10 @@ def compute_climatology(
   the period), and the anomaly standard deviation is the unbiased weighted standard deviation of
   the same values. Missing values are skipped: each bin counts the values it has.
 
-  Assumed, not checked: the time axis is sorted and every data variable has the time dimension.
-  The two outputs have `period` steps along time, the bin index (0 is Jan 1 for day-of-year
-  bins).
+  The output is one Icechunk repository with two groups, `climatology` and `anomaly_std`
+  (xarray: `open_datatree`, or `open_zarr` with `group=`), written in one commit. Assumed, not
+  checked: the time axis is sorted and every data variable has the time dimension. Both groups
+  have `period` steps along time, the bin index (0 is Jan 1 for day-of-year bins).
 
   Example::
 
@@ -263,11 +269,10 @@ def compute_climatology(
     try:
       # Read configs, then check the output paths (with the recipe's storage options).
       configs = read_configs(configs_path, schema=ClimatologyConfig)
-      check_aws_profile(input_path, climatology_output_path, anomaly_std_output_path)
-      for path in (climatology_output_path, anomaly_std_output_path):
-        check_destination(path, replace=replace, save_configs=configs.save)
-      # Both outputs are written in runs with this label (branches, commit metadata, messages);
-      # `main` moves in each repository only once both are written.
+      _warn_ignored_split_dims(configs, streaming)
+      check_aws_profile(input_path, output_path)
+      check_destination(output_path, replace=replace, save_configs=configs.save)
+      # The run's label (its branch, commit metadata and message).
       label = icechunk_utils.run_label("compute-climatology")
       # Open input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
@@ -284,13 +289,7 @@ def compute_climatology(
             raise ValueError(f"No data in the reference period {configs.reference_period}")
         if not dataset.data_vars:
           raise ValueError("Input dataset contains no data variables.")
-        _compute_and_write(
-          dataset,
-          configs,
-          (climatology_output_path, anomaly_std_output_path),
-          label=label,
-          streaming=streaming,
-        )
+        _compute_and_write(dataset, configs, output_path, label=label, streaming=streaming)
       logger.info("Input dataset closed; closing Dask client.")
     except click.ClickException:
       raise
@@ -305,26 +304,34 @@ def compute_climatology(
 def _compute_and_write(
   dataset: xr.Dataset,
   configs: ClimatologyConfig,
-  outputs: tuple[str, str],
+  output_path: str,
   *,
   label: str,
   streaming: bool,
 ) -> None:
-  """Compute the climatology and anomaly std of `dataset` and write them to `outputs`, one
-  series at a time (`_compute_streaming`) or in one Dask graph (`_compute_graph`)."""
+  """Compute the climatology and anomaly std of `dataset` and write them into the groups of
+  `output_path` (`GROUPS`), one series at a time (`_compute_streaming`) or in one Dask graph
+  (`_compute_graph`)."""
   if streaming:
-    _compute_streaming(dataset, configs, outputs, label=label)
+    _compute_streaming(dataset, configs, output_path, label=label)
   else:
-    if configs.split_dims:
-      logger.warning(f"split_dims {configs.split_dims} ignored: they apply to --streaming only")
-    _compute_graph(dataset, configs, outputs, label=label)
+    _compute_graph(dataset, configs, output_path, label=label)
+
+
+def _warn_ignored_split_dims(configs: ClimatologyConfig, streaming: bool) -> None:
+  """`split_dims` without `--streaming` (`[]` too: it selected streaming before the option)."""
+  if configs.split_dims is not None and not streaming:
+    logger.warning(
+      f"split_dims {configs.split_dims} ignored: they apply to --streaming only (without it,"
+      " everything is one Dask graph)"
+    )
 
 
 def _compute_graph(
-  dataset: xr.Dataset, configs: ClimatologyConfig, outputs: tuple[str, str], *, label: str
+  dataset: xr.Dataset, configs: ClimatologyConfig, output_path: str, *, label: str
 ) -> None:
   """Everything in one Dask graph (`_compute_climatology`), computed into a temporary store and
-  copied into the outputs (`_checkpointed`)."""
+  copied into the output's groups (`_checkpointed`)."""
   climatology, anomaly_var = _compute_climatology(
     dataset,
     time_dim=configs.time_dim,
@@ -346,11 +353,14 @@ def _compute_graph(
     climatology, anomaly_std = _checkpointed(
       [climatology, anomaly_std], configs.save, configs.time_dim
     )
-    write_outputs_together(
-      list(zip((climatology, anomaly_std), outputs, strict=True)),
+    write_tree(
+      dict(zip(GROUPS, (climatology, anomaly_std), strict=True)),
+      output_path,
       configs.save,
       label=label,
-      recipe=provenance.fingerprint(configs, exclude={"read"}),
+      # `split_dims` is ignored here.
+      recipe=provenance.fingerprint(configs, exclude={"read", "split_dims"}),
+      metadata={METHOD_KEY: "graph"},
     )
   logger.info("Climatology and anomaly standard deviation committed.")
 
@@ -985,45 +995,51 @@ def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Data
 
 
 def _compute_streaming(
-  dataset: xr.Dataset, configs: ClimatologyConfig, paths: tuple[str, str], *, label: str
+  dataset: xr.Dataset, configs: ClimatologyConfig, output_path: str, *, label: str
 ) -> None:
   """One series (variable, index of `split_dims`) at a time, written into its region.
 
-  The outputs' metadata are written first, from a template with the postprocess steps applied;
+  The groups' metadata are written first, from a template with the postprocess steps applied;
   then every series is computed in memory (`_compute_series`), postprocessed and written into its
   region. Postprocess steps therefore have to work on one series (attributes, renames, chunking).
   """
-  outputs = (
-    (paths[0], configs.postprocess_climatology),
-    (paths[1], configs.postprocess_anomaly_std),
+  outputs = tuple(
+    zip(GROUPS, (configs.postprocess_climatology, configs.postprocess_anomaly_std), strict=True)
   )
-  if configs.save.group is not None:
-    raise ValueError("split_dims writes region by region: [save] group is not supported")
-  unknown = [d for d in configs.split_dims if d not in dataset.dims]
+  split_dims = configs.split_dims or []
+  unknown = [d for d in split_dims if d not in dataset.dims]
   if unknown:
     raise ValueError(f"split_dims {unknown} are not dimensions of the input: {list(dataset.dims)}")
-  save = _one_index_per_chunk(configs.save, configs.split_dims)
+  save = _one_index_per_chunk(configs.save, split_dims)
   template = _output_template(dataset, configs.period, configs.time_dim)
-  # One run per output (its own branch) and one session on it, committed once every series is
-  # written: an interrupted run commits nothing, and `main` is untouched until both are written.
-  recipe = provenance.fingerprint(configs, exclude={"read"})
-  runs = [
-    icechunk_utils.Run(path, save.storage_options, label, recipe=recipe) for path, _ in outputs
-  ]
-  sessions = [run.session() for run in runs]
-  for (_, steps), session in zip(outputs, sessions, strict=True):
+  # One run (its own branch) and one session on it, committed once every series is written:
+  # an interrupted run commits nothing, and `main` is untouched.
+  run = icechunk_utils.Run(
+    output_path,
+    save.storage_options,
+    label,
+    recipe=provenance.fingerprint(configs, exclude={"read"}),
+  )
+  session = run.session()
+  icechunk_utils.empty(session)  # what an existing repository held (--replace) goes
+  for group, steps in outputs:
     # Metadata only: the data of the template are never computed.
     write_into_session(
-      template.arcomake.process(steps=steps) if steps else template, session, save, compute=False
+      template.arcomake.process(steps=steps) if steps else template,
+      session,
+      save.model_copy(update={"group": group}),
+      compute=False,
     )
-  # Stored chunks (shards, if any: the units of writing) of every output variable: results are
-  # chunked alike, so that Dask writes the chunks of a region in parallel.
+  # Stored chunks (shards, if any: the units of writing) of every variable: results are chunked
+  # alike, so that Dask writes the chunks of a region in parallel.
   stored_chunks = [
     {
       name: var.encoding.get("shards") or var.encoding["chunks"]
-      for name, var in xr.open_zarr(session.store, consolidated=False).data_vars.items()
+      for name, var in xr.open_zarr(
+        session.store, group=group, consolidated=False
+      ).data_vars.items()
     }
-    for session in sessions
+    for group, _ in outputs
   ]
 
   def write(results: tuple[xr.Dataset, xr.Dataset], index: dict[str, int], label: str) -> None:
@@ -1032,9 +1048,7 @@ def _compute_streaming(
     region = {configs.time_dim: slice(0, configs.period)} | {
       d: slice(i, i + 1) for d, i in index.items()
     }
-    for (_, steps), result, chunks, session in zip(
-      outputs, results, stored_chunks, sessions, strict=True
-    ):
+    for (group, steps), result, chunks in zip(outputs, results, stored_chunks, strict=True):
       if steps:
         result = result.arcomake.process(steps=steps)
       result = result.drop_attrs().chunk(
@@ -1048,10 +1062,10 @@ def _compute_streaming(
         [name for name, var in result.variables.items() if not set(var.dims) & set(region)]
       )
       with sharding.write_order(save.shard_order):  # arrays opened here: shards in that order
-        to_icechunk(result, session, region=region, mode="r+")
+        to_icechunk(result, session, region=region, mode="r+", group=group)
     logger.info(f"{label} written in {time.monotonic() - writing:.0f} s")
 
-  series = _series(dataset, configs.split_dims)
+  series = _series(dataset, split_dims)
   started = time.monotonic()
   # Each series is written in the background while the next one is read. Reads and writes use
   # local threads whatever --dask-setup says: results live in this process.
@@ -1080,11 +1094,8 @@ def _compute_streaming(
       )
     if pending is not None:
       pending.result()
-  for run, session in zip(runs, sessions, strict=True):
-    run.commit(session, f"{label}: {len(series)} series")
-  # Both outputs are written: only now does `main` move, in one repository after the other.
-  for run in runs:
-    run.finish(configs.save.retention())
+  run.commit(session, f"{label}: {len(series)} series", {METHOD_KEY: "streaming"})
+  run.finish(configs.save.retention())
   logger.info("Climatology writes completed, one series at a time.")
 
 

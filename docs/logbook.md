@@ -1336,3 +1336,12 @@ each buffer counted once, and RSS), on synthetic data and the 1 deg test output:
   150 GB per 3D variable for both outputs, before compression (warned about if the disk has less
   free). On a distributed client every worker must see the store (checked: a chunk written where
   the copy does not look would be read as NaN).
+- **Maintainer's decisions:** the statistics are one repository, a DataTree with the groups
+  `climatology` and `anomaly_std`, written in one commit (both paths); the streaming path is
+  chosen with `--streaming` (`split_dims` only says how it splits). The temporary store's layout,
+  measured on the 1 deg test output with 32 threads (without shards / with shards of 8 bins and
+  all levels in the output): chunks of whole stored units, unsharded, 66 s / 73 s; one shard per
+  Dask chunk with chunks of one unit, 80 s / 74 s; Dask's chunks, 68 s / 106 s (each copy reads
+  whole chunks of 365 bins for 8). Memory 26.5-28.5 GiB in all six runs (it follows the threads:
+  4.1 GiB with 4). Shards in the temporary store bring nothing: unsharded chunks of whole units
+  are kept.

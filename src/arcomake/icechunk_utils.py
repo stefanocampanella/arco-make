@@ -26,6 +26,7 @@ from typing import Any, Literal
 import fsspec.utils
 import icechunk
 import xarray as xr
+import zarr
 from icechunk.xarray import to_icechunk
 
 from arcomake import provenance, sharding
@@ -331,6 +332,31 @@ class PromotionError(RuntimeError):
   """`main` changed during a run: its output was not promoted (it stays on the run's branch)."""
 
 
+def empty(session: Any) -> None:
+  """Remove what a writable session's repository holds (its root group, empty again), as a write
+  in mode "w" at the root does: writes in mode "w" into groups replace only their group."""
+  zarr.open_group(session.store, mode="w")
+
+
+def _write_into(
+  session: Any,
+  dataset: xr.Dataset,
+  mode: Literal["w", "w-", "a", "a-", "r+"],
+  append_dim: Hashable | None,
+  group: str | None,
+  align_chunks: bool,
+  shard_order: sharding.ShardOrder,
+) -> None:
+  """Write `dataset` into a writable session (`Run.write`)."""
+  with sharding.write_order(shard_order):
+    if sharding.creates_arrays(shard_order, mode):
+      sharding.create_arrays(dataset, session.store, mode=mode, group=group)
+      mode = "r+"
+    to_icechunk(
+      dataset, session, mode=mode, append_dim=append_dim, group=group, align_chunks=align_chunks
+    )
+
+
 class Run:
   """The writes of one run of a command to one repository, on a branch of their own.
 
@@ -403,13 +429,24 @@ class Run:
     # last commit (`Session.amend`, icechunk 2.3) with the blocks written so far in its metadata
     # for `waiting_run`; amended snapshots are garbage-collected after `GRACE` (logbook, 18 Nov).
     session = self.session()
-    with sharding.write_order(shard_order):
-      if sharding.creates_arrays(shard_order, mode):
-        sharding.create_arrays(dataset, session.store, mode=mode, group=group)
-        mode = "r+"
-      to_icechunk(
-        dataset, session, mode=mode, append_dim=append_dim, group=group, align_chunks=align_chunks
-      )
+    _write_into(session, dataset, mode, append_dim, group, align_chunks, shard_order)
+    return self.commit(session, message, metadata)
+
+  def write_groups(
+    self,
+    groups: Mapping[str, xr.Dataset],
+    *,
+    message: str,
+    align_chunks: bool = False,
+    shard_order: sharding.ShardOrder = sharding.DEFAULT,
+    metadata: Mapping[str, Any] | None = None,
+  ) -> str:
+    """Write each dataset into its group (a DataTree; see `write` for the layout), all in one
+    commit of the run, which holds nothing else (what an existing repository held goes)."""
+    session = self.session()
+    empty(session)
+    for group, dataset in groups.items():
+      _write_into(session, dataset, "w", None, group, align_chunks, shard_order)
     return self.commit(session, message, metadata)
 
   def last_block(self) -> str | None:

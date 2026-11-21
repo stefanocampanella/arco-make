@@ -14,7 +14,7 @@ import pytest
 import xarray as xr
 from click.testing import CliRunner
 
-from arcomake import cli, icechunk_utils, provenance
+from arcomake import cli, climatology, icechunk_utils, provenance
 from arcomake.dataset_utils import write_output
 from tests.conftest import render_recipe
 
@@ -100,15 +100,16 @@ def test_climatology_outputs_record_provenance_and_recipe(tmp_path: pathlib.Path
     + ('split_dims = ["depth"]\n' if split else "")
     + '\n[read]\nengine = "zarr"\n\n[save]\n'
   )
-  clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
+  output = tmp_path / "statistics.zarr"
   path = ["--streaming"] if split else []
   args = ["compute-climatology", *path, "--dask-setup", "threads", str(recipe), str(source)]
-  result = CliRunner().invoke(cli, [*args, str(clim), str(std)])
+  result = CliRunner().invoke(cli, [*args, str(output)])
   assert result.exit_code == 0, result.output
-  for output in (clim, std):
-    (snapshot,) = commits(output)
-    assert snapshot.metadata[provenance.PROVENANCE_KEY] == provenance.environment()
-    assert len(snapshot.metadata[icechunk_utils.RECIPE_KEY]) == 16
+  (snapshot,) = commits(output)
+  assert snapshot.metadata[provenance.PROVENANCE_KEY] == provenance.environment()
+  assert len(snapshot.metadata[icechunk_utils.RECIPE_KEY]) == 16
+  # How they were computed: the recipe does not say (--streaming does).
+  assert snapshot.metadata[climatology.METHOD_KEY] == ("streaming" if split else "graph")
 
 
 def test_no_commit_of_another_repository(monkeypatch, tmp_path):

@@ -1177,30 +1177,36 @@ def write_into_session(
   return written if isinstance(written, Delayed) else None
 
 
-def write_outputs_together(
-  outputs: list[tuple[xr.Dataset, str | pathlib.Path]],
+def write_tree(
+  groups: Mapping[str, xr.Dataset],
+  destination: str | pathlib.Path,
   configs: SaveConfig,
   *,
   label: str,
   recipe: str | None = None,
-) -> list[str]:
-  """Write datasets to their repositories, each in a run named `label` (`icechunk_utils.Run`);
-  `main` moves in every repository only once all are written. Returns the new tips of `main`.
+  metadata: Mapping[str, Any] | None = None,
+) -> str:
+  """Write datasets into the groups of one repository (a DataTree; under `[save] group`, if
+  set), each with the layout of `[save]`, in one commit of a run named `label`
+  (`icechunk_utils.Run`; with `metadata`), which replaces what the repository held; `main` moves
+  to it once all are written. Returns the new tip of `main`.
 
-  Each dataset is computed by its own write: work they share is done again for each (Dask
+  Each group is computed by its own write: work they share is done again for each (Dask
   optimizes each write on its own and fuses a shared task into each), so compute it first (the
-  climatology writes its outputs from a temporary store).
+  climatology writes its groups from a temporary store).
 
   Raises:
-    icechunk_utils.PromotionError: if `main` of a repository changed meanwhile (that run stays
-      on its branch; repositories promoted before it keep the new version).
+    icechunk_utils.PromotionError: if `main` changed meanwhile (the run stays on its branch).
   """
-  runs = [
-    icechunk_utils.Run(_check_output_path(path), configs.storage_options, label, recipe=recipe)
-    for _, path in outputs
-  ]
-  for (dataset, _), run in zip(outputs, runs, strict=True):
-    logger.info(f"Writing to {run.path} ({label}) with {configs}")
-    write_output(dataset, run, configs, message=label, align_chunks=True)
-  # Every output is written: only now does `main` move, repository after repository.
-  return [run.finish(configs.retention()) for run in runs]
+  path = _check_output_path(destination)
+  run = icechunk_utils.Run(path, configs.storage_options, label, recipe=recipe)
+  logger.info(f"Writing groups {list(groups)} to {path} ({label}) with {configs}")
+  parent = "" if configs.group is None else f"{configs.group}/"
+  run.write_groups(
+    {f"{parent}{name}": prepare_for_writing(dataset, configs) for name, dataset in groups.items()},
+    message=label,
+    align_chunks=True,
+    shard_order=configs.shard_order,
+    metadata=metadata,
+  )
+  return run.finish(configs.retention())

@@ -124,15 +124,15 @@ def test_climatology_shards_follow_the_order(tmp_path: pathlib.Path, split: str)
     "[save]\nchunks = {time = 73, lat = 1, lon = 1}\nshards = {time = -1, lat = 1, lon = -1}\n"
     'shard_order = "lexicographic"\n'
   )
-  clim, std = tmp_path / "clim.zarr", tmp_path / "std.zarr"
-  args = [str(recipe), str(tmp_path / "in.zarr"), str(clim), str(std)]
+  output = tmp_path / "statistics.zarr"
+  args = [str(recipe), str(tmp_path / "in.zarr"), str(output)]
   path = ["--streaming"] if split else []
   result = CliRunner().invoke(cli, ["compute-climatology", *path, "--dask-setup", "threads", *args])
   assert result.exit_code == 0, result.output
-  for path in (clim, std):
-    assert icechunk.Repository.exists(icechunk_utils.storage(path))
+  assert icechunk.Repository.exists(icechunk_utils.storage(output))
+  for group in ("climatology", "anomaly_std"):
     assert np.array_equal(
-      physical_order(path, "x", (0, 0, 0)), expected("lexicographic", (5, 1, 2))
+      physical_order(output, f"{group}/x", (0, 0, 0)), expected("lexicographic", (5, 1, 2))
     )
 
 
