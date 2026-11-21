@@ -1189,6 +1189,44 @@ def write_into_session(
   return written if isinstance(written, Delayed) else None
 
 
+def write_into_sessions(items: list[tuple[xr.Dataset, Any]], configs: SaveConfig) -> None:
+  """Write datasets into their writable Icechunk sessions as `write_into_session` does, in one
+  Dask computation that computes the work they share once.
+
+  Their values go through one xarray `ArrayWriter`, so Dask optimizes one graph. Computing their
+  `to_zarr(compute=False)` tasks together repeated shared work: each is optimized on its own, and
+  a shared task with one consumer in each output is fused into both (the climatology's window,
+  computed once per output). The steps are those of xarray's `to_zarr`, from
+  `xarray.backends.writers` (not public API; the tests count the shared work).
+  """
+  from xarray.backends.common import ArrayWriter
+  from xarray.backends.writers import dump_to_store, get_writable_zarr_store
+
+  writer = ArrayWriter()
+  stores = []
+  # As in `write_into_session`: with another shard order, metadata first, then values in "r+".
+  mode: Literal["w", "r+"] = "r+" if sharding.creates_arrays(configs.shard_order, "w") else "w"
+  with sharding.write_order(configs.shard_order):
+    for dataset, session in items:
+      prepared = prepare_for_writing(dataset, configs)
+      if mode == "r+":
+        sharding.create_arrays(prepared, session.store, mode="w", group=configs.group)
+      store = get_writable_zarr_store(
+        session.store,
+        mode=mode,
+        group=configs.group,
+        consolidated=False,
+        zarr_format=3,
+        align_chunks=True,
+      )
+      dump_to_store(store._validate_and_autodetect_region(prepared), store, writer)
+      stores.append(store)
+    with dask.config.set(scheduler=_local_scheduler()):
+      writer.sync(compute=True)
+  for store in stores:
+    store.close()
+
+
 def _local_scheduler() -> str:
   """The scheduler for writes into sessions: synchronous if chosen (debugging), else threads
   (processes cannot write into this process's sessions)."""
@@ -1212,7 +1250,7 @@ def write_outputs_together(
   the new tips of `main`.
 
   With a local scheduler, all data are computed once and written into the runs' sessions from
-  this process (`write_into_session`). On a distributed client, writes run on the workers, and
+  this process (`write_into_sessions`). On a distributed client, writes run on the workers, and
   icechunk collects them into a session by computing that session's writes (its Dask writer
   merges their changesets as part of the computation, one session at a time): each dataset is
   written in turn, and what they share is computed again (logged).
@@ -1232,14 +1270,11 @@ def write_outputs_together(
     for (dataset, _), run in zip(outputs, runs, strict=True):
       write_output(dataset, run, configs, message=label, align_chunks=True)
   else:
-    sessions, writes = [], []
-    for (dataset, _), run in zip(outputs, runs, strict=True):
+    sessions = [run.session() for run in runs]
+    for run in runs:
       logger.info(f"Writing to {run.path} ({label}) with {configs}")
-      session = run.session()
-      writes.append(write_into_session(dataset, session, configs, compute=False))
-      sessions.append(session)
-    with dask.config.set(scheduler=_local_scheduler()), sharding.write_order(configs.shard_order):
-      dask.compute(*writes)
+    datasets = [dataset for dataset, _ in outputs]
+    write_into_sessions(list(zip(datasets, sessions, strict=True)), configs)
     for run, session in zip(runs, sessions, strict=True):
       run.commit(session, label)
   # Every output is written: only now does `main` move, repository after repository.

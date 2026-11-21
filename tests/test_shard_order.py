@@ -22,7 +22,12 @@ from click.testing import CliRunner
 from zarr.core.buffer import default_buffer_prototype
 
 from arcomake import cli, icechunk_utils, sharding
-from arcomake.dataset_utils import SaveConfig, write_into_session, write_output
+from arcomake.dataset_utils import (
+  SaveConfig,
+  write_into_session,
+  write_into_sessions,
+  write_output,
+)
 
 LAYOUT = {"chunks": {"time": 1, "depth": 1}, "shards": {"time": 4, "depth": -1}}
 
@@ -88,15 +93,20 @@ def test_shards_of_created_and_appended_arrays_follow_the_order(tmp_path: pathli
   assert metadata["morton"] == metadata[order]
 
 
-def test_writes_into_sessions_follow_the_order(tmp_path: pathlib.Path):
-  """As the climatology writes its outputs: metadata now, values computed later."""
+@pytest.mark.parametrize("together", [False, True])
+def test_writes_into_sessions_follow_the_order(tmp_path: pathlib.Path, together: bool):
+  """As the climatology writes its outputs: metadata now, values computed later (split_dims),
+  or several datasets in one computation (`write_into_sessions`, the graph path)."""
   configs = SaveConfig.model_validate({**LAYOUT, "shard_order": "lexicographic"})
   path = tmp_path / "out.zarr"
   run = icechunk_utils.Run(path, None, "test")
   session = run.session()
-  write = write_into_session(ocean(8), session, configs, compute=False)
-  with dask.config.set(scheduler="threads"):
-    dask.compute(write)
+  if together:
+    write_into_sessions([(ocean(8), session)], configs)
+  else:
+    write = write_into_session(ocean(8), session, configs, compute=False)
+    with dask.config.set(scheduler="threads"):
+      dask.compute(write)
   run.commit(session, "test")
   run.finish()
   assert np.array_equal(
