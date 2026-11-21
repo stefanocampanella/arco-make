@@ -82,6 +82,9 @@ class ReadConfig(OpenDatasetArguments):
 
   engine: EngineType | None = None
   chunks: ChunksConfig | None = None
+  # A group of the input (Zarr, Icechunk, netCDF), e.g. "climatology" of a compute-climatology
+  # output (its groups: `climatology.GROUPS`).
+  group: str | None = None
 
 
 class CodecConfig(BaseModel):

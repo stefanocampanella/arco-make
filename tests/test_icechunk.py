@@ -70,6 +70,18 @@ def test_groups_nest_under_the_save_group(ocean_ds, tmp_path):
   xr.testing.assert_allclose(open_output(path, "g/a").load(), ocean_ds)
 
 
+def test_read_tables_read_one_group(ocean_ds, tmp_path):
+  """`[read] group` reads one group of an input, e.g. the climatology of a statistics repository
+  (for `validate`, `process`), whose root holds no variables."""
+  from arcomake.dataset_utils import ReadConfig
+
+  path = tmp_path / "statistics.zarr"
+  write_tree({"climatology": ocean_ds, "anomaly_std": ocean_ds * 2}, path, SaveConfig(), label="x")
+  read = ReadConfig.model_validate({"engine": "icechunk", "group": "anomaly_std", "chunks": {}})
+  with open_input(str(path), **read.model_dump(exclude_unset=True)) as dataset:
+    xr.testing.assert_allclose(dataset.load(), ocean_ds * 2)
+
+
 def test_s3_and_gcs_storages_from_storage_options():
   """Recipes give fsspec-like options; only those Icechunk can honour are accepted."""
   s3 = icechunk_utils.storage("s3://bucket/some/prefix", {"region": "eu-south-1", "anon": True})
