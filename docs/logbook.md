@@ -1494,3 +1494,48 @@ each buffer counted once, and RSS), on synthetic data and the 1 deg test output:
   workers print the `RuntimeWarning`s download filters (the filter is set in the main process
   only). Not tried: several nodes (temporary files, the EWDS's GRIB and the HTTP file, are read by
   path: they need a `TMPDIR` every node sees).
+
+### 22 Nov: MPI optional, the image without it, the climatology in modules
+
+Maintainer's decisions (22 Nov): keep supporting MPI, but review arco-make's Dask utilities
+(untouched since the refactoring began); take MPI out of the image (its Open MPI was built to
+match one cluster); split, comment and simplify the climatology; statistics keep a copy of their
+coordinates in each group (sharing them at the root would leave readers of one group without
+the bounds, and without any coordinate through `open_zarr(group=...)`).
+
+- **Dask utilities** (`dask_utils`): `localcluster` and `mpi` now take every key of their section
+  of Dask's configuration, so `DASK_LOCALCLUSTER__MEMORY_LIMIT` reaches the workers (test: a
+  1 GiB limit, against 14.8 GB per worker before). The local cluster is closed with the command,
+  local schedulers are set for the command only. Under `mpirun -np 4`, the command started with
+  one worker of two (they register one by one): it now waits for every worker rank. Closing the
+  scheduler first left each worker logging a traceback: the workers are retired first. Checked
+  with `mpirun -np 4` and `-np 5` on the project VM (Open MPI 5.0.10); `tests/test_mpi.py` runs
+  `compute-climatology` under `mpirun -n 4` against threads (36 s), in CI too.
+- **MPI optional**: dask-mpi and mpi4py are the `mpi` extra. mpi4py's wheels hold builds for Open
+  MPI and MPICH and load the library found at run time, so CI needs no MPI headers. Every command
+  defaults to `--dask-setup threads` (`process` and `compute-climatology` defaulted to `mpi`,
+  which fails outside an MPI job).
+- **Image without MPI**: PMIx 3.2.5 and Open MPI 4.1.6 are no longer built. Built locally
+  (`apptainer build --fakeroot`): 662 MB; a climatology with threads runs; `--dask-setup mpi`
+  says to install the extra; no MPI library inside.
+- **Download on distributed setups** (after 21 Nov's check): the warning goes; workers must see
+  the run's temporary directory (checked, as the climatology's store), and get download's warning
+  filters (a worker plugin). A test downloads the sample recipe on two worker processes: the same
+  output as threads.
+- **flox** (`use_flox`, the graph path's alternative reductions): quarter of the 0.25 deg grid,
+  1 level x 8 years, day-of-year bins, window 15, threads, computed into memory:
+
+  | reductions | time | peak memory |
+  |---|---|---|
+  | folded time axis (default) | 10.7 s | 18.2 GB |
+  | flox | 42.2 s | 13.2 GB |
+
+  Same variance to 8e-7. Removed.
+- **The climatology in modules**: `climatology.py` (1,240 lines) is the package
+  `arcomake.climatology`: `command`, `config`, `graph`, `streamed`, `binning`, `kernels`,
+  `staging`. Moved verbatim (44 definitions compared as ASTs after the renames), then: the bins of
+  both paths defined once (`binning.time_bins`), which showed that streaming accepted position
+  bins over a partial period, which the graph path refuses (now refused by both); the window and
+  output type shared; one way of making each numba kernel once; unused code and the obsolete
+  header comment removed; each module ordered top-down (checked as ASTs) and documented: what is
+  computed and the formulas (package and `kernels`), each path's steps, why a temporary store.
