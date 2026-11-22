@@ -69,7 +69,12 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.dask_utils import DaskSetupType, dask_setup_option, get_client
+from arcomake.dask_utils import (
+  DaskSetupType,
+  check_workers_reach,
+  dask_setup_option,
+  get_client,
+)
 from arcomake.dataset_utils import (
   ReadConfig,
   SaveConfig,
@@ -641,23 +646,6 @@ def _staging_chunks(
   return tuple(stored), tuple(copy)
 
 
-def _check_workers_reach(path: pathlib.Path) -> None:
-  """On a distributed client, fail unless every worker sees `path`: chunks a worker writes
-  where the reader does not look would be read as missing, the fill value (NaN), silently."""
-  try:
-    from distributed import default_client
-
-    client = default_client()
-  except (ImportError, ValueError):
-    return
-  blind = sorted(w for w, seen in client.run(os.path.isdir, str(path)).items() if not seen)
-  if blind:
-    raise RuntimeError(
-      f"Dask workers {', '.join(blind)} do not see the temporary store {path}: set TMPDIR to a"
-      " filesystem every worker reaches"
-    )
-
-
 @dataclasses.dataclass
 class _Stage:
   """A temporary plain Zarr v3 store for the groups of the output (a DataTree), unsharded, and how
@@ -697,7 +685,7 @@ def _stage(
     raise RuntimeError("the climatology's temporary store needs a TempDirectoryRegistry")
   path = registry.create_temp_dir(suffix=".zarr")
   if workers:
-    _check_workers_reach(path)
+    check_workers_reach(path, "the temporary store")
   budget = detect_budget()
   staged, copies, units, size = {}, {}, [], 0
   for group, dataset in groups.items():

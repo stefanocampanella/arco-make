@@ -27,7 +27,13 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.dask_utils import DaskSetupType, dask_setup_option, get_client
+from arcomake.dask_utils import (
+  DaskSetupType,
+  WorkerSetup,
+  check_workers_reach,
+  dask_setup_option,
+  get_client,
+)
 from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
@@ -125,6 +131,14 @@ class DownloadConfig(BaseModel):
         " whole): chunks for reading are planned for each machine"
       )
     return self
+
+
+def ignore_nan_warnings() -> None:
+  """Ignore NumPy's warnings on NaN met while computing (masked data regridded, means of empty
+  cells), which would clutter the log: they are expected, and the checks count missing values."""
+  warnings.filterwarnings(
+    "ignore", message="invalid value encountered in divide", category=RuntimeWarning
+  )
 
 
 @click.command()
@@ -248,24 +262,19 @@ def download(
   set_default_logger(log_level)
 
   # Set up the Dask client and TempDirectoryRegistry.
-  # Notice: distributed dask clusters are not available due to serialization issues.
-  if dask_setup in ("processes", "mpi", "localcluster"):
-    logger.warning(
-      f"Using {dask_setup} scheduler, which is not compatible with remote arco-make xarray backends. "
-      "Please use 'threads' or 'synchronous' instead."
-    )
-  with get_client(dask_setup=dask_setup), TempDirectoryRegistry(), warnings.catch_warnings():
-    # During postprocessing computation, which may even happen while writing, if each operation
-    # does not trigger dask computations (e.g., no calls to persist or compute) some
-    # RuntimeWarnings may be issued. This happens frequently with certain algorithms when
-    # regridding masked data (containing NaNs). We filter them to avoid cluttering the log.
+  with (
+    get_client(dask_setup=dask_setup) as client,
+    TempDirectoryRegistry() as registry,
+    warnings.catch_warnings(),
+  ):
     # Set once for the command: `catch_warnings` swaps the process-wide filters, and is not
     # thread-safe (Dask computes in threads).
-    warnings.filterwarnings(
-      "ignore",
-      message="invalid value encountered in divide",
-      category=RuntimeWarning,
-    )
+    ignore_nan_warnings()
+    if client is not None:
+      # Workers write checkpoints and read the files fetched once per run, in the run's
+      # temporary directory; they warn as this process does.
+      check_workers_reach(registry.job_dir, "the run's temporary directory")
+      client.register_plugin(WorkerSetup(ignore_nan_warnings), name="arcomake-warnings")
     # Read configs and inject start and end time.
     update_time_interval = {}
     if start_datetime is not None:

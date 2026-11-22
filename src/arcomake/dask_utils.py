@@ -18,10 +18,12 @@ those of `dask_mpi.initialize` (`DASK_MPI__NTHREADS=8`, `DASK_MPI__LOCAL_DIRECTO
 
 import atexit
 import logging
+import os
+import pathlib
 import sys
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
-from typing import Any, Literal, cast, get_args
+from typing import Any, Literal, cast, get_args, override
 
 import click
 import dask
@@ -91,6 +93,34 @@ def get_client(
     if use_frisky:
       client = _frisky(client)
     yield client
+
+
+def check_workers_reach(path: pathlib.Path, what: str) -> None:
+  """On a distributed client, fail unless every worker sees the directory `path` (`what`, for the
+  message): files a worker writes where this process does not look would be missing, and chunks
+  of a Zarr store read as its fill value (NaN), silently."""
+  try:
+    client = distributed.default_client()
+  except ValueError:  # no client: Dask's local schedulers share this process's files
+    return
+  blind = sorted(w for w, seen in client.run(os.path.isdir, str(path)).items() if not seen)
+  if blind:
+    raise RuntimeError(
+      f"Dask workers {', '.join(blind)} do not see {what} {path}: set TMPDIR to a filesystem every"
+      " worker reaches"
+    )
+
+
+class WorkerSetup(distributed.WorkerPlugin):
+  """Runs `setup` (a module-level function: workers unpickle it) on every worker, those started
+  later included."""
+
+  def __init__(self, setup: Callable[[], None]):
+    self._setup = setup
+
+  @override
+  def setup(self, worker: distributed.Worker) -> None:
+    self._setup()
 
 
 def _mpi_client() -> distributed.Client:

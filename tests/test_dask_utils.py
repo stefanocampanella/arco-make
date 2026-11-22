@@ -148,3 +148,47 @@ def test_errors_closing_the_cluster_are_logged_not_raised(caplog):
   with caplog.at_level(logging.WARNING):
     dask_utils._shutdown(client)  # ty: ignore[invalid-argument-type]
   assert client.shut and "worker gone" in caplog.text
+
+
+def test_a_directory_some_worker_does_not_see_is_refused(monkeypatch, tmp_path):
+  """Files a worker writes where this process does not look would be missing: chunks of a Zarr
+  store read as NaN."""
+  import distributed
+
+  class Client:
+    def __init__(self, seen: dict[str, bool]):
+      self.seen = seen
+
+    def run(self, function, path):
+      return {worker: seen and function(path) for worker, seen in self.seen.items()}
+
+  dask_utils.check_workers_reach(tmp_path, "the store")  # no client: nothing to check
+  monkeypatch.setattr(distributed, "default_client", lambda: Client({"tcp://a": True}))
+  dask_utils.check_workers_reach(tmp_path, "the store")
+  monkeypatch.setattr(
+    distributed, "default_client", lambda: Client({"tcp://a": True, "tcp://b": False})
+  )
+  with pytest.raises(RuntimeError, match="tcp://b do not see the store"):
+    dask_utils.check_workers_reach(tmp_path, "the store")
+
+
+def _filters_nan_warnings() -> bool:
+  import warnings
+
+  return any("invalid value" in str(f[1]) for f in warnings.filters)
+
+
+def test_worker_setup_runs_on_every_worker():
+  """download's warning filters, on every worker (workers unpickle the function by reference:
+  it must be importable there, as arcomake's functions are)."""
+  from arcomake.download import ignore_nan_warnings
+
+  options = {"n_workers": 2, "threads_per_worker": 1, "processes": True}
+  with (
+    dask.config.set({"localcluster": options, "distributed.dashboard.enabled": False}),
+    dask_utils.get_client("localcluster") as client,
+  ):
+    assert client is not None
+    assert not any(client.run(_filters_nan_warnings).values())
+    client.register_plugin(dask_utils.WorkerSetup(ignore_nan_warnings), name="warnings")
+    assert list(client.run(_filters_nan_warnings).values()) == [True, True]

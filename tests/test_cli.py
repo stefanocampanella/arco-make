@@ -310,10 +310,10 @@ def test_streaming_needs_no_worker_to_see_its_store(tmp_path: pathlib.Path, monk
   a distributed client's workers (a node-local TMPDIR refused it under `mpi`)."""
   from arcomake import climatology
 
-  def blind(path):
-    raise RuntimeError("Dask workers tcp://b do not see the temporary store")
+  def blind(path, what):
+    raise RuntimeError(f"Dask workers tcp://b do not see {what}")
 
-  monkeypatch.setattr(climatology, "_check_workers_reach", blind)
+  monkeypatch.setattr(climatology, "check_workers_reach", blind)
   source = climatology_input(tmp_path)
   series, _ = run_climatology(tmp_path, source, "series", 'split_dims = ["depth"]\n[save]\n')
   assert series.exit_code == 0, series.output
@@ -642,3 +642,24 @@ def test_climatology_writes_shards_its_chunks_straddle(
   xr.testing.assert_allclose(std.t3.load(), np.sqrt(var.t3.clip(min=0)), **tolerance)
   (store,) = stores
   assert store.is_relative_to(scratch) and not store.exists()  # removed at the end
+
+
+@pytest.mark.parametrize("setup", ["localcluster", "processes"])
+def test_download_on_worker_processes_writes_what_threads_write(
+  tmp_path: pathlib.Path,
+  recipes,
+  downloaded: pathlib.Path,
+  isolated_tempdir: pathlib.Path,
+  setup: str,
+):
+  """Worker processes (the backends and steps pickled to them) write the same output: a local
+  cluster's workers see the run's temporary directory, and filter the warnings this process
+  filters; Dask's process pool too (it was warned about, untested)."""
+  import dask
+
+  output = tmp_path / "cluster.zarr"
+  options = {"n_workers": 2, "threads_per_worker": 1, "local_directory": str(isolated_tempdir)}
+  with dask.config.set({"localcluster": options, "distributed.dashboard.enabled": False}):
+    result = run("download", "--dask-setup", setup, str(recipes["download"]), str(output))
+  assert result.exit_code == 0, result.output
+  xr.testing.assert_identical(open_output(output).load(), open_output(downloaded).load())

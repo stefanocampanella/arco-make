@@ -414,29 +414,6 @@ def test_staging_shards_spanning_levels_are_copied_one_per_task():
   )
 
 
-def test_temporary_store_seen_by_every_worker(monkeypatch, tmp_path):
-  """On a distributed client, a temporary store some worker does not see is refused: its chunks
-  would be written where the copy does not read them, and read as NaN."""
-  import distributed
-
-  from arcomake import climatology
-
-  class Client:
-    def __init__(self, seen: dict[str, bool]):
-      self.seen = seen
-
-    def run(self, function, path):
-      return {worker: seen and function(path) for worker, seen in self.seen.items()}
-
-  monkeypatch.setattr(distributed, "default_client", lambda: Client({"tcp://a": True}))
-  climatology._check_workers_reach(tmp_path)
-  monkeypatch.setattr(
-    distributed, "default_client", lambda: Client({"tcp://a": True, "tcp://b": False})
-  )
-  with pytest.raises(RuntimeError, match="tcp://b do not see the temporary store"):
-    climatology._check_workers_reach(tmp_path)
-
-
 def test_temporary_store_warns_about_memory_and_disk(monkeypatch, caplog):
   """Stored units above a task's share of memory, and a store larger than the free disk, are
   warned about before computing."""
