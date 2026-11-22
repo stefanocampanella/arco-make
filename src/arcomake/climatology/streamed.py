@@ -2,7 +2,24 @@
 # SPDX-License-Identifier: MIT
 """The streaming path (`--streaming`): every series (variable, index of `split_dims`)
 computed apart in memory, as many at a time as fit, written into its region of a
-temporary store, then copied into the output."""
+temporary store, then copied into the output.
+
+`_stream` writes the metadata and coordinates of both groups into the temporary store first,
+from a lazy template of the outputs (never computed). A pool of threads then computes the series
+(`_series`), as many at once as fit in the memory budget (`_series_at_once`, `_series_bytes`).
+Each series (`_compute_series`):
+
+1. reads its values in blocks of about 1 GB along time, the next block while the current one is
+   added, and adds them to its per-bin count, mean and m2 by Welford's update in float64
+   (`_stream_bin_statistics`, `kernels.welford`);
+2. applies the window, in bands of points in parallel (`_window_statistics_in_memory`,
+   `kernels.window_bins_last`, the graph path's kernel);
+3. writes both outputs into its region of the temporary store, where it is alone: each chunk of
+   the store holds one index of the split dimensions.
+
+Everything runs in this process, on local threads, whatever `--dask-setup` says: the results
+live here. Then the store is copied into the output (`staging.copy`).
+"""
 
 import itertools
 import logging

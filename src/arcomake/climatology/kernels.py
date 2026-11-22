@@ -1,7 +1,20 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 """The numba kernels: the window over bins (both paths) and the Welford update
-(streaming)."""
+(streaming).
+
+The window, for each point and bin i: the bins b = i + offsets[j] (wrapping around the period),
+each with n_b values of mean mean_b and sum of squared deviations m2_b, are pooled with the
+weight w_j. With V1 = sum w_j n_b and V2 = sum w_j^2 n_b:
+
+- climatology c = sum w_j n_b mean_b / V1, the weighted mean of the pooled values;
+- variance = sum w_j (n_b (mean_b - c)^2 + m2_b) / (V1 - V2 / V1): the weighted sum of squared
+  deviations from c, unbiased for reliability weights (each value weighs its bin's w_j); NaN when
+  V1 - V2 / V1 is not positive (fewer than two values), and both NaN without values.
+
+Welford's update adds a value x to its bin: n += 1; delta = x - mean; mean += delta / n;
+m2 += delta (x - mean). Both kernels compute in float64.
+"""
 
 import functools
 import threading

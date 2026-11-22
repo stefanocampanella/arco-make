@@ -1,7 +1,21 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 """The graph path (`--graph`, the default): the statistics of every variable in one Dask
-graph, computed into a temporary store, then copied into the output."""
+graph, computed into a temporary store, then copied into the output.
+
+1. Per-bin statistics (`_bin_statistics`): the time axis is folded into periods x bins (each
+   step at its position on a grid of whole periods, `binning.time_bins`; missing steps become
+   NaN), then reduced over the periods in two passes, the count and the mean, then the sum of
+   squared deviations from the mean (`_fold_statistics`). Feb 29 is not on the grid: its
+   statistics are combined into Feb 28's bin (`_combine`).
+2. The window, chunk by chunk (`kernels.window_bins_last`, through `apply_ufunc`): the folded
+   data are chunked once, one period and every bin per chunk (`_chunked_for_the_window`), so that
+   neither step rechunks.
+3. Both outputs are computed together into the temporary store, and copied (`staging`).
+
+Dask holds the folded data of several years and levels at once: at 0.25 deg its memory grows
+with the years (logbook, 21 Nov), where `streamed` stays flat.
+"""
 
 import functools
 import logging
@@ -153,7 +167,9 @@ def _bin_statistics(
   bin_coords = {time_dim: np.arange(period)}
 
   # Fold the time axis into (_period, bin): step k of a folded period is bin k. Missing steps (an
-  # incomplete first or last year, gaps) become NaN, which the statistics skip.
+  # incomplete first or last year, gaps) become NaN, which the statistics skip. In turn: the
+  # regular days, their positions as the time coordinate, every position of whole periods (NaN
+  # where no step), and the time axis cut into periods (`construct` reshapes, no copy).
   regular = ~is_feb_29
   n_periods = -(-int(position.max(initial=0) + 1) // period)
   folded = (
@@ -226,7 +242,10 @@ def _fold_statistics(folded: xr.Dataset) -> BinStatistics:
 
 
 def _combine(a: BinStatistics, b: BinStatistics) -> BinStatistics:
-  """Statistics of the union of two samples (Chan et al.); an empty sample has mean NaN."""
+  """Statistics of the union of two samples (Chan et al.); an empty sample has mean NaN.
+
+  n = n_a + n_b; mean = (n_a mean_a + n_b mean_b) / n; m2 = m2_a + m2_b + (mean_b - mean_a)^2
+  n_a n_b / n. Empty samples are taken with mean 0, so that they leave the other unchanged."""
   n_a, mean_a, m2_a = a
   n_b, mean_b, m2_b = b
   n = n_a + n_b

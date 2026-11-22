@@ -1,7 +1,19 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 """The temporary store both paths compute into, and its copy into the output with the
-layout of `[save]`."""
+layout of `[save]`.
+
+Why not write into the output directly: its shards may span every level and the whole grid, so
+that one shard needs the statistics of all levels, which the graph path then held until the last
+window (logbook, 21 Nov), and the series of the streaming path would share shards. The temporary
+store is a plain Zarr v3 DataTree (one group per output), unsharded, chunked as Dask computes
+(along time, whole stored units: `_staging_chunks`). The copy then reads it in groups of whole
+stored units and writes the output in one commit, on as many threads as hold their units in
+memory (`_copy_threads`).
+
+The store lives in the run's temporary directory (`TMPDIR`), removed with it; on a distributed
+client, every worker must see it (checked), since workers write into it.
+"""
 
 import dataclasses
 import logging
@@ -17,9 +29,7 @@ import xarray as xr
 
 from arcomake import icechunk_utils
 from arcomake.chunk_plan import COPIES, Budget, detect_budget, stored_warnings
-from arcomake.dask_utils import (
-  check_workers_reach,
-)
+from arcomake.dask_utils import check_workers_reach
 from arcomake.dataset_utils import (
   SaveConfig,
   prepare_for_writing,
