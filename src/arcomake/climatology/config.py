@@ -3,7 +3,6 @@
 """The recipe of `compute-climatology` (`ClimatologyConfig`) and the output's groups."""
 
 import datetime
-import logging
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -13,9 +12,6 @@ from arcomake.dataset_utils import (
   SaveConfig,
 )
 from arcomake.processing_utils import ProcessingStepConfig
-
-logger = logging.getLogger(__name__)
-
 
 # Weighting scheme applied to the steps of the (centered) window used to
 # compute the climatology. The weights depend only on the distance from the

@@ -4,13 +4,27 @@
 (streaming)."""
 
 import functools
-import logging
 import threading
+from collections.abc import Callable
 
 import numpy as np
 import numpy.typing as npt
 
-logger = logging.getLogger(__name__)
+
+def _made_once[K](make: Callable[[], K]) -> Callable[[], K]:
+  """`make` (a kernel factory: importing numba is slow, and numba compiles a kernel at its first
+  call) called once, whatever the threads asking at once: Dask's threads ask on their first
+  chunks, and `functools.cache` alone let each of them make and compile its own. The cache is
+  `__wrapped__`."""
+  cached = functools.cache(make)
+  lock = threading.Lock()
+
+  @functools.wraps(cached)
+  def once() -> K:
+    with lock:
+      return cached()
+
+  return once
 
 
 def window_bins_last(
@@ -22,7 +36,7 @@ def window_bins_last(
   dtype: npt.DTypeLike = np.float64,
 ) -> tuple[np.ndarray, np.ndarray]:
   """The window step on per-bin statistics with the bins on the last axis, by the numba kernel
-  (`_window_kernel`): climatology and variance in `dtype`, computed in float64."""
+  (`_window_kernel`): climatology and variance in `dtype`, computed in float64. Thread-safe."""
   shape = mean.shape
   bins = shape[-1]
   climatology = np.empty((mean.size // max(bins, 1), bins), dtype=dtype)
@@ -37,21 +51,9 @@ def window_bins_last(
   return climatology.reshape(shape), variance.reshape(shape)
 
 
-_WINDOW_KERNEL_LOCK = threading.Lock()
-
-
+@_made_once
 def _window_kernel():
-  """The numba window kernel (one for all threads: numba compiles it once, at its first call).
-
-  Dask's threads ask for it at once on their first chunks: `functools.cache` alone let each of
-  them make (and compile) its own."""
-  with _WINDOW_KERNEL_LOCK:
-    return _new_window_kernel()
-
-
-@functools.cache
-def _new_window_kernel():
-  """The numba window kernel, made on first use (importing numba is slow)."""
+  """The numba window kernel."""
   import numba
 
   @numba.njit(nogil=True)
@@ -92,16 +94,34 @@ def _new_window_kernel():
   return window_rows
 
 
-# Series computed at once take turns in the Welford kernel: it is parallel already, and numba's
-# workqueue threading layer (used where neither TBB nor OpenMP is installed) aborts when parallel
-# kernels are launched from several threads at once. Updating a block takes a small part of the
-# time reading it.
-WELFORD_LOCK = threading.Lock()
+def welford(
+  count: np.ndarray, mean: np.ndarray, m2: np.ndarray, values: np.ndarray, labels: np.ndarray
+) -> None:
+  """Add the steps `values` (time first) to the per-bin statistics (bins first, then the same
+  dimensions as `values`) of the bins `labels`, in place, by the numba kernel (`_welford_kernel`):
+  Welford's update in float64, NaN skipped.
+
+  Calls take turns (`_WELFORD_LOCK`), so that several series can be computed at once."""
+  bins = count.shape[0]
+  with _WELFORD_LOCK:
+    _welford_kernel()(
+      count.reshape(bins, -1),
+      mean.reshape(bins, -1),
+      m2.reshape(bins, -1),
+      values.reshape(len(values), -1),
+      labels,
+    )
 
 
-@functools.cache
-def welford_kernel():
-  """The numba Welford kernel, compiled on first use (importing numba is slow)."""
+# The kernel is parallel already, and numba's workqueue threading layer (used where neither TBB
+# nor OpenMP is installed) aborts when parallel kernels are launched from several threads at once.
+# Updating a block takes a small part of the time reading it.
+_WELFORD_LOCK = threading.Lock()
+
+
+@_made_once
+def _welford_kernel():
+  """The numba Welford kernel."""
   import numba
 
   @numba.njit(parallel=True, nogil=True)

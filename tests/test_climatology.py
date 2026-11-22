@@ -329,7 +329,7 @@ def test_threads_share_one_window_kernel(monkeypatch):
     return njit(*args, **kwargs)
 
   monkeypatch.setattr(numba, "njit", slow_njit)
-  climatology.kernels._new_window_kernel.cache_clear()
+  climatology.kernels._window_kernel.__wrapped__.cache_clear()
   start = threading.Barrier(8)
   kernels = []
 
@@ -343,7 +343,7 @@ def test_threads_share_one_window_kernel(monkeypatch):
   for thread in threads:
     thread.join()
   # Later tests make their own, with numba's njit.
-  climatology.kernels._new_window_kernel.cache_clear()
+  climatology.kernels._window_kernel.__wrapped__.cache_clear()
   assert len(made) == 1 and len({id(kernel) for kernel in kernels}) == 1
 
 

@@ -89,16 +89,14 @@ def _compute_series(
   bins: BinningType,
 ) -> tuple[xr.Dataset, xr.Dataset]:
   """Climatology and variance of one series, in memory: one read pass, then the window in NumPy."""
-  half = window // 2
-  offsets = list(range(-half, window - half))
-  weights = binning.window_weights(offsets, weighting, scale=weighting_scale)
+  offsets, weights = binning.window(window, weighting, weighting_scale)
   results: tuple[dict[str, xr.DataArray], dict[str, xr.DataArray]] = ({}, {})
   for name, var in piece.data_vars.items():
     order = [time_dim, *(d for d in var.dims if d != time_dim)]
     started = time.monotonic()
     count, mean, m2 = _stream_bin_statistics(var, period, bins, time_dim)
     read = time.monotonic()
-    dtype = var.dtype if np.issubdtype(var.dtype, np.floating) else np.float64
+    dtype = binning.output_dtype(var.dtype)
     statistics = _window_statistics_in_memory(count, mean, m2, offsets, weights, dtype=dtype)
     logger.info(
       f"{name}: read and binned in {read - started:.0f} s, window in {time.monotonic() - read:.0f} s"
@@ -117,7 +115,7 @@ def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Data
   data_vars = {}
   for name, var in dataset.data_vars.items():
     shape = tuple(period if d == time_dim else var.sizes[d] for d in var.dims)
-    dtype = var.dtype if np.issubdtype(var.dtype, np.floating) else np.float64
+    dtype = binning.output_dtype(var.dtype)
     data_vars[name] = (var.dims, dask.array.zeros(shape, dtype=dtype, chunks=-1))
   coords = {
     name: coord.load() for name, coord in dataset.coords.items() if time_dim not in coord.dims
@@ -261,7 +259,7 @@ def _series_bytes(var: xr.DataArray, index: Mapping[str, int], period: int, time
   read (the one added, the next one being read, and Dask's pieces of it)."""
   piece = var.isel({d: slice(i, i + 1) for d, i in index.items()})
   points = math.prod(n for d, n in piece.sizes.items() if d != time_dim)
-  out = var.dtype.itemsize if np.issubdtype(var.dtype, np.floating) else 8
+  out = binning.output_dtype(var.dtype).itemsize
   steps = min(_read_block(piece, time_dim), piece.sizes[time_dim])
   block = steps * points * var.dtype.itemsize
   return period * points * (20 + 4 * out) + 3 * block
@@ -278,7 +276,7 @@ def _series_at_once(
   (`_series_bytes`), at least one, at most the series and the budget's threads.
 
   Each series reads on its own, so more series keep more reads in flight; their Welford updates
-  take turns (`kernels.WELFORD_LOCK`)."""
+  take turns (`kernels.welford`)."""
   largest = max(
     (_series_bytes(dataset[name], index, period, time_dim) for name, index in series), default=1
   )
@@ -340,13 +338,6 @@ def _stream_bin_statistics(
       values = pending.result()
       if k + 1 < len(starts):
         pending = prefetch.submit(read, starts[k + 1])
-      with kernels.WELFORD_LOCK:
-        kernels.welford_kernel()(
-          count.reshape(period, -1),
-          mean.reshape(period, -1),
-          m2.reshape(period, -1),
-          values.reshape(len(values), -1),
-          labels[start : start + len(values)],
-        )
+      kernels.welford(count, mean, m2, values, labels[start : start + len(values)])
   mean[count == 0] = np.nan
   return count, mean, m2

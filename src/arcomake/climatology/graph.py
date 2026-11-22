@@ -1,48 +1,11 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
-#
-#  The following implementation is the result of a number of experiments, mostly to overcome performance issues.
-#  In most cases, (injudicious) re-chunking was the source of these issues.
-#  Indeed, in that case Dask ended up creating huge task graphs (22GB), and jobs died, even with small timeseries.
-#  In particular, the `groupby` in the computation of the climatology is sensitive to the chunking of the dataset.
-#  Early on optimizations reusing intermediate results[1] made things worse, making the task graph even bigger and more
-#  complex, and (un)surprisingly turned out to be detrimental.
-#
-#  I tried the following:
-#    1. Compute one stat (climatology, mean, std, diff) at a time; which is the current approach.
-#    2. Adjust chunking when reading from disk, and avoid ZipStore.
-#    3. Investigate the use of flox, and in general optimizations related to groupby operations.
-#
-# Regarding the latter, see, for example:
-#    1. https://discourse.pangeo.io/t/optimizing-climatology-calculation-with-xarray-and-dask/2453
-#    2. https://flox.readthedocs.io/en/latest/user-stories/climatology.html
-#    3. https://xarray.dev/blog/flox
-#
-#  With these and other optimizations, now we're able to get the job to the end without errors and compute all the
-#  stats, including the climatology. The climatology uses vectorized reductions over periods (a streaming Welford
-#  implementation was removed in 9dcb661); flox was 4x slower than folding the time axis (logbook, 22 Nov).
-#
-#  Even without rechunking, the communication is still a bottleneck. Hence, further optimization might be:
-#   1. Try to set up a Dask cluster using UCX (which appears to be experimental) to reduce communication time.
-#
-# [1]: mean could be computed, using a reasonable approximation, as the mean of the climatology, and the std could reuse
-# the value of the mean.
-#
-# Say you have a collection of values {x_i} and labels {l_i} so that each label corresponds to multiple values.
-# Then you can compute the mean of the whole collection x_mean, or the mean of the averages for each label x_clim_mean.
-# If the number of values for each label is the same, then the two quantities are strictly equal.
-# But it's not true in general.
-# Indeed, in the case of a daily climatology, the two would differ because of leap years, which would introduce a
-# relative error of the order of 1/365.
-# Finally, the dataset might not start on the 1st of January or end before the 31 of December,
-# which would further distort the results. However, the quantities computed here are aimed at standardizing the input
-# features in a deep-learning model, and therefore such approximations are reasonably acceptable.
 """The graph path (`--graph`, the default): the statistics of every variable in one Dask
 graph, computed into a temporary store, then copied into the output."""
 
 import functools
 import logging
-from collections.abc import Callable, Hashable, Sequence
+from collections.abc import Hashable
 from typing import Any
 
 import numpy as np
@@ -110,28 +73,7 @@ def compute(
   logger.info("Climatology and anomaly standard deviation committed.")
 
 
-def balanced_tree_reduce[T](
-  func: Callable[[T, T], T],
-  seq: Sequence[T],
-  start: int = 0,
-  end: int | None = None,
-) -> T:
-  """Divide-and-conquer reduction using index bounds to avoid intermediate slices."""
-  if end is None:
-    end = len(seq)
-  count = end - start
-  if count == 0:
-    raise ValueError("Cannot reduce empty range")
-  if count == 1:
-    return seq[start]
-
-  mid = start + count // 2
-  return func(
-    balanced_tree_reduce(func, seq, start, mid),
-    balanced_tree_reduce(func, seq, mid, end),
-  )
-
-
+# Per bin: the number of values, their mean and their sum of squared deviations.
 BinStatistics = tuple[xr.Dataset, xr.Dataset, xr.Dataset]
 
 
@@ -271,13 +213,11 @@ def _compute_climatology(
       the window holds fewer than two values.
   """
   count, mean, m2 = _bin_statistics(dataset, period, bins, time_dim)
-  half = window // 2
-  offsets = list(range(-half, window - half))
-  weights = binning.window_weights(offsets, weighting, scale=weighting_scale)
+  offsets, weights = binning.window(window, weighting, weighting_scale)
 
   results: tuple[dict[str, xr.DataArray], dict[str, xr.DataArray]] = ({}, {})
   for name, var in mean.data_vars.items():
-    dtype = dataset[name].dtype if np.issubdtype(dataset[name].dtype, np.floating) else np.float64
+    dtype = binning.output_dtype(dataset[name].dtype)
     # One implementation of the window for both paths, chunk by chunk (bins last, as apply_ufunc
     # puts the core dimension), in the output's type.
     statistics = xr.apply_ufunc(

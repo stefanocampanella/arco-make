@@ -3,15 +3,12 @@
 """Which bin each time step falls in, and the weights of the window over bins: the
 definitions both paths share."""
 
-import logging
 from typing import NamedTuple
 
 import numpy as np
 import xarray as xr
 
 from arcomake.climatology.config import BinningType, WeightingType
-
-logger = logging.getLogger(__name__)
 
 
 def window_weights(
@@ -60,6 +57,21 @@ def window_weights(
       raise ValueError(f"Geometric scale (decay ratio) must be in (0, 1], got {ratio}")
     return ratio ** np.abs(positions)
   raise ValueError(f"Unsupported weighting scheme: {weighting}")
+
+
+def window(
+  size: int, weighting: WeightingType, scale: float | None
+) -> tuple[list[int], np.ndarray]:
+  """The offsets of a centred window of `size` bins (`-(size // 2)` to `size - size // 2 - 1`)
+  and their weights (`window_weights`)."""
+  half = size // 2
+  offsets = list(range(-half, size - half))
+  return offsets, window_weights(offsets, weighting, scale=scale)
+
+
+def output_dtype(dtype: np.dtype) -> np.dtype:
+  """The statistics' data type: the input's if floating, else float64."""
+  return dtype if np.issubdtype(dtype, np.floating) else np.dtype(np.float64)
 
 
 # Days before each month in a 365-day year: the day-of-year bins of `bins = "day_of_year"`.
