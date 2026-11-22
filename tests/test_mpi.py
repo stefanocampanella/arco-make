@@ -44,8 +44,13 @@ def test_compute_climatology_on_mpi_writes_what_threads_write(
   args = [str(recipe), str(tmp_path / "in.zarr")]
   threads = CliRunner().invoke(cli, ["compute-climatology", *args, str(tmp_path / "threads.zarr")])
   assert threads.exit_code == 0, threads.output
-  # Open MPI refuses more ranks than cores unless told; MPICH ignores the variable.
-  env = os.environ | {"TMPDIR": str(isolated_tempdir), "OMPI_MCA_rmaps_base_oversubscribe": "1"}
+  # Open MPI refuses more ranks than cores unless told (CI runners have fewer cores than ranks):
+  # Open MPI 4 reads the first variable, Open MPI 5 (PRRTE) the second; MPICH ignores both.
+  env = os.environ | {
+    "TMPDIR": str(isolated_tempdir),
+    "OMPI_MCA_rmaps_base_oversubscribe": "1",
+    "PRTE_MCA_rmaps_default_mapping_policy": ":oversubscribe",
+  }
   mpi = subprocess.run(
     ["mpirun", "-n", "4", *ARCO_MAKE, "compute-climatology", "--dask-setup", "mpi", *args]
     + [str(tmp_path / "mpi.zarr")],
