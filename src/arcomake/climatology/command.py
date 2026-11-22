@@ -16,7 +16,7 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.climatology import graph, streamed
+from arcomake.climatology import binning, graph, streamed
 from arcomake.climatology.config import ClimatologyConfig
 from arcomake.dask_utils import (
   DaskSetupType,
@@ -144,6 +144,8 @@ def compute_climatology(
             raise ValueError(f"No data in the reference period {configs.reference_period}")
         if not dataset.data_vars:
           raise ValueError("Input dataset contains no data variables.")
+        # The bins checked before the output is opened (streaming finds them in every series).
+        binning.time_bins(dataset[configs.time_dim], configs.period, configs.bins)
         _compute_and_write(dataset, configs, output_path, label=label, streaming=streaming)
       logger.info("Input dataset closed; closing Dask client.")
     except click.ClickException:

@@ -100,10 +100,16 @@ def test_climatology_with_missing_last_steps():
   np.testing.assert_allclose(var.x.values, ref_var, rtol=1e-12)
 
 
-def test_position_bins_need_whole_periods():
-  """Position bins refuse a partial period: leap days or partial years would shift later bins."""
+@pytest.mark.parametrize("path", ["graph", "streaming"])
+def test_position_bins_need_whole_periods(path: str):
+  """Position bins refuse a partial period: leap days or partial years would shift later bins.
+  Streaming did not check, and binned the steps of the partial period."""
+  partial = series().isel(time=slice(0, -2))
   with pytest.raises(ValueError, match="whole number of periods"):
-    _compute_climatology(series().isel(time=slice(0, -2)), period=PERIOD)
+    if path == "graph":
+      _compute_climatology(partial, period=PERIOD)
+    else:
+      _compute_series(partial, PERIOD, 1, "constant", None, "time", "position")
 
 
 def daily(start: str, end: str, seed: int = 0) -> xr.Dataset:

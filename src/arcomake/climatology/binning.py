@@ -4,11 +4,12 @@
 definitions both paths share."""
 
 import logging
+from typing import NamedTuple
 
 import numpy as np
 import xarray as xr
 
-from arcomake.climatology.config import WeightingType
+from arcomake.climatology.config import BinningType, WeightingType
 
 logger = logging.getLogger(__name__)
 
@@ -88,16 +89,39 @@ def day_of_year_bins(time: xr.DataArray) -> tuple[np.ndarray, np.ndarray]:
   return bins, is_feb_29
 
 
-def day_of_year_positions(time: xr.DataArray, period: int) -> tuple[np.ndarray, ...]:
-  """Day-of-year bins, Feb 29 flags and positions on a (year, bin) grid of daily steps.
+class TimeBins(NamedTuple):
+  """Where the time steps go: their bin, which are Feb 29 (in Feb 28's bin, apart from the
+  regular days), and their position on a grid of whole periods (bin k of period p at
+  p * period + k)."""
+
+  labels: np.ndarray
+  is_feb_29: np.ndarray
+  position: np.ndarray
+
+
+def time_bins(time: xr.DataArray, period: int, bins: BinningType) -> TimeBins:
+  """The bins of the time steps `time`, for both paths.
 
   Raises:
-    ValueError: if two steps fall on the same day (sub-daily data).
+    ValueError: day-of-year bins with a period other than 365, or with two steps on the same day
+      (sub-daily data); position bins over a partial period, where leap days and partial years
+      would shift every later bin.
   """
-  labels, is_feb_29 = day_of_year_bins(time)
-  years = np.asarray(time.dt.year.values)
-  position = (years - years.min()) * period + labels
-  regular = ~is_feb_29
-  if np.unique(position[regular]).size != np.count_nonzero(regular):
-    raise ValueError("day_of_year bins need at most one time step per day")
-  return labels, is_feb_29, position
+  if bins == "day_of_year":
+    if period != 365:
+      raise ValueError(f"day_of_year bins need period = 365, got {period}")
+    labels, is_feb_29 = day_of_year_bins(time)
+    years = np.asarray(time.dt.year.values)
+    position = (years - years.min()) * period + labels
+    regular = ~is_feb_29
+    if np.unique(position[regular]).size != np.count_nonzero(regular):
+      raise ValueError("day_of_year bins need at most one time step per day")
+    return TimeBins(labels, is_feb_29, position)
+  size = time.size
+  if size % period != 0:
+    raise ValueError(
+      f"position bins need a whole number of periods ({size} steps, period {period}): leap"
+      ' days and partial years shift every later bin; use bins = "day_of_year" for daily data'
+    )
+  steps = np.arange(size)
+  return TimeBins(steps % period, np.zeros(size, dtype=bool), steps)

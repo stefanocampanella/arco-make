@@ -89,8 +89,6 @@ def _compute_series(
   bins: BinningType,
 ) -> tuple[xr.Dataset, xr.Dataset]:
   """Climatology and variance of one series, in memory: one read pass, then the window in NumPy."""
-  if bins == "day_of_year" and period != 365:
-    raise ValueError(f"day_of_year bins need period = 365, got {period}")
   half = window // 2
   offsets = list(range(-half, window - half))
   weights = binning.window_weights(offsets, weighting, scale=weighting_scale)
@@ -324,10 +322,7 @@ def _stream_bin_statistics(
   """
   da = da.transpose(time_dim, ...)
   size = da.sizes[time_dim]
-  if bins == "day_of_year":
-    labels, _, _ = binning.day_of_year_positions(da[time_dim], period)
-  else:
-    labels = np.arange(size) % period
+  labels = binning.time_bins(da[time_dim], period, bins).labels
   shape = (period, *da.shape[1:])
   count = np.zeros(shape, dtype=np.int32)
   mean = np.zeros(shape, dtype=np.float64)

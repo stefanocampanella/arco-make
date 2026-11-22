@@ -167,16 +167,7 @@ def _bin_statistics(
 
   The bins are along `time_dim`, numbered 0 to `period - 1`.
   """
-  size = dataset.sizes[time_dim]
-  if bins == "day_of_year":
-    _, is_feb_29, position = binning.day_of_year_positions(dataset[time_dim], period)
-  else:
-    if size % period != 0:
-      raise ValueError(
-        f"position bins need a whole number of periods ({size} steps, period {period}): leap"
-        ' days and partial years shift every later bin; use bins = "day_of_year" for daily data'
-      )
-    is_feb_29, position = np.zeros(size, dtype=bool), np.arange(size)
+  _, is_feb_29, position = binning.time_bins(dataset[time_dim], period, bins)
   bin_coords = {time_dim: np.arange(period)}
 
   # Fold the time axis into (_period, bin): step k of a folded period is bin k. Missing steps (an
@@ -279,8 +270,6 @@ def _compute_climatology(
       input's data types. ``variance`` is the unbiased (reliability weights) variance, NaN where
       the window holds fewer than two values.
   """
-  if bins == "day_of_year" and period != 365:
-    raise ValueError(f"day_of_year bins need period = 365, got {period}")
   count, mean, m2 = _bin_statistics(dataset, period, bins, time_dim)
   half = window // 2
   offsets = list(range(-half, window - half))

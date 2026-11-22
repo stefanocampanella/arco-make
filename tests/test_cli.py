@@ -663,3 +663,16 @@ def test_download_on_worker_processes_writes_what_threads_write(
     result = run("download", "--dask-setup", setup, str(recipes["download"]), str(output))
   assert result.exit_code == 0, result.output
   xr.testing.assert_identical(open_output(output).load(), open_output(downloaded).load())
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+def test_bins_are_checked_before_the_output_is_opened(tmp_path: pathlib.Path, streaming: bool):
+  """Streaming found sub-daily steps (or partial periods) in every series, after opening the
+  output's run and writing the temporary store."""
+  time = pd.date_range("2020-01-01", periods=48, freq="1h")
+  xr.Dataset({"x": ("time", np.zeros(48, "float32"))}, coords={"time": time}).to_zarr(
+    tmp_path / "in.zarr"
+  )
+  result, output = run_climatology(tmp_path, tmp_path / "in.zarr", "hourly", "[save]\n", streaming)
+  assert result.exit_code != 0 and "one time step per day" in result.output
+  assert not output.exists()
