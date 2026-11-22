@@ -4,7 +4,7 @@ From: ubuntu:26.04
 %labels
     Maintainer Stefano Campanella
     Version 0.1
-    Description Apptainer image for arco-make, with Open MPI 4.1 (UCX, Slurm, PMIx v3) for running dask-mpi under Slurm.
+    Description Apptainer image for arco-make, with ecCodes built from source. No MPI: --dask-setup mpi needs the `mpi` extra and the cluster's MPI.
 
 %files
     pyproject.toml /app/pyproject.toml
@@ -27,51 +27,7 @@ From: ubuntu:26.04
         libaec-dev \
         libnetcdf-dev \
         libpng-dev \
-        libopenjp2-7-dev \
-        libucx-dev \
-        libhwloc-dev \
-        libevent-dev
-
-    # Build PMIx 3.x from source so Open MPI can launch under Slurm via the
-    # pmix_v3 plugin (srun --mpi=pmix_v3). Open MPI links against this external
-    # PMIx below, which requires external libevent and hwloc to match.
-    PMIX_VERSION=3.2.5
-    cd /tmp
-    curl -LsSf -o pmix.tar.gz \
-        "https://github.com/openpmix/openpmix/releases/download/v${PMIX_VERSION}/pmix-${PMIX_VERSION}.tar.gz"
-    tar -xzf pmix.tar.gz
-    cd "pmix-${PMIX_VERSION}"
-    ./configure --prefix=/usr/local \
-                --with-libevent \
-                --with-hwloc
-    make -j"$(nproc)"
-    make install
-    echo "/usr/local/lib" > /etc/ld.so.conf.d/pmix.conf
-    ldconfig
-    cd /tmp && rm -rf pmix.tar.gz "pmix-${PMIX_VERSION}"
-
-    # Build Open MPI from source with UCX (high-performance transports, e.g.
-    # InfiniBand), Slurm (launching via srun) and the external PMIx v3 above
-    # (pmix_v3), pinning the version.
-    OPENMPI_VERSION=4.1.6
-    OPENMPI_SERIES=v4.1
-    cd /tmp
-    curl -LsSf -o openmpi.tar.gz \
-        "https://download.open-mpi.org/release/open-mpi/${OPENMPI_SERIES}/openmpi-${OPENMPI_VERSION}.tar.gz"
-    tar -xzf openmpi.tar.gz
-    cd "openmpi-${OPENMPI_VERSION}"
-    ./configure --prefix=/usr/local \
-                --with-ucx \
-                --with-slurm \
-                --with-pmix=/usr/local \
-                --with-libevent=external \
-                --with-hwloc=external
-    make -j"$(nproc)"
-    make install
-    # Register the install prefix so libmpi.so.* is found via the linker cache.
-    echo "/usr/local/lib" > /etc/ld.so.conf.d/openmpi.conf
-    ldconfig
-    cd /tmp && rm -rf openmpi.tar.gz "openmpi-${OPENMPI_VERSION}"
+        libopenjp2-7-dev
 
     # Build and install ecCodes from source
     ECCODES_VERSION=2.48.0
@@ -112,8 +68,8 @@ From: ubuntu:26.04
 %environment
     # Add uv environment to PATH
     export PATH="/app/.venv/bin:$PATH"
-    # Expose the in-image Open MPI 4.1.6 (see %post) so mpi4py finds libmpi.so.*
-    # at runtime and the container works standalone.
+    # Expose the in-image ecCodes (see %post), also to libraries that do not read
+    # the linker cache.
     export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH}"
     # Point uv at the interpreter installed under /opt during %post; /app/.venv
     # only holds symlinks to it (a $HOME location would be hidden by the home

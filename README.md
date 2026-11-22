@@ -27,7 +27,8 @@ Dask clusters over the ranks of an MPI job (`--dask-setup mpi`) need the `mpi` e
 (`pip install '.[mpi]'`: dask-mpi and mpi4py, whose wheels work with Open MPI and MPICH-compatible
 libraries; build mpi4py from source for another MPI).
 
-A container image with an MPI build is published on the GitHub Container Registry:
+A container image (with ecCodes built from source, without MPI) is published on the GitHub Container
+Registry:
 
 ```bash
 apptainer exec oras://ghcr.io/stefanocampanella/arco-make:latest arco-make download --help
