@@ -257,19 +257,19 @@ def test_the_command_line_chooses_the_path(monkeypatch, caplog, split_dims):
   from arcomake import climatology
 
   calls = []
-  monkeypatch.setattr(climatology, "_compute_graph", lambda *a, **k: calls.append("graph"))
-  monkeypatch.setattr(climatology, "_compute_streaming", lambda *a, **k: calls.append("series"))
+  monkeypatch.setattr(climatology.graph, "compute", lambda *a, **k: calls.append("graph"))
+  monkeypatch.setattr(climatology.streamed, "compute", lambda *a, **k: calls.append("series"))
   configs = climatology.ClimatologyConfig.model_validate(
     {"period": 365, "window": 1, "weighting": "constant", "split_dims": split_dims, "read": {}}
     | {"save": {}}
   )
-  climatology._compute_and_write(xr.Dataset(), configs, "out", label="x", streaming=True)
-  climatology._compute_and_write(xr.Dataset(), configs, "out", label="x", streaming=False)
+  climatology.command._compute_and_write(xr.Dataset(), configs, "out", label="x", streaming=True)
+  climatology.command._compute_and_write(xr.Dataset(), configs, "out", label="x", streaming=False)
   assert calls == ["series", "graph"]
   with caplog.at_level(logging.WARNING):
-    climatology._warn_ignored_split_dims(configs, streaming=True)
+    climatology.command._warn_ignored_split_dims(configs, streaming=True)
     assert "ignored" not in caplog.text
-    climatology._warn_ignored_split_dims(configs, streaming=False)
+    climatology.command._warn_ignored_split_dims(configs, streaming=False)
   assert f"split_dims {split_dims} ignored" in caplog.text
 
 
@@ -285,13 +285,13 @@ def test_statistics_do_not_replace_a_version_promoted_meanwhile(
   source = climatology_input(tmp_path)
   output = tmp_path / "statistics.zarr"
   write_output(xr.Dataset({"old": ("x", np.arange(3.0))}), output, message="first")
-  stage = climatology._stage
+  stage = climatology.staging.stage
 
   def meanwhile(*args, **kwargs):
     write_output(xr.Dataset({"other": ("x", np.arange(2.0))}), output, message="meanwhile")
     return stage(*args, **kwargs)
 
-  monkeypatch.setattr(climatology, "_stage", meanwhile)
+  monkeypatch.setattr(climatology.staging, "stage", meanwhile)
   recipe = tmp_path / "promoted.toml"
   recipe.write_text(
     'period = 365\nbins = "day_of_year"\nwindow = 3\nweighting = "constant"\n'
@@ -313,7 +313,7 @@ def test_streaming_needs_no_worker_to_see_its_store(tmp_path: pathlib.Path, monk
   def blind(path, what):
     raise RuntimeError(f"Dask workers tcp://b do not see {what}")
 
-  monkeypatch.setattr(climatology, "check_workers_reach", blind)
+  monkeypatch.setattr(climatology.staging, "check_workers_reach", blind)
   source = climatology_input(tmp_path)
   series, _ = run_climatology(tmp_path, source, "series", 'split_dims = ["depth"]\n[save]\n')
   assert series.exit_code == 0, series.output
@@ -412,7 +412,7 @@ def test_series_at_once_write_what_one_at_a_time_writes(
   ds.to_zarr(tmp_path / "in.zarr")
   outputs = []
   for at_once in (1, 4):
-    monkeypatch.setattr(climatology, "_series_at_once", lambda *args, n=at_once: n)
+    monkeypatch.setattr(climatology.streamed, "_series_at_once", lambda *args, n=at_once: n)
     result, output = run_climatology(
       tmp_path, tmp_path / "in.zarr", f"at_once_{at_once}", f"{split}\n[save]\n"
     )
@@ -432,7 +432,7 @@ def test_series_are_reported_as_they_are_written(tmp_path: pathlib.Path, monkeyp
 
   reported = threading.Event()
   seen = []
-  compute, info = climatology._compute_series, climatology.logger.info
+  compute, info = climatology.streamed._compute_series, climatology.streamed.logger.info
 
   def last_waits(piece, **kwargs):
     if piece.depth.item() == 2.5:
@@ -444,9 +444,9 @@ def test_series_are_reported_as_they_are_written(tmp_path: pathlib.Path, monkeyp
       reported.set()
     return info(message, *args, **kwargs)
 
-  monkeypatch.setattr(climatology, "_compute_series", last_waits)
-  monkeypatch.setattr(climatology.logger, "info", logged)
-  monkeypatch.setattr(climatology, "_series_at_once", lambda *args: 1)
+  monkeypatch.setattr(climatology.streamed, "_compute_series", last_waits)
+  monkeypatch.setattr(climatology.streamed.logger, "info", logged)
+  monkeypatch.setattr(climatology.streamed, "_series_at_once", lambda *args: 1)
   result, _ = run_climatology(
     tmp_path, climatology_input(tmp_path), "progress", 'split_dims = ["depth"]\n[save]\n'
   )
@@ -459,15 +459,15 @@ def test_a_failing_series_fails_the_run(tmp_path: pathlib.Path, monkeypatch):
   moved."""
   from arcomake import climatology
 
-  compute = climatology._compute_series
+  compute = climatology.streamed._compute_series
 
   def failing(piece, **kwargs):
     if piece.depth.item() == 1.5:
       raise RuntimeError("series failed")
     return compute(piece, **kwargs)
 
-  monkeypatch.setattr(climatology, "_compute_series", failing)
-  monkeypatch.setattr(climatology, "_series_at_once", lambda *args: 2)
+  monkeypatch.setattr(climatology.streamed, "_compute_series", failing)
+  monkeypatch.setattr(climatology.streamed, "_series_at_once", lambda *args: 2)
   result, output = run_climatology(
     tmp_path, climatology_input(tmp_path), "failing", 'split_dims = ["depth"]\n[save]\n'
   )
@@ -493,7 +493,7 @@ def test_an_error_outside_the_series_cancels_those_not_started(tmp_path: pathlib
   )
   ds.to_zarr(tmp_path / "in.zarr")
   computed = []
-  compute, info = climatology._compute_series, climatology.logger.info
+  compute, info = climatology.streamed._compute_series, climatology.streamed.logger.info
 
   def counted(piece, **kwargs):
     computed.append(piece)
@@ -504,9 +504,9 @@ def test_an_error_outside_the_series_cancels_those_not_started(tmp_path: pathlib
       raise KeyboardInterrupt
     return info(message, *args, **kwargs)
 
-  monkeypatch.setattr(climatology, "_compute_series", counted)
-  monkeypatch.setattr(climatology.logger, "info", interrupted)
-  monkeypatch.setattr(climatology, "_series_at_once", lambda *args: 1)
+  monkeypatch.setattr(climatology.streamed, "_compute_series", counted)
+  monkeypatch.setattr(climatology.streamed.logger, "info", interrupted)
+  monkeypatch.setattr(climatology.streamed, "_series_at_once", lambda *args: 1)
   result, _ = run_climatology(
     tmp_path, tmp_path / "in.zarr", "stop", 'split_dims = ["depth"]\n[save]\n'
   )
@@ -591,13 +591,13 @@ def test_climatology_writes_shards_its_chunks_straddle(
   from arcomake.temporary_utils import TempDirectoryRegistry
 
   windows = []
-  window = climatology._window_bins_last
+  window = climatology.kernels.window_bins_last
 
   def counted(*args, **kwargs):
     windows.append(1)
     return window(*args, **kwargs)
 
-  monkeypatch.setattr(climatology, "_window_bins_last", counted)
+  monkeypatch.setattr(climatology.kernels, "window_bins_last", counted)
   scratch = tmp_path / "scratch"
   scratch.mkdir()
   monkeypatch.setenv("TMPDIR", str(scratch))
@@ -633,7 +633,9 @@ def test_climatology_writes_shards_its_chunks_straddle(
   assert clim.t3.shape == (365, 3, 4, 4)
   assert len(windows) == 3  # one per level: once, not once per output
   ds = xr.Dataset({"t3": (("time", "depth", "lat", "lon"), values)}, coords=coords)
-  mean, var = climatology._compute_climatology(ds, 365, 5, "gaussian", 2.0, "time", "day_of_year")
+  mean, var = climatology.graph._compute_climatology(
+    ds, 365, 5, "gaussian", 2.0, "time", "day_of_year"
+  )
   # Streaming accumulates in float64, the graph in float32: equal to float32 precision.
   tolerance = {"rtol": 1e-5, "atol": 1e-6} if streaming else {"rtol": 1e-6}
   xr.testing.assert_allclose(clim.t3.load(), mean.t3, **tolerance)

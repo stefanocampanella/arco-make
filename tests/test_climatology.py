@@ -12,14 +12,11 @@ import pydantic
 import pytest
 import xarray as xr
 
-from arcomake.climatology import (
-  ClimatologyConfig,
-  _compute_climatology,
-  _compute_series,
-  _read_block,
-  _staging_chunks,
-  _window_weights,
-)
+from arcomake.climatology import ClimatologyConfig
+from arcomake.climatology.binning import window_weights
+from arcomake.climatology.graph import _compute_climatology
+from arcomake.climatology.staging import _staging_chunks
+from arcomake.climatology.streamed import _compute_series, _read_block
 
 PERIOD = 6
 N_PERIODS = 5
@@ -43,7 +40,7 @@ def reference(values: np.ndarray, window: int, weighting: str) -> tuple[np.ndarr
   folded = values.reshape(N_PERIODS, PERIOD, -1)
   half = window // 2
   offsets = list(range(-half, window - half))
-  weights = _window_weights(offsets, weighting)  # type: ignore[arg-type]
+  weights = window_weights(offsets, weighting)  # type: ignore[arg-type]
   mean = np.empty(folded.shape[1:])
   var = np.empty(folded.shape[1:])
   for b in range(PERIOD):
@@ -175,13 +172,13 @@ def test_read_blocks_follow_the_input_chunks():
 
 def test_window_weights():
   """Constant weights are ones; Gaussian and geometric weights decay symmetrically from the centre."""
-  np.testing.assert_array_equal(_window_weights([-1, 0, 1], "constant"), [1, 1, 1])
-  gaussian = _window_weights([-2, -1, 0, 1, 2], "gaussian")
+  np.testing.assert_array_equal(window_weights([-1, 0, 1], "constant"), [1, 1, 1])
+  gaussian = window_weights([-2, -1, 0, 1, 2], "gaussian")
   assert gaussian[2] == 1.0 and gaussian[1] == gaussian[3] > gaussian[0] == gaussian[4]
-  geometric = _window_weights([-2, -1, 0, 1, 2], "geometric")
+  geometric = window_weights([-2, -1, 0, 1, 2], "geometric")
   np.testing.assert_allclose(geometric[0], 0.1)
   with pytest.raises(ValueError):
-    _window_weights([-1, 0, 1], "geometric", scale=2.0)
+    window_weights([-1, 0, 1], "geometric", scale=2.0)
 
 
 @pytest.mark.parametrize(
@@ -211,7 +208,7 @@ def test_series_at_once_fit_in_memory():
   """As many series at a time as the largest fits in the budget's memory, at least one, at most
   the series and the threads; a series holds its accumulators, results and blocks read."""
   from arcomake.chunk_plan import USABLE, Budget
-  from arcomake.climatology import _read_block, _series, _series_at_once, _series_bytes
+  from arcomake.climatology.streamed import _read_block, _series, _series_at_once, _series_bytes
 
   time = pd.date_range("2001-01-01", periods=730, freq="1D")
   ds = xr.Dataset(
@@ -326,20 +323,21 @@ def test_threads_share_one_window_kernel(monkeypatch):
     return njit(*args, **kwargs)
 
   monkeypatch.setattr(numba, "njit", slow_njit)
-  climatology._new_window_kernel.cache_clear()
+  climatology.kernels._new_window_kernel.cache_clear()
   start = threading.Barrier(8)
   kernels = []
 
   def ask() -> None:
     start.wait()
-    kernels.append(climatology._window_kernel())
+    kernels.append(climatology.kernels._window_kernel())
 
   threads = [threading.Thread(target=ask) for _ in range(8)]
   for thread in threads:
     thread.start()
   for thread in threads:
     thread.join()
-  climatology._new_window_kernel.cache_clear()  # later tests make their own, with numba's njit
+  # Later tests make their own, with numba's njit.
+  climatology.kernels._new_window_kernel.cache_clear()
   assert len(made) == 1 and len({id(kernel) for kernel in kernels}) == 1
 
 
@@ -406,14 +404,14 @@ def test_temporary_store_warns_about_memory_and_disk(monkeypatch, caplog):
   from arcomake.dataset_utils import SaveConfig
   from arcomake.temporary_utils import TempDirectoryRegistry
 
-  monkeypatch.setattr(climatology, "detect_budget", lambda: Budget(64 * 1024, 1))
+  monkeypatch.setattr(climatology.staging, "detect_budget", lambda: Budget(64 * 1024, 1))
   usage = collections.namedtuple("usage", "total used free")
-  monkeypatch.setattr(climatology.shutil, "disk_usage", lambda path: usage(1, 1, 0))
+  monkeypatch.setattr(climatology.staging.shutil, "disk_usage", lambda path: usage(1, 1, 0))
   time = np.arange(8)
   ds = xr.Dataset({"t": (("time", "x"), np.zeros((8, 1000), "float32"))}, coords={"time": time})
   save = SaveConfig.model_validate({"chunks": {"time": 8, "x": -1}})
   with caplog.at_level(logging.WARNING), TempDirectoryRegistry():
-    climatology._stage({"g": ds.chunk()}, save, "time")
+    climatology.staging.stage({"g": ds.chunk()}, save, "time")
   assert "may not fit" in caplog.text and "chunks" in caplog.text
 
 
@@ -430,13 +428,14 @@ def test_copies_run_on_local_threads_at_most_their_cap(monkeypatch):
     seen["scheduler"] = dask.config.get("scheduler")
     seen["threads"] = dask.config.get("num_workers")
 
-  monkeypatch.setattr(climatology, "write_tree", write_tree)
+  monkeypatch.setattr(climatology.staging, "write_tree", write_tree)
   ds = xr.Dataset({"t": (("time", "x"), np.zeros((8, 10), "float32"))}, coords={"time": range(8)})
   with TempDirectoryRegistry(), dask.config.set(scheduler="processes"):
-    stage = climatology._stage({"g": ds.chunk()}, SaveConfig(), "time")
+    stage = climatology.staging.stage({"g": ds.chunk()}, SaveConfig(), "time")
     stage.write()
     stage.threads = 3
-    climatology._copy(stage, None, SaveConfig(), label="x", metadata={})  # type: ignore[arg-type]
+    copy = climatology.staging.copy
+    copy(stage, None, SaveConfig(), label="x", metadata={})  # type: ignore[arg-type]
   assert seen == {"scheduler": "threads", "threads": 3}
 
 
@@ -453,9 +452,9 @@ def test_copy_threads_count_the_chunks_a_task_reads(monkeypatch):
   whole = 8 * 1000 * 4  # the store's chunk: Dask's, the whole of x
   # Room for 2 tasks holding the store's chunks (5 holding the stored units of 300).
   budget = Budget(int(2.5 * COPIES * whole / 0.8), 32)
-  monkeypatch.setattr(climatology, "detect_budget", lambda: budget)
+  monkeypatch.setattr(climatology.staging, "detect_budget", lambda: budget)
   with TempDirectoryRegistry():
-    stage = climatology._stage({"g": ds.chunk()}, save, "time")
+    stage = climatology.staging.stage({"g": ds.chunk()}, save, "time")
   assert stage.threads == 2
 
 
@@ -467,8 +466,8 @@ def test_copy_threads_hold_their_units():
 
   shard = 8 * 49 * 721 * 1440 * 4  # 1.6 GB
   budget = Budget(110 * 2**30, 32)
-  threads = climatology._copy_threads([shard], budget)
+  threads = climatology.staging._copy_threads([shard], budget)
   assert threads is not None and 1 <= threads < 32
   assert threads * COPIES * shard <= budget.usable
-  assert climatology._copy_threads([2**20], budget) is None  # small units: all of Dask's
-  assert climatology._copy_threads([budget.usable], budget) == 1
+  assert climatology.staging._copy_threads([2**20], budget) is None  # small units: all of Dask's
+  assert climatology.staging._copy_threads([budget.usable], budget) == 1
