@@ -111,7 +111,7 @@ class ArcoMakeSettings(BaseSettings):
     default=None, validation_alias="ECCODES_DEFINITION_PATH"
   )
   eccodes_samples_path: str | None = Field(default=None, validation_alias="ECCODES_SAMPLES_PATH")
-  # Memory `download` plans its chunks for (`--memory-limit`, which reads it), e.g. "100GB".
+  # The memory budget of every command (`chunk_plan.detect_budget`), e.g. "100GB".
   arcomake_memory_limit: str | None = Field(default=None, validation_alias="ARCOMAKE_MEMORY_LIMIT")
 
   @field_validator("arcomake_memory_limit")

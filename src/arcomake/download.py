@@ -200,11 +200,10 @@ def ignore_nan_warnings() -> None:
   "--memory-limit",
   type=Memory(),
   default=None,
-  envvar="ARCOMAKE_MEMORY_LIMIT",
-  show_envvar=True,
   help=(
-    "Memory the chunks of each block are planned for, e.g. 100GB (default: what this process may"
-    " use: physical memory, or its cgroup's or Slurm job's limit), shared among Dask's threads"
+    "Memory the chunks of each block are planned for, e.g. 100GB (default: ARCOMAKE_MEMORY_LIMIT,"
+    " else what this process may use: physical memory, or its cgroup's or Slurm job's limit),"
+    " shared among Dask's threads"
   ),
 )
 @click.option(

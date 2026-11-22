@@ -83,7 +83,7 @@ def test_invalid_values_are_reported_without_the_value(rc):
 
 
 def test_memory_limit_is_an_amount_of_memory(rc, monkeypatch: pytest.MonkeyPatch):
-  """`ARCOMAKE_MEMORY_LIMIT` (read by `download --memory-limit`) from the file reaches the
+  """`ARCOMAKE_MEMORY_LIMIT` (read by `chunk_plan.detect_budget`) from the file reaches the
   environment, where the option reads it; other values are refused."""
   rc("ARCOMAKE_MEMORY_LIMIT=100GB\n")
   assert settings.load() == ["ARCOMAKE_MEMORY_LIMIT"]

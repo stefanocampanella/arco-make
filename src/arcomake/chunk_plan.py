@@ -11,6 +11,7 @@ of its arguments, except `detect_budget`.
 
 import dataclasses
 import math
+import os
 from collections.abc import Hashable, Iterable, Mapping
 
 import dask
@@ -110,11 +111,17 @@ def dask_threads() -> int:
 
 
 def detect_budget(memory_limit: int | None = None) -> Budget:
-  """The budget of this process: `memory_limit` if given, else the memory it may use (the least
-  of physical memory, its cgroup's limit, so a Slurm job's, and its RLIMIT_RSS), shared among
-  the threads of Dask's local scheduler."""
+  """The budget of this process: `memory_limit` if given, else `ARCOMAKE_MEMORY_LIMIT` if set
+  (the settings file exports it), else the memory it may use (the least of physical memory, its
+  cgroup's limit, so a Slurm job's, and its RLIMIT_RSS), shared among the threads of Dask's local
+  scheduler. Only `download` passed its `--memory-limit`: the climatology, sizing its series and
+  copy threads, ignored the variable."""
   if memory_limit is not None:
     return Budget(memory_limit, dask_threads(), "given")
+  from arcomake.settings import parse_memory
+
+  if variable := os.environ.get("ARCOMAKE_MEMORY_LIMIT", "").strip():
+    return Budget(parse_memory(variable), dask_threads(), "ARCOMAKE_MEMORY_LIMIT")
   from distributed.system import MEMORY_LIMIT
 
   return Budget(MEMORY_LIMIT, dask_threads(), "detected")
