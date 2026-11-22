@@ -214,7 +214,6 @@ dependencies = [
     { name = "click" },
     { name = "copernicusmarine" },
     { name = "dask" },
-    { name = "dask-mpi" },
     { name = "distributed" },
     { name = "eccodes" },
     { name = "etils" },
@@ -223,7 +222,6 @@ dependencies = [
     { name = "h5netcdf" },
     { name = "icechunk" },
     { name = "matplotlib" },
-    { name = "mpi4py" },
     { name = "nc-time-axis" },
     { name = "netcdf4" },
     { name = "numba" },
@@ -258,6 +256,10 @@ experimental = [
 live = [
     { name = "eccodeslib" },
 ]
+mpi = [
+    { name = "dask-mpi" },
+    { name = "mpi4py" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -269,7 +271,7 @@ requires-dist = [
     { name = "click" },
     { name = "copernicusmarine", git = "https://github.com/mercator-ocean/copernicus-marine-toolbox.git?rev=f66a8b8c700654fec981b986fc79f6450298e96a" },
     { name = "dask" },
-    { name = "dask-mpi" },
+    { name = "dask-mpi", marker = "extra == 'mpi'" },
     { name = "distributed" },
     { name = "eccodes" },
     { name = "eccodeslib", marker = "extra == 'live'", specifier = "==2.49.*" },
@@ -282,7 +284,7 @@ requires-dist = [
     { name = "icechunk", specifier = ">=2.3.1" },
     { name = "matplotlib" },
     { name = "memray", marker = "extra == 'dev'" },
-    { name = "mpi4py" },
+    { name = "mpi4py", marker = "extra == 'mpi'" },
     { name = "nc-time-axis" },
     { name = "netcdf4" },
     { name = "numba", specifier = ">=0.61" },
@@ -305,7 +307,7 @@ requires-dist = [
     { name = "xarray-regrid", extras = ["accel"] },
     { name = "zarr", specifier = ">=3.4" },
 ]
-provides-extras = ["dev", "live", "experimental"]
+provides-extras = ["dev", "live", "mpi", "experimental"]
 
 [[package]]
 name = "arcosparse"

@@ -13,7 +13,6 @@ dependencies = [
     # returning lazily indexed arrays (undocumented): tests/live checks it.
     "copernicusmarine @ git+https://github.com/mercator-ocean/copernicus-marine-toolbox.git@f66a8b8c700654fec981b986fc79f6450298e96a",
     "dask",
-    "dask_mpi",
     "distributed",
     "eccodes",
     "etils",
@@ -21,7 +20,6 @@ dependencies = [
     "google-cloud-storage",
     "h5netcdf",
     "matplotlib",
-    "mpi4py",
     "nc-time-axis",
     "netCDF4",
     "numpy",
@@ -59,6 +57,12 @@ dev = [
 # `eccodes` bindings in uv.lock.
 live = [
     "eccodeslib==2.49.*",
+]
+# `--dask-setup mpi`. mpi4py's wheels load the MPI library found at run time (Open MPI, or MPICH
+# and the MPIs compatible with it); for another MPI, build mpi4py from source (--no-binary mpi4py).
+mpi = [
+    "dask_mpi",
+    "mpi4py",
 ]
 experimental = [
     "flox>=0.11.2",

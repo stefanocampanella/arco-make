@@ -8,7 +8,7 @@ from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Self, get_args, override
+from typing import Any, Self, override
 
 import click
 import numpy as np
@@ -27,7 +27,7 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.dask_utils import DaskSetupType, get_client
+from arcomake.dask_utils import DaskSetupType, dask_setup_option, get_client
 from arcomake.dataset_utils import (
   DatasetConfig,
   SaveConfig,
@@ -198,15 +198,7 @@ class DownloadConfig(BaseModel):
   default="info",
   type=click.Choice(["debug", "info", "warning", "error", "critical"], case_sensitive=False),
 )
-@click.option(
-  "--dask-setup",
-  default="threads",
-  type=click.Choice(
-    get_args(DaskSetupType),
-    case_sensitive=False,
-  ),
-  help="Type of Dask scheduler to use, for remote downloads the choice is between 'synchronous' or 'threads'.",
-)
+@dask_setup_option
 @click.option(
   "--progress/--no-progress",
   "progress",

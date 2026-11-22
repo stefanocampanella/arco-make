@@ -18,9 +18,8 @@ jobs:
         with:
           # As in the Apptainer image.
           python-version: "3.13"
-      - name: Install system libraries
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenmpi-dev
-      - run: uv sync --frozen --extra dev
+      # The `mpi` extra for ty to check dask_utils (mpi4py's wheel needs no MPI to install).
+      - run: uv sync --frozen --extra dev --extra mpi
       - run: uv run --frozen ruff check
       - run: uv run --frozen ruff format --check
       - run: uv run --frozen ty check
@@ -51,7 +50,8 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
-      - name: Install system libraries
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenmpi-dev
-      - run: uv sync --frozen --extra dev
+      - name: Install Open MPI
+        # mpirun and the MPI library, for the `mpi` setup's test (tests/test_mpi.py).
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openmpi-bin
+      - run: uv sync --frozen --extra dev --extra mpi
       - run: uv run --frozen pytest --cov=arcomake --cov-report=term-missing --cov-fail-under=80

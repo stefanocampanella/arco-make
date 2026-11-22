@@ -47,8 +47,6 @@ jobs:
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
         with:
           python-version: "3.13"
-      - name: Install system libraries
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenmpi-dev
       # The `live` extra adds ECMWF's ecCodes build (eccodeslib, locked): the distribution's ecCodes
       # is too old for GloFAS GRIB.
       - run: uv sync --frozen --extra dev --extra live

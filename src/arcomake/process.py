@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-from typing import Any, get_args
+from typing import Any
 
 import click
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -14,7 +14,7 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.dask_utils import DaskSetupType, get_client
+from arcomake.dask_utils import DaskSetupType, dask_setup_option, get_client
 from arcomake.dataset_utils import ReadConfig, SaveConfig, inline_grids, open_input, write_output
 from arcomake.processing_utils import ProcessingStepConfig
 
@@ -64,15 +64,7 @@ class ProcessConfig(BaseModel):
   default=False,
   is_flag=True,
 )
-@click.option(
-  "--dask-setup",
-  default="mpi",
-  type=click.Choice(
-    get_args(DaskSetupType),
-    case_sensitive=False,
-  ),
-  help="Type of Dask scheduler to use.",
-)
+@dask_setup_option
 @click.option(
   "--frisky",
   "use_frisky",
@@ -91,7 +83,7 @@ def process(
   input_path: str,
   output_path: str,
   replace: bool = False,
-  dask_setup: DaskSetupType = "mpi",
+  dask_setup: DaskSetupType = "threads",
   use_frisky: bool = False,
   log_level: str = "info",
 ):

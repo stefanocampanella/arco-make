@@ -50,7 +50,7 @@ import threading
 import time
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Literal, get_args
+from typing import Any, Literal
 
 import click
 import dask
@@ -69,7 +69,7 @@ from arcomake.cli_utils import (
   read_configs,
   set_default_logger,
 )
-from arcomake.dask_utils import DaskSetupType, get_client
+from arcomake.dask_utils import DaskSetupType, dask_setup_option, get_client
 from arcomake.dataset_utils import (
   ReadConfig,
   SaveConfig,
@@ -204,15 +204,7 @@ class ClimatologyConfig(BaseModel):
     " graph (the default)"
   ),
 )
-@click.option(
-  "--dask-setup",
-  default="mpi",
-  type=click.Choice(
-    get_args(DaskSetupType),
-    case_sensitive=False,
-  ),
-  help="Type of Dask scheduler to use.",
-)
+@dask_setup_option
 @click.option(
   "--frisky",
   "use_frisky",
@@ -232,7 +224,7 @@ def compute_climatology(
   output_path: str,
   replace: bool = False,
   streaming: bool = False,
-  dask_setup: DaskSetupType = "mpi",
+  dask_setup: DaskSetupType = "threads",
   use_frisky: bool = False,
   log_level: str = "info",
 ):

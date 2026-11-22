@@ -21,8 +21,9 @@ import logging
 import sys
 from collections.abc import Generator
 from contextlib import ExitStack, contextmanager
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, get_args
 
+import click
 import dask
 import dask.config
 import distributed
@@ -33,6 +34,18 @@ DaskSetupType = Literal["synchronous", "threads", "processes", "mpi", "localclus
 LOCAL_SCHEDULERS = ("synchronous", "threads", "processes")
 # Seconds the command's rank waits for every worker rank of an MPI job to register.
 WORKERS_TIMEOUT = 300
+
+dask_setup_option = click.option(
+  "--dask-setup",
+  default="threads",
+  show_default=True,
+  type=click.Choice(get_args(DaskSetupType), case_sensitive=False),
+  help=(
+    "Dask scheduler: one of Dask's local schedulers, a local cluster of worker processes"
+    " (localcluster: memory limits, spilling; DASK_LOCALCLUSTER__* settings), or a cluster over the"
+    " ranks of an MPI job (mpi: at least 3 ranks, the `mpi` extra; DASK_MPI__* settings)"
+  ),
+)
 
 
 def config_options(section: str) -> dict[str, Any]:
@@ -85,8 +98,6 @@ def _mpi_client() -> distributed.Client:
   try:
     import dask_mpi
   except ImportError as error:
-    import click
-
     raise click.ClickException(
       "--dask-setup mpi needs the `mpi` extra (dask-mpi and mpi4py) and an MPI library:"
       " `uv sync --extra mpi`, or `pip install '.[mpi]'` in arco-make's source tree"

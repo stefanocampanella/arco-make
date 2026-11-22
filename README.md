@@ -16,11 +16,16 @@ Arco-make requires Python 3.13 or later. Install it with [uv](https://github.com
 pip install .
 ```
 
-For development, with the test and lint tools:
+For development, with the test and lint tools (the `mpi` extra, so that the type checker finds
+dask-mpi):
 
 ```bash
-uv sync --extra dev
+uv sync --extra dev --extra mpi
 ```
+
+Dask clusters over the ranks of an MPI job (`--dask-setup mpi`) need the `mpi` extra
+(`pip install '.[mpi]'`: dask-mpi and mpi4py, whose wheels work with Open MPI and MPICH-compatible
+libraries; build mpi4py from source for another MPI).
 
 A container image with an MPI build is published on the GitHub Container Registry:
 
