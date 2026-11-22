@@ -386,6 +386,39 @@ def test_statistics_keep_every_coordinate(tmp_path: pathlib.Path, streaming: boo
     np.testing.assert_array_equal(group.lat_bnds, bounds)
 
 
+def test_streamed_series_see_the_coordinates_the_graph_sees(tmp_path: pathlib.Path):
+  """Postprocess steps on a series see every coordinate, as on the graph path: `coverage_attrs`
+  with `vertical_dim = "depth"` failed on a 2D variable's series (the ARCO-OCEAN recipe). Both
+  paths write the same statistics (to rounding: they sum in different orders), and the same
+  attributes."""
+  time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
+  rng = np.random.default_rng(5)
+  coords = {"time": time, "depth": [0.5, 1.5, 2.5], "lat": [0.0, 1.0], "lon": [0.0, 1.0, 2.0]}
+  ds = xr.Dataset(
+    {
+      "t3": (("time", "depth", "lat", "lon"), rng.standard_normal((time.size, 3, 2, 3))),
+      "t2": (("time", "lat", "lon"), rng.standard_normal((time.size, 2, 3))),
+    },
+    coords=coords,
+  ).astype("float32")
+  ds.to_zarr(tmp_path / "in.zarr")
+  steps = "".join(
+    f'[[postprocess_{group}]]\nname = "coverage_attrs"\nvertical_dim = "depth"\ntime_dim = false\n'
+    for group in ("climatology", "anomaly_std")
+  )
+  outputs = []
+  for streaming in (True, False):
+    label = "series" if streaming else "graph"
+    extra = f'split_dims = ["depth"]\n{steps}[save]\n'
+    result, output = run_climatology(tmp_path, tmp_path / "in.zarr", label, extra, streaming)
+    assert result.exit_code == 0, result.output
+    outputs.append(tuple(group.load() for group in statistics(output)))
+  for series, graph in zip(*outputs, strict=True):
+    xr.testing.assert_allclose(series, graph, rtol=1e-6, atol=1e-6)  # float32
+    assert series.attrs == graph.attrs and series.attrs["geospatial_vertical_max"] == 2.5
+    assert all(series[name].attrs == graph[name].attrs for name in series.variables)
+
+
 @pytest.mark.parametrize("split", ['split_dims = ["depth"]', ""], ids=["depth", "variables"])
 def test_series_at_once_write_what_one_at_a_time_writes(
   tmp_path: pathlib.Path, monkeypatch, split: str

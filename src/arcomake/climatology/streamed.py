@@ -69,7 +69,9 @@ def _stream(
   The groups' metadata and coordinates are written first, from a template with the postprocess
   steps applied; then every series is computed in memory (`_compute_series`), postprocessed and
   written into its region, as many at a time as fit in memory (`_series_at_once`). Postprocess
-  steps therefore have to work on one series (attributes, renames, chunking).
+  steps therefore have to work on one series (attributes, renames, chunking); a series gets every
+  coordinate of the template at its index, so steps reading coordinates see what they see on the
+  graph path.
   """
   steps_of = dict(
     zip(GROUPS, (configs.postprocess_climatology, configs.postprocess_anomaly_std), strict=True)
@@ -107,6 +109,8 @@ def _stream(
     group: {name: var.encoding["chunks"] for name, var in staged.data_vars.items()}
     for group, staged in stage.staged.items()
   }
+  # The template's coordinates (time aside: a series' bins are its own), for the steps.
+  coordinates = template.coords.to_dataset().drop_vars(configs.time_dim)
 
   def write(results: tuple[xr.Dataset, xr.Dataset], index: dict[str, int], label: str) -> None:
     writing = time.monotonic()
@@ -114,9 +118,15 @@ def _stream(
     region = {configs.time_dim: slice(0, configs.period)} | {
       d: slice(i, i + 1) for d, i in index.items()
     }
+    # Every coordinate of the template at the series' index, as the steps see on the graph path:
+    # a series carries only its variable's own (`coverage_attrs` found no `depth` on a 2D
+    # variable's series). Dropped again before writing.
+    at = {d: slice(i, i + 1) for d, i in index.items() if d in coordinates.dims}
+    around = coordinates.isel(at).coords
     for (group, steps), result in zip(steps_of.items(), results, strict=True):
       if steps:
-        result = result.arcomake.process(steps=steps)
+        missing = {name: coord for name, coord in around.items() if name not in result.coords}
+        result = result.assign_coords(missing).arcomake.process(steps=steps)
       chunks = stored_chunks[group]
       result = (
         result.drop_attrs()
