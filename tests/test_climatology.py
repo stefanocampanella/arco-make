@@ -146,25 +146,6 @@ def test_climatology_keeps_the_input_dtype():
   assert mean.x.dtype == var.x.dtype == np.float32
 
 
-def test_flox_gives_the_same_statistics():
-  """The flox implementation agrees with the folded one, Feb 29 included."""
-  pytest.importorskip("flox")
-  ds = daily("2019-03-01", "2021-07-01").chunk(time=100)
-  with pytest.raises(ValueError, match="one time step per day"):  # checked before either path
-    hourly = xr.Dataset(
-      {"x": ("time", np.zeros(48))},
-      coords={"time": pd.date_range("2020-01-01", periods=48, freq="1h")},
-    )
-    _compute_climatology(hourly, period=365, bins="day_of_year", use_flox=True)
-  values = ds.x.values.copy()
-  values[10:40] = np.nan
-  ds = ds.assign(x=("time", values))
-  mean, var = _compute_climatology(ds, period=365, window=7, bins="day_of_year")
-  mean_f, var_f = _compute_climatology(ds, period=365, window=7, bins="day_of_year", use_flox=True)
-  np.testing.assert_allclose(mean_f.x.values, mean.x.values, rtol=1e-10)
-  np.testing.assert_allclose(var_f.x.values, var.x.values, rtol=1e-10)
-
-
 def test_in_memory_series_equal_the_lazy_statistics():
   """One series at a time (S1): one read pass, then the window in NumPy, by latitude bands."""
   rng = np.random.default_rng(1)
@@ -298,7 +279,7 @@ def test_the_window_does_not_tile_the_grid():
       "lon": np.arange(360.0),
     },
   ).chunk({"time": 8, "depth": 1, "lat": -1, "lon": -1})
-  mean, _ = _compute_climatology(ds, 365, 29, "gaussian", 7.0, "time", False, "day_of_year")
+  mean, _ = _compute_climatology(ds, 365, 29, "gaussian", 7.0, "time", "day_of_year")
   assert mean.t.chunks == ((365,), (1, 1, 1), (181,), (360,))
   assert len(mean.t.__dask_graph__()) < 3000
 
@@ -319,7 +300,7 @@ def test_the_statistics_of_a_level_read_only_that_level():
   values = values.map_blocks(tagged, meta=np.array((), dtype="float32"))
   time = pd.date_range("2019-01-01", periods=400, freq="1D")
   ds = xr.Dataset({"t": (("time", "depth", "x"), values)}, coords={"time": time})
-  mean, var = _compute_climatology(ds, 365, 7, "gaussian", 2.0, "time", False, "day_of_year")
+  mean, var = _compute_climatology(ds, 365, 7, "gaussian", 2.0, "time", "day_of_year")
   for statistic in (mean, var):
     read.clear()
     statistic.t.isel(depth=0).compute()
@@ -374,8 +355,8 @@ def test_variables_chunked_differently_share_the_window_tiles():
   source = xr.Dataset({"t": (dims, t), "z": (dims, z)}, coords={"time": time})
   ds = source.assign(t=source.t.chunk(time=50, lat=7), z=source.z.chunk(time=50, lat=11))
   with dask.config.set({"array.chunk-size": "64KiB"}):
-    statistics = _compute_climatology(ds, 365, 5, "gaussian", 2.0, "time", False, "day_of_year")
-  expected = _compute_climatology(source, 365, 5, "gaussian", 2.0, "time", False, "day_of_year")
+    statistics = _compute_climatology(ds, 365, 5, "gaussian", 2.0, "time", "day_of_year")
+  expected = _compute_climatology(source, 365, 5, "gaussian", 2.0, "time", "day_of_year")
   for out, reference in zip(statistics, expected, strict=True):
     tilings = {out[name].chunksizes["lat"] for name in out.data_vars}
     assert len(tilings) == 1

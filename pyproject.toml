@@ -65,7 +65,6 @@ mpi = [
     "mpi4py",
 ]
 experimental = [
-    "flox>=0.11.2",
     "frisky",
 ]
 

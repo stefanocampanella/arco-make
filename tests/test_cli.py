@@ -633,9 +633,7 @@ def test_climatology_writes_shards_its_chunks_straddle(
   assert clim.t3.shape == (365, 3, 4, 4)
   assert len(windows) == 3  # one per level: once, not once per output
   ds = xr.Dataset({"t3": (("time", "depth", "lat", "lon"), values)}, coords=coords)
-  mean, var = climatology._compute_climatology(
-    ds, 365, 5, "gaussian", 2.0, "time", False, "day_of_year"
-  )
+  mean, var = climatology._compute_climatology(ds, 365, 5, "gaussian", 2.0, "time", "day_of_year")
   # Streaming accumulates in float64, the graph in float32: equal to float32 precision.
   tolerance = {"rtol": 1e-5, "atol": 1e-6} if streaming else {"rtol": 1e-6}
   xr.testing.assert_allclose(clim.t3.load(), mean.t3, **tolerance)

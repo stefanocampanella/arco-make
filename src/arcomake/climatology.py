@@ -20,7 +20,7 @@
 #
 #  With these and other optimizations, now we're able to get the job to the end without errors and compute all the
 #  stats, including the climatology. The climatology uses vectorized reductions over periods (a streaming Welford
-#  implementation was removed in 9dcb661); flox can be used for the grouped reductions (`use_flox`).
+#  implementation was removed in 9dcb661); flox was 4x slower than folding the time axis (logbook, 22 Nov).
 #
 #  Even without rechunking, the communication is still a bottleneck. Hence, further optimization might be:
 #   1. Try to set up a Dask cluster using UCX (which appears to be experimental) to reduce communication time.
@@ -135,9 +135,6 @@ class ClimatologyConfig(BaseModel):
   weighting: WeightingType
   weighting_scale: float | None = Field(
     default=None, ge=0.0, description="Scale of the weighting function in bins"
-  )
-  use_flox: bool = Field(
-    default=False, description="Whether to use flox for grouped periodic reductions"
   )
   split_dims: list[str] | None = Field(
     default=None,
@@ -344,7 +341,6 @@ def _compute_graph(
     window=configs.window,
     weighting=configs.weighting,
     weighting_scale=configs.weighting_scale,
-    use_flox=configs.use_flox,
     bins=configs.bins,
   )
   # Every coordinate without time, as streaming's template has them: the reductions drop those
@@ -509,7 +505,7 @@ def _combine(a: BinStatistics, b: BinStatistics) -> BinStatistics:
 
 
 def _bin_statistics(
-  dataset: xr.Dataset, period: int, bins: BinningType, time_dim: str, use_flox: bool
+  dataset: xr.Dataset, period: int, bins: BinningType, time_dim: str
 ) -> BinStatistics:
   """Per bin: the number of values, their mean and their sum of squared deviations (NaN skipped).
 
@@ -517,46 +513,15 @@ def _bin_statistics(
   """
   size = dataset.sizes[time_dim]
   if bins == "day_of_year":
-    labels, is_feb_29, position = _day_of_year_positions(dataset[time_dim], period)
+    _, is_feb_29, position = _day_of_year_positions(dataset[time_dim], period)
   else:
     if size % period != 0:
       raise ValueError(
         f"position bins need a whole number of periods ({size} steps, period {period}): leap"
         ' days and partial years shift every later bin; use bins = "day_of_year" for daily data'
       )
-    labels, is_feb_29 = np.arange(size) % period, np.zeros(size, dtype=bool)
-    position = np.arange(size)
+    is_feb_29, position = np.zeros(size, dtype=bool), np.arange(size)
   bin_coords = {time_dim: np.arange(period)}
-
-  flox_xarray = None
-  if use_flox:
-    try:
-      import flox.xarray as flox_xarray
-    except ImportError:
-      logger.warning("flox is not installed; falling back to native xarray implementation.")
-  if flox_xarray is not None:
-    group = xr.DataArray(labels, dims=[time_dim], coords={time_dim: dataset[time_dim]}, name="_bin")
-    expected = np.arange(period)
-    # "blockwise" needs no communication when time chunks hold whole periods of position bins;
-    # "cohorts" bounds memory otherwise.
-    time_chunks = dataset.chunksizes.get(time_dim, (size,))
-    aligned = bins == "position" and all(c % period == 0 for c in time_chunks)
-    method = "blockwise" if aligned else "cohorts"
-    count = flox_xarray.xarray_reduce(
-      dataset, group, func="count", expected_groups=expected, method=method
-    )
-    mean = flox_xarray.xarray_reduce(
-      dataset, group, func="nanmean", expected_groups=expected, method=method
-    )
-    var = flox_xarray.xarray_reduce(
-      dataset, group, func="nanvar", ddof=0, expected_groups=expected, method=method
-    )
-    assert isinstance(count, xr.Dataset) and isinstance(mean, xr.Dataset)
-    assert isinstance(var, xr.Dataset)
-    as_bins = [s.rename({"_bin": time_dim}).assign_coords(bin_coords) for s in (count, mean, var)]
-    m2 = as_bins[2] * as_bins[0]
-    assert isinstance(m2, xr.Dataset)
-    return as_bins[0], as_bins[1], m2
 
   # Fold the time axis into (_period, bin): step k of a folded period is bin k. Missing steps (an
   # incomplete first or last year, gaps) become NaN, which the statistics skip.
@@ -781,7 +746,6 @@ def _compute_climatology(
   weighting: WeightingType = "constant",
   weighting_scale: float | None = None,
   time_dim: str = "time",
-  use_flox: bool = False,
   bins: BinningType = "position",
 ) -> tuple[xr.Dataset, xr.Dataset]:
   """
@@ -805,8 +769,6 @@ def _compute_climatology(
       Scale of the weighting kernel, in bins (see ``_window_weights``).
   time_dim : str, default "time"
       Name of the time dimension.
-  use_flox : bool, default False
-      Use ``flox`` for the grouped reductions (falls back to xarray without it).
   bins : {"position", "day_of_year"}, default "position"
       ``"position"``: step k of each run of `period` steps is in bin k. ``"day_of_year"``: daily
       data; the bin is the day of a 365-day year, and Feb 29 is in Feb 28's bin.
@@ -820,7 +782,7 @@ def _compute_climatology(
   """
   if bins == "day_of_year" and period != 365:
     raise ValueError(f"day_of_year bins need period = 365, got {period}")
-  count, mean, m2 = _bin_statistics(dataset, period, bins, time_dim, use_flox)
+  count, mean, m2 = _bin_statistics(dataset, period, bins, time_dim)
   half = window // 2
   offsets = list(range(-half, window - half))
   weights = _window_weights(offsets, weighting, scale=weighting_scale)

@@ -10,7 +10,7 @@ import pydantic
 import pytest
 import xarray as xr
 
-from arcomake import cli_utils, climatology, icechunk_utils
+from arcomake import cli_utils, icechunk_utils
 from arcomake.checks import ChecksConfig
 from arcomake.cli_utils import check_destination, read_configs
 from arcomake.dataset_utils import (
@@ -22,7 +22,7 @@ from arcomake.dataset_utils import (
 )
 from arcomake.download import DownloadConfig
 from arcomake.process import ProcessConfig
-from tests.conftest import make_ocean_dataset, render_recipe
+from tests.conftest import render_recipe
 
 
 def test_read_configs_injects_cli_dates(tmp_path: pathlib.Path, sources: pathlib.Path):
@@ -193,31 +193,6 @@ def test_drop_variables_survive_repeated_dumps():
   assert [config.model_dump()["drop_variables"] for _ in range(2)] == [["a", "b"]] * 2
   read = ReadConfig(drop_variables=["a"])
   assert [read.model_dump()["drop_variables"] for _ in range(2)] == [["a"]] * 2
-
-
-def test_climatology_honours_use_flox(tmp_path: pathlib.Path, sources: pathlib.Path, monkeypatch):
-  """`use_flox = true` in the recipe selects the flox implementation."""
-  seen = {}
-
-  def fake_compute(dataset, **kwargs):
-    seen.update(kwargs)
-    raise RuntimeError("stop after recording the arguments")
-
-  monkeypatch.setattr(climatology, "_compute_climatology", fake_compute)
-  recipe = render_recipe("sample_climatology.toml", tmp_path, SOURCES=str(sources))
-  recipe.write_text(
-    recipe.read_text().replace('weighting = "constant"', 'weighting = "constant"\nuse_flox = true')
-  )
-  dataset = tmp_path / "in.zarr"
-  write_output(make_ocean_dataset().isel(time=slice(0, 4)), dataset, message="input")
-  with pytest.raises(click.ClickException):
-    climatology.compute_climatology.callback(  # type: ignore[misc]
-      str(recipe),
-      str(dataset),
-      str(tmp_path / "statistics.zarr"),
-      dask_setup="threads",
-    )
-  assert seen.get("use_flox") is True
 
 
 def test_check_destination(tmp_path: pathlib.Path):
