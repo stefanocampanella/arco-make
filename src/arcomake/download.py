@@ -749,7 +749,9 @@ def _extension_start(output_path: str, tip: icechunk_utils.Tip) -> datetime:
   block = tip.metadata.get(icechunk_utils.BLOCK_KEY)
   if not isinstance(block, str) or "/" not in block:
     raise click.ClickException(
-      f"{output_path} records no download block in its last commit: rewrite it with --replace"
+      f"{output_path} records no download block in its last commit: if its first download"
+      " failed, resume it (--resume, with its dates); if it is another kind of output, rewrite it"
+      " with --replace"
     )
   return datetime.strptime(block.split("/")[1], "%Y-%m-%dT%H:%M")
 

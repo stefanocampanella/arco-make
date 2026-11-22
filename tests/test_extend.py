@@ -205,3 +205,13 @@ def test_a_recipe_end_in_utc_extends(recipe, tmp_path):
   recipe.write_text("end = 2020-03-02T00:00:00+02:00\n" + text)
   refused = run(recipe, tmp_path / "other", f"--start={START}")
   assert refused.exit_code != 0 and "without a time zone, or in UTC" in refused.output
+
+
+def test_extending_a_repository_without_a_download_points_to_resume(recipe, tmp_path):
+  """A first download that failed leaves `main` at the repository's initial snapshot: --replace
+  alone, as the message said, would throw its committed blocks away."""
+  output = tmp_path / "out"
+  icechunk.Repository.create(icechunk_utils.storage(output))
+  refused = run(recipe, output, "--extend", f"--end={END}")
+  assert refused.exit_code != 0 and "records no download block" in refused.output
+  assert "--resume" in refused.output
