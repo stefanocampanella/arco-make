@@ -69,9 +69,12 @@ def _stream(
   The groups' metadata and coordinates are written first, from a template with the postprocess
   steps applied; then every series is computed in memory (`_compute_series`), postprocessed and
   written into its region, as many at a time as fit in memory (`_series_at_once`). Postprocess
-  steps therefore have to work on one series (attributes, renames, chunking); a series gets every
-  coordinate of the template at its index, so steps reading coordinates see what they see on the
-  graph path.
+  steps therefore have to work on one series (attributes, renames, chunking), and keep each
+  variable's dimensions. A series gets every coordinate of the template, sliced at its index of
+  the split dimensions: steps reading coordinates find them, but along a split dimension they see
+  the series' index only (one level, where the graph path has all), so steps whose values depend
+  on the whole axis belong to the graph path. Attributes they set are dropped: the stored ones are
+  the template's.
   """
   steps_of = dict(
     zip(GROUPS, (configs.postprocess_climatology, configs.postprocess_anomaly_std), strict=True)
@@ -109,24 +112,31 @@ def _stream(
     group: {name: var.encoding["chunks"] for name, var in staged.data_vars.items()}
     for group, staged in stage.staged.items()
   }
+  stored_dims = {
+    group: {name: var.dims for name, var in staged.data_vars.items()}
+    for group, staged in stage.staged.items()
+  }
   # The template's coordinates (time aside: a series' bins are its own), for the steps.
   coordinates = template.coords.to_dataset().drop_vars(configs.time_dim)
 
-  def write(results: tuple[xr.Dataset, xr.Dataset], index: dict[str, int], label: str) -> None:
+  def write(results: tuple[xr.Dataset, xr.Dataset], at: dict[str, slice], label: str) -> None:
     writing = time.monotonic()
     # Explicit regions: "auto" maps a dimension without coordinate to index 0.
-    region = {configs.time_dim: slice(0, configs.period)} | {
-      d: slice(i, i + 1) for d, i in index.items()
-    }
-    # Every coordinate of the template at the series' index, as the steps see on the graph path:
-    # a series carries only its variable's own (`coverage_attrs` found no `depth` on a 2D
-    # variable's series). Dropped again before writing.
-    at = {d: slice(i, i + 1) for d, i in index.items() if d in coordinates.dims}
-    around = coordinates.isel(at).coords
+    region = {configs.time_dim: slice(0, configs.period)} | at
+    # The template's coordinates at the series' index: a series carries only its variable's own
+    # (`coverage_attrs` found no `depth` on a 2D variable's series). Dropped again before writing.
+    around = coordinates.isel({d: s for d, s in at.items() if d in coordinates.dims})
     for (group, steps), result in zip(steps_of.items(), results, strict=True):
       if steps:
-        missing = {name: coord for name, coord in around.items() if name not in result.coords}
-        result = result.assign_coords(missing).arcomake.process(steps=steps)
+        result = result.assign_coords(
+          around.drop_vars(list(result.coords), errors="ignore").coords
+        ).arcomake.process(steps=steps)
+        changed = [n for n, v in result.data_vars.items() if v.dims != stored_dims[group][n]]
+        if changed:
+          raise ValueError(
+            f"postprocess_{group} changed the dimensions of {changed} on a series: with"
+            " --streaming, steps have to keep each variable's dimensions"
+          )
       chunks = stored_chunks[group]
       result = (
         result.drop_attrs()
@@ -146,7 +156,8 @@ def _stream(
     logger.info(f"{label} written in {time.monotonic() - writing:.0f} s")
 
   def compute_and_write(name: str, index: dict[str, int]) -> None:
-    piece = dataset[[name]].isel({d: slice(i, i + 1) for d, i in index.items()})
+    at = {d: slice(i, i + 1) for d, i in index.items()}
+    piece = dataset[[name]].isel(at)
     climatology, variance = _compute_series(
       piece,
       period=configs.period,
@@ -158,7 +169,7 @@ def _stream(
     )
     anomaly_std = np.sqrt(variance.clip(min=0.0))
     assert isinstance(anomaly_std, xr.Dataset)
-    write((climatology, anomaly_std), index, f"{name} {index}")
+    write((climatology, anomaly_std), at, f"{name} {index}")
 
   series = _series(dataset, split_dims)
   at_once = _series_at_once(dataset, series, configs.period, configs.time_dim, detect_budget())

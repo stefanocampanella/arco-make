@@ -387,10 +387,10 @@ def test_statistics_keep_every_coordinate(tmp_path: pathlib.Path, streaming: boo
 
 
 def test_streamed_series_see_the_coordinates_the_graph_sees(tmp_path: pathlib.Path):
-  """Postprocess steps on a series see every coordinate, as on the graph path: `coverage_attrs`
-  with `vertical_dim = "depth"` failed on a 2D variable's series (the ARCO-OCEAN recipe). Both
-  paths write the same statistics (to rounding: they sum in different orders), and the same
-  attributes."""
+  """Postprocess steps on a series find every coordinate: `coverage_attrs` with
+  `vertical_dim = "depth"` failed on a 2D variable's series (the ARCO-OCEAN recipe). Both paths
+  write the same statistics (to rounding: they sum in different orders); the stored attributes
+  are the template's on both."""
   time = pd.date_range("2019-01-01", "2021-01-01", freq="1D", inclusive="left")
   rng = np.random.default_rng(5)
   coords = {"time": time, "depth": [0.5, 1.5, 2.5], "lat": [0.0, 1.0], "lon": [0.0, 1.0, 2.0]}
@@ -417,6 +417,17 @@ def test_streamed_series_see_the_coordinates_the_graph_sees(tmp_path: pathlib.Pa
     xr.testing.assert_allclose(series, graph, rtol=1e-6, atol=1e-6)  # float32
     assert series.attrs == graph.attrs and series.attrs["geospatial_vertical_max"] == 2.5
     assert all(series[name].attrs == graph[name].attrs for name in series.variables)
+
+
+def test_streamed_steps_changing_a_series_dimensions_are_refused(tmp_path: pathlib.Path):
+  """A step changing a variable's dimensions on a series (here `squeeze`, which drops a series'
+  single level but leaves the template alone) fails, naming the variables: its region and chunks
+  no longer match the store's."""
+  source = climatology_input(tmp_path)
+  extra = 'split_dims = ["depth"]\n[[postprocess_climatology]]\nname = "squeeze"\n[save]\n'
+  result, _ = run_climatology(tmp_path, source, "squeezed", extra)
+  assert result.exit_code != 0
+  assert "postprocess_climatology changed the dimensions of ['t3']" in result.output
 
 
 @pytest.mark.parametrize("split", ['split_dims = ["depth"]', ""], ids=["depth", "variables"])
