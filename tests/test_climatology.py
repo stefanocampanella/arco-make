@@ -194,11 +194,11 @@ def test_window_weights():
     (
       {
         "reference_period": {
-          "start": datetime.datetime(1993, 1, 1, tzinfo=datetime.UTC),
+          "start": "1993-01-01T00:00:00+02:00",
           "end": "2019-01-01",
         }
       },
-      "no time zone",
+      "without a time zone, or in UTC",
     ),
     ({"bins": "day_of_year", "period": 366}, "needs period = 365"),
   ],
@@ -479,3 +479,21 @@ def test_copy_threads_hold_their_units():
   assert threads * COPIES * shard <= budget.usable
   assert climatology.staging._copy_threads([2**20], budget) is None  # small units: all of Dask's
   assert climatology.staging._copy_threads([budget.usable], budget) == 1
+
+
+def test_recipe_dates_in_utc_are_stamps_of_the_time_axis():
+  """A reference period in UTC is the naive stamp (it was refused), as in download recipes and
+  the time check, whose dates in another offset are refused (they were compared with the naive
+  time axis)."""
+  from arcomake.checks import ValidTimeCoordinateCheck
+
+  utc = datetime.datetime(1993, 1, 1, tzinfo=datetime.UTC)
+  base = {"period": 365, "window": 1, "weighting": "constant", "read": {}, "save": {}}
+  configs = ClimatologyConfig.model_validate(
+    base | {"reference_period": {"start": utc, "end": "2019-01-01"}}
+  )
+  assert configs.reference_period is not None
+  assert configs.reference_period.start == datetime.datetime(1993, 1, 1)
+  assert ValidTimeCoordinateCheck(start=utc).start == datetime.datetime(1993, 1, 1)
+  with pytest.raises(pydantic.ValidationError, match="without a time zone, or in UTC"):
+    ValidTimeCoordinateCheck(end="2020-01-01T00:00:00+02:00")  # ty: ignore[invalid-argument-type]

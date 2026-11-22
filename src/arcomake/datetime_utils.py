@@ -14,6 +14,22 @@ InclusiveOptions = Literal["left", "right", "neither", "both"]
 logger = logging.getLogger(__name__)
 
 
+def naive_utc(value: datetime | None, what: str) -> datetime | None:
+  """`value` without its time zone, if it has one and it is UTC.
+
+  The sources' stamps have no zone and are read as UTC: a UTC time is that stamp, another offset
+  would be converted to a different one than written.
+
+  Raises:
+    ValueError: for another offset, starting with `what`.
+  """
+  if value is None or value.tzinfo is None:
+    return value
+  if value.utcoffset() != timedelta(0):
+    raise ValueError(f"{what}: without a time zone, or in UTC")
+  return value.replace(tzinfo=None)
+
+
 @dataclass
 class DateInterval:
   """Represents a right open date interval."""

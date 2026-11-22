@@ -9,8 +9,9 @@ import dask
 import numpy as np
 import pandas as pd
 import xarray as xr
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from arcomake.datetime_utils import naive_utc
 from arcomake.processing_utils import check_fraction_threshold
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,12 @@ class ValidTimeCoordinateCheck(BaseModel):
   end: datetime | None = None
   freq: str = "1D"
   time_dim: str = "time"
+
+  @field_validator("start", "end")
+  @classmethod
+  def _without_zone(cls, value: datetime | None) -> datetime | None:
+    # Compared with the time axis, which has no zone.
+    return naive_utc(value, "the time check's dates are stamps of the time axis")
 
   @model_validator(mode="after")
   def validate_date_range(self) -> Self:

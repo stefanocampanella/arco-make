@@ -44,7 +44,12 @@ from arcomake.dataset_utils import (
   refuse_chunk_steps,
   write_output,
 )
-from arcomake.datetime_utils import DateInterval, IterableDateInterval, may_parse_timedelta
+from arcomake.datetime_utils import (
+  DateInterval,
+  IterableDateInterval,
+  may_parse_timedelta,
+  naive_utc,
+)
 from arcomake.processing_utils import ProcessingStepConfig, time_coverage
 from arcomake.retries import RetryConfig, with_retries
 from arcomake.settings import parse_memory
@@ -104,6 +109,13 @@ class DownloadConfig(BaseModel):
           " block: remove start and end"
         )
     return data
+
+  @field_validator("start", "end")
+  @classmethod
+  def _without_zone(cls, value: datetime | None) -> datetime | None:
+    # Compared with the stored stamps and the start of an extension, which have no zone: an
+    # offset made `download --extend` fail comparing them (TypeError).
+    return naive_utc(value, "start and end are stamps of the time axis")
 
   @field_validator("step", mode="before")
   @classmethod

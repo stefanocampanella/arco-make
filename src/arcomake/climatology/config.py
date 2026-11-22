@@ -5,12 +5,13 @@
 import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from arcomake.dataset_utils import (
   ReadConfig,
   SaveConfig,
 )
+from arcomake.datetime_utils import naive_utc
 from arcomake.processing_utils import ProcessingStepConfig
 
 # Weighting scheme applied to the steps of the (centered) window used to
@@ -39,10 +40,16 @@ class ReferencePeriod(BaseModel):
   start: datetime.datetime
   end: datetime.datetime
 
+  @field_validator("start", "end")
+  @classmethod
+  def _without_zone(cls, value: datetime.datetime) -> datetime.datetime:
+    # Compared with the time axis, which has no zone.
+    naive = naive_utc(value, "reference_period dates are stamps of the time axis")
+    assert naive is not None
+    return naive
+
   @model_validator(mode="after")
-  def _ordered_and_naive(self) -> "ReferencePeriod":
-    if self.start.tzinfo is not None or self.end.tzinfo is not None:
-      raise ValueError("reference_period dates have no time zone (time axes are naive)")
+  def _ordered(self) -> "ReferencePeriod":
     if self.start >= self.end:
       raise ValueError(f"reference_period start ({self.start}) must be before end ({self.end})")
     return self

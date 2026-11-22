@@ -190,3 +190,18 @@ def test_extension_messages(recipe, tmp_path, monkeypatch):
   fail_every_block(monkeypatch)
   failed = run(recipe, output, "--extend", f"--end={END}")
   assert failed.exit_code != 0 and "--extend --resume continues from there" in failed.output
+
+
+def test_a_recipe_end_in_utc_extends(recipe, tmp_path):
+  """TOML dates with an offset are aware: an end in UTC is that stamp (an aware end failed the
+  comparison with the extension's start, a TypeError); another offset is refused at load."""
+  output = tmp_path / "out"
+  assert run(recipe, output, f"--start={START}", f"--end={MIDDLE}").exit_code == 0
+  text = recipe.read_text()
+  recipe.write_text("end = 2020-03-02T00:00:00Z\n" + text)
+  extended = run(recipe, output, "--extend")
+  assert extended.exit_code == 0, extended.output
+  assert open_output(output).sizes["time"] == 5
+  recipe.write_text("end = 2020-03-02T00:00:00+02:00\n" + text)
+  refused = run(recipe, tmp_path / "other", f"--start={START}")
+  assert refused.exit_code != 0 and "without a time zone, or in UTC" in refused.output

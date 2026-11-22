@@ -32,6 +32,7 @@ from arcomake import chunk_plan, hdf5_lock, icechunk_utils, sharding
 from arcomake.datetime_utils import (
   IterableDateInterval,
   may_parse_timedelta,
+  naive_utc,
 )
 from arcomake.processing_utils import ProcessingStepConfig
 from arcomake.steps import needs_for
@@ -150,13 +151,7 @@ class PartStaticTime(BaseModel):
   @field_validator("static_time")
   @classmethod
   def _without_zone(cls, value: datetime.datetime | None) -> datetime.datetime | None:
-    # The sources' stamps have no zone and are read as UTC: a UTC time is that stamp, another
-    # offset would be converted to a different one than written.
-    if value is None or value.tzinfo is None:
-      return value
-    if value.utcoffset() != datetime.timedelta(0):
-      raise ValueError("static_time is a stamp of the source: without a time zone, or in UTC")
-    return value.replace(tzinfo=None)
+    return naive_utc(value, "static_time is a stamp of the source")
 
 
 class PartAlignment(BaseModel):
