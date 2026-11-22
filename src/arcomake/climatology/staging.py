@@ -30,37 +30,6 @@ from arcomake.temporary_utils import get_current_temp_registry
 logger = logging.getLogger(__name__)
 
 
-def _staging_chunks(
-  dims: tuple[Hashable, ...],
-  shape: tuple[int, ...],
-  dask_chunks: tuple[int, ...],
-  unit: tuple[int, ...] | None,
-  itemsize: int,
-  time_dim: str,
-  target: int,
-) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
-  """The chunks of a variable in the temporary store, and the Dask chunks of its copy (None:
-  those of the store).
-
-  The copy's chunks are the stored units (`unit`: shards, else chunks), with along `time_dim` as
-  many whole units as `target` bytes hold (at least one). The store's chunks are Dask's (the
-  first of each dimension), with the copy's along `time_dim` and the units' where they divide
-  Dask's: copying reads each chunk of the store once, and one-bin units do not make a store of
-  tiny files.
-  """
-  if unit is None or time_dim not in dims:
-    return dask_chunks, None
-  copy = [min(u, n) for u, n in zip(unit, shape, strict=True)]
-  axis = dims.index(time_dim)
-  units = max(1, target // (math.prod(copy) * itemsize))
-  copy[axis] = min(shape[axis], copy[axis] * units)
-  stored = [
-    c if axis_ == axis or d % c == 0 else d
-    for axis_, (d, c) in enumerate(zip(dask_chunks, copy, strict=True))
-  ]
-  return tuple(stored), tuple(copy)
-
-
 @dataclasses.dataclass
 class Stage:
   """A temporary plain Zarr v3 store for the groups of the output (a DataTree), unsharded, and how
@@ -142,14 +111,35 @@ def stage(
   return Stage(path, staged, copies, restored, _copy_threads(units, budget))
 
 
-def _copy_threads(units: list[int], budget: Budget) -> int | None:
-  """Threads for the copy: as many as hold `COPIES` times the largest unit each within the
-  budget's memory, at least one (None: all of Dask's). Each copy task holds its unit, the pieces
-  read for it and its encoded form: 3.1 GiB for a shard of 8 bins, 49 levels and the 0.25 deg
-  grid (1.6 GB); 32 of them did not fit in 110 GB, and 8 copied as fast as 16 (logbook, 21 Nov)."""
-  largest = max(units, default=0)
-  fits = budget.usable // (COPIES * largest) if largest else budget.threads
-  return None if fits >= budget.threads else max(1, int(fits))
+def _staging_chunks(
+  dims: tuple[Hashable, ...],
+  shape: tuple[int, ...],
+  dask_chunks: tuple[int, ...],
+  unit: tuple[int, ...] | None,
+  itemsize: int,
+  time_dim: str,
+  target: int,
+) -> tuple[tuple[int, ...], tuple[int, ...] | None]:
+  """The chunks of a variable in the temporary store, and the Dask chunks of its copy (None:
+  those of the store).
+
+  The copy's chunks are the stored units (`unit`: shards, else chunks), with along `time_dim` as
+  many whole units as `target` bytes hold (at least one). The store's chunks are Dask's (the
+  first of each dimension), with the copy's along `time_dim` and the units' where they divide
+  Dask's: copying reads each chunk of the store once, and one-bin units do not make a store of
+  tiny files.
+  """
+  if unit is None or time_dim not in dims:
+    return dask_chunks, None
+  copy = [min(u, n) for u, n in zip(unit, shape, strict=True)]
+  axis = dims.index(time_dim)
+  units = max(1, target // (math.prod(copy) * itemsize))
+  copy[axis] = min(shape[axis], copy[axis] * units)
+  stored = [
+    c if axis_ == axis or d % c == 0 else d
+    for axis_, (d, c) in enumerate(zip(dask_chunks, copy, strict=True))
+  ]
+  return tuple(stored), tuple(copy)
 
 
 def copy(
@@ -187,3 +177,13 @@ def copy(
     local["num_workers"] = stage.threads
   with dask.config.set(local):
     write_tree(groups, run, save, label=label, metadata=metadata)
+
+
+def _copy_threads(units: list[int], budget: Budget) -> int | None:
+  """Threads for the copy: as many as hold `COPIES` times the largest unit each within the
+  budget's memory, at least one (None: all of Dask's). Each copy task holds its unit, the pieces
+  read for it and its encoded form: 3.1 GiB for a shard of 8 bins, 49 levels and the 0.25 deg
+  grid (1.6 GB); 32 of them did not fit in 110 GB, and 8 copied as fast as 16 (logbook, 21 Nov)."""
+  largest = max(units, default=0)
+  fits = budget.usable // (COPIES * largest) if largest else budget.threads
+  return None if fits >= budget.threads else max(1, int(fits))

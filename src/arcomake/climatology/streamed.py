@@ -34,96 +34,6 @@ from arcomake.temporary_utils import TempDirectoryRegistry
 logger = logging.getLogger(__name__)
 
 
-def _window_statistics_in_memory(
-  count: np.ndarray,
-  mean: np.ndarray,
-  m2: np.ndarray,
-  offsets: list[int],
-  weights: np.ndarray,
-  workers: int | None = None,
-  band: int = 1 << 15,
-  dtype: npt.DTypeLike = np.float64,
-) -> tuple[np.ndarray, np.ndarray]:
-  """The window step of `graph._compute_climatology` on in-memory per-bin statistics (bins on
-  axis 0), in `dtype`.
-
-  Same kernel as the lazy path, over bands of `band` points (all axes after the bins, flattened),
-  in parallel, so that memory stays a few times the size of one band per thread.
-  """
-  shape = mean.shape
-  count, mean, m2 = (a.reshape(shape[0], -1) for a in (count, mean, m2))
-  climatology = np.empty(mean.shape, dtype=dtype)
-  variance = np.empty(mean.shape, dtype=dtype)
-
-  def window_band(start: int) -> None:
-    part = (slice(None), slice(start, start + band))
-    c, v = kernels.window_bins_last(
-      count[part].T, mean[part].T, m2[part].T, offsets, weights, dtype
-    )
-    climatology[part] = c.T
-    variance[part] = v.T
-
-  # Bands are independent, and the kernel releases the GIL: compute them in parallel.
-  with ThreadPoolExecutor(max_workers=workers or min(16, os.cpu_count() or 1)) as pool:
-    list(pool.map(window_band, range(0, mean.shape[1], band)))
-  return climatology.reshape(shape), variance.reshape(shape)
-
-
-def _series(dataset: xr.Dataset, split_dims: list[str]) -> list[tuple[str, dict[str, int]]]:
-  """(variable, {dim: index}) for every series: each variable, each index of its split dims."""
-  series = []
-  for name, var in dataset.data_vars.items():
-    dims = [d for d in split_dims if d in var.dims]
-    for index in itertools.product(*(range(var.sizes[d]) for d in dims)):
-      series.append((str(name), dict(zip(dims, index, strict=True))))
-  return series
-
-
-def _compute_series(
-  piece: xr.Dataset,
-  period: int,
-  window: int,
-  weighting: WeightingType,
-  weighting_scale: float | None,
-  time_dim: str,
-  bins: BinningType,
-) -> tuple[xr.Dataset, xr.Dataset]:
-  """Climatology and variance of one series, in memory: one read pass, then the window in NumPy."""
-  offsets, weights = binning.window(window, weighting, weighting_scale)
-  results: tuple[dict[str, xr.DataArray], dict[str, xr.DataArray]] = ({}, {})
-  for name, var in piece.data_vars.items():
-    order = [time_dim, *(d for d in var.dims if d != time_dim)]
-    started = time.monotonic()
-    count, mean, m2 = _stream_bin_statistics(var, period, bins, time_dim)
-    read = time.monotonic()
-    dtype = binning.output_dtype(var.dtype)
-    statistics = _window_statistics_in_memory(count, mean, m2, offsets, weights, dtype=dtype)
-    logger.info(
-      f"{name}: read and binned in {read - started:.0f} s, window in {time.monotonic() - read:.0f} s"
-    )
-    coords: dict[Hashable, Any] = {d: var[d] for d in order[1:] if d in var.coords}
-    coords[time_dim] = np.arange(period)
-    for out, values in zip(results, statistics, strict=True):
-      out[str(name)] = xr.DataArray(values, dims=order, coords=coords).transpose(*var.dims)
-  climatology, variance = xr.Dataset(results[0]), xr.Dataset(results[1])
-  assert isinstance(climatology, xr.Dataset) and isinstance(variance, xr.Dataset)
-  return climatology, variance
-
-
-def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Dataset:
-  """The outputs' layout, lazily (never computed): `period` bins along time, other dims kept."""
-  data_vars = {}
-  for name, var in dataset.data_vars.items():
-    shape = tuple(period if d == time_dim else var.sizes[d] for d in var.dims)
-    dtype = binning.output_dtype(var.dtype)
-    data_vars[name] = (var.dims, dask.array.zeros(shape, dtype=dtype, chunks=-1))
-  coords = {
-    name: coord.load() for name, coord in dataset.coords.items() if time_dim not in coord.dims
-  }
-  coords[time_dim] = np.arange(period)
-  return xr.Dataset(data_vars, coords=coords)
-
-
 def compute(
   dataset: xr.Dataset, configs: ClimatologyConfig, output_path: str, *, label: str
 ) -> None:
@@ -252,17 +162,14 @@ def _stream(
   logger.info("Climatology writes completed, series by series.")
 
 
-def _series_bytes(var: xr.DataArray, index: Mapping[str, int], period: int, time_dim: str) -> int:
-  """Memory one series of `var` (at `index` of its split dimensions) holds while it is computed
-  and written: the per-bin count, mean and m2 (20 bytes per bin and point), four arrays of
-  results per bin and point (climatology, variance, its clip and square root), and three blocks
-  read (the one added, the next one being read, and Dask's pieces of it)."""
-  piece = var.isel({d: slice(i, i + 1) for d, i in index.items()})
-  points = math.prod(n for d, n in piece.sizes.items() if d != time_dim)
-  out = binning.output_dtype(var.dtype).itemsize
-  steps = min(_read_block(piece, time_dim), piece.sizes[time_dim])
-  block = steps * points * var.dtype.itemsize
-  return period * points * (20 + 4 * out) + 3 * block
+def _series(dataset: xr.Dataset, split_dims: list[str]) -> list[tuple[str, dict[str, int]]]:
+  """(variable, {dim: index}) for every series: each variable, each index of its split dims."""
+  series = []
+  for name, var in dataset.data_vars.items():
+    dims = [d for d in split_dims if d in var.dims]
+    for index in itertools.product(*(range(var.sizes[d]) for d in dims)):
+      series.append((str(name), dict(zip(dims, index, strict=True))))
+  return series
 
 
 def _series_at_once(
@@ -288,6 +195,19 @@ def _series_at_once(
   return at_once
 
 
+def _series_bytes(var: xr.DataArray, index: Mapping[str, int], period: int, time_dim: str) -> int:
+  """Memory one series of `var` (at `index` of its split dimensions) holds while it is computed
+  and written: the per-bin count, mean and m2 (20 bytes per bin and point), four arrays of
+  results per bin and point (climatology, variance, its clip and square root), and three blocks
+  read (the one added, the next one being read, and Dask's pieces of it)."""
+  piece = var.isel({d: slice(i, i + 1) for d, i in index.items()})
+  points = math.prod(n for d, n in piece.sizes.items() if d != time_dim)
+  out = binning.output_dtype(var.dtype).itemsize
+  steps = min(_read_block(piece, time_dim), piece.sizes[time_dim])
+  block = steps * points * var.dtype.itemsize
+  return period * points * (20 + 4 * out) + 3 * block
+
+
 def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:
   """Steps to read at once: about `target_bytes`, a whole number of the input's time chunks.
 
@@ -306,6 +226,51 @@ def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> i
     stored = da.encoding.get("chunks")
     chunk = int(preferred or (stored[axis] if stored else 1))
   return max(chunk, steps // chunk * chunk)
+
+
+def _output_template(dataset: xr.Dataset, period: int, time_dim: str) -> xr.Dataset:
+  """The outputs' layout, lazily (never computed): `period` bins along time, other dims kept."""
+  data_vars = {}
+  for name, var in dataset.data_vars.items():
+    shape = tuple(period if d == time_dim else var.sizes[d] for d in var.dims)
+    dtype = binning.output_dtype(var.dtype)
+    data_vars[name] = (var.dims, dask.array.zeros(shape, dtype=dtype, chunks=-1))
+  coords = {
+    name: coord.load() for name, coord in dataset.coords.items() if time_dim not in coord.dims
+  }
+  coords[time_dim] = np.arange(period)
+  return xr.Dataset(data_vars, coords=coords)
+
+
+def _compute_series(
+  piece: xr.Dataset,
+  period: int,
+  window: int,
+  weighting: WeightingType,
+  weighting_scale: float | None,
+  time_dim: str,
+  bins: BinningType,
+) -> tuple[xr.Dataset, xr.Dataset]:
+  """Climatology and variance of one series, in memory: one read pass, then the window in NumPy."""
+  offsets, weights = binning.window(window, weighting, weighting_scale)
+  results: tuple[dict[str, xr.DataArray], dict[str, xr.DataArray]] = ({}, {})
+  for name, var in piece.data_vars.items():
+    order = [time_dim, *(d for d in var.dims if d != time_dim)]
+    started = time.monotonic()
+    count, mean, m2 = _stream_bin_statistics(var, period, bins, time_dim)
+    read = time.monotonic()
+    dtype = binning.output_dtype(var.dtype)
+    statistics = _window_statistics_in_memory(count, mean, m2, offsets, weights, dtype=dtype)
+    logger.info(
+      f"{name}: read and binned in {read - started:.0f} s, window in {time.monotonic() - read:.0f} s"
+    )
+    coords: dict[Hashable, Any] = {d: var[d] for d in order[1:] if d in var.coords}
+    coords[time_dim] = np.arange(period)
+    for out, values in zip(results, statistics, strict=True):
+      out[str(name)] = xr.DataArray(values, dims=order, coords=coords).transpose(*var.dims)
+  climatology, variance = xr.Dataset(results[0]), xr.Dataset(results[1])
+  assert isinstance(climatology, xr.Dataset) and isinstance(variance, xr.Dataset)
+  return climatology, variance
 
 
 def _stream_bin_statistics(
@@ -341,3 +306,38 @@ def _stream_bin_statistics(
       kernels.welford(count, mean, m2, values, labels[start : start + len(values)])
   mean[count == 0] = np.nan
   return count, mean, m2
+
+
+def _window_statistics_in_memory(
+  count: np.ndarray,
+  mean: np.ndarray,
+  m2: np.ndarray,
+  offsets: list[int],
+  weights: np.ndarray,
+  workers: int | None = None,
+  band: int = 1 << 15,
+  dtype: npt.DTypeLike = np.float64,
+) -> tuple[np.ndarray, np.ndarray]:
+  """The window step of `graph._compute_climatology` on in-memory per-bin statistics (bins on
+  axis 0), in `dtype`.
+
+  Same kernel as the lazy path, over bands of `band` points (all axes after the bins, flattened),
+  in parallel, so that memory stays a few times the size of one band per thread.
+  """
+  shape = mean.shape
+  count, mean, m2 = (a.reshape(shape[0], -1) for a in (count, mean, m2))
+  climatology = np.empty(mean.shape, dtype=dtype)
+  variance = np.empty(mean.shape, dtype=dtype)
+
+  def window_band(start: int) -> None:
+    part = (slice(None), slice(start, start + band))
+    c, v = kernels.window_bins_last(
+      count[part].T, mean[part].T, m2[part].T, offsets, weights, dtype
+    )
+    climatology[part] = c.T
+    variance[part] = v.T
+
+  # Bands are independent, and the kernel releases the GIL: compute them in parallel.
+  with ThreadPoolExecutor(max_workers=workers or min(16, os.cpu_count() or 1)) as pool:
+    list(pool.map(window_band, range(0, mean.shape[1], band)))
+  return climatology.reshape(shape), variance.reshape(shape)

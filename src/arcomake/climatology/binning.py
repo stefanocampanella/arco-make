@@ -11,6 +11,81 @@ import xarray as xr
 from arcomake.climatology.config import BinningType, WeightingType
 
 
+class TimeBins(NamedTuple):
+  """Where the time steps go: their bin, which are Feb 29 (in Feb 28's bin, apart from the
+  regular days), and their position on a grid of whole periods (bin k of period p at
+  p * period + k)."""
+
+  labels: np.ndarray
+  is_feb_29: np.ndarray
+  position: np.ndarray
+
+
+def time_bins(time: xr.DataArray, period: int, bins: BinningType) -> TimeBins:
+  """The bins of the time steps `time`, for both paths.
+
+  Raises:
+    ValueError: day-of-year bins with a period other than 365, or with two steps on the same day
+      (sub-daily data); position bins over a partial period, where leap days and partial years
+      would shift every later bin.
+  """
+  if bins == "day_of_year":
+    if period != 365:
+      raise ValueError(f"day_of_year bins need period = 365, got {period}")
+    labels, is_feb_29 = day_of_year_bins(time)
+    years = np.asarray(time.dt.year.values)
+    position = (years - years.min()) * period + labels
+    regular = ~is_feb_29
+    if np.unique(position[regular]).size != np.count_nonzero(regular):
+      raise ValueError("day_of_year bins need at most one time step per day")
+    return TimeBins(labels, is_feb_29, position)
+  size = time.size
+  if size % period != 0:
+    raise ValueError(
+      f"position bins need a whole number of periods ({size} steps, period {period}): leap"
+      ' days and partial years shift every later bin; use bins = "day_of_year" for daily data'
+    )
+  steps = np.arange(size)
+  return TimeBins(steps % period, np.zeros(size, dtype=bool), steps)
+
+
+# Feb 29 counts in Feb 28's bin (0-based day 58 of a 365-day year).
+FEB_29_BIN = 58
+
+
+def day_of_year_bins(time: xr.DataArray) -> tuple[np.ndarray, np.ndarray]:
+  """The 0-based day of a 365-day year of each time stamp, and which stamps are Feb 29.
+
+  Days after Feb 29 in a leap year take the bin of the same date in other years; Feb 29 itself
+  takes Feb 28's bin (`FEB_29_BIN`). Works for numpy and cftime dates with standard months.
+  """
+  month = np.asarray(time.dt.month.values)
+  day = np.asarray(time.dt.day.values)
+  is_feb_29 = (month == 2) & (day == 29)
+  if np.any((day > _DAYS_IN_MONTH[month - 1]) & ~is_feb_29):
+    raise ValueError("day_of_year bins need a calendar with standard month lengths")
+  bins = _DAYS_BEFORE_MONTH[month - 1] + day - 1
+  bins[is_feb_29] = FEB_29_BIN
+  return bins, is_feb_29
+
+
+# Days before each month in a 365-day year: the day-of-year bins of `bins = "day_of_year"`.
+_DAYS_BEFORE_MONTH = np.cumsum([0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30])
+
+
+_DAYS_IN_MONTH = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
+
+
+def window(
+  size: int, weighting: WeightingType, scale: float | None
+) -> tuple[list[int], np.ndarray]:
+  """The offsets of a centred window of `size` bins (`-(size // 2)` to `size - size // 2 - 1`)
+  and their weights (`window_weights`)."""
+  half = size // 2
+  offsets = list(range(-half, size - half))
+  return offsets, window_weights(offsets, weighting, scale=scale)
+
+
 def window_weights(
   offsets: list[int], weighting: WeightingType, scale: float | None = None
 ) -> np.ndarray:
@@ -59,81 +134,6 @@ def window_weights(
   raise ValueError(f"Unsupported weighting scheme: {weighting}")
 
 
-def window(
-  size: int, weighting: WeightingType, scale: float | None
-) -> tuple[list[int], np.ndarray]:
-  """The offsets of a centred window of `size` bins (`-(size // 2)` to `size - size // 2 - 1`)
-  and their weights (`window_weights`)."""
-  half = size // 2
-  offsets = list(range(-half, size - half))
-  return offsets, window_weights(offsets, weighting, scale=scale)
-
-
 def output_dtype(dtype: np.dtype) -> np.dtype:
   """The statistics' data type: the input's if floating, else float64."""
   return dtype if np.issubdtype(dtype, np.floating) else np.dtype(np.float64)
-
-
-# Days before each month in a 365-day year: the day-of-year bins of `bins = "day_of_year"`.
-_DAYS_BEFORE_MONTH = np.cumsum([0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30])
-
-
-_DAYS_IN_MONTH = np.array([31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31])
-
-
-# Feb 29 counts in Feb 28's bin (0-based day 58 of a 365-day year).
-FEB_29_BIN = 58
-
-
-def day_of_year_bins(time: xr.DataArray) -> tuple[np.ndarray, np.ndarray]:
-  """The 0-based day of a 365-day year of each time stamp, and which stamps are Feb 29.
-
-  Days after Feb 29 in a leap year take the bin of the same date in other years; Feb 29 itself
-  takes Feb 28's bin (`FEB_29_BIN`). Works for numpy and cftime dates with standard months.
-  """
-  month = np.asarray(time.dt.month.values)
-  day = np.asarray(time.dt.day.values)
-  is_feb_29 = (month == 2) & (day == 29)
-  if np.any((day > _DAYS_IN_MONTH[month - 1]) & ~is_feb_29):
-    raise ValueError("day_of_year bins need a calendar with standard month lengths")
-  bins = _DAYS_BEFORE_MONTH[month - 1] + day - 1
-  bins[is_feb_29] = FEB_29_BIN
-  return bins, is_feb_29
-
-
-class TimeBins(NamedTuple):
-  """Where the time steps go: their bin, which are Feb 29 (in Feb 28's bin, apart from the
-  regular days), and their position on a grid of whole periods (bin k of period p at
-  p * period + k)."""
-
-  labels: np.ndarray
-  is_feb_29: np.ndarray
-  position: np.ndarray
-
-
-def time_bins(time: xr.DataArray, period: int, bins: BinningType) -> TimeBins:
-  """The bins of the time steps `time`, for both paths.
-
-  Raises:
-    ValueError: day-of-year bins with a period other than 365, or with two steps on the same day
-      (sub-daily data); position bins over a partial period, where leap days and partial years
-      would shift every later bin.
-  """
-  if bins == "day_of_year":
-    if period != 365:
-      raise ValueError(f"day_of_year bins need period = 365, got {period}")
-    labels, is_feb_29 = day_of_year_bins(time)
-    years = np.asarray(time.dt.year.values)
-    position = (years - years.min()) * period + labels
-    regular = ~is_feb_29
-    if np.unique(position[regular]).size != np.count_nonzero(regular):
-      raise ValueError("day_of_year bins need at most one time step per day")
-    return TimeBins(labels, is_feb_29, position)
-  size = time.size
-  if size % period != 0:
-    raise ValueError(
-      f"position bins need a whole number of periods ({size} steps, period {period}): leap"
-      ' days and partial years shift every later bin; use bins = "day_of_year" for daily data'
-    )
-  steps = np.arange(size)
-  return TimeBins(steps % period, np.zeros(size, dtype=bool), steps)

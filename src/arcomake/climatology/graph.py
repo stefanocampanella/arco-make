@@ -73,33 +73,73 @@ def compute(
   logger.info("Climatology and anomaly standard deviation committed.")
 
 
+def _compute_climatology(
+  dataset: xr.Dataset,
+  period: int,
+  window: int = 1,
+  weighting: WeightingType = "constant",
+  weighting_scale: float | None = None,
+  time_dim: str = "time",
+  bins: BinningType = "position",
+) -> tuple[xr.Dataset, xr.Dataset]:
+  """
+  Compute the climatological mean and unbiased sample variance of every data variable.
+
+  Bin b pools the values of bins b + k for k in a centred `window` (wrapping around the
+  period), each weighted by the weight of its offset k. Missing values (NaN, missing steps,
+  incomplete periods) are skipped: each bin counts only the values it has (B6).
+
+  Parameters
+  ----------
+  dataset : xr.Dataset
+      Input Dataset, sorted along the time dimension.
+  period : int
+      Number of bins (e.g. 365 daily bins).
+  window : int, default 1
+      Number of bins of the (centred) window; 1 gives the plain per-bin statistics.
+  weighting : {"constant", "gaussian", "geometric"}, default "constant"
+      Weighting of the window's bins (see ``binning.window_weights``).
+  weighting_scale : float or None, default None
+      Scale of the weighting kernel, in bins (see ``binning.window_weights``).
+  time_dim : str, default "time"
+      Name of the time dimension.
+  bins : {"position", "day_of_year"}, default "position"
+      ``"position"``: step k of each run of `period` steps is in bin k. ``"day_of_year"``: daily
+      data; the bin is the day of a 365-day year, and Feb 29 is in Feb 28's bin.
+
+  Returns
+  -------
+  tuple[xr.Dataset, xr.Dataset]
+      ``(mean, variance)``, each with `period` bins along ``time_dim`` (numbered from 0) and the
+      input's data types. ``variance`` is the unbiased (reliability weights) variance, NaN where
+      the window holds fewer than two values.
+  """
+  count, mean, m2 = _bin_statistics(dataset, period, bins, time_dim)
+  offsets, weights = binning.window(window, weighting, weighting_scale)
+
+  results: tuple[dict[str, xr.DataArray], dict[str, xr.DataArray]] = ({}, {})
+  for name, var in mean.data_vars.items():
+    dtype = binning.output_dtype(dataset[name].dtype)
+    # One implementation of the window for both paths, chunk by chunk (bins last, as apply_ufunc
+    # puts the core dimension), in the output's type.
+    statistics = xr.apply_ufunc(
+      functools.partial(kernels.window_bins_last, offsets=offsets, weights=weights, dtype=dtype),
+      count[name],
+      var,
+      m2[name],
+      input_core_dims=[[time_dim]] * 3,
+      output_core_dims=[[time_dim]] * 2,
+      dask="parallelized",
+      output_dtypes=[dtype, dtype],
+      dask_gufunc_kwargs={"allow_rechunk": True},
+    )
+    for out, value in zip(results, statistics, strict=True):
+      out[str(name)] = value.transpose(*var.dims)
+  return xr.Dataset(results[0]), xr.Dataset(results[1])
+
+
 # Per bin: the number of values, their mean and their sum of squared deviations.
 BinStatistics = tuple[xr.Dataset, xr.Dataset, xr.Dataset]
-
-
-def _fold_statistics(folded: xr.Dataset) -> BinStatistics:
-  """Count, mean and sum of squared deviations over `_period`, skipping NaN (0 without values).
-
-  Two passes, each level from its own chunks. They were tied with `bind` to a checkpoint of
-  every chunk's mean, which kept Dask from reusing the folded data (read again from the input)
-  but made every level wait for all levels' means: the statistics of all levels were computed
-  first and held until their windows. Dask's one-pass variance was slower and needed more memory
-  over several years (its per-chunk intermediates; logbook, 21 Nov)."""
-  count = folded.count("_period")
-  mean = folded.mean("_period", skipna=True)
-  m2 = ((folded - mean) ** 2).sum("_period", skipna=True)
-  return count, mean, m2
-
-
-def _combine(a: BinStatistics, b: BinStatistics) -> BinStatistics:
-  """Statistics of the union of two samples (Chan et al.); an empty sample has mean NaN."""
-  n_a, mean_a, m2_a = a
-  n_b, mean_b, m2_b = b
-  n = n_a + n_b
-  mean_a0, mean_b0 = mean_a.fillna(0.0), mean_b.fillna(0.0)
-  mean = ((n_a * mean_a0 + n_b * mean_b0) / n).where(n > 0)
-  m2 = m2_a + m2_b + ((mean_b0 - mean_a0) ** 2 * n_a * n_b / n).where(n > 0, 0.0)
-  return n, mean, m2
 
 
 def _bin_statistics(
@@ -171,66 +211,26 @@ def _chunked_for_the_window(folded: xr.Dataset, time_dim: str) -> xr.Dataset:
   return folded.chunk(chunks).unify_chunks()
 
 
-def _compute_climatology(
-  dataset: xr.Dataset,
-  period: int,
-  window: int = 1,
-  weighting: WeightingType = "constant",
-  weighting_scale: float | None = None,
-  time_dim: str = "time",
-  bins: BinningType = "position",
-) -> tuple[xr.Dataset, xr.Dataset]:
-  """
-  Compute the climatological mean and unbiased sample variance of every data variable.
+def _fold_statistics(folded: xr.Dataset) -> BinStatistics:
+  """Count, mean and sum of squared deviations over `_period`, skipping NaN (0 without values).
 
-  Bin b pools the values of bins b + k for k in a centred `window` (wrapping around the
-  period), each weighted by the weight of its offset k. Missing values (NaN, missing steps,
-  incomplete periods) are skipped: each bin counts only the values it has (B6).
+  Two passes, each level from its own chunks. They were tied with `bind` to a checkpoint of
+  every chunk's mean, which kept Dask from reusing the folded data (read again from the input)
+  but made every level wait for all levels' means: the statistics of all levels were computed
+  first and held until their windows. Dask's one-pass variance was slower and needed more memory
+  over several years (its per-chunk intermediates; logbook, 21 Nov)."""
+  count = folded.count("_period")
+  mean = folded.mean("_period", skipna=True)
+  m2 = ((folded - mean) ** 2).sum("_period", skipna=True)
+  return count, mean, m2
 
-  Parameters
-  ----------
-  dataset : xr.Dataset
-      Input Dataset, sorted along the time dimension.
-  period : int
-      Number of bins (e.g. 365 daily bins).
-  window : int, default 1
-      Number of bins of the (centred) window; 1 gives the plain per-bin statistics.
-  weighting : {"constant", "gaussian", "geometric"}, default "constant"
-      Weighting of the window's bins (see ``binning.window_weights``).
-  weighting_scale : float or None, default None
-      Scale of the weighting kernel, in bins (see ``binning.window_weights``).
-  time_dim : str, default "time"
-      Name of the time dimension.
-  bins : {"position", "day_of_year"}, default "position"
-      ``"position"``: step k of each run of `period` steps is in bin k. ``"day_of_year"``: daily
-      data; the bin is the day of a 365-day year, and Feb 29 is in Feb 28's bin.
 
-  Returns
-  -------
-  tuple[xr.Dataset, xr.Dataset]
-      ``(mean, variance)``, each with `period` bins along ``time_dim`` (numbered from 0) and the
-      input's data types. ``variance`` is the unbiased (reliability weights) variance, NaN where
-      the window holds fewer than two values.
-  """
-  count, mean, m2 = _bin_statistics(dataset, period, bins, time_dim)
-  offsets, weights = binning.window(window, weighting, weighting_scale)
-
-  results: tuple[dict[str, xr.DataArray], dict[str, xr.DataArray]] = ({}, {})
-  for name, var in mean.data_vars.items():
-    dtype = binning.output_dtype(dataset[name].dtype)
-    # One implementation of the window for both paths, chunk by chunk (bins last, as apply_ufunc
-    # puts the core dimension), in the output's type.
-    statistics = xr.apply_ufunc(
-      functools.partial(kernels.window_bins_last, offsets=offsets, weights=weights, dtype=dtype),
-      count[name],
-      var,
-      m2[name],
-      input_core_dims=[[time_dim]] * 3,
-      output_core_dims=[[time_dim]] * 2,
-      dask="parallelized",
-      output_dtypes=[dtype, dtype],
-      dask_gufunc_kwargs={"allow_rechunk": True},
-    )
-    for out, value in zip(results, statistics, strict=True):
-      out[str(name)] = value.transpose(*var.dims)
-  return xr.Dataset(results[0]), xr.Dataset(results[1])
+def _combine(a: BinStatistics, b: BinStatistics) -> BinStatistics:
+  """Statistics of the union of two samples (Chan et al.); an empty sample has mean NaN."""
+  n_a, mean_a, m2_a = a
+  n_b, mean_b, m2_b = b
+  n = n_a + n_b
+  mean_a0, mean_b0 = mean_a.fillna(0.0), mean_b.fillna(0.0)
+  mean = ((n_a * mean_a0 + n_b * mean_b0) / n).where(n > 0)
+  m2 = m2_a + m2_b + ((mean_b0 - mean_a0) ** 2 * n_a * n_b / n).where(n > 0, 0.0)
+  return n, mean, m2
