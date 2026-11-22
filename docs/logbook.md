@@ -1539,3 +1539,19 @@ the bounds, and without any coordinate through `open_zarr(group=...)`).
   output type shared; one way of making each numba kernel once; unused code and the obsolete
   header comment removed; each module ordered top-down (checked as ASTs) and documented: what is
   computed and the formulas (package and `kernels`), each path's steps, why a temporary store.
+
+### 22 Nov: the coarsening notes move to ARCO-OCEAN; statistics streamed level by level
+
+- **Notes moved** (maintainer, 20 Nov, roadmap point 3): `docs/coarsen-ocean-datasets.md`,
+  `docs/coarsen_analysis.py` and their doctests (offline and live) describe ARCO-OCEAN's choices,
+  so they are in the arco-ocean repository now (fork PR on #13), still tested: arco-make pinned
+  in a `notes` dependency group, the offline examples in that repository's CI. Offline and live
+  examples pass there, in a fresh environment. The entries above (19-20 Nov) keep their
+  references to the former paths.
+- **Streamed series see every coordinate**: running the ARCO-OCEAN statistics recipe with
+  `split_dims = ["depth"]` and `--streaming` failed: its `coverage_attrs` (`vertical_dim =
+  "depth"`) ran on a 2D variable's series, which carried no `depth`. Each series now gets the
+  template's coordinates at its index before the postprocess steps (dropped again before
+  writing; along a split dimension, its own index only), and a step changing a variable's
+  dimensions on a series is refused by name (it failed in the region write). Then, on the 1 deg test output: 210 series, 3 min, the statistics validated. The fork
+  recipe now splits by level and its script streams by default.
