@@ -213,16 +213,24 @@ def _series_at_once(
 
 
 def _series_bytes(var: xr.DataArray, index: Mapping[str, int], period: int, time_dim: str) -> int:
-  """Memory one series of `var` (at `index` of its split dimensions) holds while it is computed
-  and written: the per-bin count, mean and m2 (20 bytes per bin and point), four arrays of
-  results per bin and point (climatology, variance, its clip and square root), and three blocks
-  read (the one added, the next one being read, and Dask's pieces of it)."""
+  """Memory one series of `var` (at `index` of its split dimensions) holds at most while it is
+  computed and written, the largest of its three phases:
+
+  - reading: the per-bin count, mean and m2 (20 bytes per bin and point) and three blocks read
+    (the one added, the next one being read, and Dask's pieces of it);
+  - the window: the per-bin statistics, the climatology and the variance, and each thread's band
+    (contiguous copies of its count, mean and m2, and its two results);
+  - writing: four arrays of results (climatology, variance, its clip and square root).
+  """
   piece = var.isel({d: slice(i, i + 1) for d, i in index.items()})
   points = math.prod(n for d, n in piece.sizes.items() if d != time_dim)
   out = binning.output_dtype(var.dtype).itemsize
   steps = min(_read_block(piece, time_dim), piece.sizes[time_dim])
   block = steps * points * var.dtype.itemsize
-  return period * points * (20 + 4 * out) + 3 * block
+  statistics, result = period * points * 20, period * points * out
+  bands = min(_window_threads(), -(-points // _WINDOW_BAND))
+  window = bands * min(_WINDOW_BAND, points) * period * (20 + 2 * out)
+  return max(statistics + 3 * block, statistics + 2 * result + window, 4 * result)
 
 
 def _read_block(da: xr.DataArray, time_dim: str, target_bytes: float = 1e9) -> int:
@@ -325,6 +333,14 @@ def _stream_bin_statistics(
   return count, mean, m2
 
 
+# Points per band of the window over a series' statistics, and the threads computing bands.
+_WINDOW_BAND = 1 << 15
+
+
+def _window_threads() -> int:
+  return min(16, os.cpu_count() or 1)
+
+
 def _window_statistics_in_memory(
   count: np.ndarray,
   mean: np.ndarray,
@@ -332,7 +348,7 @@ def _window_statistics_in_memory(
   offsets: list[int],
   weights: np.ndarray,
   workers: int | None = None,
-  band: int = 1 << 15,
+  band: int = _WINDOW_BAND,
   dtype: npt.DTypeLike = np.float64,
 ) -> tuple[np.ndarray, np.ndarray]:
   """The window step of `graph._compute_climatology` on in-memory per-bin statistics (bins on
@@ -355,6 +371,6 @@ def _window_statistics_in_memory(
     variance[part] = v.T
 
   # Bands are independent, and the kernel releases the GIL: compute them in parallel.
-  with ThreadPoolExecutor(max_workers=workers or min(16, os.cpu_count() or 1)) as pool:
+  with ThreadPoolExecutor(max_workers=workers or _window_threads()) as pool:
     list(pool.map(window_band, range(0, mean.shape[1], band)))
   return climatology.reshape(shape), variance.reshape(shape)

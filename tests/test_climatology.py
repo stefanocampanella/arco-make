@@ -212,7 +212,8 @@ def test_climatology_recipes_are_checked_when_loaded(table: dict, message: str):
 
 def test_series_at_once_fit_in_memory():
   """As many series at a time as the largest fits in the budget's memory, at least one, at most
-  the series and the threads; a series holds its accumulators, results and blocks read."""
+  the series and the threads; a series holds the most of its phases: reading, the window,
+  writing."""
   from arcomake.chunk_plan import USABLE, Budget
   from arcomake.climatology.streamed import _read_block, _series, _series_at_once, _series_bytes
 
@@ -232,8 +233,9 @@ def test_series_at_once_fit_in_memory():
   t3 = _series_bytes(ds.t3, {"depth": 0}, 365, "time")
   t2 = _series_bytes(ds.t2, {}, 365, "time")
   assert _read_block(ds.t3.isel(depth=slice(0, 1)), "time") > 730  # about 1 GB: the whole series
-  blocks = 3 * 730 * 1000 * 4
-  assert t3 == 365 * 1000 * (20 + 4 * 4) + blocks
+  reading = 365 * 1000 * 20 + 3 * 730 * 1000 * 4
+  window = 365 * 1000 * (20 + 2 * 4) * 2  # statistics, results; one band of all 1000 points
+  assert t3 == max(reading, window, 365 * 1000 * 4 * 4)
   assert t2 > t3  # float64: larger results and blocks
   at_once = [
     _series_at_once(ds, series, 365, "time", Budget(int(usable / USABLE) + 1, threads))
