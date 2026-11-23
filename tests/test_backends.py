@@ -127,16 +127,25 @@ def test_ewds_days_left_out_fail_the_block(tmp_path: pathlib.Path, monkeypatch: 
   ("costs", "accepted"),
   [
     ({"id": "size", "cost": 59.0, "limit": 500.0}, True),
+    ({"cost": 3.0, "limit": 60.0, "request_is_valid": None, "invalid_reason": None}, True),
     ({"cost": 730.0, "limit": 500.0}, False),
     ({"cost": 30.0, "limit": 500.0, "request_is_valid": False, "invalid_reason": "no data"}, False),
     (RuntimeError("unreachable"), False),
     (None, False),  # an older cdsapi client: no cost estimates
   ],
-  ids=["valid", "above-the-limit", "unpublished-dates", "estimate-fails", "no-estimates"],
+  ids=[
+    "valid",
+    "valid-none",
+    "above-the-limit",
+    "unpublished-dates",
+    "estimate-fails",
+    "no-estimates",
+  ],
 )
 def test_ewds_cost_estimate_decides(costs, accepted):
   """The answers of the service's cost estimate, as measured on 18 Nov 2026 (a year of two
-  variables costs 730 of 500; a month not published yet is not a valid combination)."""
+  variables costs 730 of 500; a month not published yet is not a valid combination). A valid
+  request may come back with `request_is_valid` None (23 Nov 2026): it was taken for a refusal."""
 
   class Datastores:
     def estimate_costs(self, name, request):

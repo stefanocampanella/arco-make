@@ -322,7 +322,10 @@ class EarlyWarningDataStore(BackendEntrypoint):
     except Exception as error:
       logger.warning(f"EWDS cost estimate failed ({error}): one request per month")
       return False
-    accepted = costs.get("request_is_valid", True) and costs["cost"] <= costs["limit"]
+    # A valid request comes back with `request_is_valid` None (measured 23 Nov 2026), not True:
+    # only False refuses it.
+    valid = costs.get("request_is_valid") is not False
+    accepted = valid and costs["cost"] <= costs["limit"]
     if not accepted:
       reason = str(costs.get("invalid_reason") or f"cost {costs['cost']} > {costs['limit']}")
       logger.info(
