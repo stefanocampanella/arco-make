@@ -184,3 +184,36 @@ def test_ecmwf_open_data_reads_a_recent_run(tmp_path: pathlib.Path):
   # Metres a day, a little negative at most (accumulations are packed lossily in GRIB).
   assert float(total.min()) > -1e-3 and 0.0005 < float(total.mean()) < 0.01
   assert bool(ds.tp.isel(time=-1).isnull().all())  # no increment after the last step
+
+
+def test_ecmwf_open_data_forecast_download(tmp_path: pathlib.Path):
+  """A forecast download of three recent runs with a window of two (ECMWF open data, anonymous):
+  the last two runs kept, three lead days each, valid times, daily means and sums plausible,
+  every run its own forecast."""
+  first = datetime.date.today() - datetime.timedelta(days=5)
+  end = first + datetime.timedelta(days=3)
+  output = tmp_path / "forecast"
+  result = CliRunner().invoke(
+    cli,
+    [
+      "download",
+      "--dask-setup",
+      "threads",
+      "--no-progress",
+      f"--start={first}",
+      f"--end={end}",
+      str(RECIPES / "forecast_ecmwf_open_data.toml"),
+      str(output),
+    ],
+  )
+  assert result.exit_code == 0, failure_report(result)
+  ds = open_output(output)
+  assert ds.sizes["init_time"] == 2 and ds.sizes["lead_time"] == 3
+  assert str(ds.init_time.values[-1])[:10] == str(end - datetime.timedelta(days=1))
+  lead = ds.valid_time - ds.init_time
+  assert (lead == ds.lead_time).all()
+  assert float(ds.t2m.min()) > 230.0 and float(ds.t2m.max()) < 320.0
+  # Metres a day: differences of accumulations packed in GRIB (lossy) may be a little negative
+  # (-1.2e-4 seen, 23 Nov 2026), which recipes clip (`clip_negative`), as for ERA5.
+  assert float(ds.tp.min()) > -1e-3 and float(ds.tp.max()) < 0.5
+  assert bool(ds.ifs_forecast.all())
