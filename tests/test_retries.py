@@ -177,3 +177,18 @@ def test_a_commit_that_landed_is_not_redone(
   assert lost and "already committed by the previous attempt" in result.output
   times = open_output(output).time.values
   assert len(times) == 5 and len(set(times)) == 5
+
+
+def test_expected_errors_are_raised_unlogged(caplog: pytest.LogCaptureFixture):
+  """An error the caller handles as an outcome (a forecast run not published yet) is raised at
+  once, without the error line other errors get."""
+
+  class Outcome(Exception):
+    pass
+
+  def action():
+    raise Outcome("not yet")
+
+  with caplog.at_level(logging.INFO), pytest.raises(Outcome):
+    with_retries(action, RetryConfig(), "block", sleep=lambda s: None, expected=(Outcome,))
+  assert not [r for r in caplog.records if r.levelno >= logging.ERROR]

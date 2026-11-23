@@ -448,8 +448,10 @@ def download(
             ),
             configs.retries,
             _describe(date_interval),
+            expected=(RunNotPublished,),
           )
         except RunNotPublished as exc:
+          logger.info(f"{_describe(date_interval)}: {exc}: stopping before it")
           # The runs before are complete: promoted below; this one and the later ones wait.
           stopped = exc
           break
@@ -686,12 +688,14 @@ def _processed_block(
 
 
 def _with_coordinate_attrs(datasets: list[xr.Dataset], stand_ins: set[int]) -> list[xr.Dataset]:
-  """`datasets` with the coordinates of the stand-ins (`id` in `stand_ins`) given the attributes
-  of the same coordinates in the run's other datasets: datasets are merged with identical
-  attributes, and a stand-in's are not its dataset's own."""
+  """`datasets` with the stand-ins (`id` in `stand_ins`) given the attributes of the run's other
+  datasets, their own and their coordinates': datasets are merged with identical attributes, and
+  a stand-in's are not its dataset's own."""
   attrs: dict[Hashable, dict[Any, Any]] = {}
+  own: dict[Any, Any] | None = None
   for dataset in datasets:
     if id(dataset) not in stand_ins:
+      own = dict(dataset.attrs) if own is None else own
       for name, coord in dataset.coords.items():
         attrs.setdefault(name, dict(coord.attrs))
   out = []
@@ -700,6 +704,7 @@ def _with_coordinate_attrs(datasets: list[xr.Dataset], stand_ins: set[int]) -> l
       for name in dataset.coords:
         if name in attrs:
           dataset[name].attrs = attrs[name]
+      dataset.attrs = dict(own or {})
     out.append(dataset)
   return out
 
@@ -926,6 +931,8 @@ def _checked_block(
       if mask not in absent
     }
     fields = no_nans.model_dump(exclude=set(no_nans.model_extra or {}))
+    if isinstance(fields.get("exact"), list):  # a stand-in mask is no longer one of the masks
+      fields["exact"] = [mask for mask in fields["exact"] if mask in kept]
     config = config.model_copy(
       update={"ensure_no_nans": type(no_nans).model_validate(fields | kept)}
     )

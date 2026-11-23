@@ -126,14 +126,18 @@ def with_retries[T](
   config: RetryConfig,
   what: str,
   sleep: Callable[[float], Any] | None = None,
+  expected: tuple[type[Exception], ...] = (),
 ) -> T:
   """Run `action`, again after each transient error (`is_transient`) as `config` says; other
-  errors, and the last transient one, are raised. The log tells which is which."""
+  errors, and the last transient one, are raised. The log tells which is which. `expected`
+  errors are outcomes the caller handles (a forecast run not published yet): raised unlogged."""
   waits = config.waits()
   attempt = 1
   while True:
     try:
       return action()
+    except expected:
+      raise
     except Exception as error:
       summary = f"{type(error).__name__}: {str(error)[:200]}"
       if not is_transient(error):

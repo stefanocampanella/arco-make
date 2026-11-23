@@ -724,3 +724,19 @@ def test_static_parts_say_nothing_of_a_series_end(tmp_path):
   ends: list = []
   download_and_process(config, FIRST, FIRST + 3 * DAY, part_ends=ends)
   assert ends == []
+
+
+def test_stand_ins_merge_with_global_attributes_and_exact_masks(forecast_recipe, tmp_path):
+  """A stand-in takes the run's other datasets' attributes (they are merged with identical
+  ones), and an `exact` list naming a stand-in mask leaves it out."""
+  recipe, unavailable = forecast_recipe
+  steps = "".join(
+    f'\n[[datasets.{name}.postprocess]]\nname = "assign_attrs"\norigin = "x"\n'
+    for name in ("atmos", "ocean", "static")
+  )
+  checks = '\n[checks.ensure_no_nans]\nexact = ["t2m"]\nt2m = ["sst"]\n'
+  recipe.write_text(recipe.read_text().replace("\n[save]", f"{steps}{checks}\n[save]"))
+  unavailable.add(FIRST + DAY)
+  result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-03")
+  assert result.exit_code == 0, result.output
+  assert open_output(tmp_path / "out").attrs["origin"] == "x"

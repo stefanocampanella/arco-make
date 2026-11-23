@@ -293,9 +293,16 @@ class ECMWFOpenData(BackendEntrypoint):
       except FileNotFoundError:
         published = False
       if published and listed:
+        suffix = f"-{stream}-{type}.grib2"
+        if any(str(name).endswith(suffix) for name in listed):
+          # Its files are there, their indexes not yet: being published.
+          raise RunIncomplete(
+            f"{root}: the {model} {stream} run of {run_datetime:%Y-%m-%d %H:%M} has no indexes"
+            " yet (being published?)"
+          )
         raise ValueError(
-          f"{root}: the {model} {stream} run of {run_datetime:%Y-%m-%d %H:%M} has no indexed"
-          f" files of type {type!r} (check `type` and `stream`)"
+          f"{root}: the {model} {stream} run of {run_datetime:%Y-%m-%d %H:%M} has no files of"
+          f" type {type!r} (check `type` and `stream`)"
         )
       if published:
         raise ValueError(
@@ -377,7 +384,7 @@ class ECMWFOpenData(BackendEntrypoint):
       last = i + 2 == len(spacings)
       if spacing > following or (last and following > spacing):
         at = i if spacing > following else i + 1
-        raise ValueError(
+        raise RunIncomplete(
           f"the {model} run of {run:%Y-%m-%d %H:%M} lacks a step between {steps[at]} and"
           f" {steps[at + 1]} h (being published, or lost)"
         )

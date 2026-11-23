@@ -194,10 +194,10 @@ def test_a_step_missing_inside_the_run_fails(tree: pathlib.Path):
   spacing: not seen.)"""
   run_dir = tree / f"{RUN:%Y%m%d}" / "00z" / "ifs" / "0p25" / "oper"
   (run_dir / f"{RUN:%Y%m%d%H}0000-6h-oper-fc.index").unlink()
-  with pytest.raises(ValueError, match="lacks a step between 3 and 9 h"):
+  with pytest.raises(RunIncomplete, match="lacks a step between 3 and 9 h"):
     _open(tree, RUN, RUN + 24 * HOUR, param="2t")
   (run_dir / f"{RUN:%Y%m%d%H}0000-30h-oper-fc.index").unlink()
-  with pytest.raises(ValueError, match="lacks a step between 24 and 36 h"):
+  with pytest.raises(RunIncomplete, match="lacks a step between 24 and 36 h"):
     _open(tree, RUN + 12 * HOUR, RUN + 36 * HOUR, param="2t")
 
 
@@ -215,6 +215,26 @@ def test_a_recipe_mistake_is_not_a_missing_run(tree: pathlib.Path, options):
   recipe's mistake: it fails, instead of becoming NaN as a run not published."""
   with pytest.raises(ValueError, match="check"):
     _open(tree, RUN, RUN + 12 * HOUR, param="2t", **options)
+
+
+def test_files_before_their_indexes_are_a_run_being_published(tree: pathlib.Path):
+  """A run whose files are listed but not yet their indexes is being published: incomplete (a
+  recent run waits), not a recipe's mistake."""
+  later = RUN + 24 * HOUR
+  run_dir = tree / f"{later:%Y%m%d}" / "00z" / "ifs" / "0p25" / "oper"
+  run_dir.mkdir(parents=True)
+  (run_dir / f"{later:%Y%m%d%H}0000-0h-oper-fc.grib2").write_bytes(b"")
+  with (
+    pytest.raises(RunIncomplete, match="no indexes yet"),
+    TempDirectoryRegistry(base_dir=tree.parent / "registry"),
+  ):
+    ECMWFOpenData().open_dataset(
+      str(tree),
+      run_datetime=later,
+      start_datetime=later,
+      end_datetime=later + 12 * HOUR,
+      param="2t",
+    )
 
 
 def test_steps_need_their_index():

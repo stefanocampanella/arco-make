@@ -217,7 +217,7 @@ A dataset's `flag` is a boolean variable (`init_time` x `lead_time`): true where
 run's own forecast. A series is a run's own forecast only if, when read, it has no stamp at or after
 the run's horizon (a later release would have one): runs collected later (a backfill, a missed day)
 take the series' later values, flagged false. A run its source does not have (not published yet, not
-archived) leaves that dataset NaN in the run, flagged false, shaped as its variables are stored (the first run needs every source). With `missing_after` (e.g. `"2D"`), a run younger than that which a source lacks, or has in part, has not been published yet: the download stops before it, the runs before stored, with exit status 75; the same command later collects it, instead of storing NaN for good. A run
+archived) leaves that dataset NaN in the run, flagged false, shaped as its variables are stored (the first run needs every source). With `missing_after` (e.g. `"2D"`), a run younger than that which a source lacks, or has in part, has not been published yet: the download stops before it, the runs before stored, with exit status 75; `download --extend` later collects it (the same command, if nothing was stored yet), instead of storing NaN for good. A run
 whose datasets cover different valid times (a source not published to the horizon yet) fails. With
 `window`, a run beyond it shifts the stored runs back without copying them; the runs dropped go with
 the versions that hold them (`keep_versions`). The window is not part of the recipe's fingerprint, so
