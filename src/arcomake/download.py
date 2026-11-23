@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import functools
+import json
 import logging
 import math
 import warnings
@@ -52,10 +53,12 @@ from arcomake.datetime_utils import (
   naive_utc,
 )
 from arcomake.forecast import (
+  VARIABLES_KEY,
   ForecastConfig,
   RunReport,
   as_run,
   flags,
+  missing_dataset,
   series_is_the_run,
   with_missing,
 )
@@ -560,6 +563,7 @@ def _processed_block(
   static: RunStatic | None = None,
   run: datetime | None = None,
   report: RunReport | None = None,
+  missing: Callable[[str], xr.Dataset] | None = None,
 ) -> Generator[xr.Dataset]:
   """The datasets of one block, read, processed and merged, with the global postprocessing
   (lazy: computed when written); with a `budget`, the parts are chunked as planned for it.
@@ -568,8 +572,10 @@ def _processed_block(
   block (in memory) and reused by the others, instead of being read and processed for each.
 
   With `run` (a forecast run; `date_interval` its valid times), "runs" datasets read that run; a
-  source without it leaves its dataset out (`report.unavailable`); `report.real` tells, per
-  dataset, whether its values are the run's own forecast (`forecast` module).
+  source without it leaves its dataset out (`report.unavailable`), stood in for by `missing`
+  (NaN for its variables as stored, so that the recipe's later steps find them) if given;
+  `report.real` tells, per dataset, whether its values are the run's own forecast, and
+  `report.variables` which variables each dataset with time gave (`forecast` module).
   """
   # Download and postprocess each dataset, possibly using checkpointing to disk.
   with ExitStack() as stack:
@@ -604,9 +610,16 @@ def _processed_block(
           raise
         logger.warning(f"{dataset_name}: {error}: NaN in this run, its flag false")
         report.unavailable.append(dataset_name)
+        if missing is None:  # the first run: it fails, needing every dataset
+          continue
+        dataset = missing(dataset_name)
+        datasets.append(dataset)
+        valid_times[dataset_name] = dataset[configs.time_dim].values
         continue
       if report is not None and part_ends is not None:
         report.real[dataset_name] = runs or series_is_the_run(part_ends, date_interval.end)
+        if configs.time_dim in dataset.dims:
+          report.variables[dataset_name] = sorted(map(str, dataset.data_vars))
       if static is not None and configs.time_dim not in dataset.dims:
         logger.info(f"{dataset_name} is static: computed once for the run")
         dataset = dataset.load()
@@ -653,9 +666,28 @@ def _commit_message(interval: DateInterval) -> str:
   return f"download [{interval.start:%Y-%m-%dT%H:%M}, {interval.end:%Y-%m-%dT%H:%M})"
 
 
-def _block_metadata(interval: DateInterval) -> dict[str, str]:
-  """The block of a commit; the run adds the recipe's fingerprint (`Run(recipe=...)`)."""
-  return {icechunk_utils.BLOCK_KEY: block_key(interval)}
+def _block_metadata(
+  interval: DateInterval, variables: dict[str, list[str]] | None = None
+) -> dict[str, str]:
+  """The block of a commit; the run adds the recipe's fingerprint (`Run(recipe=...)`). A
+  forecast run's commit also records the variables of each dataset (`forecast.VARIABLES_KEY`)."""
+  metadata = {icechunk_utils.BLOCK_KEY: block_key(interval)}
+  if variables is not None:
+    metadata[VARIABLES_KEY] = json.dumps(variables, sort_keys=True)
+  return metadata
+
+
+def _recorded_variables(run: icechunk_utils.Run) -> dict[str, list[str]]:
+  """The variables of each dataset of the forecast runs, as the tip of the run's branch records
+  them (`forecast.VARIABLES_KEY`)."""
+  tip = next(iter(run.repo.ancestry(branch=run.branch)))
+  recorded = (tip.metadata or {}).get(VARIABLES_KEY)
+  if not isinstance(recorded, str):
+    return {}
+  variables: dict[str, list[str]] = {
+    str(name): [str(v) for v in names] for name, names in json.loads(recorded).items()
+  }
+  return variables
 
 
 def _write_block(
@@ -683,6 +715,57 @@ def _write_block(
   # A forecast block is run `date_interval.start`, read over its valid times.
   read_interval = date_interval if fc is None else DateInterval(*fc.interval(date_interval.start))
   report = RunReport() if fc is not None else None
+  group, time_dim = configs.save.group, configs.time_dim
+  # A later forecast run stands in NaN, shaped as stored, for a dataset its source lacks.
+  recorded: dict[str, list[str]] = {}
+  with ExitStack() as stack:
+    missing = None
+    if fc is not None and not first:
+      recorded = _recorded_variables(run)
+      session = run.repo.readonly_session(branch=run.branch)
+      stored = stack.enter_context(xr.open_zarr(session.store, group=group, consolidated=False))
+
+      def missing(name: str) -> xr.Dataset:
+        if name not in recorded:
+          raise click.ClickException(
+            f"{name} has no run of {date_interval.start:%Y-%m-%d %H:%M}, and the output records"
+            " no variables of it to stand in NaN for"
+          )
+        return missing_dataset(stored, recorded[name], date_interval.start, fc, time_dim)
+
+    _write_run_or_block(
+      configs,
+      date_interval,
+      read_interval,
+      run,
+      report,
+      missing,
+      recorded,
+      first=first,
+      progress=progress,
+      budget=budget,
+      static=static,
+    )
+
+
+def _write_run_or_block(
+  configs: DownloadConfig,
+  date_interval: DateInterval,
+  read_interval: DateInterval,
+  run: icechunk_utils.Run,
+  report: RunReport | None,
+  missing: Callable[[str], xr.Dataset] | None,
+  recorded: dict[str, list[str]],
+  *,
+  first: bool,
+  progress: bool,
+  budget: Budget | None,
+  static: RunStatic | None,
+) -> None:
+  """`_write_block`'s reading, checking and writing of a block (a forecast run: with its
+  report, the stand-ins for datasets without the run, and the variables recorded)."""
+  fc = configs.forecast
+  group, time_dim = configs.save.group, configs.time_dim
   with (
     _processed_block(
       configs,
@@ -692,20 +775,20 @@ def _write_block(
       static=static,
       run=date_interval.start if fc is not None else None,
       report=report,
+      missing=missing,
     ) as dataset,
     ProgressBar() if progress else nullcontext(),
   ):
-    group, time_dim = configs.save.group, configs.time_dim
     if not first and static is not None and not static.checked:
       _check_static(dataset, run, group, time_dim)
       static.checked = True
-    # A later forecast run: how many runs are stored, and the variables along them (those this
-    # run lacks, its sources having no such run, are left out of the checks).
+    # A later forecast run: how many runs are stored; the variables of the datasets it lacks
+    # (NaN, flagged) are left out of the checks.
     stored_runs, absent = 0, frozenset()
     if fc is not None and not first:
-      stored_runs, stored_names = _stored_runs(run, group, fc.init_dim)
-      flag_names = {conf.flag for conf in configs.datasets.values() if conf.flag is not None}
-      absent = stored_names - set(map(str, dataset.data_vars)) - flag_names
+      stored_runs, _ = _stored_runs(run, group, fc.init_dim)
+      unavailable = report.unavailable if report is not None else []
+      absent = frozenset(v for name in unavailable for v in recorded.get(name, []))
     # With a full window of forecast runs, the stored runs kept with this one (the oldest are
     # dropped); None when every stored run stays (an append).
     keep = None
@@ -727,7 +810,10 @@ def _write_block(
       message=_commit_message(date_interval),
       mode="w" if first else "a-",
       append_dim=None if first else append_dim,
-      metadata=_block_metadata(date_interval),
+      metadata=_block_metadata(
+        date_interval,
+        None if report is None else {**recorded, **report.variables},
+      ),
       # Chunks are planned for reading; the stored layout is the recipe's.
       align_chunks=True,
       keep=keep,
@@ -820,7 +906,10 @@ def _checked_block(
   if (no_nans := config.ensure_no_nans) is not None:
     table = no_nans.model_dump(exclude_none=True)
     table.setdefault("time_dim", time_dim)
-    dataset = checks.guard_no_nans(dataset, **table)
+    # The stand-ins of datasets without the run are NaN by design: not checked, kept.
+    held = [name for name in dataset.data_vars if name in absent]
+    guarded = checks.guard_no_nans(dataset.drop_vars(held), **table)
+    dataset = guarded.assign({name: dataset[name] for name in held}) if held else guarded
   return dataset
 
 

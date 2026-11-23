@@ -333,17 +333,36 @@ def test_a_series_ending_before_the_horizon_fails(forecast_recipe, tmp_path):
   assert open_output(output).sizes["init_time"] == 1
 
 
-def test_a_run_shorter_than_those_stored_fails(forecast_recipe, tmp_path):
-  """A run whose datasets all end early (here the run source lacks the run, and the series ends a
-  day short) has fewer lead times than those stored: it fails, before writing."""
+def test_a_short_series_beside_a_missing_source_fails(forecast_recipe, tmp_path):
+  """The NaN standing in for a source without the run has the stored lead times: a series ending
+  a day short beside it fails the run, naming the series, before writing."""
   recipe, unavailable = forecast_recipe
   output = tmp_path / "out"
   assert download(recipe, output, "--start=2026-11-01", "--end=2026-11-02").exit_code == 0
   unavailable.add(FIRST + DAY)
   write_series(tmp_path / "series.zarr", FIRST + 3 * DAY)
   result = download(recipe, output, "--extend", "--end=2026-11-03")
-  assert result.exit_code != 0 and "other lead times than those stored" in result.output
+  assert result.exit_code != 0 and "different valid times: ocean" in result.output
   assert open_output(output).sizes["init_time"] == 1
+
+
+def test_later_steps_find_the_variables_of_a_missing_source(forecast_recipe, tmp_path):
+  """A dataset without its run is stood in for by NaN for its variables as stored, before the
+  recipe's later steps: steps naming them (attributes, masks) run as on any run."""
+  recipe, unavailable = forecast_recipe
+  # Attributes on a coordinate too: the stand-in's coordinates must not carry the stored ones.
+  steps = (
+    '\n[[postprocess]]\nname = "assign_var_attrs"\nt2m = {units = "K"}\n'
+    'lat = {units = "degrees_north"}\n'
+  )
+  recipe.write_text(recipe.read_text().replace("\n[save]", f"{steps}\n[save]"))
+  unavailable.add(FIRST + DAY)
+  result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-03")
+  assert result.exit_code == 0, result.output
+  out = open_output(tmp_path / "out")
+  assert out.t2m.isel(init_time=1).isnull().all() and out.t2m.attrs["units"] == "K"
+  assert out.lat.attrs["units"] == "degrees_north"
+  assert out.atmos_forecast.values[:, 0].tolist() == [True, False]
 
 
 def test_a_failed_run_resumes(forecast_recipe, tmp_path, monkeypatch: pytest.MonkeyPatch):

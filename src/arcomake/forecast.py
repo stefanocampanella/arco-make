@@ -83,6 +83,39 @@ class RunReport:
 
   real: dict[str, bool] = field(default_factory=dict)
   unavailable: list[str] = field(default_factory=list)
+  # The variables each dataset with time gave (after its own steps): recorded in the commit
+  # (`VARIABLES_KEY`), so that a later run lacking a dataset can stand in NaN for them.
+  variables: dict[str, list[str]] = field(default_factory=dict)
+
+
+# Commit metadata: the variables of each dataset of the forecast runs, {dataset: [variable]}.
+VARIABLES_KEY = "arcomake_dataset_variables"
+
+
+def missing_dataset(
+  stored: xr.Dataset,
+  names: Iterable[str],
+  run: datetime.datetime,
+  config: ForecastConfig,
+  time_dim: str,
+) -> xr.Dataset:
+  """NaN for a dataset whose source has no run `run`: its variables `names` as stored (shapes,
+  types, coordinates), along `time_dim` at the run's valid times, as its own steps would have
+  given them (lazily: nothing is read). The recipe's later steps and checks then see them."""
+  names = list(names)
+  if missing := [name for name in names if name not in stored.data_vars]:
+    raise ValueError(
+      f"{missing} are not in the output: the recipe's later steps rename them? A dataset without"
+      " its run is stood in for by its variables as stored"
+    )
+  template = stored[names].isel({config.init_dim: -1}, drop=True)
+  extra = [n for n in template.coords if n not in template.dims]
+  template = template.drop_vars(extra)
+  valid = np.datetime64(run, "ns") + template[config.lead_dim].values
+  template = template.assign_coords({config.lead_dim: valid}).rename({config.lead_dim: time_dim})
+  # Without attributes (coordinates too): the stored ones are the recipe's later steps', which
+  # datasets are merged before (with identical attributes, which the datasets' steps drop).
+  return xr.full_like(template, np.nan).drop_attrs()
 
 
 def series_is_the_run(part_ends: Iterable[np.datetime64], run_end: datetime.datetime) -> bool:
