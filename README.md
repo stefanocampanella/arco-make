@@ -333,6 +333,29 @@ Versions follow [Semantic Versioning](https://semver.org); [CHANGELOG.md](CHANGE
 how to upgrade recipes, and what the public interface is. Before 1.0.0 a minor version may break recipes,
 commands or outputs.
 
+## Licence
+
+Arco-make is released under the MIT licence ([LICENSE](LICENSE)); every file carries its licence
+and copyright in [REUSE](https://reuse.software) form (`reuse lint` runs in CI). Its dependencies
+keep their own licences, all permissive except the Copernicus Marine toolbox (`copernicusmarine`,
+and `arcosparse` it uses: EUPL-1.2) and `certifi` and `tqdm` (MPL-2.0); the container image
+redistributes them unmodified, each with its licence in its installed metadata, and ecCodes
+(Apache-2.0) with its licence and notice in `/usr/local/share/doc/eccodes`.
+
+Arco-make does not license the data it writes: an output is a work derived from its sources and
+is bound by their licences and attribution requirements, which the recipe should record (for
+example in a global `attribution` attribute).
+
+## Use of AI tools
+
+Much of arco-make's code, tests and documentation has been written with AI coding assistants
+(Claude Code, by Anthropic), directed and reviewed by the maintainer. Every change was reviewed
+before being merged and is covered by the offline test suite; changes that affect outputs were
+checked against real data (`docs/logbook.md` records how). The commits of the 0.2.0 rewrite, all
+made with an assistant, name it in a `Co-Authored-By` trailer; earlier commits do not record
+whether one was used. The maintainer is responsible for the code as published: please report
+problems as issues.
+
 ## Development
 
 ```bash
