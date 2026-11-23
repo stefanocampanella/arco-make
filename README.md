@@ -128,9 +128,11 @@ compressors = [{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuf
 
 Sources are read with xarray: any of its engines (e.g. `zarr`, `h5netcdf`), or one of the backends of
 arco-make, `copernicusmarine` (Copernicus Marine, `cm://DATASET_ID`), `earlywarningdatastore` (EWDS,
-`ewds://DATASET`), `netcdfoverhttp` (a NetCDF file served over HTTP) and `icechunk` (an Icechunk
+`ewds://DATASET`), `netcdfoverhttp` (a NetCDF file served over HTTP), `icechunk` (an Icechunk
 repository, such as an output of arco-make: the tip of `main`, or the version named by `branch`, `tag`
-or `snapshot_id`). Credentials come from the environment of each service's client, never from recipes.
+or `snapshot_id`) and, in forecast recipes, `ecmwfopendata` (ECMWF's open data forecasts from a copy of
+data.ecmwf.int's tree, e.g. `s3://ecmwf-forecasts`, read anonymously: only the fields of `param` are
+fetched). Credentials come from the environment of each service's client, never from recipes.
 
 Day D is the interval from 00:00 of D to 00:00 of D+1, stamped D 00:00 (`resample` with `label` and
 `closed` "left"). Sources that stamp a value at the end of its period, such as ERA5 hourly
@@ -169,6 +171,58 @@ the recipe the output was written with (its dates aside), the static variables c
 stored ones, every block appended. A failed extension continues with `--extend --resume`. With the
 dates left to the command, one recipe serves the first download and every extension:
 `download --start 1993-01-01 --end 2026-07-01 R OUT`, then `download --extend --end 2026-08-01 R OUT`.
+
+A recipe with a `[forecast]` table writes forecast runs instead of a series: each block is one run,
+for the initialization times of `[start, end)` every `every` (in place of `step`), read over its valid
+times `[run, run + horizon)` with the same parts, steps and checks as any block, and stored along
+`init_time`, with `lead_time` (valid time minus initialization) and `valid_time` as a coordinate;
+static variables are stored once.
+
+```toml
+[forecast]
+horizon = "10D"        # lead times [0, horizon)
+every = "1D"           # between runs (the default)
+window = 1826          # optional: the runs kept; each new run drops the oldest beyond
+
+[datasets.atmosphere]  # a source of runs: its parts read each run (ecmwfopendata, earlywarningdatastore)
+forecast = "runs"
+flag = "atmosphere_forecast"
+
+[[datasets.atmosphere.parts]]
+filename_or_obj = "s3://ecmwf-forecasts"
+engine = "ecmwfopendata"
+param = ["2t"]         # GRIB short names; accumulations become increments between steps
+
+[[datasets.atmosphere.postprocess]]
+name = "resample"
+time = "1D"
+label = "left"
+closed = "left"
+reduce = "mean"
+
+[datasets.ocean]       # a series read by valid time (the default), e.g. a best estimate overwritten daily
+flag = "ocean_forecast"
+
+[[datasets.ocean.parts]]
+filename_or_obj = "cm://cmems_mod_glo_phy_anfc_0.083deg_P1D-m"
+variables = ["zos"]
+
+[save]
+chunks = {init_time = 1, lead_time = -1}   # with a window: one run per stored object
+```
+
+(Sources on different grids need `regrid` steps to a common grid, as in a historical recipe.)
+
+A dataset's `flag` is a boolean variable (`init_time` x `lead_time`): true where its values are the
+run's own forecast. A series is a run's own forecast only if, when read, it has no stamp at or after
+the run's horizon (a later release would have one): runs collected later (a backfill, a missed day)
+take the series' later values, flagged false. A run its source does not have (not published yet, not
+archived) leaves that dataset NaN in the run, flagged false; the first run needs every source. A run
+whose datasets cover different valid times (a source not published to the horizon yet) fails. With
+`window`, a run beyond it shifts the stored runs back without copying them; the runs dropped go with
+the versions that hold them (`keep_versions`). The window is not part of the recipe's fingerprint, so
+it may grow or shrink. `download --start S --end E R OUT` writes the runs of `[S, E)` (a backfill),
+`download --extend --end E R OUT` the runs after the last stored one (a daily job; missed days included).
 
 A download recipe may give `[checks]`, the tables of a `validate` recipe, run on each block before its
 commit, like pre-commit hooks: `valid_time_coordinate` over the block (its table takes no dates),

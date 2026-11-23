@@ -1555,3 +1555,69 @@ the bounds, and without any coordinate through `open_zarr(group=...)`).
   writing; along a split dimension, its own index only), and a step changing a variable's
   dimensions on a series is refused by name (it failed in the region write). Then, on the 1 deg test output: 210 series, 3 min, the statistics validated. The fork
   recipe now splits by level and its script streams by default.
+
+### 23 Nov: forecast downloads (roadmap point 7)
+
+**Maintainer's decisions (22 Nov)**, confirming those of 17 Nov (runs along `init_time` x
+`lead_time` with a 2D `valid_time`, 00 UTC runs, daily values, GLO12 physics, IFS HRES open
+data at 0.25 deg, the GloFAS forecast): a window of **5 years** of runs, which may be lengthened
+later; **backfill** from the end of the historical dataset to the start of collection; where a
+run's own forecast does not exist (GLO12 overwrites its releases, a day the job missed), the
+values come from **later data, flagged** (GLO12 from its best-estimate series by valid time; IFS
+and GloFAS runs requested again from their archives, NaN only where the archive lacks one); **no
+waves**, and levels, coarsening, steps and variables as in the historical recipes (GloFAS:
+`dis24_outlets`, the control member, 10 lead days); the operational GloFAS forecast whatever its
+version, recorded.
+
+**Sources, checked 22-23 Nov:**
+- IFS HRES 0.25 deg on AWS (`s3://ecmwf-forecasts`, anonymous) from early 2024 (0.4 deg before):
+  85 GRIB2 files per 00 UTC run, 3-hourly to 144 h then 6-hourly to 360 h, each with a JSON-lines
+  `.index` of byte ranges; every ERA5 variable of the ARCO-OCEAN recipe is there (2t, 2d, 10u,
+  10v, msl, tp, ssrd, strd, lsm; `z` at step 0 only, so the static fields stay ERA5's). A run is
+  on AWS at about 07:30 UTC. The bucket answers bursts with `SlowDown` (503, retried).
+- GloFAS forecast (EWDS `cems-glofas-forecast`) from 2019-11-05, `system_version =
+  "operational"`, control member; the GRIB has `step` (24-720 h) with `valid_time`, and the
+  initialization as a scalar. The service's cost estimate calls a run not published yet "not a
+  valid combination" (that day's run at 05:00 UTC), and a valid request comes back with
+  `request_is_valid` None: arco-make read None as a refusal, so historical blocks spanning
+  months went per month (fixed). **[Moby-Dick]** the operational forecast is GloFAS v4.x
+  (ECMWF's versioning page), the historical data v5.0: a model change between history and
+  forecasts.
+- GLO12 (`GLOBAL_ANALYSISFORECAST_PHY_001_024`): a best-estimate series by valid time,
+  overwritten daily; a release covers its day + 9.
+
+**arco-make** (PR #21, on #20):
+- `ecmwfopendata`, a backend reading one run of ECMWF's open data along valid time: the fields
+  asked are fetched by byte range (two days of three fields at 0.25 deg: 4 s), read by cfgrib,
+  removed at once; accumulations become increments stamped at the start of their interval, so a
+  daily sum is exactly acc(24(k+1)) - acc(24k). They are packed lossily: a day's precipitation
+  came out at -1.2e-4 m somewhere, so recipes clip it (as for ERA5). cfgrib's `history`
+  attribute (the temporary file's path) is dropped: datasets of one run did not merge.
+  **[Moby-Dick]** IFS daily means come from 8 samples a day (3-hourly) to day 5, 4 after
+  (6-hourly); ERA5's from 24.
+- The EWDS backend reads forecast runs (one request per run: its day, the lead hours).
+- `[forecast]` recipes: each block is one run, read over its valid times with the recipe's
+  parts and steps, stored along `init_time`; "runs" datasets read each run (a run the source
+  lacks: NaN, flagged), "series" datasets are read by valid time and are a run's own forecast only
+  if the series ends before the run's horizon when read; a `flag` variable per component. With
+  `window`, a run beyond it shifts the stored runs back by whole objects (`Session.shift_array`,
+  no copy) and the dropped runs go with the versions that hold them: with `keep_versions = 1`, as
+  many objects after each run. `--extend` adds the runs after the last stored one (missed days
+  included); the window is out of the fingerprint.
+- **[Moby-Dick]** forecast flags: false where a component's values are not its run's own
+  forecast (GLO12 runs collected after their day, backfilled runs; any component missing at its
+  source).
+
+**Live check** (23 Nov, 06:00 UTC, the project VM; a 1 deg box over the Adriatic, IFS 2t and
+tp, GloFAS `dis24`, GLO12 `zos`, 10 lead days, a window of 2): a backfill of the runs of 18-20
+Nov, then `--extend` to the run of 22 Nov. Every run committed, about 3 minutes each (mostly the
+EWDS queue: a backfill of 145 runs would take about 7 hours), 3 GB peak; the last two runs kept,
+valid times init + lead, plausible values (t2m 266-292 K, tp 0-0.08 m a day, dis24 to 230 m3/s,
+zos -0.49 to -0.20 m), IFS and GloFAS flagged as their runs' own forecasts, GLO12 as not: its
+series already ended on 2 Dec, the release of 23 Nov being out by 06:00 UTC (earlier than the
+12:00 of its manual). The Copernicus Marine toolbox's end is inclusive (the subset of [R, R + 10
+days] has 11 days), which the series rule relies on.
+
+**Next**: the ARCO-OCEAN forecast recipes (three resolutions, mirroring the historical ones)
+and the daily script, after the historical dataset; a cron time after every source has
+published (GLO12 by 06:00 UTC on 23 Nov, IFS about 07:30 UTC, GloFAS to be measured).

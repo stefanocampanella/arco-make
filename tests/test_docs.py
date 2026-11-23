@@ -29,11 +29,13 @@ def toml_examples() -> list[tuple[str, str]]:
   return examples
 
 
-def test_readme_recipe_is_valid():
-  """The recipe shown in the README loads as a download recipe."""
+def test_readme_recipes_are_valid():
+  """The recipes shown in the README (a series, forecast runs) load as download recipes."""
   readme = (ROOT / "README.md").read_text()
-  (example,) = re.findall(r"```toml\n(.*?)```", readme, re.S)
-  DownloadConfig.model_validate(tomllib.loads(example))
+  examples = re.findall(r"```toml\n(.*?)```", readme, re.S)
+  assert len(examples) == 2
+  for example in examples:
+    DownloadConfig.model_validate(tomllib.loads(example))
 
 
 @pytest.mark.parametrize(("name", "example"), toml_examples())
