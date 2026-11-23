@@ -111,6 +111,9 @@ def test_a_run_along_valid_time(tree: pathlib.Path):
   assert hours.tolist() == [0, 3, 6, 9, 12, 18, 24]
   assert list(out.data_vars) == ["t2m"]
   assert out.t2m.dims == ("time", "latitude", "longitude")
+  # cfgrib's history names the temporary file: datasets of one run would not merge, and the
+  # output would publish a local path.
+  assert "history" not in out.attrs and out.attrs["GRIB_centre"] == "ecmf"
   assert out.t2m.mean(["latitude", "longitude"]).values.tolist() == hours.tolist()
 
 

@@ -44,7 +44,9 @@ class RunUnavailable(LookupError):
 def _steps_as_time(dataset: xr.Dataset, time_dim: str) -> xr.Dataset:
   """A forecast run as cfgrib opens it (`time` its initialization, `step` the lead times,
   `valid_time` their sum) along `time_dim`, the valid times: the steps of a recipe then apply as
-  to any series. Scalar coordinates of the GRIB (`number`, `surface`, ...) are dropped."""
+  to any series. Scalar coordinates of the GRIB (`number`, `surface`, ...) are dropped, and so is
+  cfgrib's `history` attribute: it names the temporary file read and the time of reading, so it
+  differs between datasets (merged with identical attributes) and would publish a local path."""
   if "valid_time" not in dataset.coords:
     raise ValueError("a forecast run needs a valid_time coordinate (init + step)")
   if "step" not in dataset.dims:
@@ -53,7 +55,8 @@ def _steps_as_time(dataset: xr.Dataset, time_dim: str) -> xr.Dataset:
   scalars = [name for name in dataset.coords if dataset[name].ndim == 0]
   dataset = dataset.drop_vars([*scalars, "valid_time"], errors="ignore")
   dataset = dataset.drop_vars("step").rename({"step": time_dim})
-  return dataset.assign_coords({time_dim: valid})
+  attrs = {key: value for key, value in dataset.attrs.items() if key != "history"}
+  return dataset.assign_coords({time_dim: valid}).drop_attrs(deep=False).assign_attrs(attrs)
 
 
 def _drop_variables(dataset: xr.Dataset, names: str | Iterable[str] | None) -> xr.Dataset:
@@ -252,7 +255,9 @@ class ECMWFOpenData(BackendEntrypoint):
     run's start (GRIB `stepType` "accum": precipitation, radiation) become the increments between
     consecutive steps, stamped at the start of theirs: a daily sum of day k is then exactly the
     accumulation at its end minus that at its start, whatever the steps (3-hourly, then 6-hourly
-    for IFS). Variables keep cfgrib's names (`t2m` for "2t").
+    for IFS). The accumulations are packed lossily in GRIB, so an increment can be a little
+    negative (-1.2e-4 m of precipitation seen over a day): clip them in the recipe
+    (`clip_negative`), as for ERA5. Variables keep cfgrib's names (`t2m` for "2t").
 
     Raises:
       RunUnavailable: if the source has no such run (not published yet, or not archived).
