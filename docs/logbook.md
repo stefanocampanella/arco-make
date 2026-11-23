@@ -1660,3 +1660,22 @@ decompression" reading a source (the same block passed four times before and aft
 truncated chunk, most likely. arco-make took it for a permanent error; it is now transient
 (maintainer, 23 Nov: `retries.DECOMPRESSION_ERRORS`), so the block is read again, and a chunk
 corrupt at the source fails once the attempts are spent.
+
+GLO12's static geometry (maintainer, 23 Nov: the forecast volumes use GLO12's 3D `e3t`; a
+mismatch of `deptho` goes into its comment; the radius stays 6,378,100 m, GLO12's 9,250 m `e2t`
+being 1/12 deg rounded). Measured on the static products (`deptho` on 1/17 of the columns):
+- Partial bottom cells: 1.6 % of GLO12's sea cells are thinner than their level. Against full
+  layers, the sea volume is 0.75 % less in all: levels 0-36 within 0.13 %, 42-47 -0.8 % to
+  -6.8 %, level 48 +17.6 % (its bottom cells take in level 49, no sea in the mask, up to 906 m
+  thick against 448). 1,275 cells of levels 6-9 are sea in the mask with an `e3t` of 0.
+- The forecast recipes regrid each native cell's water (`e3t` where the mask has sea, 0 on land)
+  conservatively: `volcello` = mean water thickness x `areacello`. At 1 deg its total equals
+  GLO12's own (sum of `e1t` x `e2t` x `e3t` x `mask`, scaled to the areas' radius) to 4 digits;
+  `depth_bnds` stays the nominal layers. CF gives a 1D coordinate's bounds per level only
+  (bounds take the coordinate's dimensions plus the vertices); a coarse cell's partial bottom
+  cells vary inside it anyway, so the volume (and its thickness, if ever published as
+  `thkcello`, standard name `cell_thickness`) carries them.
+- **[Moby-Dick]** `deptho` is not the bottom of the water column the mask and layers give. GLO12's
+  lies about half a level below it in every column (near the centre of the first land level;
+  median 200 m deeper); GLORYS12's within half a level of it, above or below (48 % inside the
+  deepest sea level). Both recipes say so in `deptho`'s comment. Use `volcello` for water.
