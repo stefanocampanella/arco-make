@@ -280,46 +280,96 @@ class ECMWFOpenData(BackendEntrypoint):
       listed = []
     steps = self._steps(listed, prefix, stream, type)
     if not steps:
+      # Not published (or not archived) only if the run's time has nothing at all: a run there
+      # without this model, resolution, stream or type is a recipe's mistake, not a gap.
+      time_dir = f"{path}/{run_datetime:%Y%m%d}/{run_datetime:%H}z"
+      try:
+        published = bool(fs.ls(time_dir, detail=False))
+      except FileNotFoundError:
+        published = False
+      if published and listed:
+        raise ValueError(
+          f"{root}: the {model} {stream} run of {run_datetime:%Y-%m-%d %H:%M} has no indexed"
+          f" files of type {type!r} (check `type` and `stream`)"
+        )
+      if published:
+        raise ValueError(
+          f"{root} has runs of {run_datetime:%Y-%m-%d %H:%M}, but not {model}/{resolution}/"
+          f"{stream} (check `model`, `resolution` and `stream`)"
+        )
       raise RunUnavailable(f"{root} has no {model} {stream} run of {run_datetime:%Y-%m-%d %H:%M}")
     first = start_datetime - run_datetime
     last = end_datetime - run_datetime
     wanted = [s for s in steps if first <= datetime.timedelta(hours=s) <= last]
-    if not wanted or datetime.timedelta(hours=steps[-1]) < last:
+    if not wanted or datetime.timedelta(hours=wanted[-1]) != last:
       raise ValueError(
-        f"the {model} run of {run_datetime:%Y-%m-%d %H:%M} has steps to {steps[-1]} h:"
-        f" valid times to {end_datetime} are asked"
+        f"the {model} run of {run_datetime:%Y-%m-%d %H:%M} has no step at {end_datetime} (steps"
+        f" to {steps[-1]} h): the block must end on a step (an accumulation's last interval"
+        " needs it)"
       )
+    self._no_gaps(wanted, run_datetime, model)
     names = [f"{run_dir}/{prefix}-{s}h-{stream}-{type}" for s in wanted]
     indexes = fs.cat([f"{name}{self.INDEX_SUFFIX}" for name in names])
-    fields: dict[str, list[tuple[str, int, int]]] = {p: [] for p in params}
+    # Per field, per step, the byte ranges of its messages (several for levels or members).
+    fields: dict[str, list[list[tuple[str, int, int]]]] = {p: [] for p in params}
     for name in names:
+      found: dict[str, list[tuple[str, int, int]]] = {p: [] for p in params}
       for line in indexes[f"{name}{self.INDEX_SUFFIX}"].decode().splitlines():
         if not line.strip():
           continue
         entry = json.loads(line)
-        if entry.get("levtype") == levtype and entry.get("param") in fields:
+        if entry.get("levtype") == levtype and entry.get("param") in found:
           offset, length = int(entry["_offset"]), int(entry["_length"])
-          fields[entry["param"]].append((f"{name}.grib2", offset, offset + length))
-    if missing := [p for p, found in fields.items() if len(found) != len(names)]:
+          found[entry["param"]].append((f"{name}.grib2", offset, offset + length))
+      for param, ranges in found.items():
+        fields[param].append(ranges)
+    # Every step needs the same messages of a field (none missing at some steps).
+    if missing := [p for p, per_step in fields.items() if len({len(r) for r in per_step}) != 1]:
       raise ValueError(
         f"the {model} run of {run_datetime:%Y-%m-%d %H:%M} lacks {missing} ({levtype}) at some"
         f" of the steps {wanted}"
+      )
+    if absent := [p for p, per_step in fields.items() if not per_step[0]]:
+      raise ValueError(
+        f"the {model} run of {run_datetime:%Y-%m-%d %H:%M} has no {absent} ({levtype})"
       )
     registry = get_current_temp_registry()
     if registry is None:
       raise ValueError("No temporary directory registry available.")
     directory = registry.create_temp_dir()
     try:
+      # One concurrent fetch of every message of every field.
+      ranges = [r for per_step in fields.values() for step in per_step for r in step]
+      paths, starts, ends = map(list, zip(*ranges, strict=True))
+      blobs = iter(fs.cat_ranges(paths, starts, ends))
       datasets = []
-      for name, ranges in fields.items():
-        paths, starts, ends = map(list, zip(*ranges, strict=True))
-        blobs = fs.cat_ranges(paths, starts, ends)
+      for name, per_step in fields.items():
         grib = directory / f"{name}.grib2"
-        grib.write_bytes(b"".join(blobs))
+        grib.write_bytes(b"".join(next(blobs) for step in per_step for _ in step))
         datasets.append(self._read(grib, time_dim, deaccumulate))
     finally:
       shutil.rmtree(directory, ignore_errors=True)
     return _drop_variables(xr.merge(datasets, join="exact"), drop_variables)
+
+  @staticmethod
+  def _no_gaps(steps: list[int], run: datetime.datetime, model: str) -> None:
+    """Fail if a step is missing inside the steps read (a file not published yet, or lost): the
+    spacing of a run's steps never shrinks (IFS: 3 hours to 144 h, then 6), so a spacing larger
+    than the next one is a gap; and the last spacing may not be larger than the one before (a
+    gap before the last step; a block ending one step after the spacing grows is refused too,
+    which daily blocks of IFS never do). A daily mean would average fewer samples, silently. A
+    step missing just where the spacing grows (141 h for IFS) looks like the change of spacing,
+    and is not seen: ECMWF publishes whole runs, step by step, and a run still being published
+    lacks its last steps (no step at the block's end)."""
+    spacings = [b - a for a, b in itertools.pairwise(steps)]
+    for i, (spacing, following) in enumerate(itertools.pairwise(spacings)):
+      last = i + 2 == len(spacings)
+      if spacing > following or (last and following > spacing):
+        at = i if spacing > following else i + 1
+        raise ValueError(
+          f"the {model} run of {run:%Y-%m-%d %H:%M} lacks a step between {steps[at]} and"
+          f" {steps[at + 1]} h (being published, or lost)"
+        )
 
   @staticmethod
   def _steps(listed: Iterable[str], prefix: str, stream: str, type: str) -> list[int]:
@@ -487,6 +537,23 @@ class EarlyWarningDataStore(BackendEntrypoint):
     # Without an estimate, the run is requested anyway: a run the service lacks then fails.
     if (costs := self._estimate(client, dataset_name, request)) is not None:
       if not self._valid(costs):
+        # The service answers so for any combination it lacks: a run not published yet, and a
+        # recipe's mistake (a variable, a product type). The same request for a run a week
+        # older tells which.
+        older = run - datetime.timedelta(days=7)
+        again = self._estimate(
+          client,
+          dataset_name,
+          request
+          | {"year": [f"{older.year}"], "month": [f"{older.month:02}"]}
+          | {"day": [f"{older.day:02}"]},
+        )
+        if again is not None and not self._valid(again):
+          reason = str(costs.get("invalid_reason") or "").splitlines()[:1]
+          raise ValueError(
+            f"{dataset_name} refuses the request for the run of {run:%Y-%m-%d} and for a run a"
+            f" week older (check the recipe's variable, product type and versions): {reason}"
+          )
         raise RunUnavailable(f"{dataset_name} has no run of {run:%Y-%m-%d %H:%M}")
       if costs["cost"] > costs["limit"]:
         raise ValueError(

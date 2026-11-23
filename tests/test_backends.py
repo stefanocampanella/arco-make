@@ -188,7 +188,7 @@ def _forecast_service(
 
   class Datastores:
     def estimate_costs(self, name, request):
-      return costs
+      return costs(request) if callable(costs) else costs
 
   class Legacy:
     client = Datastores()
@@ -246,12 +246,25 @@ def test_ewds_forecast_run_along_valid_time(
 
 def test_ewds_forecast_run_not_published(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
   """A run the service does not have yet is not a valid combination for its cost estimate
-  (checked 23 Nov 2026 for that day's run): `RunUnavailable`, and nothing is requested."""
-  costs = {"cost": 3.0, "limit": 60.0, "request_is_valid": False, "invalid_reason": "no data"}
-  made = _forecast_service(monkeypatch, costs)
+  (checked 23 Nov 2026 for that day's run), while the same request for a run a week older is:
+  `RunUnavailable`, and nothing is requested."""
+  invalid = {"cost": 3.0, "limit": 60.0, "request_is_valid": False, "invalid_reason": "no data"}
+  valid = {"cost": 3.0, "limit": 60.0, "request_is_valid": None}
+  made = _forecast_service(monkeypatch, lambda r: invalid if r["day"] == ["23"] else valid)
   with TempDirectoryRegistry(base_dir=tmp_path), pytest.raises(backends.RunUnavailable):
     _open_run(datetime(2026, 11, 23), datetime(2026, 11, 24), datetime(2026, 12, 4))
   assert made == []
+
+
+def test_ewds_forecast_recipe_mistake_fails(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+  """A request refused for a run a week older too is a recipe's mistake (a variable, a product
+  type): it fails, instead of becoming NaN as a run not published."""
+  invalid = {"cost": 3.0, "limit": 60.0, "request_is_valid": False, "invalid_reason": "no data"}
+  _forecast_service(monkeypatch, invalid)
+  with TempDirectoryRegistry(base_dir=tmp_path), pytest.raises(ValueError, match="check the"):
+    _open_run(datetime(2026, 11, 23), datetime(2026, 11, 24), datetime(2026, 12, 4))
 
 
 def test_ewds_forecast_run_above_the_limit_fails(

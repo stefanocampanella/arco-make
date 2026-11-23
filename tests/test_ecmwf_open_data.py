@@ -23,8 +23,9 @@ HOUR = datetime.timedelta(hours=1)
 STEPS = [0, 3, 6, 9, 12, 18, 24, 30, 36]
 
 
-def _message(param: str, step: int, values: np.ndarray) -> bytes:
-  handle = eccodes.codes_grib_new_from_samples("regular_ll_sfc_grib2")
+def _message(param: str, step: int, values: np.ndarray, level: int | None = None) -> bytes:
+  sample = "regular_ll_sfc_grib2" if level is None else "regular_ll_pl_grib2"
+  handle = eccodes.codes_grib_new_from_samples(sample)
   try:
     grid = {
       "Ni": 4,
@@ -41,6 +42,8 @@ def _message(param: str, step: int, values: np.ndarray) -> bytes:
     for key, value in grid.items():
       eccodes.codes_set(handle, key, value)
     eccodes.codes_set(handle, "shortName", param)
+    if level is not None:
+      eccodes.codes_set(handle, "level", level)
     if eccodes.codes_get(handle, "stepType") == "accum":
       eccodes.codes_set(handle, "stepRange", f"0-{step}")
     else:
@@ -70,16 +73,18 @@ def tree(tmp_path: pathlib.Path) -> pathlib.Path:
   run_dir.mkdir(parents=True)
   for step in STEPS:
     fields = [
-      ("2t", "sfc", np.full((3, 4), float(step))),
-      ("tp", "sfc", np.full((3, 4), accumulated(step))),
-      ("2t", "pl", np.full((3, 4), -1.0)),  # another level type: never read as sfc
+      ("2t", "sfc", np.full((3, 4), float(step)), None),
+      ("tp", "sfc", np.full((3, 4), accumulated(step)), None),
+      # Another level type, never read as sfc: two levels, so two messages per step.
+      ("t", "pl", np.full((3, 4), 250.0), 500),
+      ("t", "pl", np.full((3, 4), 280.0), 850),
     ]
     if step % 6 == 0:
-      fields.append(("msl", "sfc", np.full((3, 4), 1e5)))
+      fields.append(("msl", "sfc", np.full((3, 4), 1e5), None))
     name = run_dir / f"{RUN:%Y%m%d%H}0000-{step}h-oper-fc"
     blob, lines = b"", []
-    for param, levtype, values in fields:
-      message = _message(param, step, values)
+    for param, levtype, values, level in fields:
+      message = _message(param, step, values, level)
       lines.append(
         json.dumps(
           {"param": param, "levtype": levtype, "step": str(step), "_offset": len(blob)}
@@ -173,6 +178,43 @@ def test_a_field_missing_at_some_steps_fails(tree: pathlib.Path):
   """A field the run lacks at some steps (msl here only every 6 hours) fails, naming it."""
   with pytest.raises(ValueError, match="msl"):
     _open(tree, RUN, RUN + 12 * HOUR, param=["2t", "msl"])
+
+
+def test_fields_on_several_levels(tree: pathlib.Path):
+  """A field with several messages per step (pressure levels; ensemble members alike) is read
+  whole: a level dimension, as cfgrib makes it."""
+  out = _open(tree, RUN, RUN + 12 * HOUR, param="t", levtype="pl")
+  assert out.t.sizes["isobaricInhPa"] == 2
+  assert sorted(out.t.isel(time=0, latitude=0, longitude=0).values.tolist()) == [250.0, 280.0]
+
+
+def test_a_step_missing_inside_the_run_fails(tree: pathlib.Path):
+  """A step missing among those read (a file being published, or lost) fails: a daily mean would
+  average fewer samples, silently. (One missing where the spacing grows looks like the change of
+  spacing: not seen.)"""
+  run_dir = tree / f"{RUN:%Y%m%d}" / "00z" / "ifs" / "0p25" / "oper"
+  (run_dir / f"{RUN:%Y%m%d%H}0000-6h-oper-fc.index").unlink()
+  with pytest.raises(ValueError, match="lacks a step between 3 and 9 h"):
+    _open(tree, RUN, RUN + 24 * HOUR, param="2t")
+  (run_dir / f"{RUN:%Y%m%d%H}0000-30h-oper-fc.index").unlink()
+  with pytest.raises(ValueError, match="lacks a step between 24 and 36 h"):
+    _open(tree, RUN + 12 * HOUR, RUN + 36 * HOUR, param="2t")
+
+
+def test_a_block_ends_on_a_step(tree: pathlib.Path):
+  """A block whose end is not a step would leave its last increment NaN inside the block."""
+  with pytest.raises(ValueError, match="no step at"):
+    _open(tree, RUN, RUN + 15 * HOUR, param="tp")
+
+
+@pytest.mark.parametrize(
+  "options", [{"stream": "opr"}, {"resolution": "0p4"}, {"type": "ef"}], ids=str
+)
+def test_a_recipe_mistake_is_not_a_missing_run(tree: pathlib.Path, options):
+  """A run that is there, but not with the recipe's model, resolution, stream or type, is a
+  recipe's mistake: it fails, instead of becoming NaN as a run not published."""
+  with pytest.raises(ValueError, match="check"):
+    _open(tree, RUN, RUN + 12 * HOUR, param="2t", **options)
 
 
 def test_steps_need_their_index():
