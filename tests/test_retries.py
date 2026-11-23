@@ -8,6 +8,8 @@ import importlib
 import logging
 import pathlib
 
+import numcodecs
+import numpy as np
 import pytest
 import requests
 from click.testing import CliRunner
@@ -59,6 +61,24 @@ def test_transient_errors(error):
 )
 def test_errors_that_would_recur(error):
   assert not is_transient(error)
+
+
+def blosc_error() -> RuntimeError:
+  """What numcodecs raises for a Blosc chunk cut short (e.g. a read that ended early)."""
+  data = numcodecs.Blosc(cname="lz4").encode(np.arange(10_000, dtype="f4"))
+  try:
+    numcodecs.Blosc().decode(data[: len(data) // 2])
+  except RuntimeError as error:
+    return error
+  raise AssertionError("a truncated chunk decompressed")
+
+
+def test_a_chunk_that_does_not_decompress_is_transient():
+  """A source chunk that does not decompress was most likely cut short on the way: the block is
+  read again (seen once reading a source, on a block that passed before and after)."""
+  assert is_transient(blosc_error())
+  assert is_transient(raised_from(ValueError("dask task failed"), blosc_error()))
+  assert not is_transient(RuntimeError("error during something else"))
 
 
 def test_botocore_errors():

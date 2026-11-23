@@ -35,6 +35,10 @@ TRANSIENT_ERRNOS = {
   errno.ENETUNREACH,
   errno.EHOSTUNREACH,
 }
+# A compressed chunk that does not decompress: most likely cut short on the way (a read ending
+# early without an error), so read again; a chunk corrupt at the source fails once the attempts
+# are spent. numcodecs raises it as a bare RuntimeError (zarr 2 and 3 alike).
+DECOMPRESSION_ERRORS = ("error during blosc decompression",)
 
 
 class RetryConfig(BaseModel):
@@ -92,9 +96,12 @@ def _status(error: BaseException) -> int | None:
 
 def is_transient(error: BaseException) -> bool:
   """Whether `error` (or an error it comes from) is worth another try: a timeout, a dropped or
-  refused connection, or an HTTP answer of `TRANSIENT_STATUSES`."""
+  refused connection, an HTTP answer of `TRANSIENT_STATUSES`, or a chunk that does not
+  decompress (`DECOMPRESSION_ERRORS`)."""
   for cause in _causes(error):
     if isinstance(cause, TimeoutError | asyncio.TimeoutError | socket.timeout | ConnectionError):
+      return True
+    if type(cause) is RuntimeError and str(cause).startswith(DECOMPRESSION_ERRORS):
       return True
     if isinstance(cause, OSError) and cause.errno in TRANSIENT_ERRNOS:
       return True

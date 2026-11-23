@@ -1654,7 +1654,8 @@ The final end-to-end (code of PR #21's last commit; 10:25-10:52 UTC): the runs o
 stored, 4-8 minutes each, 15 GB peak; every variable plausible (thetao -3.1 to 33.7 degC, ocean
 fields in 61 % of the cells, sea ice 70 %, the rest everywhere), the cell bounds and static
 fields there; IFS and GloFAS their runs' own forecasts, GLO12 only on 23 Nov's run (the earlier
-ones collected after their day). Open: one attempt before failed a block with "error during
-blosc decompression" reading a source (the same block passed four times before and after): a
-truncated chunk, most likely; arco-make takes it for a permanent error (no block retry). If it
-recurs, classing it as transient is a one-line change in `retries.is_transient`.
+ones collected after their day). One attempt before failed a block with "error during blosc
+decompression" reading a source (the same block passed four times before and after): a
+truncated chunk, most likely. arco-make took it for a permanent error; it is now transient
+(maintainer, 23 Nov: `retries.DECOMPRESSION_ERRORS`), so the block is read again, and a chunk
+corrupt at the source fails once the attempts are spent.
