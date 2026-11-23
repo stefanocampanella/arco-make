@@ -1693,3 +1693,26 @@ collection has run for a while, preferably on the commit that made the published
 candidate (1.0.0rc1) was considered and set aside: each commit's provenance records the version,
 so the published data would carry "rc" for good. `CHANGELOG.md` lists the upgrade from 0.1.0 and
 states the interface; the tag (`v0.2.0`) goes on master once the stack is merged.
+
+### 23 Nov: the open points of the #18 review
+
+The maintainer's answers (23 Nov): every change before the production run is fine (no output
+has to stay extendable across it). So:
+
+- **Parts' `storage_options` left out of the fingerprint.** They say how a source is read
+  (anonymous or a profile, an endpoint), as `timeout` does: in the fingerprint, a download that
+  had to change them could neither resume nor be extended. Outputs written before keep their
+  fingerprint.
+- **Old provenance fingerprints**: nothing to do, no output written before has to be extended.
+- **A failed climatology run's branch** stays until retention removes it (after `GRACE`): fine,
+  it is never promoted.
+- **Branch names**: `waiting_run` found a failed run by the prefix of its branch name, so
+  `download` matched extensions (`download-extend-...`) too, and sorted them by the label's last
+  part; `download` told extensions apart by another prefix test, and re-parsed block keys with a
+  second copy of their format. Labels are now read back only by `parse_label`, runs matched by
+  exact command (`WaitingRun.command`), block ends by `block_end`.
+- **One opening of the output**: `download --extend` opened the repository four times before its
+  first block (each opening reads its configuration and references, each can stall); the checks
+  and the run now share one (`existing_repository`, `Run(repository=...)`, reopened with the
+  write timeouts without reading storage).
+
