@@ -41,6 +41,11 @@ class RunUnavailable(LookupError):
   download leaves the dataset out of that run (NaN, flagged), instead of failing it."""
 
 
+class RunIncomplete(RunUnavailable):
+  """A forecast run its source has in part only (its last steps missing): being published, if
+  recent; else cut short, or a horizon beyond the run's, which a forecast download refuses."""
+
+
 def _steps_as_time(dataset: xr.Dataset, time_dim: str) -> xr.Dataset:
   """A forecast run as cfgrib opens it (`time` its initialization, `step` the lead times,
   `valid_time` their sum) along `time_dim`, the valid times: the steps of a recipe then apply as
@@ -301,6 +306,12 @@ class ECMWFOpenData(BackendEntrypoint):
     first = start_datetime - run_datetime
     last = end_datetime - run_datetime
     wanted = [s for s in steps if first <= datetime.timedelta(hours=s) <= last]
+    if datetime.timedelta(hours=steps[-1]) < last:
+      # Its last steps are not there (yet): being published, or cut short in the archive.
+      raise RunIncomplete(
+        f"{root}: the {model} run of {run_datetime:%Y-%m-%d %H:%M} has steps to {steps[-1]} h"
+        f" only, not to {end_datetime} (being published?)"
+      )
     if not wanted or datetime.timedelta(hours=wanted[-1]) != last:
       raise ValueError(
         f"the {model} run of {run_datetime:%Y-%m-%d %H:%M} has no step at {end_datetime} (steps"

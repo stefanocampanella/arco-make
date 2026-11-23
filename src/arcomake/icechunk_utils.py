@@ -573,6 +573,15 @@ class Run:
     block = metadata.get(BLOCK_KEY)
     return str(block) if block is not None and metadata.get(RUN_KEY) == self.label else None
 
+  def abandon(self) -> None:
+    """Delete the run's branch, which holds no commit of the run: `main` stays as it was, and no
+    failed run waits there (a forecast download stopped at its first run)."""
+    tip = next(iter(self.repo.ancestry(branch=self.branch)))
+    if tip.id != self.base:
+      raise RuntimeError(f"{self.branch} holds commits of the run: not abandoned")
+    self.repo.delete_branch(self.branch)
+    logger.info(f"Abandoned {self.branch} (nothing written) in {self.path}")
+
   def finish(self, retention: "Retention | None" = None) -> str:
     """Move `main` to the run's last commit (if `main` is still where the run started), then
     delete the run's branch and apply `retention`; return the new tip of `main`.

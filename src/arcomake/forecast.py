@@ -93,35 +93,62 @@ def now() -> datetime.datetime:
 class RunReport:
   """What a run's datasets tell about it, gathered while its block is read: per dataset, whether
   its values are the run's own forecast; the datasets whose source had no such run, and the
-  variables standing in for them (NaN)."""
+  variables standing in for them (NaN); the variables each dataset gave (after its own steps),
+  recorded in the commit (`VARIABLES_KEY`) for the stand-ins of later runs."""
 
   real: dict[str, bool] = field(default_factory=dict)
   unavailable: list[str] = field(default_factory=list)
   standing_in: list[str] = field(default_factory=list)
+  variables: dict[str, list[str]] = field(default_factory=dict)
 
 
 class RunNotPublished(RuntimeError):
-  """A source has not published a run yet (younger than `missing_after`): the download stops
-  before it, the runs before stored, to collect it later."""
+  """A source has not published a run yet, or not all of it (younger than `missing_after`): the
+  download stops before it, the runs before stored, to collect it later."""
 
 
-# How many earlier runs of a source are tried for a stand-in (`stand_in`).
-STAND_IN_TRIES = 7
+# Commit metadata: the variables of each dataset of the forecast runs, {dataset: [variable]}.
+VARIABLES_KEY = "arcomake_dataset_variables"
 
 
-def stand_in(dataset: xr.Dataset, time_dim: str) -> xr.Dataset:
-  """NaN for a dataset whose source has no such run, shaped as the dataset is: `dataset` is the
-  same dataset read from an earlier run of the source over the run's valid times (its own steps
-  applied: names, coordinates and attributes as they would have been), its variables along
-  `time_dim` NaN (lazily: their values are never read), its others (static) as read.
+def missing_dataset(
+  stored: xr.Dataset,
+  names: Iterable[str],
+  run: datetime.datetime,
+  config: ForecastConfig,
+  time_dim: str,
+) -> xr.Dataset:
+  """The stand-in for a dataset whose source has no run `run`: its variables `names` (as its own
+  steps gave them in earlier runs, `VARIABLES_KEY`) taken from the output, those along runs NaN
+  along `time_dim` at the run's valid times (lazily: nothing is read), the static ones as stored.
+  Without attributes: the caller gives the coordinates those of the run's other datasets (they
+  are merged with identical attributes); the recipe's later steps set the variables' again.
+
+  It needs the variables to keep their names through the recipe's later steps, and those along
+  runs to be floating point (NaN).
 
   Raises:
-    ValueError: for a variable along time that is not floating point (NaN cannot stand in).
+    ValueError: for a variable not in the output (renamed by the later steps?) or not floating
+      point.
   """
-  timed = [name for name, var in dataset.data_vars.items() if time_dim in var.dims]
-  if not_float := [name for name in timed if dataset[name].dtype.kind != "f"]:
+  names = list(names)
+  if missing := [name for name in names if name not in stored.data_vars]:
+    raise ValueError(
+      f"{missing} are not in the output: the recipe's later steps rename them? A dataset without"
+      " its run is stood in for by its variables as stored"
+    )
+  timed = [name for name in names if config.init_dim in stored[name].dims]
+  static = [name for name in names if name not in timed]
+  if not_float := [name for name in timed if stored[name].dtype.kind != "f"]:
     raise ValueError(f"{not_float} are not floating point: NaN cannot stand in for them")
-  return dataset.assign({name: xr.full_like(dataset[name], np.nan) for name in timed})
+  template = stored[timed].isel({config.init_dim: -1}, drop=True)
+  template = template.drop_vars([n for n in template.coords if n not in template.dims])
+  valid = np.datetime64(run, "ns") + template[config.lead_dim].values
+  template = template.assign_coords({config.lead_dim: valid}).rename({config.lead_dim: time_dim})
+  filled = xr.full_like(template, np.nan)
+  if static:
+    filled = filled.assign({name: stored[name] for name in static})
+  return filled.drop_attrs()
 
 
 def series_is_the_run(part_ends: Iterable[np.datetime64], run_end: datetime.datetime) -> bool:
@@ -205,11 +232,12 @@ def as_run(
 
 
 __all__ = [
+  "VARIABLES_KEY",
   "ForecastConfig",
   "RunNotPublished",
   "RunReport",
   "as_run",
   "flags",
+  "missing_dataset",
   "series_is_the_run",
-  "stand_in",
 ]

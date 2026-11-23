@@ -208,6 +208,8 @@ def forecast_recipe(tmp_path, monkeypatch: pytest.MonkeyPatch):
     run = kwargs["run_datetime"]
     if run in unavailable:
       raise backends.RunUnavailable(f"fake-forecast has no run of {run:%Y-%m-%d}")
+    if ("incomplete", run) in unavailable:
+      raise backends.RunIncomplete(f"fake-forecast has part of the run of {run:%Y-%m-%d}")
     valid = pd.date_range(
       kwargs["start_datetime"], kwargs["end_datetime"], freq="6h", inclusive="left"
     )
@@ -310,39 +312,98 @@ def test_a_run_not_published_yet_waits(forecast_recipe, tmp_path, monkeypatch, t
   assert open_output(output).atmos_forecast.values[:, 0].tolist() == [True, True, True]
 
 
-def test_the_first_run_stands_in_too(forecast_recipe, tmp_path):
-  """The first run's missing source is stood in for as any run's (an earlier run of it)."""
+def test_the_first_run_needs_every_dataset(forecast_recipe, tmp_path):
+  """The first run has nothing stored to shape a stand-in on: it needs every source."""
   recipe, unavailable = forecast_recipe
   unavailable.add(FIRST)
   result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-03")
-  assert result.exit_code == 0, result.output
-  out = open_output(tmp_path / "out")
-  assert out.t2m.isel(init_time=0).isnull().all() and out.t2m.isel(init_time=1).notnull().all()
+  assert result.exit_code != 0 and "The first run" in result.output
 
 
-def test_no_earlier_run_to_stand_in_fails(forecast_recipe, tmp_path):
-  """A source without the run nor any of the `STAND_IN_TRIES` before it gives nothing to shape
-  NaN on: the run fails, naming it."""
+def test_a_first_run_not_published_yet_stores_nothing(forecast_recipe, tmp_path, monkeypatch):
+  """A new output whose first run is not published yet: nothing stored, no run waiting (its
+  branch goes), exit status 75; the same command later writes it."""
+  monkeypatch.setattr(forecast, "now", lambda: FIRST + DAY)
   recipe, unavailable = forecast_recipe
-  unavailable.update(FIRST - k * DAY for k in range(forecast.STAND_IN_TRIES + 1))
-  result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-02")
-  assert result.exit_code != 0 and "nor any of the 7 before" in result.output
+  recipe.write_text(
+    recipe.read_text().replace('horizon = "3D"\n', 'horizon = "3D"\nmissing_after = "3D"\n')
+  )
+  unavailable.add(FIRST)
+  output = tmp_path / "out"
+  result = download(recipe, output, "--start=2026-11-01", "--end=2026-11-02")
+  assert result.exit_code == download_module.NOT_PUBLISHED_EXIT, result.output
+  assert "nothing stored" in result.output
+  unavailable.clear()
+  again = download(recipe, output, "--start=2026-11-01", "--end=2026-11-02")
+  assert again.exit_code == 0, again.output
+  assert open_output(output).sizes["init_time"] == 1
 
 
-def test_a_stand_in_is_nan_shaped_as_read():
-  """Variables along time NaN (lazily), static ones as read, attributes kept; integers refused."""
-  ds = xr.Dataset(
+@pytest.mark.parametrize("why", ["incomplete", "short series"])
+def test_a_recent_run_published_in_part_waits(forecast_recipe, tmp_path, monkeypatch, why):
+  """A recent run its sources have published in part (a run's last steps, a series' last days
+  missing) is not published yet either: the download stops before it, exit status 75."""
+  monkeypatch.setattr(forecast, "now", lambda: FIRST + 2 * DAY)
+  recipe, unavailable = forecast_recipe
+  recipe.write_text(
+    recipe.read_text().replace('horizon = "3D"\n', 'horizon = "3D"\nmissing_after = "3D"\n')
+  )
+  if why == "incomplete":
+    unavailable.add(("incomplete", FIRST + DAY))
+  else:
+    write_series(tmp_path / "series.zarr", FIRST + 3 * DAY)  # run 2 needs it to Nov 4
+  output = tmp_path / "out"
+  result = download(recipe, output, "--start=2026-11-01", "--end=2026-11-03")
+  assert result.exit_code == download_module.NOT_PUBLISHED_EXIT, result.output
+  assert open_output(output).sizes["init_time"] == 1
+
+
+def test_an_old_incomplete_run_fails(forecast_recipe, tmp_path):
+  """An old run a source has in part (cut short in its archive, or a horizon beyond its runs')
+  fails, instead of becoming NaN."""
+  recipe, unavailable = forecast_recipe
+  unavailable.add(("incomplete", FIRST + DAY))
+  result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-03")
+  assert result.exit_code != 0 and "horizon beyond" in result.output
+
+
+def test_a_stand_in_mask_leaves_what_it_applies_to_unchecked(forecast_recipe, tmp_path):
+  """A stand-in mask says nothing of where values belong: the variables it applies to are left
+  out of `ensure_no_nans` (checked everywhere, their NaN outside it would fail the run)."""
+  recipe, unavailable = forecast_recipe
+  checks = '\n[checks.ensure_no_nans]\nt2m = ["sst"]\n'
+  recipe.write_text(recipe.read_text().replace("\n[save]", f"{checks}\n[save]"))
+  unavailable.add(FIRST + DAY)
+  result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-03")
+  assert result.exit_code == 0, result.output
+
+
+def test_a_stand_in_from_the_stored_layout():
+  """Variables along runs NaN at the run's valid times (lazily), static ones as stored, no
+  attributes; variables not in the output (renamed later?) and integers refused."""
+  dims = ("init_time", "lead_time", "lat")
+  stored = xr.Dataset(
     {
-      "t": (("time", "lat"), np.ones((2, 2), "float32"), {"units": "K"}),
-      "mask": ("lat", np.array([1.0, 0.0])),
+      "t": (dims, np.ones((2, 3, 2), "float32"), {"units": "K"}),
+      "n": (dims, np.ones((2, 3, 2), "int32")),
+      "ldd": ("lat", np.array([5.0, 1.0])),
     },
-    coords={"time": pd.date_range(FIRST, periods=2), "lat": ("lat", LAT, {"units": "deg"})},
+    coords={
+      "init_time": pd.date_range(FIRST, periods=2).to_numpy(),
+      "lead_time": np.arange(3) * np.timedelta64(1, "D").astype("timedelta64[ns]"),
+      "lat": ("lat", LAT, {"units": "degrees_north"}),
+    },
   ).chunk()
-  out = forecast.stand_in(ds, "time")
-  assert out.t.isnull().all() and out.t.attrs == {"units": "K"} and out.t.dtype == "float32"
-  assert out.lat.attrs == {"units": "deg"} and out.mask.values.tolist() == [1.0, 0.0]
+  config = forecast.ForecastConfig(horizon="3D")
+  run = FIRST + 5 * DAY
+  out = forecast.missing_dataset(stored, ["t", "ldd"], run, config, "time")
+  assert out.t.dims == ("time", "lat") and out.t.isnull().all() and out.t.attrs == {}
+  assert out.time.values[0] == np.datetime64(run, "ns") and out.time.size == 3
+  assert out.ldd.values.tolist() == [5.0, 1.0] and out.lat.attrs == {}
+  with pytest.raises(ValueError, match="not in the output"):
+    forecast.missing_dataset(stored, ["t2m"], run, config, "time")
   with pytest.raises(ValueError, match="not floating point"):
-    forecast.stand_in(ds.assign(n=ds.t.astype("int32")), "time")
+    forecast.missing_dataset(stored, ["n"], run, config, "time")
 
 
 def test_an_extension_adds_the_runs_after_the_last(forecast_recipe, tmp_path):

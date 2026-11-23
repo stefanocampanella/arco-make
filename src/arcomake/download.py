@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import functools
+import json
 import logging
 import math
-import sys
 import warnings
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Hashable
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -19,7 +19,7 @@ from dask.utils import format_bytes
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from arcomake import checks, icechunk_utils, provenance
-from arcomake.backends import RunUnavailable
+from arcomake.backends import RunIncomplete, RunUnavailable
 from arcomake.checks import ChecksConfig, ValidationError
 from arcomake.chunk_plan import Budget, PlanError, detect_budget, stored_warnings
 from arcomake.cli_utils import (
@@ -53,14 +53,14 @@ from arcomake.datetime_utils import (
   naive_utc,
 )
 from arcomake.forecast import (
-  STAND_IN_TRIES,
+  VARIABLES_KEY,
   ForecastConfig,
   RunNotPublished,
   RunReport,
   as_run,
   flags,
+  missing_dataset,
   series_is_the_run,
-  stand_in,
 )
 from arcomake.processing_utils import ProcessingStepConfig, time_coverage
 from arcomake.retries import RetryConfig, with_retries
@@ -430,6 +430,7 @@ def download(
     progress = progress and dask_setup in ("processes", "threads")
     static = RunStatic()
     stopped: RunNotPublished | None = None
+    stored_here = 0  # blocks this command committed
     try:
       for number, date_interval in todo:
         logger.info(f"Downloading data from {date_interval.start} to {date_interval.end}")
@@ -452,6 +453,7 @@ def download(
           # The runs before are complete: promoted below; this one and the later ones wait.
           stopped = exc
           break
+        stored_here += 1
     except click.ClickException:
       raise
     except ValidationError as exc:
@@ -471,6 +473,13 @@ def download(
         f"An error occurred ({type(exc).__name__}). Aborting: the blocks written are on branch"
         f" {run.branch}, `main` is unchanged; {again} continues from there."
       ) from exc
+    if stopped is not None and not stored_here and not done:
+      # Nothing to promote: the run's branch goes, the output stays as it was.
+      run.abandon()
+      click.echo(
+        f"A run is not published yet ({stopped}): nothing stored; run this again later", err=True
+      )
+      raise click.exceptions.Exit(NOT_PUBLISHED_EXIT)
     # Every block is written: `main` moves to them, then the recipe's retention applies.
     try:
       run.finish(configs.save.retention())
@@ -478,10 +487,11 @@ def download(
       raise click.ClickException(str(exc)) from exc
     if stopped is not None:
       click.echo(
-        f"Not published yet ({stopped}): the runs before are stored; run again later (--extend)",
+        f"A run is not published yet ({stopped}): the runs before are stored; run again later"
+        " (--extend)",
         err=True,
       )
-      sys.exit(NOT_PUBLISHED_EXIT)
+      raise click.exceptions.Exit(NOT_PUBLISHED_EXIT)
 
 
 def _print_plan(configs: DownloadConfig, interval: DateInterval, budget: Budget) -> None:
@@ -575,6 +585,7 @@ def _processed_block(
   static: RunStatic | None = None,
   run: datetime | None = None,
   report: RunReport | None = None,
+  missing: Callable[[str], xr.Dataset] | None = None,
 ) -> Generator[xr.Dataset]:
   """The datasets of one block, read, processed and merged, with the global postprocessing
   (lazy: computed when written); with a `budget`, the parts are chunked as planned for it.
@@ -583,16 +594,19 @@ def _processed_block(
   block (in memory) and reused by the others, instead of being read and processed for each.
 
   With `run` (a forecast run; `date_interval` its valid times), "runs" datasets read that run; a
-  source without it is stood in for by NaN shaped as the dataset (`_stand_in`: read from an
-  earlier run of the source, so that the recipe's later steps find it as any dataset;
-  `report.unavailable`, `report.standing_in`), unless the run may not be published yet
-  (`RunNotPublished`); `report.real` tells, per dataset, whether its values are the run's own
-  forecast (`forecast` module).
+  source without it is stood in for by `missing` (NaN for its variables as stored, so that the
+  recipe's later steps find it as any dataset: `forecast.missing_dataset`; `report.unavailable`,
+  `report.standing_in`; on the first run, there is none: it fails), unless the run may not be
+  published yet, or not all of it (`RunNotPublished`); a run old and incomplete fails.
+  `report.real` tells, per dataset, whether its values are the run's own forecast, and
+  `report.variables` which variables each dataset gave (`forecast` module).
   """
   # Download and postprocess each dataset, possibly using checkpointing to disk.
   with ExitStack() as stack:
     datasets: list[xr.Dataset] = []
     valid_times: dict[str, np.ndarray] = {}  # of a forecast run's datasets with time
+    standing_in: list[str] = []  # the datasets stood in for (`missing`)
+    stand_ins: list[xr.Dataset] = []
     for dataset_name, dataset_conf in configs.datasets.items():
       if dataset_conf.skip:
         logger.info(f"Skipping dataset {dataset_name} due to 'skip' flag")
@@ -622,20 +636,31 @@ def _processed_block(
         if not runs or report is None or run is None or fc is None:
           raise
         if fc.not_published_yet(run):
-          raise RunNotPublished(f"{dataset_name}: {error}, not published yet") from error
+          raise RunNotPublished(f"{dataset_name}: {error}") from error
+        if isinstance(error, RunIncomplete):
+          raise ValueError(
+            f"{dataset_name}: {error}: cut short in the source's archive, or a horizon beyond its"
+            " runs'"
+          ) from error
+        if missing is None:
+          raise click.ClickException(
+            f"The first run ({run:%Y-%m-%d %H:%M}) lacks {dataset_name} ({error}): start from a"
+            " run every source has (--start)"
+          ) from error
         logger.warning(f"{dataset_name}: {error}: NaN in this run, its flag false")
         report.unavailable.append(dataset_name)
-        dataset = stack.enter_context(
-          _stand_in(configs, dataset_name, date_interval, run, budget=budget)
-        )
+        dataset = missing(dataset_name)
         report.standing_in.extend(
           str(name) for name, var in dataset.data_vars.items() if configs.time_dim in var.dims
         )
+        standing_in.append(dataset_name)
+        stand_ins.append(dataset)
         datasets.append(dataset)
         valid_times[dataset_name] = dataset[configs.time_dim].values
         continue
       if report is not None and part_ends is not None:
         report.real[dataset_name] = runs or series_is_the_run(part_ends, date_interval.end)
+        report.variables[dataset_name] = sorted(map(str, dataset.data_vars))
       if static is not None and configs.time_dim not in dataset.dims:
         logger.info(f"{dataset_name} is static: computed once for the run")
         dataset = dataset.load()
@@ -644,7 +669,10 @@ def _processed_block(
       if run is not None and configs.time_dim in dataset.dims:
         valid_times[dataset_name] = dataset[configs.time_dim].values
     if run is not None:
-      _same_valid_times(valid_times, run)
+      fc = configs.forecast
+      _same_valid_times(valid_times, run, fc is not None and fc.not_published_yet(run))
+      if standing_in:
+        datasets = _with_coordinate_attrs(datasets, set(map(id, stand_ins)))
     with xr.merge(
       datasets, join="exact", compat="no_conflicts", combine_attrs="identical"
     ) as dataset:
@@ -657,51 +685,31 @@ def _processed_block(
       yield dataset
 
 
-def _stand_in(
-  configs: DownloadConfig,
-  name: str,
-  date_interval: DateInterval,
-  run: datetime,
-  *,
-  budget: Budget | None,
-) -> xr.Dataset:
-  """NaN for dataset `name`, whose source has no run `run`, shaped as the dataset would be: the
-  dataset read from the latest of the `STAND_IN_TRIES` runs before that the source has, over
-  `run`'s valid times, through its own steps, its variables along time NaN (`forecast.stand_in`:
-  only opened, never read).
-
-  Raises:
-    click.ClickException: if none of those runs is there either.
-  """
-  fc = configs.forecast
-  assert fc is not None
-  conf = configs.datasets[name]
-  for tries in range(1, STAND_IN_TRIES + 1):
-    earlier = run - tries * fc.every
-    try:
-      dataset = download_and_process(
-        conf,
-        date_interval.start,
-        date_interval.end,
-        time_dim=configs.time_dim,
-        budget=budget,
-        name=name,
-        later_steps=configs.postprocess,
-        run_datetime=earlier,
-      )
-    except RunUnavailable:
-      continue
-    logger.info(f"{name}: NaN shaped as the run of {earlier:%Y-%m-%d %H:%M} stands in")
-    return stand_in(dataset, configs.time_dim)
-  raise click.ClickException(
-    f"{name} has no run of {run:%Y-%m-%d %H:%M}, nor any of the {STAND_IN_TRIES} before, to stand"
-    " in NaN shaped as it"
-  )
+def _with_coordinate_attrs(datasets: list[xr.Dataset], stand_ins: set[int]) -> list[xr.Dataset]:
+  """`datasets` with the coordinates of the stand-ins (`id` in `stand_ins`) given the attributes
+  of the same coordinates in the run's other datasets: datasets are merged with identical
+  attributes, and a stand-in's are not its dataset's own."""
+  attrs: dict[Hashable, dict[Any, Any]] = {}
+  for dataset in datasets:
+    if id(dataset) not in stand_ins:
+      for name, coord in dataset.coords.items():
+        attrs.setdefault(name, dict(coord.attrs))
+  out = []
+  for dataset in datasets:
+    if id(dataset) in stand_ins:
+      for name in dataset.coords:
+        if name in attrs:
+          dataset[name].attrs = attrs[name]
+    out.append(dataset)
+  return out
 
 
-def _same_valid_times(valid_times: dict[str, np.ndarray], run: datetime) -> None:
+def _same_valid_times(
+  valid_times: dict[str, np.ndarray], run: datetime, recent: bool = False
+) -> None:
   """A forecast run's datasets cover the same valid times: a source ending before the run's
-  horizon (a release not out yet) fails the run, named, before the merge would."""
+  horizon fails the run, named, before the merge would; for a `recent` run (younger than
+  `missing_after`), a release not out yet: `RunNotPublished`."""
   if not valid_times:
     return
   longest = max(valid_times.values(), key=len)
@@ -712,10 +720,11 @@ def _same_valid_times(valid_times: dict[str, np.ndarray], run: datetime) -> None
       for name, times in short.items()
     )
     last = np.datetime_as_string(longest.max(), unit="m")
-    raise ValueError(
+    message = (
       f"The datasets of the run of {run:%Y-%m-%d %H:%M} have different valid times: {ends}, the"
       f" others to {last} (a source not published to the run's horizon yet?)"
     )
+    raise RunNotPublished(message) if recent else ValueError(message)
 
 
 def _commit_message(interval: DateInterval) -> str:
@@ -724,9 +733,28 @@ def _commit_message(interval: DateInterval) -> str:
   return f"download [{interval.start:%Y-%m-%dT%H:%M}, {interval.end:%Y-%m-%dT%H:%M})"
 
 
-def _block_metadata(interval: DateInterval) -> dict[str, str]:
-  """The block of a commit; the run adds the recipe's fingerprint (`Run(recipe=...)`)."""
-  return {icechunk_utils.BLOCK_KEY: block_key(interval)}
+def _block_metadata(
+  interval: DateInterval, variables: dict[str, list[str]] | None = None
+) -> dict[str, str]:
+  """The block of a commit; the run adds the recipe's fingerprint (`Run(recipe=...)`). A
+  forecast run's commit also records the variables of each dataset (`forecast.VARIABLES_KEY`)."""
+  metadata = {icechunk_utils.BLOCK_KEY: block_key(interval)}
+  if variables is not None:
+    metadata[VARIABLES_KEY] = json.dumps(variables, sort_keys=True)
+  return metadata
+
+
+def _recorded_variables(run: icechunk_utils.Run) -> dict[str, list[str]]:
+  """The variables of each dataset of the forecast runs, as the tip of the run's branch records
+  them (`forecast.VARIABLES_KEY`)."""
+  tip = next(iter(run.repo.ancestry(branch=run.branch)))
+  recorded = (tip.metadata or {}).get(VARIABLES_KEY)
+  if not isinstance(recorded, str):
+    return {}
+  variables: dict[str, list[str]] = {
+    str(name): [str(v) for v in names] for name, names in json.loads(recorded).items()
+  }
+  return variables
 
 
 def _write_block(
@@ -755,7 +783,25 @@ def _write_block(
   read_interval = date_interval if fc is None else DateInterval(*fc.interval(date_interval.start))
   report = RunReport() if fc is not None else None
   group, time_dim = configs.save.group, configs.time_dim
+  # A later forecast run stands in NaN, shaped as stored, for a dataset its source lacks.
+  recorded: dict[str, list[str]] = {}
+  missing = None
+  stack = ExitStack()
+  if fc is not None and not first:
+    recorded = _recorded_variables(run)
+
+    def missing(name: str) -> xr.Dataset:
+      if name not in recorded:
+        raise click.ClickException(
+          f"{name} has no run of {date_interval.start:%Y-%m-%d %H:%M}, and the output records no"
+          " variables of it to stand in NaN for"
+        )
+      session = run.repo.readonly_session(branch=run.branch)
+      stored = stack.enter_context(xr.open_zarr(session.store, group=group, consolidated=False))
+      return missing_dataset(stored, recorded[name], date_interval.start, fc, time_dim)
+
   with (
+    stack,
     _processed_block(
       configs,
       read_interval,
@@ -764,6 +810,7 @@ def _write_block(
       static=static,
       run=date_interval.start if fc is not None else None,
       report=report,
+      missing=missing,
     ) as dataset,
     ProgressBar() if progress else nullcontext(),
   ):
@@ -794,7 +841,9 @@ def _write_block(
       message=_commit_message(date_interval),
       mode="w" if first else "a-",
       append_dim=None if first else append_dim,
-      metadata=_block_metadata(date_interval),
+      metadata=_block_metadata(
+        date_interval, None if report is None else {**recorded, **report.variables}
+      ),
       # Chunks are planned for reading; the stored layout is the recipe's.
       align_chunks=True,
       keep=keep,
@@ -831,6 +880,16 @@ def _as_stored_run(
         f"The run of {start:%Y-%m-%d %H:%M} has other lead times than those stored (a source"
         f" ends before the run's horizon?): {out[fc.lead_dim].values.astype('timedelta64[h]')}"
       )
+    lacking = [
+      str(name)
+      for name, var in stored.data_vars.items()
+      if fc.init_dim in var.dims and name not in out.variables
+    ]
+    if lacking:
+      raise click.ClickException(
+        f"The run of {start:%Y-%m-%d %H:%M} lacks the stored variables {lacking}: appending it"
+        " would leave them shorter than the others"
+      )
   return out
 
 
@@ -853,6 +912,14 @@ def _checked_block(
   """
   if absent and config.ensure_no_nans is not None:
     no_nans = config.ensure_no_nans
+    # A stand-in mask says nothing of where values belong: what it applies to is not checked
+    # (checked everywhere instead, its NaN outside the mask would fail the run).
+    absent = absent | {
+      str(v)
+      for mask, variables in (no_nans.model_extra or {}).items()
+      if mask in absent
+      for v in variables
+    }
     kept = {
       mask: [v for v in variables if v not in absent]
       for mask, variables in (no_nans.model_extra or {}).items()

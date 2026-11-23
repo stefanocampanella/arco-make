@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
-from arcomake.backends import ECMWFOpenData, RunUnavailable
+from arcomake.backends import ECMWFOpenData, RunIncomplete, RunUnavailable
 from arcomake.temporary_utils import TempDirectoryRegistry
 
 eccodes = pytest.importorskip("eccodes")
@@ -170,7 +170,7 @@ def test_a_run_not_there_is_unavailable(tree: pathlib.Path):
 def test_valid_times_beyond_the_run_fail(tree: pathlib.Path):
   """A window past the run's last step is a recipe's mistake (a horizon the model does not
   reach): it fails, naming the steps."""
-  with pytest.raises(ValueError, match="steps to 36 h"):
+  with pytest.raises(RunIncomplete, match="steps to 36 h only"):
     _open(tree, RUN, RUN + 48 * HOUR, param="2t")
 
 
