@@ -366,6 +366,30 @@ class EarlyWarningDataStorePartConfig(PartTimeOffset, PartTimeout, PartAlignment
     return _engine_given_or_implied(data, lambda url: _has_scheme(url, "ewds"))
 
 
+class ECMWFOpenDataPartConfig(PartTimeOffset, PartTimeout, PartAlignment):
+  """A forecast run of ECMWF's open data (`backends.ECMWFOpenData`): `filename_or_obj` is the
+  root of a copy of data.ecmwf.int's tree (e.g. "s3://ecmwf-forecasts", read anonymously),
+  `param` the fields' GRIB short names. Read only in forecast downloads, which inject the run."""
+
+  model_config = ConfigDict(extra="forbid")
+
+  filename_or_obj: str
+  engine: Literal["ecmwfopendata"]
+  param: str | list[str]
+  levtype: str | None = None
+  model: str | None = None
+  resolution: str | None = None
+  stream: str | None = None
+  type: str | None = None
+  deaccumulate: bool | None = None
+  drop_variables: str | list[str] | None = None
+  storage_options: dict[str, Any] | None = None
+  time_dim: str | None = None
+  run_datetime: datetime.datetime | None = None
+  start_datetime: datetime.datetime | None = None
+  end_datetime: datetime.datetime | None = None
+
+
 class ZarrPartConfig(
   OpenDatasetArguments, PartTimeOffset, PartTimeout, PartStaticTime, PartAlignment
 ):
@@ -398,7 +422,7 @@ class GenericPartConfig(
 
 
 DEDICATED_ENGINES = frozenset(
-  {"copernicusmarine", "netcdfoverhttp", "earlywarningdatastore", "zarr"}
+  {"copernicusmarine", "netcdfoverhttp", "earlywarningdatastore", "ecmwfopendata", "zarr"}
 )
 
 
@@ -406,6 +430,7 @@ DatasetPartConfig = (
   CopernicusMarinePartConfig
   | NetCDFOverHTTPPartConfig
   | EarlyWarningDataStorePartConfig
+  | ECMWFOpenDataPartConfig
   | ZarrPartConfig
   | GenericPartConfig
 )
@@ -807,7 +832,7 @@ def _planned(
 
 
 # The engines that read forecast runs (`run_datetime`), along valid time.
-RUN_ENGINES = frozenset({"earlywarningdatastore"})
+RUN_ENGINES = frozenset({"earlywarningdatastore", "ecmwfopendata"})
 
 
 def download_and_process(
@@ -847,7 +872,7 @@ def download_and_process(
       part_conf["engine"] = engine
     if engine != "copernicusmarine":
       _with_timeout(part_conf, engine, getattr(raw_part, "timeout", None))
-    if engine == "earlywarningdatastore" or engine == "copernicusmarine":
+    if engine in ("earlywarningdatastore", "copernicusmarine", "ecmwfopendata"):
       part_conf.update(start_datetime=start_datetime - offset, end_datetime=end_datetime - offset)
     if run_datetime is not None:
       if engine not in RUN_ENGINES:

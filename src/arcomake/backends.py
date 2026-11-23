@@ -2,8 +2,12 @@
 # SPDX-License-Identifier: MIT
 import datetime
 import itertools
+import json
 import logging
 import os
+import pathlib
+import re
+import shutil
 import threading
 import warnings
 from collections.abc import Iterable
@@ -13,6 +17,9 @@ from urllib.parse import urlparse
 from zipfile import ZipFile
 
 import cdsapi
+import fsspec
+import fsspec.core
+import fsspec.utils
 import numpy as np
 import requests
 import xarray as xr
@@ -204,6 +211,141 @@ class NetCDFOverHTTP(BackendEntrypoint):
     else:
       url = urlparse(filename_or_obj)
       return url.scheme == "http" or url.scheme == "https"
+
+
+class ECMWFOpenData(BackendEntrypoint):
+  """ECMWF's open data forecasts (IFS, AIFS), one run along valid time, from a copy of
+  data.ecmwf.int's tree: AWS's `s3://ecmwf-forecasts` (anonymous, from early 2024 at 0.25 deg),
+  Azure's or Google's.
+
+  A run is a directory of GRIB2 files, one per step, each with a JSON-lines `.index` giving every
+  field's byte range: only the fields asked are fetched (`fsspec`'s `cat_ranges`, concurrent),
+  written to the run's temporary directory, read by cfgrib, and the files removed. Steps are those
+  listed in the run's directory whose valid times are in [start, end], the end included: an
+  accumulated field's last interval needs it (the instant fields' stamp at `end` is cut by the
+  block's time selection, as is the last interval's NaN).
+  """
+
+  INDEX_SUFFIX = ".index"
+
+  @override
+  def open_dataset(
+    self,
+    filename_or_obj,
+    *,
+    drop_variables: str | Iterable[str] | None = None,
+    run_datetime: datetime.datetime | None = None,
+    start_datetime: datetime.datetime | None = None,
+    end_datetime: datetime.datetime | None = None,
+    param: str | Iterable[str] | None = None,
+    levtype: str = "sfc",
+    model: str = "ifs",
+    resolution: str = "0p25",
+    stream: str = "oper",
+    type: str = "fc",
+    deaccumulate: bool = True,
+    time_dim: str = "time",
+    storage_options: dict[str, Any] | None = None,
+  ) -> xr.Dataset:
+    """The run of `run_datetime`, fields `param` (GRIB short names, e.g. "2t", "tp") of
+    `levtype`, along `time_dim` (valid times). With `deaccumulate`, fields accumulated since the
+    run's start (GRIB `stepType` "accum": precipitation, radiation) become the increments between
+    consecutive steps, stamped at the start of theirs: a daily sum of day k is then exactly the
+    accumulation at its end minus that at its start, whatever the steps (3-hourly, then 6-hourly
+    for IFS). Variables keep cfgrib's names (`t2m` for "2t").
+
+    Raises:
+      RunUnavailable: if the source has no such run (not published yet, or not archived).
+    """
+    if run_datetime is None or start_datetime is None or end_datetime is None:
+      raise ValueError("ecmwfopendata reads forecast runs: run, start and end are injected")
+    if param is None:
+      raise ValueError("ecmwfopendata: give `param`, the GRIB short names of the fields")
+    params = [param] if isinstance(param, str) else list(param)
+    root = str(filename_or_obj).rstrip("/")
+    options = dict(storage_options or {})
+    if fsspec.utils.get_protocol(root) in ("s3", "s3a"):
+      options.setdefault("anon", True)
+    fs, path = fsspec.core.url_to_fs(root, **options)
+    run_dir = f"{path}/{run_datetime:%Y%m%d}/{run_datetime:%H}z/{model}/{resolution}/{stream}"
+    prefix = f"{run_datetime:%Y%m%d%H}0000"
+    try:
+      listed = fs.ls(run_dir, detail=False)
+    except FileNotFoundError:
+      listed = []
+    steps = self._steps(listed, prefix, stream, type)
+    if not steps:
+      raise RunUnavailable(f"{root} has no {model} {stream} run of {run_datetime:%Y-%m-%d %H:%M}")
+    first = start_datetime - run_datetime
+    last = end_datetime - run_datetime
+    wanted = [s for s in steps if first <= datetime.timedelta(hours=s) <= last]
+    if not wanted or datetime.timedelta(hours=steps[-1]) < last:
+      raise ValueError(
+        f"the {model} run of {run_datetime:%Y-%m-%d %H:%M} has steps to {steps[-1]} h:"
+        f" valid times to {end_datetime} are asked"
+      )
+    names = [f"{run_dir}/{prefix}-{s}h-{stream}-{type}" for s in wanted]
+    indexes = fs.cat([f"{name}{self.INDEX_SUFFIX}" for name in names])
+    fields: dict[str, list[tuple[str, int, int]]] = {p: [] for p in params}
+    for name in names:
+      for line in indexes[f"{name}{self.INDEX_SUFFIX}"].decode().splitlines():
+        if not line.strip():
+          continue
+        entry = json.loads(line)
+        if entry.get("levtype") == levtype and entry.get("param") in fields:
+          offset, length = int(entry["_offset"]), int(entry["_length"])
+          fields[entry["param"]].append((f"{name}.grib2", offset, offset + length))
+    if missing := [p for p, found in fields.items() if len(found) != len(names)]:
+      raise ValueError(
+        f"the {model} run of {run_datetime:%Y-%m-%d %H:%M} lacks {missing} ({levtype}) at some"
+        f" of the steps {wanted}"
+      )
+    registry = get_current_temp_registry()
+    if registry is None:
+      raise ValueError("No temporary directory registry available.")
+    directory = registry.create_temp_dir()
+    try:
+      datasets = []
+      for name, ranges in fields.items():
+        paths, starts, ends = map(list, zip(*ranges, strict=True))
+        blobs = fs.cat_ranges(paths, starts, ends)
+        grib = directory / f"{name}.grib2"
+        grib.write_bytes(b"".join(blobs))
+        datasets.append(self._read(grib, time_dim, deaccumulate))
+    finally:
+      shutil.rmtree(directory, ignore_errors=True)
+    return _drop_variables(xr.merge(datasets, join="exact"), drop_variables)
+
+  @staticmethod
+  def _steps(listed: Iterable[str], prefix: str, stream: str, type: str) -> list[int]:
+    """The steps (hours) of a run's GRIB files with an index, sorted."""
+    names = {pathlib.PurePosixPath(p).name for p in listed}
+    pattern = re.compile(rf"{prefix}-(\d+)h-{re.escape(stream)}-{re.escape(type)}\.grib2")
+    steps = []
+    for name in names:
+      match = pattern.fullmatch(name)
+      if match and f"{name.removesuffix('.grib2')}{ECMWFOpenData.INDEX_SUFFIX}" in names:
+        steps.append(int(match.group(1)))
+    return sorted(steps)
+
+  @staticmethod
+  def _read(grib: pathlib.Path, time_dim: str, deaccumulate: bool) -> xr.Dataset:
+    """One field's steps, loaded (its file is removed after), along valid time."""
+    with _GRIB_OPEN_LOCK:
+      dataset = xr.open_dataset(grib, engine="cfgrib", backend_kwargs={"indexpath": ""}).load()
+    dataset = _steps_as_time(dataset, time_dim)
+    if not deaccumulate:
+      return dataset
+    for name, var in dataset.data_vars.items():
+      if var.attrs.get("GRIB_stepType") == "accum":
+        # The increment over [t_i, t_i+1], stamped t_i; the last stamp has none.
+        increments = var.shift({time_dim: -1}) - var
+        dataset[name] = increments.assign_attrs(var.attrs | {"GRIB_stepType": "increment"})
+    return dataset
+
+  @override
+  def guess_can_open(self, filename_or_obj) -> bool:
+    return False  # explicit: engine = "ecmwfopendata"
 
 
 class EarlyWarningDataStore(BackendEntrypoint):

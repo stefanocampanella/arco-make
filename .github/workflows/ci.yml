@@ -50,8 +50,11 @@ jobs:
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
-      - name: Install Open MPI
-        # mpirun and the MPI library, for the `mpi` setup's test (tests/test_mpi.py).
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openmpi-bin
+      - name: Install Open MPI and ecCodes
+        # mpirun and the MPI library, for the `mpi` setup's test (tests/test_mpi.py); ecCodes, for
+        # the GRIB files tests/test_ecmwf_open_data.py writes (skipped without it).
+        run: >
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends
+          openmpi-bin libeccodes-dev
       - run: uv sync --frozen --extra dev --extra mpi
       - run: uv run --frozen pytest --cov=arcomake --cov-report=term-missing --cov-fail-under=80

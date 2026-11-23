@@ -67,6 +67,26 @@ def test_parts_read_no_run_without_one(monkeypatch: pytest.MonkeyPatch):
   assert "run_datetime" not in received
 
 
+def test_ecmwf_open_data_parts_get_the_run_and_the_block(monkeypatch: pytest.MonkeyPatch):
+  """An `ecmwfopendata` part needs its engine named (its URL is any copy of the tree), and gets
+  the run and the block's valid times."""
+  received = {}
+
+  def fake_open_input(**kwargs):
+    received.update(kwargs)
+    time = pd.date_range(RUN, periods=8, freq="3h")
+    return xr.Dataset({"t2m": ("time", np.ones(8))}, coords={"time": time})
+
+  monkeypatch.setattr(dataset_utils, "open_input", fake_open_input)
+  part = {"filename_or_obj": "s3://ecmwf-forecasts", "param": ["2t"]}
+  with pytest.raises(ValueError):
+    DatasetConfig.model_validate({"parts": [part]})  # a generic part needs no `param`
+  config = DatasetConfig.model_validate({"parts": [part | {"engine": "ecmwfopendata"}]})
+  download_and_process(config, RUN, RUN + DAY, run_datetime=RUN)
+  assert (received["run_datetime"], received["start_datetime"]) == (RUN, RUN)
+  assert received["end_datetime"] == RUN + DAY and received["param"] == ["2t"]
+
+
 def test_engines_without_runs_are_refused():
   """A part whose engine reads no forecast runs cannot be read as one."""
   part = CopernicusMarinePartConfig.model_validate({"filename_or_obj": "cm://some-dataset"})

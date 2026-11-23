@@ -11,6 +11,7 @@ The services revise their data, so these tests check structure, completeness and
 not exact numbers. A failure means a service, a client library or arco-make's use of them changed.
 """
 
+import datetime
 import os
 import pathlib
 from dataclasses import dataclass
@@ -20,7 +21,8 @@ import pytest
 from click.testing import CliRunner, Result
 
 from arcomake import cli, settings
-from arcomake.backends import CopernicusMarine
+from arcomake.backends import CopernicusMarine, ECMWFOpenData
+from arcomake.temporary_utils import TempDirectoryRegistry
 from tests.conftest import open_output
 
 RECIPES = pathlib.Path(__file__).parent / "recipes"
@@ -158,3 +160,26 @@ def test_copernicusmarine_returns_lazy_arrays():
     dataset_version="202311",
   )
   assert {name: ds[name].chunks for name in ("thetao", "zos")} == {"thetao": None, "zos": None}
+
+
+def test_ecmwf_open_data_reads_a_recent_run(tmp_path: pathlib.Path):
+  """A recent IFS run from AWS's copy of ECMWF's open data (anonymous): a day of 2 m temperature
+  and precipitation along valid time, 3-hourly, precipitation as increments (plausible daily
+  totals), on the global 0.25 deg grid. A run three days old is published whatever the hour."""
+  run = datetime.datetime.combine(
+    datetime.date.today() - datetime.timedelta(days=3), datetime.time()
+  )
+  day = datetime.timedelta(days=1)
+  with TempDirectoryRegistry(base_dir=tmp_path):
+    ds = ECMWFOpenData().open_dataset(
+      "s3://ecmwf-forecasts",
+      run_datetime=run,
+      start_datetime=run,
+      end_datetime=run + day,
+      param=["2t", "tp"],
+    )
+  assert dict(ds.sizes) == {"time": 9, "latitude": 721, "longitude": 1440}
+  assert float(ds.t2m.min()) > 180.0 and float(ds.t2m.max()) < 340.0
+  total = ds.tp.isel(time=slice(0, 8)).sum("time")  # the day's eight 3-hour increments
+  assert float(total.min()) > -1e-6 and 0.0005 < float(total.mean()) < 0.01  # metres a day
+  assert bool(ds.tp.isel(time=-1).isnull().all())  # no increment after the last step
