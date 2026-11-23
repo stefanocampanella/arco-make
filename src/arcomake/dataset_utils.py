@@ -663,6 +663,23 @@ class DatasetConfig(BaseModel):
   checkpointing: CheckpointingConfig | None = None
   parts: list[DatasetPartConfig] = Field(default_factory=list)
   postprocess: list[ProcessingStepConfig] = Field(default_factory=list)
+  # In a forecast recipe: how the source gives runs ("runs": the parts read each run; "series":
+  # read by valid time), and the flag variable telling where the values are the run's own
+  # forecast (see `forecast`).
+  forecast: Literal["runs", "series"] = "series"
+  flag: str | None = None
+
+  @model_validator(mode="after")
+  def _runs_from_run_engines(self) -> Self:
+    if self.forecast == "runs":
+      for number, part in enumerate(self.parts, start=1):
+        engine = getattr(part, "engine", None)
+        if engine not in RUN_ENGINES:
+          raise ValueError(
+            f'forecast = "runs": part {number} (engine {engine!r}) reads no forecast runs'
+            f" (engines that do: {', '.join(sorted(RUN_ENGINES))})"
+          )
+    return self
 
   @model_validator(mode="before")
   @classmethod
@@ -844,9 +861,14 @@ def download_and_process(
   name: str = "dataset",
   later_steps: Sequence[ProcessingStepConfig] = (),
   run_datetime: datetime.datetime | None = None,
+  part_ends: list[np.datetime64] | None = None,
 ) -> xr.Dataset:
   """The dataset of `configs` over [start, end): its parts read, time-sliced and merged, then its
   steps applied (lazily: computed when written).
+
+  With `part_ends`, the last time stamp of each part as opened (moved by its offset, before the
+  block's time selection) is appended to it: a forecast tells from it whether a series is a run's
+  own forecast (`forecast.series_is_the_run`).
 
   With `run_datetime`, the parts read that forecast run (`RUN_ENGINES`; their backends return
   the run along valid time, so [start, end) are valid times), others are refused.
@@ -887,6 +909,8 @@ def download_and_process(
       part = _snap_coordinates(part, [p for _, p in opened], raw_part.coordinate_tolerance)
     if offset:
       part = _shift_time(part, offset, time_dim)
+    if part_ends is not None and time_dim in part.coords and part[time_dim].size:
+      part_ends.append(np.datetime64(part[time_dim].values.max(), "ns"))
     if static_time is not None:
       part = _static_at(part, static_time, time_dim)
     else:
@@ -960,6 +984,7 @@ def maybe_checkpointing_download_and_process(
   name: str = "dataset",
   later_steps: Sequence[ProcessingStepConfig] = (),
   run_datetime: datetime.datetime | None = None,
+  part_ends: list[np.datetime64] | None = None,
 ) -> xr.Dataset:
   checkpointing_conf = configs.checkpointing
   checkpointing_step = checkpointing_conf.step if checkpointing_conf else None
@@ -979,6 +1004,7 @@ def maybe_checkpointing_download_and_process(
       name=name,
       later_steps=later_steps,
       run_datetime=run_datetime,
+      part_ends=part_ends,
     )
   parsed_step = may_parse_timedelta(checkpointing_step)
   if parsed_step >= end_datetime - start_datetime:
@@ -991,6 +1017,7 @@ def maybe_checkpointing_download_and_process(
       name=name,
       later_steps=later_steps,
       run_datetime=run_datetime,
+      part_ends=part_ends,
     )
 
   registry = get_current_temp_registry()
@@ -1014,6 +1041,7 @@ def maybe_checkpointing_download_and_process(
       name=name,
       later_steps=later_steps,
       run_datetime=run_datetime,
+      part_ends=part_ends,
     ) as downloaded:
       # A copy with its own encodings: the downloaded dataset is left unchanged.
       dataset = _without_zarr2_codecs(downloaded)

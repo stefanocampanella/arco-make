@@ -1,22 +1,27 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
-"""Forecast downloads: runs read along valid time."""
+"""Forecast downloads: runs read along valid time, stored along their initialization."""
 
 import datetime
+import importlib
 
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
+from click.testing import CliRunner, Result
 
-from arcomake import dataset_utils
+from arcomake import backends, cli, dataset_utils
+from arcomake.cli_utils import read_configs
 from arcomake.dataset_utils import (
   CopernicusMarinePartConfig,
   DatasetConfig,
   EarlyWarningDataStorePartConfig,
   download_and_process,
 )
+from tests.conftest import open_output
 
+download_module = importlib.import_module("arcomake.download")  # the module, not the command
 DAY = datetime.timedelta(days=1)
 RUN = datetime.datetime(2026, 11, 21)
 
@@ -92,3 +97,274 @@ def test_engines_without_runs_are_refused():
   part = CopernicusMarinePartConfig.model_validate({"filename_or_obj": "cm://some-dataset"})
   with pytest.raises(ValueError, match="reads no forecast runs"):
     download_and_process(DatasetConfig(parts=[part]), RUN, RUN + DAY, run_datetime=RUN)
+
+
+def test_runs_need_engines_that_read_runs():
+  with pytest.raises(ValueError, match="reads no forecast runs"):
+    DatasetConfig.model_validate(
+      {"forecast": "runs", "parts": [{"filename_or_obj": "x.zarr", "engine": "zarr"}]}
+    )
+
+
+# Forecast downloads end to end: a run source (EWDS parts, answered here), a best-estimate series
+# (a local Zarr store, overwritten by each "release") and a static dataset.
+
+FIRST = datetime.datetime(2026, 11, 1)
+LAT, LON = [0.0, 1.0], [10.0, 11.0, 12.0]
+
+RECIPE = """
+[forecast]
+horizon = "3D"
+
+[datasets.atmos]
+forecast = "runs"
+flag = "atmos_forecast"
+
+[[datasets.atmos.parts]]
+filename_or_obj = "ewds://fake-forecast"
+system_version = "operational"
+hydrological_model = "m"
+product_type = "control_forecast"
+variable = "v"
+
+[[datasets.atmos.postprocess]]
+name = "resample"
+time = "1D"
+label = "left"
+closed = "left"
+reduce = "mean"
+
+[datasets.ocean]
+flag = "ocean_forecast"
+
+[[datasets.ocean.parts]]
+filename_or_obj = "@SERIES@"
+engine = "zarr"
+
+[datasets.static]
+
+[[datasets.static.parts]]
+filename_or_obj = "@STATIC@"
+engine = "zarr"
+
+[save]
+chunks = {init_time = 1}
+"""
+
+
+def atmos_value(run: datetime.datetime, valid: np.datetime64) -> float:
+  """The run source's value: the run's day number x 100 + the lead in hours."""
+  lead = (valid - np.datetime64(run, "ns")) / np.timedelta64(1, "h")
+  return (run - FIRST).days * 100.0 + lead
+
+
+def write_series(path, end: datetime.datetime) -> None:
+  """The best-estimate series as a release ending at `end` (exclusive) leaves it: daily values,
+  the day number since FIRST."""
+  time = pd.date_range(FIRST - 5 * DAY, end - DAY, freq="1D")
+  days = ((time - pd.Timestamp(FIRST)) / pd.Timedelta("1D")).to_numpy()
+  values = np.broadcast_to(days[:, None, None], (time.size, len(LAT), len(LON)))
+  ds = xr.Dataset(
+    {"sst": (("time", "lat", "lon"), values.copy())},
+    coords={"time": time, "lat": LAT, "lon": LON},
+  )
+  ds.to_zarr(path, mode="w", consolidated=False)
+
+
+@pytest.fixture
+def forecast_recipe(tmp_path, monkeypatch: pytest.MonkeyPatch):
+  """The recipe, its series and static stores; the EWDS answered by `atmos_value` every 6 hours,
+  except for the runs in `unavailable` (returned, for a test to fill)."""
+  write_series(tmp_path / "series.zarr", FIRST + 5 * DAY)  # the release of run 3 (Nov 3)
+  xr.Dataset(
+    {"depth": (("lat", "lon"), np.ones((len(LAT), len(LON))))},
+    coords={"lat": LAT, "lon": LON},
+  ).to_zarr(tmp_path / "static.zarr", mode="w", consolidated=False)
+  recipe = tmp_path / "forecast.toml"
+  text = RECIPE.replace("@SERIES@", str(tmp_path / "series.zarr"))
+  recipe.write_text(text.replace("@STATIC@", str(tmp_path / "static.zarr")))
+  unavailable: set[datetime.datetime] = set()
+  real_open = dataset_utils.open_input
+
+  def open_input(filename_or_obj, **kwargs):
+    if kwargs.get("engine") != "earlywarningdatastore":
+      return real_open(filename_or_obj, **kwargs)
+    run = kwargs["run_datetime"]
+    if run in unavailable:
+      raise backends.RunUnavailable(f"fake-forecast has no run of {run:%Y-%m-%d}")
+    valid = pd.date_range(
+      kwargs["start_datetime"], kwargs["end_datetime"], freq="6h", inclusive="left"
+    )
+    values = np.array([atmos_value(run, v) for v in valid.to_numpy()])
+    data = np.broadcast_to(values[:, None, None], (valid.size, len(LAT), len(LON)))
+    return xr.Dataset(
+      {"t2m": (("time", "lat", "lon"), data.copy())},
+      coords={"time": valid, "lat": LAT, "lon": LON},
+    )
+
+  monkeypatch.setattr(dataset_utils, "open_input", open_input)
+  return recipe, unavailable
+
+
+def download(recipe, output, *options: str) -> Result:
+  args = ["download", "--dask-setup", "threads", *options, str(recipe), str(output)]
+  return CliRunner().invoke(cli, args)
+
+
+def test_runs_stored_along_init_time(forecast_recipe, tmp_path):
+  """Three runs: lead days 0-2 each, valid time = init + lead, the run source's daily means, the
+  series by valid time, the static dataset once. The series is the last run's own forecast only
+  (its release reaches that run's horizon, not beyond): the earlier runs are flagged."""
+  recipe, _ = forecast_recipe
+  result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-04")
+  assert result.exit_code == 0, result.output
+  out = open_output(tmp_path / "out")
+  assert dict(out.sizes) == {"init_time": 3, "lead_time": 3, "lat": 2, "lon": 3}
+  assert out.t2m.dims == ("init_time", "lead_time", "lat", "lon")
+  assert out.depth.dims == ("lat", "lon")
+  inits = pd.date_range(FIRST, periods=3, freq="1D").to_numpy()
+  np.testing.assert_array_equal(out.init_time.values, inits)
+  assert (out.lead_time.values / np.timedelta64(1, "D")).tolist() == [0, 1, 2]
+  np.testing.assert_array_equal(
+    out.valid_time.values, inits[:, None] + out.lead_time.values[None, :]
+  )
+  for i, init in enumerate(inits):
+    run = pd.Timestamp(init).to_pydatetime()
+    for lead in range(3):
+      day = init + np.timedelta64(lead, "D")
+      hours = [day + np.timedelta64(h, "h") for h in (0, 6, 12, 18)]
+      expected = np.mean([atmos_value(run, h) for h in hours])
+      assert float(out.t2m.isel(init_time=i, lead_time=lead, lat=0, lon=0)) == expected
+      assert float(out.sst.isel(init_time=i, lead_time=lead, lat=0, lon=0)) == i + lead
+  assert out.atmos_forecast.values.all()
+  assert out.ocean_forecast.values[:, 0].tolist() == [False, False, True]
+
+
+def test_time_coverage_spans_every_run(forecast_recipe, tmp_path):
+  """`coverage_attrs` gives the output's coverage: the valid times of every run stored, from the
+  first run's start to the last run's last lead day."""
+  recipe, _ = forecast_recipe
+  steps = '\n[[postprocess]]\nname = "coverage_attrs"\n'
+  recipe.write_text(recipe.read_text().replace("\n[save]", f"{steps}\n[save]"))
+  result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-04")
+  assert result.exit_code == 0, result.output
+  attrs = open_output(tmp_path / "out").attrs
+  assert attrs["time_coverage_start"] == "2026-11-01T00:00:00Z"
+  assert attrs["time_coverage_end"] == "2026-11-05T00:00:00Z"
+  assert attrs["time_coverage_resolution"] == "P1D"
+
+
+def test_a_run_its_source_lacks_is_nan_and_flagged(forecast_recipe, tmp_path):
+  """A run the source does not have (not published, not archived) leaves its dataset NaN in that
+  run, flagged; the other datasets are written."""
+  recipe, unavailable = forecast_recipe
+  unavailable.add(FIRST + DAY)
+  result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-04")
+  assert result.exit_code == 0, result.output
+  out = open_output(tmp_path / "out")
+  assert out.t2m.isel(init_time=1).isnull().all()
+  assert out.t2m.isel(init_time=[0, 2]).notnull().all()
+  assert out.atmos_forecast.values[:, 0].tolist() == [True, False, True]
+  assert out.sst.isel(init_time=1).notnull().all()
+
+
+def test_the_first_run_needs_every_dataset(forecast_recipe, tmp_path):
+  recipe, unavailable = forecast_recipe
+  unavailable.add(FIRST)
+  result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-03")
+  assert result.exit_code != 0 and "The first run" in result.output
+
+
+def test_an_extension_adds_the_runs_after_the_last(forecast_recipe, tmp_path):
+  """`--extend` adds the runs after the last stored one, a missed day included, and equals one
+  download of them all made at the same time; a run stored as its own forecast keeps its flag."""
+  recipe, _ = forecast_recipe
+  output = tmp_path / "out"
+  first = download(recipe, output, "--start=2026-11-01", "--end=2026-11-04")
+  assert first.exit_code == 0, first.output
+  write_series(tmp_path / "series.zarr", FIRST + 7 * DAY)  # two releases later (Nov 5)
+  extended = download(recipe, output, "--extend", "--end=2026-11-06")
+  assert extended.exit_code == 0, extended.output
+  out = open_output(output)
+  assert out.sizes["init_time"] == 5
+  assert out.ocean_forecast.values[:, 0].tolist() == [False, False, True, False, True]
+  whole = download(recipe, tmp_path / "whole", "--start=2026-11-01", "--end=2026-11-06")
+  assert whole.exit_code == 0, whole.output
+  reference = open_output(tmp_path / "whole")
+  xr.testing.assert_identical(
+    out.drop_vars("ocean_forecast"), reference.drop_vars("ocean_forecast")
+  )
+
+
+def test_a_series_ending_before_the_horizon_fails(forecast_recipe, tmp_path):
+  """A run whose series does not reach its horizon (its release not out yet) fails, naming the
+  dataset, before writing."""
+  recipe, _ = forecast_recipe
+  output = tmp_path / "out"
+  assert download(recipe, output, "--start=2026-11-01", "--end=2026-11-02").exit_code == 0
+  write_series(tmp_path / "series.zarr", FIRST + 3 * DAY)  # a day short of run 2's horizon
+  result = download(recipe, output, "--extend", "--end=2026-11-03")
+  assert result.exit_code != 0
+  assert "different valid times: ocean to 2026-11-03T00:00" in result.output
+  assert open_output(output).sizes["init_time"] == 1
+
+
+def test_a_run_shorter_than_those_stored_fails(forecast_recipe, tmp_path):
+  """A run whose datasets all end early (here the run source lacks the run, and the series ends a
+  day short) has fewer lead times than those stored: it fails, before writing."""
+  recipe, unavailable = forecast_recipe
+  output = tmp_path / "out"
+  assert download(recipe, output, "--start=2026-11-01", "--end=2026-11-02").exit_code == 0
+  unavailable.add(FIRST + DAY)
+  write_series(tmp_path / "series.zarr", FIRST + 3 * DAY)
+  result = download(recipe, output, "--extend", "--end=2026-11-03")
+  assert result.exit_code != 0 and "other lead times than those stored" in result.output
+  assert open_output(output).sizes["init_time"] == 1
+
+
+def test_a_failed_run_resumes(forecast_recipe, tmp_path, monkeypatch: pytest.MonkeyPatch):
+  """A run that fails leaves the stored ones on the run's branch; `--resume` writes the rest."""
+  recipe, _ = forecast_recipe
+  real = download_module.as_run
+  failures = []
+
+  def failing(block, run, *args, **kwargs):
+    if run == FIRST + 2 * DAY and not failures:
+      failures.append(run)
+      raise RuntimeError("boom")
+    return real(block, run, *args, **kwargs)
+
+  monkeypatch.setattr(download_module, "as_run", failing)
+  output = tmp_path / "out"
+  failed = download(recipe, output, "--start=2026-11-01", "--end=2026-11-04")
+  assert failed.exit_code != 0 and "--resume continues" in failed.output
+  resumed = download(recipe, output, "--resume", "--start=2026-11-01", "--end=2026-11-04")
+  assert resumed.exit_code == 0, resumed.output
+  assert open_output(output).sizes["init_time"] == 3
+
+
+def test_plan_prints_the_first_run(forecast_recipe, tmp_path):
+  recipe, _ = forecast_recipe
+  args = ("--plan", "--start=2026-11-01", "--end=2026-11-03")
+  result = download(recipe, tmp_path / "out", *args)
+  assert result.exit_code == 0, result.output
+  assert "t2m (init_time, lead_time, lat, lon)" in result.output
+
+
+@pytest.mark.parametrize(
+  ("old", "new", "message"),
+  [
+    ('[forecast]\nhorizon = "3D"\n', 'step = "1D"\n', "are for forecast recipes"),
+    ("[forecast]\n", 'step = "1D"\n[forecast]\n', "every instead"),
+    ("", "", None),
+  ],
+  ids=["no-forecast-table", "step-and-forecast", "valid"],
+)
+def test_forecast_recipes_are_checked(old, new, message, tmp_path):
+  path = tmp_path / "r.toml"
+  path.write_text(RECIPE.replace(old, new) if old else RECIPE)
+  if message is None:
+    assert read_configs(str(path), schema=download_module.DownloadConfig).forecast is not None
+    return
+  with pytest.raises(Exception, match=message):
+    read_configs(str(path), schema=download_module.DownloadConfig)
