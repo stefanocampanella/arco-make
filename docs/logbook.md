@@ -1618,6 +1618,43 @@ series already ended on 2 Dec, the release of 23 Nov being out by 06:00 UTC (ear
 12:00 of its manual). The Copernicus Marine toolbox's end is inclusive (the subset of [R, R + 10
 days] has 11 days), which the series rule relies on.
 
-**Next**: the ARCO-OCEAN forecast recipes (three resolutions, mirroring the historical ones)
-and the daily script, after the historical dataset; a cron time after every source has
-published (GLO12 by 06:00 UTC on 23 Nov, IFS about 07:30 UTC, GloFAS to be measured).
+**The ARCO-OCEAN forecast recipes, end to end** (fork, `forecast_res-<res>.toml`, generated
+from the historical recipes; `scripts/forecast.sh`; the 1 deg recipe, a backfill of the runs of
+20-21 Nov, then the daily extension to 23 Nov's run, about 6 minutes per run, 15 GB peak). Each
+attempt found something arco-make had to do:
+- A "runs" dataset may hold parts that read no runs (GloFAS's drainage network, a static file).
+- Runs lost their static coordinates on dimensions of no variable (the cell bounds), and the
+  next run failed comparing them.
+- A source without a run was left out of the merge, so the recipe's later steps naming its
+  variables failed (`dis24_outlets` today, before GloFAS published). It is stood in for, before
+  those steps, by its variables as stored (each commit records each dataset's variables), NaN
+  at the run's valid times, static ones as stored, coordinates with the run's other datasets'
+  attributes. Two reviews shaped it: a first version gave the coordinates the stored attributes
+  (the merge refused them) and the static variables NaN; a second read the dataset from an
+  earlier run of its source instead, which failed where that run lacks the steps or has another
+  time grid, and downloaded it. The first run needs every source.
+- A run not published yet became NaN for good: `[forecast] missing_after` (ARCO-OCEAN: 2 days)
+  stops the download before such a run (a source without it, with part of it, or a series short
+  of its horizon), the runs before promoted, exit status 75; the daily script tries again (every
+  30 minutes, 6 times), else the next day. An old run a source has in part fails.
+- In the fork, `--virtual-env` of the scripts never selected the environment given (uv ran the
+  repository's own); fixed there.
+
+Static fields (maintainer, 23 Nov): GLO12's own, whose bathymetry and sea differ from GLORYS12's
+in about 0.4 % of the native 3D cells (20 Nov: GLO12 values on 199k cells GLORYS12 calls land,
+NaN on 823k it calls sea; grids equal to 1e-5); the layer thicknesses stay GLORYS12's 1D `e3t`
+(GLO12's is 3D, with partial bottom cells; its largest value per level is GLORYS12's), and the
+cell areas the historical radius (GLO12's static `e2t` is 9,250 m per 1/12 deg everywhere, a
+radius of 6,359,800 m). **[Moby-Dick]** each dataset carries its own sea: use the forecasts'
+`seafrac` with the forecasts.
+
+**Publication times** (23 Nov 2026, UTC): GLO12's release by 06:00, IFS on AWS at 07:30, the
+GloFAS forecast between 09:45 and 10:00 (one day; checked every 15 minutes). Cron at 10:30.
+The final end-to-end (code of PR #21's last commit; 10:25-10:52 UTC): the runs of 20-23 Nov
+stored, 4-8 minutes each, 15 GB peak; every variable plausible (thetao -3.1 to 33.7 degC, ocean
+fields in 61 % of the cells, sea ice 70 %, the rest everywhere), the cell bounds and static
+fields there; IFS and GloFAS their runs' own forecasts, GLO12 only on 23 Nov's run (the earlier
+ones collected after their day). Open: one attempt before failed a block with "error during
+blosc decompression" reading a source (the same block passed four times before and after): a
+truncated chunk, most likely; arco-make takes it for a permanent error (no block retry). If it
+recurs, classing it as transient is a one-line change in `retries.is_transient`.
