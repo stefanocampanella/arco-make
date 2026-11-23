@@ -1068,8 +1068,9 @@ def block_key(interval: DateInterval) -> str:
 def recipe_fingerprint(configs: DownloadConfig) -> str:
   """A fingerprint of what decides what a download writes: a run is resumed, and an output
   extended, only with the same. Settings that only change how blocks are read are left out
-  (`[retries]`, parts' `timeout`, `checkpointing`): a run that failed on timeouts can resume with
-  longer ones. Options at their default are left out too: an option a later version adds, with a
+  (`[retries]`, parts' `timeout` and `storage_options`, `checkpointing`): a run that failed on
+  timeouts can resume with longer ones, and a source read with other credentials or another
+  endpoint gives the same data. Options at their default are left out too: an option a later version adds, with a
   default keeping the earlier behaviour, does not change the fingerprint of recipes without it.
   `[grids]` is left out: the regrid steps carry the grids they name. `[checks]` is left out: a
   run stopped by a check may resume once the check is changed. The dates are left out: a recipe
@@ -1090,6 +1091,7 @@ def recipe_fingerprint(configs: DownloadConfig) -> str:
     dataset.pop("checkpointing", None)
     for part in dataset["parts"]:
       part.pop("timeout", None)
+      part.pop("storage_options", None)
   return provenance.hash_recipe(recipe)
 
 

@@ -155,13 +155,21 @@ def test_only_a_download_output_can_be_extended(recipe, tmp_path):
 
 
 def test_access_and_retention_do_not_change_the_fingerprint(recipe):
-  """A renamed profile or another retention must not block extensions."""
+  """A renamed profile, another retention or another way to read the sources must not block
+  extensions."""
   configs = download_module.DownloadConfig.model_validate(tomllib.loads(recipe.read_text()))
   other_save = configs.save.model_copy(
     update={"keep_versions": 5, "storage_options": {"anon": True}}
   )
   other = configs.model_copy(update={"save": other_save})
   assert download_module.recipe_fingerprint(other) == download_module.recipe_fingerprint(configs)
+  # Nor the sources' access (anonymous or a profile, an endpoint): the same data, read otherwise.
+  data = tomllib.loads(recipe.read_text())
+  for dataset in data["datasets"].values():
+    for part in dataset["parts"]:
+      part["storage_options"] = {"anon": True}
+  sources = download_module.DownloadConfig.model_validate(data)
+  assert download_module.recipe_fingerprint(sources) == download_module.recipe_fingerprint(configs)
 
 
 def test_an_extension_refuses_a_main_that_moved_meanwhile(recipe, tmp_path, monkeypatch):
