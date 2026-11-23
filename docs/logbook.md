@@ -1649,7 +1649,8 @@ radius of 6,359,800 m). **[Moby-Dick]** each dataset carries its own sea: use th
 `seafrac` with the forecasts.
 
 **Publication times** (23 Nov 2026, UTC): GLO12's release by 06:00, IFS on AWS at 07:30, the
-GloFAS forecast between 09:45 and 10:00 (one day; checked every 15 minutes). Cron at 10:30.
+GloFAS forecast between 09:45 and 10:00 (one day; checked every 15 minutes). Cron at 12:00
+(maintainer, 23 Nov: it was 10:30; two hours of room for a late release, GloFAS's above all).
 The final end-to-end (code of PR #21's last commit; 10:25-10:52 UTC): the runs of 20-23 Nov
 stored, 4-8 minutes each, 15 GB peak; every variable plausible (thetao -3.1 to 33.7 degC, ocean
 fields in 61 % of the cells, sea ice 70 %, the rest everywhere), the cell bounds and static
