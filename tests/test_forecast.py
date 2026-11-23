@@ -292,6 +292,24 @@ def test_a_run_its_source_lacks_is_nan_and_flagged(forecast_recipe, tmp_path):
   assert out.sst.isel(init_time=1).notnull().all()
 
 
+@pytest.mark.parametrize(("today", "stored"), [(FIRST + 2 * DAY, False), (FIRST + 9 * DAY, True)])
+def test_a_run_not_published_yet_fails(forecast_recipe, tmp_path, monkeypatch, today, stored):
+  """With `missing_after = "3D"`, a source without a run younger than 3 days has not published it
+  yet: the run fails, to be collected later (NaN would be for good); older, NaN, flagged."""
+  monkeypatch.setattr(forecast, "now", lambda: today)
+  recipe, unavailable = forecast_recipe
+  recipe.write_text(
+    recipe.read_text().replace('horizon = "3D"\n', 'horizon = "3D"\nmissing_after = "3D"\n')
+  )
+  unavailable.add(FIRST + DAY)
+  result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-03")
+  if stored:
+    assert result.exit_code == 0, result.output
+    assert open_output(tmp_path / "out").atmos_forecast.values[:, 0].tolist() == [True, False]
+  else:
+    assert result.exit_code != 0 and "not published yet" in result.output
+
+
 def test_the_first_run_needs_every_dataset(forecast_recipe, tmp_path):
   recipe, unavailable = forecast_recipe
   unavailable.add(FIRST)

@@ -606,8 +606,13 @@ def _processed_block(
           )
         )
       except RunUnavailable as error:
-        if not runs or report is None:
+        if not runs or report is None or run is None:
           raise
+        if configs.forecast is not None and configs.forecast.not_published_yet(run):
+          raise ValueError(
+            f"{dataset_name}: {error}, not published yet (a run younger than [forecast]"
+            " missing_after): collect it again later"
+          ) from error
         logger.warning(f"{dataset_name}: {error}: NaN in this run, its flag false")
         report.unavailable.append(dataset_name)
         if missing is None:  # the first run: it fails, needing every dataset
@@ -1038,6 +1043,8 @@ def recipe_fingerprint(configs: DownloadConfig) -> str:
     recipe.get("save", {}).pop(key, None)
   # A forecast output's window may change (more years kept): it is retention, not content.
   recipe.get("forecast", {}).pop("window", None)
+  # When a missing run counts as missing changes when runs are collected, not what they hold.
+  recipe.get("forecast", {}).pop("missing_after", None)
   for dataset in recipe["datasets"].values():
     dataset.pop("checkpointing", None)
     for part in dataset["parts"]:

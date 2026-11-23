@@ -51,14 +51,18 @@ class ForecastConfig(BaseModel):
   # The runs kept: each new run drops the oldest beyond (a rolling window); all without. Out of
   # the recipe's fingerprint: an output's window may grow or shrink (`download --extend`).
   window: Annotated[int, Field(ge=1)] | None = None
+  # A source without a run younger than this (from its initialization) has not published it
+  # yet: the run fails, to be collected again later, instead of storing NaN for good. Older,
+  # the source lacks it (not archived): NaN, flagged. None: NaN whatever the run's age.
+  missing_after: datetime.timedelta | None = None
   init_dim: str = "init_time"
   lead_dim: str = "lead_time"
   valid_coord: str = "valid_time"
 
-  @field_validator("horizon", "every", mode="before")
+  @field_validator("horizon", "every", "missing_after", mode="before")
   @classmethod
-  def _parse(cls, value: str | datetime.timedelta) -> datetime.timedelta:
-    return may_parse_timedelta(value)
+  def _parse(cls, value: str | datetime.timedelta | None) -> datetime.timedelta | None:
+    return None if value is None else may_parse_timedelta(value)
 
   @field_validator("horizon", "every")
   @classmethod
@@ -67,6 +71,10 @@ class ForecastConfig(BaseModel):
       raise ValueError("must be positive")
     return value
 
+  def not_published_yet(self, run: datetime.datetime) -> bool:
+    """Whether a source without run `run` may still publish it (`missing_after`)."""
+    return self.missing_after is not None and now() - run < self.missing_after
+
   def interval(self, run: datetime.datetime) -> tuple[datetime.datetime, datetime.datetime]:
     """The valid times of run `run`'s block: [run, run + horizon)."""
     return run, run + self.horizon
@@ -74,6 +82,11 @@ class ForecastConfig(BaseModel):
 
 # The stored units of initialization and valid times: any run of any spacing, to the second.
 TIME_UNITS = "seconds since 1970-01-01"
+
+
+def now() -> datetime.datetime:
+  """The current time, UTC, without zone (as the runs' stamps)."""
+  return datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
 
 
 @dataclass
