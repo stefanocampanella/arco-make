@@ -18,6 +18,11 @@ Each dataset says how its source gives runs (`DatasetConfig.forecast`):
   real forecast only if the series has no stamp at or after R + horizon when it is read: a later
   release would have one. Otherwise its values come from later releases, which the flag tells.
 
+With `window`, the output keeps the last `window` runs: a new run shifts the stored ones back
+(`icechunk_utils.Run.write_rolled`, chunks moved, not copied) and takes the last slot; the runs
+dropped stay in the snapshots that hold them until the recipe's retention expires those. The
+stored layout then holds one run per object along `init_dim` (`[save] chunks` and `shards`).
+
 A dataset's `flag` names a boolean variable (`init_dim` x lead): true where its values are run
 R's own forecast. Datasets may share a flag (true where all of them are).
 """
@@ -25,10 +30,11 @@ R's own forecast. Datasets may share a flag (true where all of them are).
 import datetime
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from typing import Annotated
 
 import numpy as np
 import xarray as xr
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from arcomake.datetime_utils import may_parse_timedelta
 
@@ -42,6 +48,9 @@ class ForecastConfig(BaseModel):
   horizon: datetime.timedelta
   # Between runs: the recipe's `step` (one block per run).
   every: datetime.timedelta = datetime.timedelta(days=1)
+  # The runs kept: each new run drops the oldest beyond (a rolling window); all without. Out of
+  # the recipe's fingerprint: an output's window may grow or shrink (`download --extend`).
+  window: Annotated[int, Field(ge=1)] | None = None
   init_dim: str = "init_time"
   lead_dim: str = "lead_time"
   valid_coord: str = "valid_time"

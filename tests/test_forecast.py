@@ -11,7 +11,7 @@ import pytest
 import xarray as xr
 from click.testing import CliRunner, Result
 
-from arcomake import backends, cli, dataset_utils
+from arcomake import backends, cli, dataset_utils, icechunk_utils
 from arcomake.cli_utils import read_configs
 from arcomake.dataset_utils import (
   CopernicusMarinePartConfig,
@@ -367,4 +367,134 @@ def test_forecast_recipes_are_checked(old, new, message, tmp_path):
     assert read_configs(str(path), schema=download_module.DownloadConfig).forecast is not None
     return
   with pytest.raises(Exception, match=message):
+    read_configs(str(path), schema=download_module.DownloadConfig)
+
+
+# A rolling window of runs: each new run drops the oldest beyond `window`.
+
+
+def with_window(recipe, window: int) -> None:
+  text = recipe.read_text()
+  lines = [line for line in text.splitlines() if not line.startswith("window = ")]
+  text = "\n".join(lines) + "\n"
+  recipe.write_text(text.replace('horizon = "3D"\n', f'horizon = "3D"\nwindow = {window}\n'))
+
+
+def test_a_window_keeps_the_last_runs(forecast_recipe, tmp_path):
+  """With `window = 2`, four runs leave the last two: their values, initialization and valid
+  times as a download of those two alone; the static dataset stays."""
+  recipe, _ = forecast_recipe
+  with_window(recipe, 2)
+  write_series(tmp_path / "series.zarr", FIRST + 6 * DAY)  # the release of run 4 (Nov 4)
+  output = tmp_path / "out"
+  result = download(recipe, output, "--start=2026-11-01", "--end=2026-11-05")
+  assert result.exit_code == 0, result.output
+  out = open_output(output)
+  np.testing.assert_array_equal(
+    out.init_time.values, pd.date_range(FIRST + 2 * DAY, periods=2, freq="1D").to_numpy()
+  )
+  assert out.ocean_forecast.values[:, 0].tolist() == [False, True]
+  alone = download(recipe, tmp_path / "alone", "--start=2026-11-03", "--end=2026-11-05")
+  assert alone.exit_code == 0, alone.output
+  xr.testing.assert_identical(out, open_output(tmp_path / "alone"))
+
+
+def test_a_window_bounds_the_storage(forecast_recipe, tmp_path, monkeypatch: pytest.MonkeyPatch):
+  """Runs shifted out of the window go with the versions that held them: with one version kept
+  (and no grace period), the repository holds as many chunk objects after each later run."""
+  monkeypatch.setattr(icechunk_utils, "GRACE", datetime.timedelta(0))
+  # Chunks this small are inlined in the manifests: stored as objects, they can be counted.
+  config = icechunk_utils.icechunk.RepositoryConfig
+  monkeypatch.setattr(
+    icechunk_utils.icechunk,
+    "RepositoryConfig",
+    lambda **kwargs: config(inline_chunk_threshold_bytes=0, **kwargs),
+  )
+  recipe, _ = forecast_recipe
+  with_window(recipe, 2)
+  recipe.write_text(recipe.read_text().replace("[save]\n", "[save]\nkeep_versions = 1\n"))
+  write_series(tmp_path / "series.zarr", FIRST + 9 * DAY)
+  output = tmp_path / "out"
+
+  def chunks() -> int:
+    return sum(1 for f in (output / "chunks").rglob("*") if f.is_file())
+
+  assert download(recipe, output, "--start=2026-11-01", "--end=2026-11-04").exit_code == 0
+  counts = [chunks()]
+  for end in ("2026-11-05", "2026-11-06", "2026-11-07"):
+    extended = download(recipe, output, "--extend", f"--end={end}")
+    assert extended.exit_code == 0, extended.output
+    counts.append(chunks())
+  assert open_output(output).sizes["init_time"] == 2
+  # A version is a command's last commit: its earlier commits (here the first command's three
+  # runs) go with the next command's retention; from then on, as many objects after each run.
+  assert counts[1] > 0 and counts[1:] == [counts[1]] * 3, counts
+
+
+def test_a_window_grows_and_shrinks(forecast_recipe, tmp_path):
+  """The window is out of the recipe's fingerprint: lengthened, runs are appended until it is
+  full; shortened, the oldest runs beyond it go at the next run."""
+  recipe, _ = forecast_recipe
+  write_series(tmp_path / "series.zarr", FIRST + 8 * DAY)
+  output = tmp_path / "out"
+  with_window(recipe, 2)
+  assert download(recipe, output, "--start=2026-11-01", "--end=2026-11-04").exit_code == 0
+  assert open_output(output).sizes["init_time"] == 2
+  with_window(recipe, 3)
+  grown = download(recipe, output, "--extend", "--end=2026-11-05")
+  assert grown.exit_code == 0, grown.output
+  inits = open_output(output).init_time.values
+  np.testing.assert_array_equal(inits, pd.date_range(FIRST + DAY, periods=3, freq="1D").to_numpy())
+  with_window(recipe, 2)
+  shrunk = download(recipe, output, "--extend", "--end=2026-11-06")
+  assert shrunk.exit_code == 0, shrunk.output
+  out = open_output(output)
+  expected = pd.date_range(FIRST + 3 * DAY, periods=2, freq="1D").to_numpy()
+  np.testing.assert_array_equal(out.init_time.values, expected)
+  np.testing.assert_array_equal(
+    out.valid_time.values, expected[:, None] + out.lead_time.values[None, :]
+  )
+  run = pd.Timestamp(expected[0]).to_pydatetime()
+  hours = [np.datetime64(run) + np.timedelta64(h, "h") for h in (0, 6, 12, 18)]
+  assert float(out.t2m.isel(init_time=0, lead_time=0, lat=0, lon=0)) == np.mean(
+    [atmos_value(run, h) for h in hours]
+  )
+
+
+def test_a_failed_rolled_run_resumes(forecast_recipe, tmp_path, monkeypatch: pytest.MonkeyPatch):
+  """A run failing once the window is full leaves `main` as it was; `--resume` completes it."""
+  recipe, _ = forecast_recipe
+  with_window(recipe, 2)
+  write_series(tmp_path / "series.zarr", FIRST + 6 * DAY)
+  real = download_module.as_run
+  failures = []
+
+  def failing(block, run, *args, **kwargs):
+    if run == FIRST + 3 * DAY and not failures:
+      failures.append(run)
+      raise RuntimeError("boom")
+    return real(block, run, *args, **kwargs)
+
+  monkeypatch.setattr(download_module, "as_run", failing)
+  output = tmp_path / "out"
+  failed = download(recipe, output, "--start=2026-11-01", "--end=2026-11-05")
+  assert failed.exit_code != 0
+  resumed = download(recipe, output, "--resume", "--start=2026-11-01", "--end=2026-11-05")
+  assert resumed.exit_code == 0, resumed.output
+  inits = open_output(output).init_time.values
+  np.testing.assert_array_equal(
+    inits, pd.date_range(FIRST + 2 * DAY, periods=2, freq="1D").to_numpy()
+  )
+
+
+@pytest.mark.parametrize(
+  "save",
+  ["chunks = {lat = 1}", "chunks = 1", "chunks = {init_time = 1}\nshards = {init_time = 2}"],
+  ids=["no-init-chunks", "not-a-table", "shards-of-two-runs"],
+)
+def test_a_window_needs_one_run_per_object(save, tmp_path):
+  path = tmp_path / "r.toml"
+  text = RECIPE.replace('horizon = "3D"\n', 'horizon = "3D"\nwindow = 2\n')
+  path.write_text(text.replace("chunks = {init_time = 1}", save))
+  with pytest.raises(Exception, match="one run per stored object"):
     read_configs(str(path), schema=download_module.DownloadConfig)

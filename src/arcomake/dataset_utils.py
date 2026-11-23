@@ -1175,8 +1175,13 @@ def write_output(
   metadata: Mapping[str, Any] | None = None,
   align_chunks: bool = False,
   recipe: str | None = None,
+  keep: int | None = None,
 ) -> str:
   """Write a dataset with the layout of `[save]` (see `prepare_for_writing`) in one commit.
+
+  With `keep`, the dataset (one step along `append_dim`) is written after the last `keep` steps
+  stored, the others dropped: a rolling window of forecast runs
+  (`icechunk_utils.Run.write_rolled`). Runs only.
 
   With `align_chunks`, Dask chunks that straddle the stored chunks (or shards) are rechunked to
   fit them (see `icechunk_utils.Run.write`); else such a layout is refused.
@@ -1195,6 +1200,19 @@ def write_output(
   prepared = prepare_for_writing(dataset, configs)
   if isinstance(destination, icechunk_utils.Run):
     logger.info(f"Writing to {destination.path} ({message}) with {configs}")
+    if keep is not None:
+      if append_dim is None:
+        raise ValueError("write_output: a rolling write (keep) goes along append_dim")
+      return destination.write_rolled(
+        prepared,
+        dim=append_dim,
+        keep=keep,
+        message=message,
+        group=configs.group,
+        metadata=metadata,
+        align_chunks=align_chunks,
+        shard_order=configs.shard_order,
+      )
     return destination.write(
       prepared,
       message=message,

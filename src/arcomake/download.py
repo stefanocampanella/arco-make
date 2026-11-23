@@ -150,6 +150,23 @@ class DownloadConfig(BaseModel):
       )
     return self
 
+  @model_validator(mode="after")
+  def _one_run_per_object(self) -> Self:
+    # A rolling window moves whole stored objects (`Session.shift_array`): one run in each.
+    if self.forecast is None or self.forecast.window is None:
+      return self
+    dim = self.forecast.init_dim
+    for name in ("chunks", "shards"):
+      layout = getattr(self.save, name)
+      if layout is None and name == "shards":
+        continue
+      if not isinstance(layout, dict) or layout.get(dim) != 1:
+        raise ValueError(
+          f"[save] {name}: a rolling window of runs needs one run per stored object: give"
+          f" {name} as a table with {dim} = 1"
+        )
+    return self
+
   @property
   def block_step(self) -> timedelta:
     """The length of a block: `step`, or the time between forecast runs."""
@@ -676,8 +693,16 @@ def _write_block(
     if not first and static is not None and not static.checked:
       _check_static(dataset, run, group, time_dim)
       static.checked = True
+    # With a full window of forecast runs, the stored runs kept with this one (the oldest are
+    # dropped); None when every stored run stays (an append).
+    keep = None
+    window = fc.window if fc is not None else None
+    if window is not None and fc is not None and not first:
+      keep = window - 1 if _stored_steps(run, group, fc.init_dim) >= window else None
     stamps_of = time_dim if fc is None else fc.valid_coord
-    dataset = _with_output_coverage(dataset, run, group, time_dim, first, stored=stamps_of)
+    dataset = _with_output_coverage(
+      dataset, run, group, time_dim, first, stored=stamps_of, keep=keep
+    )
     if configs.checks is not None:
       dataset = _checked_block(dataset, configs.checks, read_interval, time_dim)
     if fc is not None and report is not None:
@@ -693,7 +718,15 @@ def _write_block(
       metadata=_block_metadata(date_interval),
       # Chunks are planned for reading; the stored layout is the recipe's.
       align_chunks=True,
+      keep=keep,
     )
+
+
+def _stored_steps(run: icechunk_utils.Run, group: str | None, dim: str) -> int:
+  """How many steps along `dim` (forecast runs) the run's branch holds."""
+  session = run.repo.readonly_session(branch=run.branch)
+  with xr.open_zarr(session.store, group=group, consolidated=False) as stored:
+    return int(stored.sizes[dim])
 
 
 def _as_stored_run(
@@ -825,12 +858,14 @@ def _with_output_coverage(
   time_dim: str,
   first: bool,
   stored: str | None = None,
+  keep: int | None = None,
 ) -> xr.Dataset:
   """`dataset` with the time coverage of the whole output, if it has one (`coverage_attrs`).
 
   xarray replaces a store's attributes with each appended block's: the coverage is computed here
   from the output's stamps (those stored on the run's branch, variable `stored`, by default
-  `time_dim`; a forecast's valid times), then the block's, for every block.
+  `time_dim`; a forecast's valid times, of the last `keep` runs if a window drops the others),
+  then the block's, for every block.
   """
   if "time_coverage_start" not in dataset.attrs:
     return dataset
@@ -838,7 +873,8 @@ def _with_output_coverage(
   if not first:
     store = run.repo.readonly_session(branch=run.branch).store
     with xr.open_zarr(store, group=group, consolidated=False) as output:
-      kept = output[stored or time_dim].values.ravel()
+      values = output[stored or time_dim].values
+      kept = (values[len(values) - keep :] if keep is not None else values).ravel()
       # A forecast's runs share valid times: each counted once, so the resolution is found.
       stamps = np.unique(np.concatenate([kept, stamps]))
   computed = time_coverage(stamps)
@@ -870,12 +906,15 @@ def recipe_fingerprint(configs: DownloadConfig) -> str:
   run stopped by a check may resume once the check is changed. The dates are left out: a recipe
   is the same over any period (an extension keeps it), and a resumed run's blocks are checked
   against those stored. `[save]` access and retention (`storage_options`, `keep_history`,
-  `keep_versions`) are left out: a renamed profile or a new retention must not block extensions."""
+  `keep_versions`) are left out: a renamed profile or a new retention must not block extensions;
+  so is a forecast's `window`, for the same reason."""
   recipe = configs.model_dump(
     mode="json", exclude={"retries", "grids", "checks", "start", "end"}, exclude_defaults=True
   )
   for key in ("storage_options", "keep_history", "keep_versions"):
     recipe.get("save", {}).pop(key, None)
+  # A forecast output's window may change (more years kept): it is retention, not content.
+  recipe.get("forecast", {}).pop("window", None)
   for dataset in recipe["datasets"].values():
     dataset.pop("checkpointing", None)
     for part in dataset["parts"]:

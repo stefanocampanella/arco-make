@@ -26,7 +26,9 @@ from typing import Any, Literal
 
 import fsspec.utils
 import icechunk
+import numpy as np
 import xarray as xr
+import xarray.coding.times
 import zarr
 from icechunk.xarray import to_icechunk
 
@@ -395,6 +397,23 @@ def _write_into(
     )
 
 
+def _write_index_value(array: Any, coordinate: xr.DataArray, position: int) -> None:
+  """Write the one value of `coordinate` at `position` of a stored index coordinate, encoded as
+  stored (CF units and calendar for times)."""
+  attrs = dict(array.attrs)
+  values = coordinate.values
+  if "units" in attrs and np.issubdtype(values.dtype, np.datetime64):
+    encoded, _, _ = xr.coding.times.encode_cf_datetime(
+      values, attrs["units"], attrs.get("calendar", "proleptic_gregorian")
+    )
+    if not np.array_equal(np.asarray(encoded).astype(array.dtype), encoded):
+      raise ValueError(
+        f"{coordinate.name}: {values} cannot be stored in the stored units ({attrs['units']})"
+      )
+    values = np.asarray(encoded)
+  array[position : position + 1] = values.astype(array.dtype)
+
+
 class Run:
   """The writes of one run of a command to one repository, on a branch of their own.
 
@@ -468,6 +487,65 @@ class Run:
     # for `waiting_run`; amended snapshots are garbage-collected after `GRACE` (logbook, 18 Nov).
     session = self.session()
     _write_into(session, dataset, mode, append_dim, group, align_chunks, shard_order)
+    return self.commit(session, message, metadata)
+
+  def write_rolled(
+    self,
+    dataset: xr.Dataset,
+    *,
+    dim: str,
+    keep: int,
+    message: str,
+    group: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+    align_chunks: bool = False,
+    shard_order: sharding.ShardOrder = sharding.DEFAULT,
+  ) -> str:
+    """Write `dataset`, one step along `dim`, after the last `keep` steps stored, dropping the
+    earlier ones, in one commit of the run: a rolling window of `keep` + 1 steps (forecast runs).
+
+    Every stored array along `dim` (one step per stored object along it: chunk, or shard) is
+    shifted back by the steps dropped (`Session.shift_array`: chunks moved, none copied; those
+    shifted out go with the snapshots that still hold them, `Retention`), resized if the window
+    shrank, and the new step written into the last slot. Variables without `dim` (static ones)
+    are not written. The index coordinate of `dim`, which region writes leave out, is written
+    encoded as stored.
+    """
+    session = self.session()
+    root = zarr.open_group(session.store, path=group or "", mode="r+")
+    index = root[dim]
+    if not isinstance(index, zarr.Array):
+      raise ValueError(f"{dim!r} is not an array of the output")
+    stored = index.shape[0]
+    drop = stored - keep
+    if drop < 1:
+      raise ValueError(f"{stored} steps along {dim!r} stored, {keep} to keep: append instead")
+    for name, array in root.arrays():
+      names: list[str] = list(getattr(array.metadata, "dimension_names", None) or ())
+      if dim not in names:
+        continue
+      axis = names.index(dim)
+      if array.chunks[axis] != 1 or (array.shards is not None and array.shards[axis] != 1):
+        raise ValueError(
+          f"{name}: a rolling window needs one step of {dim!r} per stored object (chunks and"
+          f" shards of 1 along it), not {array.shards or array.chunks}"
+        )
+      session.shift_array(f"/{array.path}", [-drop if i == axis else 0 for i in range(len(names))])
+      if stored != keep + 1:
+        shape = list(array.shape)
+        shape[axis] = keep + 1
+        array.resize(shape)
+    written = dataset.drop_vars([n for n, v in dataset.variables.items() if dim not in v.dims])
+    with sharding.write_order(shard_order):
+      to_icechunk(
+        written,
+        session,
+        mode="r+",
+        region={dim: slice(keep, keep + 1)},
+        group=group,
+        align_chunks=align_chunks,
+      )
+    _write_index_value(index, dataset[dim], keep)
     return self.commit(session, message, metadata)
 
   def write_groups(
