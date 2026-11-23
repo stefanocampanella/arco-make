@@ -143,6 +143,14 @@ def as_run(
   renamed = block.assign_coords({time_dim: leads}).rename({time_dim: config.lead_dim})
   out = renamed[timed].expand_dims({config.init_dim: [init]})
   out = out.merge(renamed[static], compat="identical", combine_attrs="override")
+  # Coordinates without time on dimensions of no variable (cell bounds, on `bnds`): selecting the
+  # variables left them out.
+  static_coords = {
+    name: renamed[name]
+    for name in renamed.coords
+    if config.lead_dim not in renamed[name].dims and name not in out.coords
+  }
+  out = out.assign_coords(static_coords)
   out = out.assign(dict(run_flags))
   valid = out[config.init_dim] + out[config.lead_dim]
   out = out.assign_coords({config.valid_coord: valid.transpose(config.init_dim, config.lead_dim)})

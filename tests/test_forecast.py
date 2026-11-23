@@ -524,6 +524,24 @@ def test_a_window_needs_one_run_per_object(save, tmp_path):
     read_configs(str(path), schema=download_module.DownloadConfig)
 
 
+def test_a_run_keeps_the_static_coordinates():
+  """Coordinates without time on dimensions of no variable (cell bounds on `bnds`) stay in the
+  run: they were lost, and the next run found the stored ones missing."""
+  block = xr.Dataset(
+    {"t": (("time", "lat"), np.ones((3, 2))), "depth": ("lat", np.ones(2))},
+    coords={
+      "time": pd.date_range(FIRST, periods=3, freq="1D"),
+      "lat": LAT,
+      "lat_bnds": (("lat", "bnds"), np.array([[-0.5, 0.5], [0.5, 1.5]])),
+    },
+  )
+  config = forecast.ForecastConfig(horizon="3D")
+  run = forecast.as_run(block, FIRST, config, "time", {})
+  assert run.lat_bnds.dims == ("lat", "bnds")
+  np.testing.assert_array_equal(run.lat_bnds.values, block.lat_bnds.values)
+  assert run.t.dims == ("init_time", "lead_time", "lat") and run.depth.dims == ("lat",)
+
+
 def test_stored_variables_missing_without_a_missing_source_fail():
   """NaN fills only the datasets whose source had no such run: a run lacking stored variables
   otherwise is an error."""
