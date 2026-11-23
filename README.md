@@ -326,6 +326,12 @@ High-resolution sources can yield blocks larger than memory: each source is proc
 > Arco-make relies on `xarray` and `dask`; regridding uses `xarray-regrid`. GRIB sources (EWDS) need a
 > recent ecCodes (2.48 is used in the container image).
 
+## Versions
+
+Versions follow [Semantic Versioning](https://semver.org); [CHANGELOG.md](CHANGELOG.md) says what changed,
+how to upgrade recipes, and what the public interface is. Before 1.0.0 a minor version may break recipes,
+commands or outputs.
+
 ## Development
 
 ```bash

@@ -1679,3 +1679,17 @@ being 1/12 deg rounded). Measured on the static products (`deptho` on 1/17 of th
   lies about half a level below it in every column (near the centre of the first land level;
   median 200 m deeper); GLORYS12's within half a level of it, above or below (48 % inside the
   deepest sea level). Both recipes say so in `deptho`'s comment. Use `volcello` for water.
+
+### 23 Nov: version 0.2.0 (roadmap point 11)
+
+The last pull request of the stack sets the version to 0.2.0 (maintainer's decision), not 1.0.0.
+Under Semantic Versioning a breaking change before 1.0 bumps the minor version, so 0.2.0 says what
+this release is: most of arco-make rewritten, 0.1.0 recipes and outputs not carried over, the
+interface not yet declared stable. 1.0.0 is a promise that the interface (recipes, commands,
+output layout, the commit metadata read by `--resume` and `--extend`) stays compatible within the
+major version, and the production run has yet to test it: a breaking fix found there would make a
+2.0.0 within weeks. 1.0.0 follows once a production dataset has been made and the daily forecast
+collection has run for a while, preferably on the commit that made the published data. A release
+candidate (1.0.0rc1) was considered and set aside: each commit's provenance records the version,
+so the published data would carry "rc" for good. `CHANGELOG.md` lists the upgrade from 0.1.0 and
+states the interface; the tag (`v0.2.0`) goes on master once the stack is merged.
