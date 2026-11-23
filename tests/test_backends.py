@@ -161,6 +161,132 @@ def test_ewds_cost_estimate_decides(costs, accepted):
   assert EarlyWarningDataStore._accepted(client, "cems-glofas-historical", request) is accepted
 
 
+def _forecast_grib(run: datetime, hours: list[int]) -> xr.Dataset:
+  """A forecast run as cfgrib opens the GloFAS forecast GRIB (checked 23 Nov 2026): `step` the
+  lead times, `valid_time` along them, the initialization and the member as scalars."""
+  steps = np.array(hours, dtype="timedelta64[h]").astype("timedelta64[ns]")
+  return xr.Dataset(
+    {"dis24": (("step", "latitude", "longitude"), np.arange(len(hours) * 4.0).reshape(-1, 2, 2))},
+    coords={
+      "step": steps,
+      "valid_time": ("step", np.datetime64(run, "ns") + steps),
+      "time": np.datetime64(run, "ns"),
+      "number": 0,
+      "surface": 0.0,
+      "latitude": [1.0, 0.0],
+      "longitude": [0.0, 1.0],
+    },
+  )
+
+
+def _forecast_service(
+  monkeypatch: pytest.MonkeyPatch, costs: dict | None, answer=None
+) -> list[dict]:
+  """The EWDS with its cost estimate answering `costs` and its requests answered by `answer`
+  (default: the run asked); returns the requests made."""
+  made: list[dict] = []
+
+  class Datastores:
+    def estimate_costs(self, name, request):
+      return costs
+
+  class Legacy:
+    client = Datastores()
+
+  def process(self, name, requests, **kwargs):
+    made.extend(requests)
+    (request,) = requests
+    run = datetime(int(request["year"][0]), int(request["month"][0]), int(request["day"][0]))
+    hours = [int(h) for h in request["leadtime_hour"]]
+    return [answer(run, hours) if answer is not None else _forecast_grib(run, hours)]
+
+  monkeypatch.setattr(EarlyWarningDataStore, "_process_requests", process)
+  monkeypatch.setattr(
+    EarlyWarningDataStore,
+    "get_cdsapi_client",
+    staticmethod(lambda **kwargs: Legacy() if costs is not None else object()),
+  )
+  return made
+
+
+def _open_run(run: datetime, start: datetime, end: datetime) -> xr.Dataset:
+  return EarlyWarningDataStore().open_dataset(
+    "ewds://cems-glofas-forecast",
+    start_datetime=start,
+    end_datetime=end,
+    run_datetime=run,
+    system_version="operational",
+    hydrological_model="lisflood",
+    product_type="control_forecast",
+    variable="river_discharge_in_the_last_24_hours",
+  )
+
+
+@pytest.mark.parametrize("costs", [{"cost": 10.0, "limit": 60.0}, None], ids=["estimate", "none"])
+def test_ewds_forecast_run_along_valid_time(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, costs
+):
+  """A forecast run is one request for the run's day and the lead hours whose valid times are in
+  [start, end), returned along `time`, the valid times. A recipe's `time_offset = "-24h"` shifts
+  [start, end) by a day: the run's ten days of daily discharge are leads 24 to 240 h. Without a
+  cost estimate, the run is requested anyway."""
+  made = _forecast_service(monkeypatch, costs)
+  run = datetime(2026, 11, 21)
+  with TempDirectoryRegistry(base_dir=tmp_path):
+    out = _open_run(run, datetime(2026, 11, 22), datetime(2026, 12, 2))
+  (request,) = made
+  assert (request["year"], request["month"], request["day"]) == (["2026"], ["11"], ["21"])
+  assert request["leadtime_hour"] == [str(h) for h in range(24, 241, 24)]
+  assert "timespan" not in request
+  assert out.dis24.dims == ("time", "latitude", "longitude")
+  days = out["time"].values.astype("datetime64[D]")
+  assert days.tolist() == np.arange("2026-11-22", "2026-12-02", dtype="datetime64[D]").tolist()
+  assert set(out.coords) == {"time", "latitude", "longitude"}
+
+
+def test_ewds_forecast_run_not_published(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+  """A run the service does not have yet is not a valid combination for its cost estimate
+  (checked 23 Nov 2026 for that day's run): `RunUnavailable`, and nothing is requested."""
+  costs = {"cost": 3.0, "limit": 60.0, "request_is_valid": False, "invalid_reason": "no data"}
+  made = _forecast_service(monkeypatch, costs)
+  with TempDirectoryRegistry(base_dir=tmp_path), pytest.raises(backends.RunUnavailable):
+    _open_run(datetime(2026, 11, 23), datetime(2026, 11, 24), datetime(2026, 12, 4))
+  assert made == []
+
+
+def test_ewds_forecast_run_above_the_limit_fails(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+  """A run above the service's limit is a recipe's mistake (too many variables), not a missing
+  run: it fails instead of becoming NaN."""
+  _forecast_service(monkeypatch, {"cost": 80.0, "limit": 60.0})
+  with TempDirectoryRegistry(base_dir=tmp_path), pytest.raises(ValueError, match="limit"):
+    _open_run(datetime(2026, 11, 21), datetime(2026, 11, 22), datetime(2026, 12, 2))
+
+
+def test_ewds_forecast_run_with_other_lead_times_fails(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+  """A run answered with lead times missing fails, naming those asked."""
+  _forecast_service(
+    monkeypatch, {"cost": 10.0, "limit": 60.0}, answer=lambda run, h: _forecast_grib(run, h[:-1])
+  )
+  with TempDirectoryRegistry(base_dir=tmp_path), pytest.raises(ValueError, match="lead times"):
+    _open_run(datetime(2026, 11, 21), datetime(2026, 11, 22), datetime(2026, 12, 2))
+
+
+def test_ewds_forecast_run_of_one_lead_time(
+  tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+):
+  """A run of one lead time (scalar `step` in the GRIB) has a time dimension of one stamp."""
+  one = lambda run, hours: _forecast_grib(run, hours).isel(step=0)  # noqa: E731
+  _forecast_service(monkeypatch, {"cost": 1.0, "limit": 60.0}, answer=one)
+  with TempDirectoryRegistry(base_dir=tmp_path):
+    out = _open_run(datetime(2026, 11, 21), datetime(2026, 11, 22), datetime(2026, 11, 23))
+  assert out.dis24.dims == ("time", "latitude", "longitude")
+  assert out["time"].values.tolist() == [np.datetime64("2026-11-22", "ns").astype(int)]
+
+
 def test_cdsapi_client_receives_explicit_url(monkeypatch: pytest.MonkeyPatch):
   """`url` given to `get_cdsapi_client` reaches `cdsapi.Client`."""
   received = {}

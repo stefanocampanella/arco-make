@@ -29,6 +29,26 @@ logger = logging.getLogger(__name__)
 _GRIB_OPEN_LOCK = threading.Lock()
 
 
+class RunUnavailable(LookupError):
+  """A forecast run its source does not have (not published yet, or not archived): a forecast
+  download leaves the dataset out of that run (NaN, flagged), instead of failing it."""
+
+
+def _steps_as_time(dataset: xr.Dataset, time_dim: str) -> xr.Dataset:
+  """A forecast run as cfgrib opens it (`time` its initialization, `step` the lead times,
+  `valid_time` their sum) along `time_dim`, the valid times: the steps of a recipe then apply as
+  to any series. Scalar coordinates of the GRIB (`number`, `surface`, ...) are dropped."""
+  if "valid_time" not in dataset.coords:
+    raise ValueError("a forecast run needs a valid_time coordinate (init + step)")
+  if "step" not in dataset.dims:
+    dataset = dataset.expand_dims("step")
+  valid = dataset["valid_time"].values.reshape(-1)
+  scalars = [name for name in dataset.coords if dataset[name].ndim == 0]
+  dataset = dataset.drop_vars([*scalars, "valid_time"], errors="ignore")
+  dataset = dataset.drop_vars("step").rename({"step": time_dim})
+  return dataset.assign_coords({time_dim: valid})
+
+
 def _drop_variables(dataset: xr.Dataset, names: str | Iterable[str] | None) -> xr.Dataset:
   """Apply `drop_variables` as xarray's own backends do: listed variables absent are ignored."""
   if names is None:
@@ -219,6 +239,7 @@ class EarlyWarningDataStore(BackendEntrypoint):
     longitude_dim: str = "longitude",
     max_workers: int | None = None,
     timeout: float | None = None,
+    run_datetime: datetime.datetime | None = None,
   ) -> xr.Dataset:
     url = urlparse(filename_or_obj)
     if url.path or url.query or url.fragment:
@@ -226,9 +247,11 @@ class EarlyWarningDataStore(BackendEntrypoint):
         f"Possibly invalid EWDS URL: {filename_or_obj}. Ignoring path, query and fragment"
       )
     dataset_name = url.netloc
-    if any(
-      arg is None for arg in [system_version, hydrological_model, product_type, timespan, variable]
-    ):
+    # A forecast run (`run_datetime`) takes no timespan: its lead times are the request's.
+    required = [system_version, hydrological_model, product_type, variable]
+    if run_datetime is None:
+      required.append(timespan)
+    if any(arg is None for arg in required):
       raise ValueError("Missing required argument.")
     if start_datetime is None or end_datetime is None:
       raise ValueError("Missing required argument.")
@@ -239,12 +262,17 @@ class EarlyWarningDataStore(BackendEntrypoint):
       "system_version": [system_version],
       "hydrological_model": [hydrological_model],
       "product_type": [product_type],
-      "timespan": [timespan],
+      **({"timespan": [timespan]} if timespan is not None else {}),
       "variable": [variable] if isinstance(variable, str) else variable,
       "data_format": "grib2",
       "download_format": "zip",
     }
     client_options = {} if timeout is None else {"timeout": timeout}
+    if run_datetime is not None:
+      run = self._forecast_run(
+        dataset_name, base, run_datetime, start_datetime, end_datetime, time_dim, client_options
+      )
+      return _drop_variables(run, drop_variables)
     groups = self._request_groups(dataset_name, base, start_datetime, end_datetime, client_options)
     requests = [base | self._year_request(dates) for dates in groups]
     raw_datasets = self._process_requests(
@@ -280,6 +308,69 @@ class EarlyWarningDataStore(BackendEntrypoint):
 
     return _drop_variables(xr.concat(datasets, dim=time_dim), drop_variables)
 
+  def _forecast_run(
+    self,
+    dataset_name: str,
+    base: dict[str, Any],
+    run: datetime.datetime,
+    start: datetime.datetime,
+    end: datetime.datetime,
+    time_dim: str,
+    client_options: dict[str, Any],
+  ) -> xr.Dataset:
+    """The forecast run of `run` whose valid times are in [start, end), along `time_dim`: one
+    request, for the run's day and its lead hours (multiples of `LEAD_HOURS`, as the service
+    gives them).
+
+    The service's cost estimate is asked first: a run it refuses (not published yet; it answers
+    as for any combination it lacks) raises `RunUnavailable`.
+    """
+    leads = self._lead_hours(run, start, end)
+    if not leads:
+      raise ValueError(f"no lead time of the run {run} is in [{start}, {end})")
+    request = base | {
+      "year": [f"{run.year}"],
+      "month": [f"{run.month:02}"],
+      "day": [f"{run.day:02}"],
+      "leadtime_hour": [str(hours) for hours in leads],
+    }
+    client = self.get_cdsapi_client(
+      progress=False, client_logger=self.client_logger, **client_options
+    )
+    # Without an estimate, the run is requested anyway: a run the service lacks then fails.
+    if (costs := self._estimate(client, dataset_name, request)) is not None:
+      if not self._valid(costs):
+        raise RunUnavailable(f"{dataset_name} has no run of {run:%Y-%m-%d %H:%M}")
+      if costs["cost"] > costs["limit"]:
+        raise ValueError(
+          f"{dataset_name}: the run of {run:%Y-%m-%d} costs {costs['cost']}, above the service's"
+          f" limit of {costs['limit']} (fields: lead times x variables)"
+        )
+    (dataset,) = self._process_requests(dataset_name, [request], **client_options)
+    dataset = _steps_as_time(dataset, time_dim)
+    wanted = np.array([run + datetime.timedelta(hours=h) for h in leads], dtype="datetime64[ns]")
+    if not np.array_equal(dataset[time_dim].values, wanted):
+      raise ValueError(
+        f"{dataset_name} gave the run {run:%Y-%m-%d} with other lead times than asked: {leads}"
+      )
+    return dataset
+
+  # The lead times of the EWDS forecasts are whole days (GloFAS: 24 to 720 hours).
+  LEAD_HOURS = 24
+
+  @classmethod
+  def _lead_hours(
+    cls, run: datetime.datetime, start: datetime.datetime, end: datetime.datetime
+  ) -> list[int]:
+    """The lead hours of the run whose valid times are in [start, end)."""
+    first = max(1, -(-(start - run) // datetime.timedelta(hours=cls.LEAD_HOURS)))
+    hours = []
+    lead = first * cls.LEAD_HOURS
+    while run + datetime.timedelta(hours=lead) < end:
+      hours.append(lead)
+      lead += cls.LEAD_HOURS
+    return hours
+
   def _request_groups(
     self,
     dataset_name: str,
@@ -311,21 +402,34 @@ class EarlyWarningDataStore(BackendEntrypoint):
     return groups
 
   @staticmethod
-  def _accepted(client: Any, dataset_name: str, request: dict[str, Any]) -> bool:
-    """Whether the service's cost estimate accepts `request` (valid, within the limit). False if
-    the estimate is unavailable (an older client, an error): requests per month then, as before."""
+  def _estimate(client: Any, dataset_name: str, request: dict[str, Any]) -> dict[str, Any] | None:
+    """The service's cost estimate of `request`; None if unavailable (an older client, an
+    error)."""
     datastores = getattr(client, "client", None)  # the legacy cdsapi client's datastores client
     if datastores is None:
-      return False
+      return None
     try:
-      costs = datastores.estimate_costs(dataset_name, request)
+      return datastores.estimate_costs(dataset_name, request)
     except Exception as error:
-      logger.warning(f"EWDS cost estimate failed ({error}): one request per month")
+      logger.warning(f"EWDS cost estimate failed ({error})")
+      return None
+
+  @staticmethod
+  def _valid(costs: dict[str, Any]) -> bool:
+    """Whether a cost estimate says its request is a valid combination of values. A valid
+    request comes back with `request_is_valid` None (measured 23 Nov 2026), not True: only False
+    refuses it."""
+    return costs.get("request_is_valid") is not False
+
+  @classmethod
+  def _accepted(cls, client: Any, dataset_name: str, request: dict[str, Any]) -> bool:
+    """Whether the service's cost estimate accepts `request` (valid, within the limit). False if
+    the estimate is unavailable: requests per month then, as before."""
+    costs = cls._estimate(client, dataset_name, request)
+    if costs is None:
+      logger.info("No EWDS cost estimate: one request per month")
       return False
-    # A valid request comes back with `request_is_valid` None (measured 23 Nov 2026), not True:
-    # only False refuses it.
-    valid = costs.get("request_is_valid") is not False
-    accepted = valid and costs["cost"] <= costs["limit"]
+    accepted = cls._valid(costs) and costs["cost"] <= costs["limit"]
     if not accepted:
       reason = str(costs.get("invalid_reason") or f"cost {costs['cost']} > {costs['limit']}")
       logger.info(

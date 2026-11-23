@@ -354,6 +354,8 @@ class EarlyWarningDataStorePartConfig(PartTimeOffset, PartTimeout, PartAlignment
   drop_variables: str | list[str] | None = None
   start_datetime: datetime.datetime | str | None = None
   end_datetime: datetime.datetime | str | None = None
+  # The forecast run to read (a forecast download injects it); without, the historical product.
+  run_datetime: datetime.datetime | None = None
   time_dim: str | None = None
   latitude_dim: str | None = None
   longitude_dim: str | None = None
@@ -804,6 +806,10 @@ def _planned(
   ]
 
 
+# The engines that read forecast runs (`run_datetime`), along valid time.
+RUN_ENGINES = frozenset({"earlywarningdatastore"})
+
+
 def download_and_process(
   configs: DatasetConfig,
   start_datetime: datetime.datetime,
@@ -812,9 +818,13 @@ def download_and_process(
   budget: chunk_plan.Budget | None = None,
   name: str = "dataset",
   later_steps: Sequence[ProcessingStepConfig] = (),
+  run_datetime: datetime.datetime | None = None,
 ) -> xr.Dataset:
   """The dataset of `configs` over [start, end): its parts read, time-sliced and merged, then its
   steps applied (lazily: computed when written).
+
+  With `run_datetime`, the parts read that forecast run (`RUN_ENGINES`; their backends return
+  the run along valid time, so [start, end) are valid times), others are refused.
 
   With a `budget`, the parts are chunked by `chunk_plan.plan` for their slices of the block and
   the needs of the dataset's steps and of the `later_steps` (the recipe's steps after merging);
@@ -839,6 +849,12 @@ def download_and_process(
       _with_timeout(part_conf, engine, getattr(raw_part, "timeout", None))
     if engine == "earlywarningdatastore" or engine == "copernicusmarine":
       part_conf.update(start_datetime=start_datetime - offset, end_datetime=end_datetime - offset)
+    if run_datetime is not None:
+      if engine not in RUN_ENGINES:
+        raise ValueError(
+          f"{name}: engine {engine!r} reads no forecast runs (engines that do: {sorted(RUN_ENGINES)})"
+        )
+      part_conf["run_datetime"] = run_datetime
     part = open_input(**part_conf)
     if raw_part.rename is not None:
       part = part.rename(raw_part.rename)
@@ -850,7 +866,7 @@ def download_and_process(
       part = _static_at(part, static_time, time_dim)
     else:
       part = part.arcomake.time_sel(start_datetime, end_datetime, time_dim=time_dim)
-    opened.append((tokenize(repr(raw_part), start_datetime, end_datetime), part))
+    opened.append((tokenize(repr(raw_part), start_datetime, end_datetime, run_datetime), part))
   if not opened:
     raise ValueError("No parts found in the dataset configuration")
   if budget is not None:
@@ -918,6 +934,7 @@ def maybe_checkpointing_download_and_process(
   budget: chunk_plan.Budget | None = None,
   name: str = "dataset",
   later_steps: Sequence[ProcessingStepConfig] = (),
+  run_datetime: datetime.datetime | None = None,
 ) -> xr.Dataset:
   checkpointing_conf = configs.checkpointing
   checkpointing_step = checkpointing_conf.step if checkpointing_conf else None
@@ -936,6 +953,7 @@ def maybe_checkpointing_download_and_process(
       budget=budget,
       name=name,
       later_steps=later_steps,
+      run_datetime=run_datetime,
     )
   parsed_step = may_parse_timedelta(checkpointing_step)
   if parsed_step >= end_datetime - start_datetime:
@@ -947,6 +965,7 @@ def maybe_checkpointing_download_and_process(
       budget=budget,
       name=name,
       later_steps=later_steps,
+      run_datetime=run_datetime,
     )
 
   registry = get_current_temp_registry()
@@ -969,6 +988,7 @@ def maybe_checkpointing_download_and_process(
       budget=budget,
       name=name,
       later_steps=later_steps,
+      run_datetime=run_datetime,
     ) as downloaded:
       # A copy with its own encodings: the downloaded dataset is left unchanged.
       dataset = _without_zarr2_codecs(downloaded)
