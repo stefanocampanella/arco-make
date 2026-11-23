@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Any, Self, override
 
 import click
+import icechunk
 import numpy as np
 import xarray as xr
 from dask.diagnostics import ProgressBar
@@ -355,13 +356,16 @@ def download(
       update_time_interval["end"] = end_datetime
     configs = read_configs(configs_path, inject=update_time_interval, schema=DownloadConfig)
     tip: icechunk_utils.Tip | None = None
+    # The output's repository, opened once for every check before the run, which takes it over.
+    repo: icechunk.Repository | None = None
     if extend:
       if replace or start_datetime is not None:
         raise click.ClickException(
           "--extend starts where the output's last block ended: not with --replace nor --start"
         )
       # `main` read once: the extension's start and recipe, and the version it extends.
-      tip = _main_tip(output_path, configs)
+      repo = _open_output(output_path, configs)
+      tip = _main_tip(output_path, repo)
       configs = configs.model_copy(update={"start": _extension_start(output_path, tip)})
     if configs.start is None or configs.end is None:
       raise click.ClickException(
@@ -394,19 +398,27 @@ def download(
     # Check the output destination (a failed run waiting there, or an existing version), then
     # start a run on a branch of its own, or continue the failed one.
     recipe = recipe_fingerprint(configs)
+    if repo is None:
+      repo = _open_output(output_path, configs)
     waiting = _waiting_run(
-      output_path, configs, resume=resume, replace=replace, extend=extend, recipe=recipe
+      output_path, repo, resume=resume, replace=replace, extend=extend, recipe=recipe
     )
     if tip is not None:
       _check_extended_recipe(output_path, tip, recipe)
-    check_destination(output_path, replace=replace or resume or extend, save_configs=configs.save)
+    check_destination(
+      output_path,
+      replace=replace or resume or extend,
+      save_configs=configs.save,
+      repository=repo,
+    )
     try:
       run = icechunk_utils.Run(
         output_path,
         configs.save.storage_options,
-        icechunk_utils.run_label(EXTEND_COMMAND if extend else "download"),
+        icechunk_utils.run_label(EXTEND_COMMAND if extend else DOWNLOAD_COMMAND),
         waiting=waiting if resume else None,
         recipe=recipe,
+        repository=repo,
       )
     except Exception as exc:
       raise click.ClickException(f"Could not start writing {output_path}: {exc}") from exc
@@ -1060,9 +1072,23 @@ def _committed(run: icechunk_utils.Run, interval: DateInterval) -> bool:
   return True
 
 
+# How a block's ends are written in its key: `block_key` writes them, `block_end` reads them.
+BLOCK_TIME = "%Y-%m-%dT%H:%M"
+
+
 def block_key(interval: DateInterval) -> str:
   """How a block is named in the commit metadata (`icechunk_utils.BLOCK_KEY`)."""
-  return f"{interval.start:%Y-%m-%dT%H:%M}/{interval.end:%Y-%m-%dT%H:%M}"
+  return f"{interval.start:{BLOCK_TIME}}/{interval.end:{BLOCK_TIME}}"
+
+
+def block_end(key: str) -> datetime | None:
+  """The end of the block named `key` (`block_key`), or `None` if `key` is not one."""
+  start, _, end = key.partition("/")
+  try:
+    datetime.strptime(start, BLOCK_TIME)
+    return datetime.strptime(end, BLOCK_TIME)
+  except ValueError:
+    return None
 
 
 def recipe_fingerprint(configs: DownloadConfig) -> str:
@@ -1099,13 +1125,25 @@ def recipe_fingerprint(configs: DownloadConfig) -> str:
 # before are stored; run it again later, as it was (--extend), not --resume.
 NOT_PUBLISHED_EXIT = 75
 
-# The command of extension runs (their label and branch): a failed one resumes only as one.
+# The commands of download runs (their labels and branches): a failed extension resumes only as
+# one.
+DOWNLOAD_COMMAND = "download"
 EXTEND_COMMAND = "download-extend"
 
 
-def _main_tip(output_path: str, configs: DownloadConfig) -> icechunk_utils.Tip:
+def _open_output(output_path: str, configs: DownloadConfig) -> icechunk.Repository | None:
+  """The output's repository, or `None` if there is none yet."""
   try:
-    return icechunk_utils.main_tip(output_path, configs.save.storage_options)
+    return icechunk_utils.existing_repository(output_path, configs.save.storage_options)
+  except Exception as exc:
+    raise click.ClickException(f"Could not check {output_path} for a repository: {exc}") from exc
+
+
+def _main_tip(output_path: str, repo: icechunk.Repository | None) -> icechunk_utils.Tip:
+  if repo is None:
+    raise click.ClickException(f"Nothing to extend at {output_path}: no repository there")
+  try:
+    return icechunk_utils.main_tip(repo)
   except Exception as exc:
     raise click.ClickException(f"Nothing to extend at {output_path}: {exc}") from exc
 
@@ -1114,13 +1152,14 @@ def _extension_start(output_path: str, tip: icechunk_utils.Tip) -> datetime:
   """Where an extension starts: the end of the last block `main`'s tip commits (exact, whatever
   the time axis: calendars, labels, resampling)."""
   block = tip.metadata.get(icechunk_utils.BLOCK_KEY)
-  if not isinstance(block, str) or "/" not in block:
+  end = block_end(block) if isinstance(block, str) else None
+  if end is None:
     raise click.ClickException(
       f"{output_path} records no download block in its last commit: if its first download"
       " failed, resume it (--resume, with its dates); if it is another kind of output, rewrite it"
       " with --replace"
     )
-  return datetime.strptime(block.split("/")[1], "%Y-%m-%dT%H:%M")
+  return end
 
 
 def _check_extended_recipe(output_path: str, tip: icechunk_utils.Tip, recipe: str) -> None:
@@ -1135,7 +1174,7 @@ def _check_extended_recipe(output_path: str, tip: icechunk_utils.Tip, recipe: st
 
 def _waiting_run(
   output_path: str,
-  configs: DownloadConfig,
+  repo: icechunk.Repository | None,
   *,
   resume: bool,
   replace: bool,
@@ -1147,7 +1186,7 @@ def _waiting_run(
   --extend: resumed as a download, its first block would replace the output), a plain run
   refuses to start beside one."""
   try:
-    waiting = icechunk_utils.waiting_run(output_path, configs.save.storage_options, "download")
+    waiting = icechunk_utils.waiting_run(repo, DOWNLOAD_COMMAND, EXTEND_COMMAND)
   except Exception as exc:
     raise click.ClickException(f"Could not check {output_path} for a failed run: {exc}") from exc
   if resume:
@@ -1158,7 +1197,7 @@ def _waiting_run(
         f"main changed since {waiting.branch} started, which can no longer be promoted: start"
         " over with --replace"
       )
-    extension = waiting.label.startswith(f"{EXTEND_COMMAND}-")
+    extension = waiting.command == EXTEND_COMMAND
     if extension != extend:
       raise click.ClickException(
         f"{waiting.branch} is a failed extension: --extend --resume continues it"
@@ -1171,7 +1210,7 @@ def _waiting_run(
         " over with --replace"
       )
   elif waiting is not None and waiting.current and not replace:
-    if waiting.label.startswith(f"{EXTEND_COMMAND}-"):
+    if waiting.command == EXTEND_COMMAND:
       how = "--extend --resume continues it; --replace (without --extend) rewrites the output"
     elif extend:
       how = "it is not an extension: --resume or --replace, without --extend"

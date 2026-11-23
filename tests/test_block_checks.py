@@ -74,7 +74,7 @@ def test_a_failing_block_is_not_committed_and_the_run_resumes(tmp_path, sources)
     r"NaN values found for variable thetao\S* .*in a block, first in its chunk at 2020-02-28",
     failed.output,
   )
-  waiting = icechunk_utils.waiting_run(output, None, "download")
+  waiting = icechunk_utils.waiting_run(icechunk_utils.existing_repository(output), "download")
   assert waiting is not None and len(waiting.blocks) == 1
   resumed = run(recipe_with(tmp_path, sources, ""), output, "--resume")
   assert resumed.exit_code == 0, resumed.output

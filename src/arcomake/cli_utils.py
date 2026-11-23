@@ -78,10 +78,15 @@ def read_configs(
 
 
 def check_destination(
-  path: str, replace: bool = False, save_configs: SaveConfig | None = None
+  path: str,
+  replace: bool = False,
+  save_configs: SaveConfig | None = None,
+  repository: icechunk.Repository | None = None,
 ) -> None:
   """Check an output path before any work: usable by Icechunk, reachable, and either absent or
-  (with `replace`) an Icechunk repository, which the run writes a new version of."""
+  (with `replace`) an Icechunk repository, which the run writes a new version of. `repository`:
+  the repository at `path`, if the command opened it already (`icechunk_utils.existing_repository`):
+  not opened again."""
   if str(path).rstrip("/").lower().endswith(".zip"):
     # Zip outputs were removed with Zarr v3: a `.zip` name would silently become a directory.
     raise click.ClickException(f"{path}: zip outputs are not supported; write a directory or a URL")
@@ -99,10 +104,11 @@ def check_destination(
     return
   # Outputs are Icechunk repositories, replaced by a new version: anything else is left alone.
   try:
-    repository = icechunk.Repository.exists(storage)
+    if repository is None and icechunk.Repository.exists(storage):
+      repository = icechunk_utils.open_repository(storage)
     # A repository whose `main` is still its first snapshot holds no version yet: a first run
     # failed there (its branch may hold what it wrote), and a retry needs no --replace.
-    unwritten = repository and icechunk_utils.has_no_version(storage)
+    unwritten = repository is not None and icechunk_utils.has_no_version(repository)
   except Exception as exc:
     raise click.ClickException(f"Could not check whether {path} is a repository: {exc}") from exc
   if unwritten:
@@ -112,7 +118,7 @@ def check_destination(
     raise click.ClickException(
       f"Output destination {path} already exists (--replace writes a new version of it)"
     )
-  if not repository:
+  if repository is None:
     raise click.ClickException(
       f"Output destination {path} exists and is not an Icechunk repository: remove it first"
     )

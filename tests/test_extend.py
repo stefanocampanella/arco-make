@@ -140,10 +140,7 @@ def test_an_extension_starts_where_the_last_block_ended(recipe, tmp_path):
   """Not from the stamps (monthly or right-labelled axes, cftime): from the last block."""
   output = tmp_path / "out"
   assert run(recipe, output, f"--start={START}", f"--end={MIDDLE}").exit_code == 0
-  configs = download_module.DownloadConfig.model_validate(
-    tomllib.loads(recipe.read_text()) | {"end": END}
-  )
-  tip = download_module._main_tip(str(output), configs)
+  tip = download_module._main_tip(str(output), icechunk_utils.existing_repository(output))
   assert str(download_module._extension_start(str(output), tip)) == "2020-02-28 00:00:00"
 
 
@@ -172,6 +169,25 @@ def test_access_and_retention_do_not_change_the_fingerprint(recipe):
   assert download_module.recipe_fingerprint(sources) == download_module.recipe_fingerprint(configs)
 
 
+def test_an_extension_opens_the_output_once(recipe, tmp_path, monkeypatch):
+  """Its checks (the tip of `main`, a failed run waiting, the destination) and its run share one
+  opening of the repository: each opening reads its configuration and references again."""
+  output = tmp_path / "out"
+  assert run(recipe, output, f"--start={START}", f"--end={MIDDLE}").exit_code == 0
+  opened = []
+  for name in ("open", "open_or_create"):
+    real = getattr(icechunk.Repository, name)
+
+    def counting(*args, real=real, name=name, **kwargs):
+      opened.append(name)
+      return real(*args, **kwargs)
+
+    monkeypatch.setattr(icechunk.Repository, name, counting)
+  extended = run(recipe, output, "--extend", f"--end={END}")
+  assert extended.exit_code == 0, extended.output
+  assert opened == ["open"]
+
+
 def test_an_extension_refuses_a_main_that_moved_meanwhile(recipe, tmp_path, monkeypatch):
   """Its start was read from `main`: if another run was promoted before this one started, it
   would append days already stored."""
@@ -179,8 +195,8 @@ def test_an_extension_refuses_a_main_that_moved_meanwhile(recipe, tmp_path, monk
   assert run(recipe, output, f"--start={START}", f"--end={MIDDLE}").exit_code == 0
   real = download_module._main_tip
 
-  def stale(output_path, configs):
-    tip = real(output_path, configs)
+  def stale(output_path, repo):
+    tip = real(output_path, repo)
     return icechunk_utils.Tip(snapshot="0" * 20, metadata=tip.metadata)
 
   monkeypatch.setattr(download_module, "_main_tip", stale)

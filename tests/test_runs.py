@@ -298,3 +298,32 @@ def test_keep_history_needs_a_unit(value):
   """A bare number would be read as nanoseconds or seconds and expire nearly the whole history."""
   with pytest.raises(ValidationError, match="with its unit"):
     SaveConfig.model_validate({"keep_history": value})
+
+
+def test_labels_are_read_back_by_command_and_start():
+  """Only `parse_label` takes labels apart: a command may contain dashes (`download-extend`),
+  and branches that are not runs' are ignored."""
+  label = icechunk_utils.run_label("download-extend")
+  parsed = icechunk_utils.parse_label(label)
+  assert parsed is not None
+  command, started = parsed
+  assert command == "download-extend"
+  assert abs(datetime.datetime.now() - started) < datetime.timedelta(days=1)
+  assert icechunk_utils.parse_label("main") is None
+  assert icechunk_utils.parse_label("download-20200101") is None
+
+
+def test_a_waiting_run_is_one_of_the_commands_asked_for(tmp_path: pathlib.Path):
+  """`download` does not match a failed `download-extend` run (a shared prefix), and the newest
+  of the commands asked for is the waiting run, with its command."""
+  path = tmp_path / "out"
+  write_output(dataset(0.0), path, message="first")
+  icechunk_utils.Run(path, None, icechunk_utils.run_label("download"))
+  icechunk_utils.Run(path, None, icechunk_utils.run_label("download-extend"))
+  repo = icechunk_utils.existing_repository(path)
+  waiting = icechunk_utils.waiting_run(repo, "download")
+  assert waiting is not None and waiting.command == "download"
+  newest = icechunk_utils.waiting_run(repo, "download", "download-extend")
+  assert newest is not None and newest.command == "download-extend"
+  assert icechunk_utils.waiting_run(repo, "process") is None
+  assert icechunk_utils.waiting_run(None, "download") is None

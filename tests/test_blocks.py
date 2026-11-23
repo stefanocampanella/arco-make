@@ -69,7 +69,7 @@ def test_a_failed_block_keeps_those_before_it(
   output = tmp_path / "out.zarr"
   failed = run(recipe, output)
   assert failed.exit_code != 0 and "--resume continues from there" in failed.output
-  waiting = icechunk_utils.waiting_run(output, None, "download")
+  waiting = icechunk_utils.waiting_run(icechunk_utils.existing_repository(output), "download")
   assert waiting is not None and waiting.blocks == ("2020-02-26T00:00/2020-02-28T00:00",)
   fail["start"] = None
   resumed = run(recipe, output, "--resume")

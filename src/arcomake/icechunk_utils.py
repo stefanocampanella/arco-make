@@ -199,14 +199,11 @@ def storage(
   )
 
 
-def open_repository(
-  repository_storage: icechunk.Storage, *, create: bool = False
-) -> icechunk.Repository:
-  """The repository at `repository_storage`, its requests tried `MAX_TRIES` times, each try
-  bounded: opened to read, by `CONNECT_TIMEOUT_MS` and `READ_TIMEOUT_MS`; with `create`, to write
-  (created if there is none), by `CONNECT_TIMEOUT_MS` and `WRITE_ATTEMPT_TIMEOUT_MS` (a read
+def _config(write: bool) -> icechunk.RepositoryConfig:
+  """Requests tried `MAX_TRIES` times, each try bounded: to read, by `CONNECT_TIMEOUT_MS` and
+  `READ_TIMEOUT_MS`; to write, by `CONNECT_TIMEOUT_MS` and `WRITE_ATTEMPT_TIMEOUT_MS` (a read
   timeout would cut uploads)."""
-  if create:
+  if write:
     timeouts = icechunk.StorageTimeoutSettings(
       connect_timeout_ms=CONNECT_TIMEOUT_MS, operation_attempt_timeout_ms=WRITE_ATTEMPT_TIMEOUT_MS
     )
@@ -215,12 +212,31 @@ def open_repository(
       connect_timeout_ms=CONNECT_TIMEOUT_MS, read_timeout_ms=READ_TIMEOUT_MS
     )
   retries = icechunk.StorageRetriesSettings(max_tries=MAX_TRIES)
-  config = icechunk.RepositoryConfig(
+  return icechunk.RepositoryConfig(
     storage=icechunk.StorageSettings(timeouts=timeouts, retries=retries)
   )
+
+
+def open_repository(
+  repository_storage: icechunk.Storage, *, create: bool = False
+) -> icechunk.Repository:
+  """The repository at `repository_storage`, opened to read, or with `create` to write (created
+  if there is none); see `_config` for the bounds of its requests."""
   if create:
-    return icechunk.Repository.open_or_create(repository_storage, config=config)
-  return icechunk.Repository.open(repository_storage, config=config)
+    return icechunk.Repository.open_or_create(repository_storage, config=_config(write=True))
+  return icechunk.Repository.open(repository_storage, config=_config(write=False))
+
+
+def existing_repository(
+  path: str | pathlib.Path, storage_options: Mapping[str, Any] | None = None
+) -> icechunk.Repository | None:
+  """The repository at `path`, opened to read, or `None` if there is none: one opening for the
+  checks a command makes before writing (`check_destination`, `main_tip`, `waiting_run`), passed
+  on to its `Run`."""
+  repository_storage = storage(path, storage_options)
+  if not icechunk.Repository.exists(repository_storage):
+    return None
+  return open_repository(repository_storage)
 
 
 def is_repository(
@@ -230,16 +246,31 @@ def is_repository(
   return icechunk.Repository.exists(storage(path, storage_options))
 
 
-def has_no_version(repository_storage: icechunk.Storage) -> bool:
+def has_no_version(repo: icechunk.Repository) -> bool:
   """Whether `main` of the repository is still its first snapshot (no run finished there)."""
-  tip = next(iter(open_repository(repository_storage).ancestry(branch=BRANCH)))
+  tip = next(iter(repo.ancestry(branch=BRANCH)))
   return tip.parent_id is None
+
+
+# A run's label is its command and its start time, to the microsecond: `run_label` writes it,
+# `parse_label` reads it back (nothing else takes labels apart).
+LABEL_TIME = "%Y%m%dT%H%M%S%fZ"
 
 
 def run_label(command: str) -> str:
   """A label for one run of `command`: its start time, to the microsecond (branch names, commit
   metadata, and the messages that tie the outputs of one run together)."""
-  return f"{command}-{datetime.datetime.now(datetime.UTC):%Y%m%dT%H%M%S%fZ}"
+  return f"{command}-{datetime.datetime.now(datetime.UTC):{LABEL_TIME}}"
+
+
+def parse_label(label: str) -> tuple[str, datetime.datetime] | None:
+  """The command and start time of a run's label (`run_label`), or `None` for anything else."""
+  command, _, stamp = label.rpartition("-")
+  try:
+    started = datetime.datetime.strptime(stamp, LABEL_TIME)
+  except ValueError:
+    return None
+  return (command, started) if command else None
 
 
 def write(
@@ -284,9 +315,8 @@ class Tip:
   metadata: dict[str, Any]
 
 
-def main_tip(path: str | pathlib.Path, storage_options: Mapping[str, Any] | None = None) -> Tip:
+def main_tip(repo: icechunk.Repository) -> Tip:
   """The commit `main` points to."""
-  repo = open_repository(storage(path, storage_options))
   info = next(iter(repo.ancestry(branch=BRANCH)))
   return Tip(snapshot=str(info.id), metadata=dict(info.metadata or {}))
 
@@ -327,6 +357,7 @@ class WaitingRun:
   """A run that failed before `main` moved to it: its branch holds the blocks it committed."""
 
   label: str
+  command: str  # the command of the run (`run_label`)
   branch: str
   base: str  # the tip of `main` when it started
   blocks: tuple[str, ...]  # the intervals committed, oldest first (`BLOCK_KEY`)
@@ -334,23 +365,19 @@ class WaitingRun:
   current: bool  # whether `main` is still where the run started (it can still be promoted)
 
 
-def waiting_run(
-  path: str | pathlib.Path, storage_options: Mapping[str, Any] | None, command: str
-) -> WaitingRun | None:
-  """The newest run of `command` whose branch is still in the repository at `path` (a run that
+def waiting_run(repo: icechunk.Repository | None, *commands: str) -> WaitingRun | None:
+  """The newest run of one of `commands` whose branch is still in the repository (a run that
   failed), or `None`; also `None` if there is no repository."""
-  repository_storage = storage(path, storage_options)
-  if not icechunk.Repository.exists(repository_storage):
+  if repo is None:
     return None
-  repo = open_repository(repository_storage)
-  # The newest by start time (the label's last part): extension runs share the prefix.
-  branches = sorted(
-    (b for b in repo.list_branches() if b.startswith(f"run/{command}-")),
-    key=lambda branch: branch.rsplit("-", 1)[-1],
-  )
-  if not branches:
+  runs = []
+  for branch in repo.list_branches():
+    parsed = parse_label(branch.removeprefix("run/")) if branch.startswith("run/") else None
+    if parsed is not None and parsed[0] in commands:
+      runs.append((parsed[1], parsed[0], branch))
+  if not runs:
     return None
-  branch = branches[-1]
+  _, command, branch = max(runs)
   label = branch.removeprefix("run/")
   blocks: list[str] = []
   recipe = None
@@ -365,7 +392,7 @@ def waiting_run(
     recipe = recipe or metadata.get(RECIPE_KEY)
   assert base is not None  # a run's branch starts from a snapshot of `main`
   current = repo.lookup_branch(BRANCH) == base
-  return WaitingRun(label, branch, base, tuple(reversed(blocks)), recipe, current)
+  return WaitingRun(label, command, branch, base, tuple(reversed(blocks)), recipe, current)
 
 
 class PromotionError(RuntimeError):
@@ -432,13 +459,19 @@ class Run:
     *,
     waiting: "WaitingRun | None" = None,
     recipe: str | None = None,
+    repository: icechunk.Repository | None = None,
   ) -> None:
     """Start a run labelled `label`, or continue `waiting` (a run that failed, see
-    `waiting_run`) on its branch. `recipe`: its fingerprint, in every commit's metadata."""
+    `waiting_run`) on its branch. `recipe`: its fingerprint, in every commit's metadata.
+    `repository`: the repository at `path` if the command opened it already (to check it), taken
+    over to write instead of opened again."""
     self.path = str(path)
     self.recipe = recipe
     provenance.environment()  # what made the output, read when the run starts
-    self.repo = open_repository(storage(path, storage_options), create=True)
+    if repository is not None:
+      self.repo = repository.reopen(config=_config(write=True))
+    else:
+      self.repo = open_repository(storage(path, storage_options), create=True)
     if waiting is not None:
       self.label, self.branch, self.base = waiting.label, waiting.branch, waiting.base
       logger.info(f"Continuing {self.path} on branch {self.branch} (from {self.base})")
