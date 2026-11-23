@@ -72,6 +72,10 @@ class ForecastConfig(BaseModel):
     return run, run + self.horizon
 
 
+# The stored units of initialization and valid times: any run of any spacing, to the second.
+TIME_UNITS = "seconds since 1970-01-01"
+
+
 @dataclass
 class RunReport:
   """What a run's datasets tell about it, gathered while its block is read: per dataset, whether
@@ -145,6 +149,11 @@ def as_run(
   out[config.lead_dim].attrs = {"long_name": "lead time: valid time minus initialization time"}
   out[config.init_dim].attrs = {"long_name": "initialization time of the forecast run"}
   out[config.valid_coord].attrs = {"long_name": "valid time: initialization time plus lead time"}
+  # Explicit units: xarray infers them from the first run's one value ("days since" it), which
+  # cannot hold the later runs of a recipe with runs less than a day apart.
+  for name in (config.init_dim, config.valid_coord):
+    out[name].encoding = {"units": TIME_UNITS, "calendar": "proleptic_gregorian", "dtype": "int64"}
+  out[config.lead_dim].encoding = {"units": "seconds", "dtype": "int64"}
   return out.assign_attrs(block.attrs)
 
 

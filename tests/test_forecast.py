@@ -86,7 +86,9 @@ def test_ecmwf_open_data_parts_get_the_run_and_the_block(monkeypatch: pytest.Mon
   part = {"filename_or_obj": "s3://ecmwf-forecasts", "param": ["2t"]}
   with pytest.raises(ValueError):
     DatasetConfig.model_validate({"parts": [part]})  # a generic part needs no `param`
-  config = DatasetConfig.model_validate({"parts": [part | {"engine": "ecmwfopendata"}]})
+  config = DatasetConfig.model_validate(
+    {"forecast": "runs", "parts": [part | {"engine": "ecmwfopendata"}]}
+  )
   download_and_process(config, RUN, RUN + DAY, run_datetime=RUN)
   assert (received["run_datetime"], received["start_datetime"]) == (RUN, RUN)
   assert received["end_datetime"] == RUN + DAY and received["param"] == ["2t"]
@@ -516,3 +518,61 @@ def test_stored_variables_missing_without_a_missing_source_fail():
     forecast.with_missing(run, stored, "init_time", [])
   filled = forecast.with_missing(run, stored, "init_time", ["source_of_b"])
   assert filled.b.isnull().all() and filled.a.notnull().all()
+
+
+def test_runs_less_than_a_day_apart(forecast_recipe, tmp_path):
+  """Runs every 12 hours keep their initialization and valid times (the units are explicit: from
+  the first run's one value, xarray would infer days), appended and rolled."""
+  recipe, _ = forecast_recipe
+  text = recipe.read_text()
+  atmos_only = text[: text.index("[datasets.ocean]")]
+  atmos_only = atmos_only.replace('horizon = "3D"\n', 'horizon = "1D"\nevery = "12h"\nwindow = 3\n')
+  atmos_only = atmos_only.replace('time = "1D"', 'time = "6h"')
+  recipe.write_text(atmos_only + "\n[save]\nchunks = {init_time = 1}\n")
+  output = tmp_path / "out"
+  result = download(recipe, output, "--start=2026-11-01", "--end=2026-11-03")
+  assert result.exit_code == 0, result.output
+  out = open_output(output)
+  expected = pd.date_range("2026-11-01T12:00", periods=3, freq="12h").to_numpy()
+  np.testing.assert_array_equal(out.init_time.values, expected)
+  assert (out.lead_time.values / np.timedelta64(1, "h")).tolist() == [0, 6, 12, 18]
+  np.testing.assert_array_equal(
+    out.valid_time.values, expected[:, None] + out.lead_time.values[None, :]
+  )
+
+
+def test_an_end_off_the_runs_grid_is_refused(forecast_recipe, tmp_path):
+  recipe, _ = forecast_recipe
+  result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-03T06:00:00")
+  assert result.exit_code != 0 and "not a whole number of runs" in result.output
+
+
+def test_checks_leave_out_a_missing_source(forecast_recipe, tmp_path):
+  """`ensure_no_nans` leaves out the variables of a source without the run (stored as NaN,
+  flagged), and checks the others."""
+  recipe, unavailable = forecast_recipe
+  checks = '\n[checks.ensure_no_nans]\ndepth = ["t2m", "sst"]\n'
+  recipe.write_text(recipe.read_text().replace("\n[save]", f"{checks}\n[save]"))
+  unavailable.add(FIRST + DAY)
+  result = download(recipe, tmp_path / "out", "--start=2026-11-01", "--end=2026-11-03")
+  assert result.exit_code == 0, result.output
+  assert open_output(tmp_path / "out").t2m.isel(init_time=1).isnull().all()
+
+
+def test_engines_reading_only_runs_need_a_runs_dataset():
+  part = {"filename_or_obj": "s3://ecmwf-forecasts", "engine": "ecmwfopendata", "param": "2t"}
+  with pytest.raises(ValueError, match="reads forecast runs only"):
+    DatasetConfig.model_validate({"parts": [part]})
+
+
+def test_static_parts_say_nothing_of_a_series_end(tmp_path):
+  """A part read at one instant (`static_time`) is left out of the series' ends."""
+  time = pd.date_range(FIRST - 5 * DAY, periods=30, freq="1D")
+  xr.Dataset(
+    {"mask": (("time", "lat"), np.ones((30, 2)))}, coords={"time": time, "lat": LAT}
+  ).to_zarr(tmp_path / "m.zarr", consolidated=False)
+  part = {"filename_or_obj": str(tmp_path / "m.zarr"), "engine": "zarr", "static_time": FIRST}
+  config = DatasetConfig.model_validate({"parts": [part]})
+  ends: list = []
+  download_and_process(config, FIRST, FIRST + 3 * DAY, part_ends=ends)
+  assert ends == []

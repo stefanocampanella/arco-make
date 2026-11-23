@@ -366,6 +366,12 @@ def download(
         if extend
         else "The recipe has no dates: give --start and --end"
       )
+    fc = configs.forecast
+    if fc is not None and (configs.end - configs.start) % fc.every:
+      raise click.ClickException(
+        f"[{configs.start}, {configs.end}) is not a whole number of runs every {fc.every}: an"
+        " end off the runs' grid would put every later run (--extend) off it too"
+      )
     if extend and configs.start >= configs.end:
       logger.info(f"Nothing to extend: {output_path} reaches {configs.end} already")
       return
@@ -693,18 +699,24 @@ def _write_block(
     if not first and static is not None and not static.checked:
       _check_static(dataset, run, group, time_dim)
       static.checked = True
+    # A later forecast run: how many runs are stored, and the variables along them (those this
+    # run lacks, its sources having no such run, are left out of the checks).
+    stored_runs, absent = 0, frozenset()
+    if fc is not None and not first:
+      stored_runs, stored_names = _stored_runs(run, group, fc.init_dim)
+      flag_names = {conf.flag for conf in configs.datasets.values() if conf.flag is not None}
+      absent = stored_names - set(map(str, dataset.data_vars)) - flag_names
     # With a full window of forecast runs, the stored runs kept with this one (the oldest are
     # dropped); None when every stored run stays (an append).
     keep = None
-    window = fc.window if fc is not None else None
-    if window is not None and fc is not None and not first:
-      keep = window - 1 if _stored_steps(run, group, fc.init_dim) >= window else None
+    if fc is not None and fc.window is not None and stored_runs >= fc.window:
+      keep = fc.window - 1
     stamps_of = time_dim if fc is None else fc.valid_coord
     dataset = _with_output_coverage(
       dataset, run, group, time_dim, first, stored=stamps_of, keep=keep
     )
     if configs.checks is not None:
-      dataset = _checked_block(dataset, configs.checks, read_interval, time_dim)
+      dataset = _checked_block(dataset, configs.checks, read_interval, time_dim, absent)
     if fc is not None and report is not None:
       dataset = _as_stored_run(configs, fc, dataset, date_interval.start, report, run, first)
     append_dim = time_dim if fc is None else fc.init_dim
@@ -722,11 +734,15 @@ def _write_block(
     )
 
 
-def _stored_steps(run: icechunk_utils.Run, group: str | None, dim: str) -> int:
-  """How many steps along `dim` (forecast runs) the run's branch holds."""
+def _stored_runs(
+  run: icechunk_utils.Run, group: str | None, dim: str
+) -> tuple[int, frozenset[str]]:
+  """How many steps along `dim` (forecast runs) the run's branch holds, and its data variables
+  along `dim`."""
   session = run.repo.readonly_session(branch=run.branch)
   with xr.open_zarr(session.store, group=group, consolidated=False) as stored:
-    return int(stored.sizes[dim])
+    names = frozenset(str(n) for n, v in stored.data_vars.items() if dim in v.dims)
+    return int(stored.sizes[dim]), names
 
 
 def _as_stored_run(
@@ -762,14 +778,32 @@ def _as_stored_run(
 
 
 def _checked_block(
-  dataset: xr.Dataset, config: ChecksConfig, date_interval: DateInterval, time_dim: str
+  dataset: xr.Dataset,
+  config: ChecksConfig,
+  date_interval: DateInterval,
+  time_dim: str,
+  absent: frozenset[str] = frozenset(),
 ) -> xr.Dataset:
   """`dataset` checked by the recipe's `[checks]`, like pre-commit hooks: the time axis over the
   block, and the checks reading only coordinates and attributes (`checks.METADATA_CHECKS`), now;
   missing values while the block is written (`guard_no_nans`, no second reading). Tables without
   a `time_dim` take the recipe's. A failure raises `ValidationError` naming the check, so the
   block is not committed.
+
+  `absent`: variables a forecast run lacks because their source had no such run (NaN, flagged):
+  `ensure_no_nans` leaves them out, and the masks among them with what they apply to.
   """
+  if absent and config.ensure_no_nans is not None:
+    no_nans = config.ensure_no_nans
+    kept = {
+      mask: [v for v in variables if v not in absent]
+      for mask, variables in (no_nans.model_extra or {}).items()
+      if mask not in absent
+    }
+    fields = no_nans.model_dump(exclude=set(no_nans.model_extra or {}))
+    config = config.model_copy(
+      update={"ensure_no_nans": type(no_nans).model_validate(fields | kept)}
+    )
   if (time_check := config.valid_time_coordinate) is not None:
     _named(
       "valid_time_coordinate",

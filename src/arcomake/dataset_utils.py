@@ -671,6 +671,13 @@ class DatasetConfig(BaseModel):
 
   @model_validator(mode="after")
   def _runs_from_run_engines(self) -> Self:
+    # Engines that read only runs belong to "runs" datasets (of forecast recipes).
+    for number, part in enumerate(self.parts, start=1):
+      if getattr(part, "engine", None) in RUN_ONLY_ENGINES and self.forecast != "runs":
+        raise ValueError(
+          f'part {number} reads forecast runs only: give its dataset forecast = "runs" (in a'
+          " recipe with a [forecast] table)"
+        )
     if self.forecast == "runs":
       for number, part in enumerate(self.parts, start=1):
         engine = getattr(part, "engine", None)
@@ -850,6 +857,8 @@ def _planned(
 
 # The engines that read forecast runs (`run_datetime`), along valid time.
 RUN_ENGINES = frozenset({"earlywarningdatastore", "ecmwfopendata"})
+# Those that read nothing else (the EWDS has historical products too).
+RUN_ONLY_ENGINES = frozenset({"ecmwfopendata"})
 
 
 def download_and_process(
@@ -909,7 +918,13 @@ def download_and_process(
       part = _snap_coordinates(part, [p for _, p in opened], raw_part.coordinate_tolerance)
     if offset:
       part = _shift_time(part, offset, time_dim)
-    if part_ends is not None and time_dim in part.coords and part[time_dim].size:
+    # A part read at one instant (`static_time`) says nothing of where a series ends.
+    if (
+      part_ends is not None
+      and static_time is None
+      and time_dim in part.coords
+      and part[time_dim].size
+    ):
       part_ends.append(np.datetime64(part[time_dim].values.max(), "ns"))
     if static_time is not None:
       part = _static_at(part, static_time, time_dim)
