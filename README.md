@@ -184,7 +184,7 @@ horizon = "10D"        # lead times [0, horizon)
 every = "1D"           # between runs (the default)
 window = 1826          # optional: the runs kept; each new run drops the oldest beyond
 
-[datasets.atmosphere]  # a source of runs: its parts read each run (ecmwfopendata, earlywarningdatastore)
+[datasets.atmosphere]  # a source of runs: its ecmwfopendata or earlywarningdatastore parts read each run
 forecast = "runs"
 flag = "atmosphere_forecast"
 

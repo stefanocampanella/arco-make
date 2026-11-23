@@ -678,14 +678,14 @@ class DatasetConfig(BaseModel):
           f'part {number} reads forecast runs only: give its dataset forecast = "runs" (in a'
           " recipe with a [forecast] table)"
         )
-    if self.forecast == "runs":
-      for number, part in enumerate(self.parts, start=1):
-        engine = getattr(part, "engine", None)
-        if engine not in RUN_ENGINES:
-          raise ValueError(
-            f'forecast = "runs": part {number} (engine {engine!r}) reads no forecast runs'
-            f" (engines that do: {', '.join(sorted(RUN_ENGINES))})"
-          )
+    # A "runs" dataset reads its runs from parts of engines that read runs; its other parts (a
+    # static file, say: GloFAS's drainage network) are read as in any block.
+    engines = {getattr(part, "engine", None) for part in self.parts}
+    if self.forecast == "runs" and self.parts and not engines & RUN_ENGINES:
+      raise ValueError(
+        'forecast = "runs": no part reads forecast runs (engines that do:'
+        f" {', '.join(sorted(RUN_ENGINES))})"
+      )
     return self
 
   @model_validator(mode="before")
@@ -879,8 +879,9 @@ def download_and_process(
   block's time selection) is appended to it: a forecast tells from it whether a series is a run's
   own forecast (`forecast.series_is_the_run`).
 
-  With `run_datetime`, the parts read that forecast run (`RUN_ENGINES`; their backends return
-  the run along valid time, so [start, end) are valid times), others are refused.
+  With `run_datetime`, the parts of engines that read runs (`RUN_ENGINES`) read that forecast
+  run (their backends return it along valid time, so [start, end) are valid times); at least one
+  must. The others are read as in any block (a static file, say).
 
   With a `budget`, the parts are chunked by `chunk_plan.plan` for their slices of the block and
   the needs of the dataset's steps and of the `later_steps` (the recipe's steps after merging);
@@ -890,6 +891,12 @@ def download_and_process(
   # spanning a long time period, with several sets of variables in different datasets (bio, phys, etc.),
   # which needs to be downloaded one piece at a time. Hence, `parts` list in the TOML configuration file
   # represents different pieces of the same dataset.
+  if run_datetime is not None and not any(
+    getattr(part, "engine", None) in RUN_ENGINES for part in configs.parts
+  ):
+    raise ValueError(
+      f"{name}: no part reads forecast runs (engines that do: {sorted(RUN_ENGINES)})"
+    )
   opened: list[tuple[str, xr.Dataset]] = []
   for raw_part in configs.parts:
     offset = raw_part.time_offset or datetime.timedelta(0)
@@ -905,11 +912,7 @@ def download_and_process(
       _with_timeout(part_conf, engine, getattr(raw_part, "timeout", None))
     if engine in ("earlywarningdatastore", "copernicusmarine", "ecmwfopendata"):
       part_conf.update(start_datetime=start_datetime - offset, end_datetime=end_datetime - offset)
-    if run_datetime is not None:
-      if engine not in RUN_ENGINES:
-        raise ValueError(
-          f"{name}: engine {engine!r} reads no forecast runs (engines that do: {sorted(RUN_ENGINES)})"
-        )
+    if run_datetime is not None and engine in RUN_ENGINES:
       part_conf["run_datetime"] = run_datetime
     part = open_input(**part_conf)
     if raw_part.rename is not None:

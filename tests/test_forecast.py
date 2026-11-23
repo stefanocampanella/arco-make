@@ -95,14 +95,36 @@ def test_ecmwf_open_data_parts_get_the_run_and_the_block(monkeypatch: pytest.Mon
 
 
 def test_engines_without_runs_are_refused():
-  """A part whose engine reads no forecast runs cannot be read as one."""
+  """A dataset none of whose parts reads forecast runs cannot be read as one."""
   part = CopernicusMarinePartConfig.model_validate({"filename_or_obj": "cm://some-dataset"})
-  with pytest.raises(ValueError, match="reads no forecast runs"):
+  with pytest.raises(ValueError, match="no part reads forecast runs"):
     download_and_process(DatasetConfig(parts=[part]), RUN, RUN + DAY, run_datetime=RUN)
 
 
+def test_other_parts_of_a_runs_dataset_are_read_as_in_any_block(monkeypatch: pytest.MonkeyPatch):
+  """A "runs" dataset may have parts that read no runs (GloFAS's drainage network, a static
+  file): they get no run, and are read as in any block."""
+  received: list[dict] = []
+
+  def fake_open_input(**kwargs):
+    received.append(kwargs)
+    if kwargs.get("engine") == "netcdfoverhttp":
+      return xr.Dataset({"ldd": ("x", np.ones(2))})
+    valid = pd.date_range(RUN + DAY, periods=10, freq="1D")
+    return xr.Dataset({"dis24": ("time", np.ones(10))}, coords={"time": valid})
+
+  monkeypatch.setattr(dataset_utils, "open_input", fake_open_input)
+  static = {"filename_or_obj": "https://example.org/ldd.nc", "engine": "netcdfoverhttp"}
+  config = DatasetConfig.model_validate(
+    {"forecast": "runs", "parts": [_ewds_part(time_offset="-24h"), static]}
+  )
+  out = download_and_process(config, RUN, RUN + 10 * DAY, run_datetime=RUN)
+  assert "run_datetime" in received[0] and "run_datetime" not in received[1]
+  assert set(out.data_vars) == {"dis24", "ldd"}
+
+
 def test_runs_need_engines_that_read_runs():
-  with pytest.raises(ValueError, match="reads no forecast runs"):
+  with pytest.raises(ValueError, match="no part reads forecast runs"):
     DatasetConfig.model_validate(
       {"forecast": "runs", "parts": [{"filename_or_obj": "x.zarr", "engine": "zarr"}]}
     )
