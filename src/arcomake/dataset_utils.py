@@ -891,12 +891,6 @@ def download_and_process(
   # spanning a long time period, with several sets of variables in different datasets (bio, phys, etc.),
   # which needs to be downloaded one piece at a time. Hence, `parts` list in the TOML configuration file
   # represents different pieces of the same dataset.
-  if run_datetime is not None and not any(
-    getattr(part, "engine", None) in RUN_ENGINES for part in configs.parts
-  ):
-    raise ValueError(
-      f"{name}: no part reads forecast runs (engines that do: {sorted(RUN_ENGINES)})"
-    )
   opened: list[tuple[str, xr.Dataset]] = []
   for raw_part in configs.parts:
     offset = raw_part.time_offset or datetime.timedelta(0)

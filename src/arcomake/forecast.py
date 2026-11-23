@@ -92,43 +92,36 @@ def now() -> datetime.datetime:
 @dataclass
 class RunReport:
   """What a run's datasets tell about it, gathered while its block is read: per dataset, whether
-  its values are the run's own forecast; the datasets whose source had no such run."""
+  its values are the run's own forecast; the datasets whose source had no such run, and the
+  variables standing in for them (NaN)."""
 
   real: dict[str, bool] = field(default_factory=dict)
   unavailable: list[str] = field(default_factory=list)
-  # The variables each dataset with time gave (after its own steps): recorded in the commit
-  # (`VARIABLES_KEY`), so that a later run lacking a dataset can stand in NaN for them.
-  variables: dict[str, list[str]] = field(default_factory=dict)
+  standing_in: list[str] = field(default_factory=list)
 
 
-# Commit metadata: the variables of each dataset of the forecast runs, {dataset: [variable]}.
-VARIABLES_KEY = "arcomake_dataset_variables"
+class RunNotPublished(RuntimeError):
+  """A source has not published a run yet (younger than `missing_after`): the download stops
+  before it, the runs before stored, to collect it later."""
 
 
-def missing_dataset(
-  stored: xr.Dataset,
-  names: Iterable[str],
-  run: datetime.datetime,
-  config: ForecastConfig,
-  time_dim: str,
-) -> xr.Dataset:
-  """NaN for a dataset whose source has no run `run`: its variables `names` as stored (shapes,
-  types, coordinates), along `time_dim` at the run's valid times, as its own steps would have
-  given them (lazily: nothing is read). The recipe's later steps and checks then see them."""
-  names = list(names)
-  if missing := [name for name in names if name not in stored.data_vars]:
-    raise ValueError(
-      f"{missing} are not in the output: the recipe's later steps rename them? A dataset without"
-      " its run is stood in for by its variables as stored"
-    )
-  template = stored[names].isel({config.init_dim: -1}, drop=True)
-  extra = [n for n in template.coords if n not in template.dims]
-  template = template.drop_vars(extra)
-  valid = np.datetime64(run, "ns") + template[config.lead_dim].values
-  template = template.assign_coords({config.lead_dim: valid}).rename({config.lead_dim: time_dim})
-  # Without attributes (coordinates too): the stored ones are the recipe's later steps', which
-  # datasets are merged before (with identical attributes, which the datasets' steps drop).
-  return xr.full_like(template, np.nan).drop_attrs()
+# How many earlier runs of a source are tried for a stand-in (`stand_in`).
+STAND_IN_TRIES = 7
+
+
+def stand_in(dataset: xr.Dataset, time_dim: str) -> xr.Dataset:
+  """NaN for a dataset whose source has no such run, shaped as the dataset is: `dataset` is the
+  same dataset read from an earlier run of the source over the run's valid times (its own steps
+  applied: names, coordinates and attributes as they would have been), its variables along
+  `time_dim` NaN (lazily: their values are never read), its others (static) as read.
+
+  Raises:
+    ValueError: for a variable along time that is not floating point (NaN cannot stand in).
+  """
+  timed = [name for name, var in dataset.data_vars.items() if time_dim in var.dims]
+  if not_float := [name for name in timed if dataset[name].dtype.kind != "f"]:
+    raise ValueError(f"{not_float} are not floating point: NaN cannot stand in for them")
+  return dataset.assign({name: xr.full_like(dataset[name], np.nan) for name in timed})
 
 
 def series_is_the_run(part_ends: Iterable[np.datetime64], run_end: datetime.datetime) -> bool:
@@ -211,34 +204,12 @@ def as_run(
   return out.assign_attrs(block.attrs)
 
 
-def with_missing(
-  run: xr.Dataset, stored: xr.Dataset, init_dim: str, unavailable: Iterable[str]
-) -> xr.Dataset:
-  """`run` with the stored variables along `init_dim` it lacks (datasets whose source had no
-  such run, `unavailable`) as NaN, shaped and typed as stored (lazily: nothing is read). A run
-  lacking stored variables while every source had it is an error, not a gap to fill."""
-  missing = [
-    name
-    for name, var in stored.data_vars.items()
-    if init_dim in var.dims and name not in run.variables
-  ]
-  if not missing:
-    return run
-  if not list(unavailable):
-    raise ValueError(f"the run lacks the stored variables {missing}, though every source had it")
-  template = stored[missing].isel({init_dim: [-1]}).drop_vars(init_dim)
-  filled = xr.full_like(template, np.nan).assign_coords({init_dim: run[init_dim].values})
-  filled = filled.drop_vars([n for n in filled.coords if n not in filled.dims], errors="ignore")
-  for name in missing:
-    filled[name].attrs = stored[name].attrs
-  return run.merge(filled, join="left", compat="override")
-
-
 __all__ = [
   "ForecastConfig",
+  "RunNotPublished",
   "RunReport",
   "as_run",
   "flags",
   "series_is_the_run",
-  "with_missing",
+  "stand_in",
 ]
