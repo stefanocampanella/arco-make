@@ -11,7 +11,7 @@ import pytest
 import xarray as xr
 from click.testing import CliRunner, Result
 
-from arcomake import backends, cli, dataset_utils, icechunk_utils
+from arcomake import backends, cli, dataset_utils, forecast, icechunk_utils
 from arcomake.cli_utils import read_configs
 from arcomake.dataset_utils import (
   CopernicusMarinePartConfig,
@@ -498,3 +498,21 @@ def test_a_window_needs_one_run_per_object(save, tmp_path):
   path.write_text(text.replace("chunks = {init_time = 1}", save))
   with pytest.raises(Exception, match="one run per stored object"):
     read_configs(str(path), schema=download_module.DownloadConfig)
+
+
+def test_stored_variables_missing_without_a_missing_source_fail():
+  """NaN fills only the datasets whose source had no such run: a run lacking stored variables
+  otherwise is an error."""
+  dims = ("init_time", "lead_time")
+  stored = xr.Dataset(
+    {"a": (dims, np.ones((1, 2))), "b": (dims, np.ones((1, 2)))},
+    coords={
+      "init_time": [np.datetime64(FIRST, "ns")],
+      "lead_time": np.array([0, 1], "timedelta64[D]").astype("timedelta64[ns]"),
+    },
+  )
+  run = stored[["a"]].assign_coords(init_time=[np.datetime64(FIRST + DAY, "ns")])
+  with pytest.raises(ValueError, match="every source had it"):
+    forecast.with_missing(run, stored, "init_time", [])
+  filled = forecast.with_missing(run, stored, "init_time", ["source_of_b"])
+  assert filled.b.isnull().all() and filled.a.notnull().all()

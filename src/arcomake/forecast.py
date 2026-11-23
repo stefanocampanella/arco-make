@@ -152,7 +152,8 @@ def with_missing(
   run: xr.Dataset, stored: xr.Dataset, init_dim: str, unavailable: Iterable[str]
 ) -> xr.Dataset:
   """`run` with the stored variables along `init_dim` it lacks (datasets whose source had no
-  such run) as NaN, shaped and typed as stored (lazily: nothing is read)."""
+  such run, `unavailable`) as NaN, shaped and typed as stored (lazily: nothing is read). A run
+  lacking stored variables while every source had it is an error, not a gap to fill."""
   missing = [
     name
     for name, var in stored.data_vars.items()
@@ -160,6 +161,8 @@ def with_missing(
   ]
   if not missing:
     return run
+  if not list(unavailable):
+    raise ValueError(f"the run lacks the stored variables {missing}, though every source had it")
   template = stored[missing].isel({init_dim: [-1]}).drop_vars(init_dim)
   filled = xr.full_like(template, np.nan).assign_coords({init_dim: run[init_dim].values})
   filled = filled.drop_vars([n for n in filled.coords if n not in filled.dims], errors="ignore")
