@@ -1716,3 +1716,21 @@ has to stay extendable across it). So:
   and the run now share one (`existing_repository`, `Run(repository=...)`, reopened with the
   write timeouts without reading storage).
 
+### 23 Nov: the atmospheric variables' attributes [Moby-Dick]
+
+The ERA5 variables carried ERA5's attributes as read. Checked on the published 0.25 deg dataset
+(metadata only): `ssrd` has the standard name of the flux, `surface_downwelling_shortwave_flux_in_air`
+(W m-2), on a daily total in J m-2; `strd`, `tp`, `10u`, `10v`, `2t` and `2d` have none (only
+`msl` has a right one); no atmospheric variable says how its day was reduced (`cell_methods`).
+The forecast recipes read IFS through cfgrib, which added 27 `GRIB_*` attributes per variable and
+`standard_name = "unknown"` on `2d`, `strd` and `tp`.
+
+The arco-ocean recipes (historical and forecast, maintainer 23 Nov) now give the eight variables
+ERA5's `long_name`, `short_name` and `units`, CF standard names (`eastward_wind`,
+`northward_wind`, `dew_point_temperature`, `air_temperature`, `air_pressure_at_mean_sea_level`,
+`integral_wrt_time_of_surface_downwelling_shortwave_flux_in_air` and `..._longwave_...` for
+`ssrd` and `strd`, `lwe_thickness_of_precipitation_amount` for `tp`) and `cell_methods`
+(`time: mean`; `time: sum` for `ssrd`, `strd`, `tp`), identical in both datasets (checked at 1
+deg). **[Moby-Dick]** In the published dataset, read `ssrd` as a daily total in J m-2 whatever
+its standard name; `tp` and `dis24_outlets` are both metres of water per day over the cell.
+
