@@ -47,6 +47,10 @@ From: ubuntu:26.04
     make -j"$(nproc)"
     ctest -j"$(nproc)"
     make install
+    # ecCodes is Apache-2.0: its licence and notice go with the binaries the image redistributes.
+    mkdir -p /usr/local/share/doc/eccodes
+    cp "../eccodes-${ECCODES_VERSION}-Source/LICENSE" "../eccodes-${ECCODES_VERSION}-Source/NOTICE" \
+        /usr/local/share/doc/eccodes/
     # Register the install prefix so libeccodes.so.* is found via the linker cache.
     echo "/usr/local/lib" > /etc/ld.so.conf.d/eccodes.conf
     ldconfig
