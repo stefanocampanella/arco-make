@@ -5,8 +5,8 @@ sources. It works from *recipes*: TOML files that say where each source is, how 
 resampling, masks, renaming...), and how to store the result. It also computes statistics of the result,
 such as a climatology, for standardizing the inputs of data-driven models.
 
-It was built to produce [ARCO-OCEAN](https://github.com/inogs/arco-ocean), whose recipes live in that
-repository.
+It was built to produce [ARCO-OCEAN](https://github.com/stefanocampanella/arco-ocean), whose
+recipes live in that repository.
 
 ## Installation
 
