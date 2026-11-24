@@ -1,0 +1,123 @@
+# A small download recipe used by the tests and shown in the README.
+# Three local Zarr sources stand for remote ones: an hourly atmosphere, a daily 3D ocean with a
+# coastline, and a static bathymetry. Everything is regridded to a common 1-degree grid, the
+# ocean mask is derived from the bathymetry, and gaps inside the mask are filled.
+# `@SOURCES@` is replaced by the directory of the sources.
+
+time_dim = "time"
+start = 2020-02-26T00:00:00
+end = 2020-03-02T00:00:00
+# Download in blocks of 2 days: each block is written (first) or appended (others) to the output.
+step = "2D"
+
+# The target grid of the regrid steps, written once and named by them.
+[grids.one_degree]
+south = -1.5
+north = 1.5
+west = 0.5
+east = 3.5
+resolution_lat = 1.0
+resolution_lon = 1.0
+
+# Atmosphere: hourly fields, averaged to daily values.
+[[datasets.atmosphere.parts]]
+filename_or_obj = "@SOURCES@/atmosphere.zarr"
+engine = "zarr"
+
+[[datasets.atmosphere.postprocess]]
+name = "select_variables"
+variables = ["t2m"]
+
+[[datasets.atmosphere.postprocess]]
+name = "resample"
+time = "1D"
+label = "left"
+closed = "left"
+reduce = "mean"
+
+[[datasets.atmosphere.postprocess]]
+name = "regrid"
+method = "conservative"
+grid = "one_degree"
+kwargs = {skipna = true, nan_threshold = 1.0}
+
+# Ocean: daily 3D fields, NaN on land and below the bottom.
+[datasets.ocean.checkpointing]
+step = "1D"
+
+[[datasets.ocean.parts]]
+filename_or_obj = "@SOURCES@/ocean.zarr"
+engine = "zarr"
+
+[[datasets.ocean.postprocess]]
+name = "get_bottom"
+depth_dim = "depth"
+variables = {thetao = "thetao_bottom"}
+replace = false
+
+[[datasets.ocean.postprocess]]
+name = "regrid"
+method = "conservative"
+grid = "one_degree"
+kwargs = {skipna = true, nan_threshold = 1.0}
+
+[[datasets.ocean.postprocess]]
+name = "astype"
+dtype = "float32"
+casting = "same_kind"
+
+# Datasets are merged with identical global attributes: drop the source's ones.
+[[datasets.ocean.postprocess]]
+name = "drop_attrs"
+deep = false
+
+# Static bathymetry and the 3D sea mask derived from it.
+[[datasets.ocean_static.parts]]
+filename_or_obj = "@SOURCES@/static.zarr"
+engine = "zarr"
+
+[[datasets.ocean_static.postprocess]]
+name = "regrid"
+method = "conservative"
+grid = "one_degree"
+kwargs = {skipna = false}
+
+[[datasets.ocean_static.postprocess]]
+name = "astype"
+dtype = "float32"
+casting = "same_kind"
+
+[[datasets.ocean_static.postprocess]]
+name = "get_sea_mask"
+bathymetry = "deptho"
+depth_coordinate = "depth"
+depth_dim = "depth"
+mask_name = "sea_mask"
+
+# Steps applied after merging all datasets.
+[[postprocess]]
+name = "masked_fill"
+mask_name = "sea_mask"
+fill_value = {thetao = "thetao_bottom"}
+variables = ["thetao"]
+
+[[postprocess]]
+name = "rename_coordinates"
+name_dict = {latitude = "lat", longitude = "lon"}
+
+[[postprocess]]
+name = "transpose"
+dims = ["time", "depth", "lat", "lon"]
+missing_dims = "ignore"
+
+[[postprocess]]
+name = "assign_attrs"
+title = "Synthetic sample dataset"
+
+[save]
+chunks = {time = 1, depth = 1, lat = -1, lon = -1}
+compressors = [{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuffle = "shuffle"}}]
+
+[save.encoding.time]
+units = "days since 2020-01-01"
+dtype = "int32"

@@ -2,12 +2,15 @@
 # SPDX-License-Identifier: MIT
 import logging
 import tomllib
+from collections.abc import Mapping
 from typing import Any, TypeVar, overload
 
 import click
 import fsspec
+import icechunk
 from pydantic import BaseModel, ValidationError
 
+from arcomake import icechunk_utils
 from arcomake.dataset_utils import SaveConfig
 
 logger = logging.getLogger(__name__)
@@ -18,6 +21,7 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 def check_path(exists=True, file_okay=True, dir_okay=True):
 
   def _check_path(ctx: click.Context, param: click.Parameter, value: str) -> str:
+    check_aws_profile(value)  # checking existence opens a botocore session for s3:// paths
     fs, path = fsspec.url_to_fs(value)
     if exists and not fs.exists(path):
       raise click.ClickException(f"{path} does not exist")
@@ -42,6 +46,18 @@ def read_configs(
 ) -> dict[str, Any]: ...
 
 
+def _merged(base: dict[str, Any], update: Mapping[str, Any]) -> dict[str, Any]:
+  """`base` with the values of `update`, tables merged key by key (CLI options injected into a
+  recipe, e.g. one bound of a check, keep the rest of its table)."""
+  merged = dict(base)
+  for key, value in update.items():
+    if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+      merged[key] = _merged(merged[key], value)
+    else:
+      merged[key] = value
+  return merged
+
+
 def read_configs(
   path: str,
   schema: type[ModelT] | None = None,
@@ -52,7 +68,7 @@ def read_configs(
     configs = tomllib.load(config_file)
   if inject is not None:
     logger.info(f"Updating configs with {inject}")
-    configs.update(inject)
+    configs = _merged(configs, inject)
   if schema is not None:
     try:
       return schema.model_validate(configs)
@@ -61,22 +77,52 @@ def read_configs(
   return configs
 
 
-def check_if_overwriting(
-  path: str, overwrite: bool = False, save_configs: SaveConfig | None = None
+def check_destination(
+  path: str,
+  replace: bool = False,
+  save_configs: SaveConfig | None = None,
+  repository: icechunk.Repository | None = None,
 ) -> None:
+  """Check an output path before any work: usable by Icechunk, reachable, and either absent or
+  (with `replace`) an Icechunk repository, which the run writes a new version of. `repository`:
+  the repository at `path`, if the command opened it already (`icechunk_utils.existing_repository`):
+  not opened again."""
+  if str(path).rstrip("/").lower().endswith(".zip"):
+    # Zip outputs were removed with Zarr v3: a `.zip` name would silently become a directory.
+    raise click.ClickException(f"{path}: zip outputs are not supported; write a directory or a URL")
   storage_options = getattr(save_configs, "storage_options", None) if save_configs else None
-  fs, fs_path = fsspec.url_to_fs(path, **(storage_options or {}))
+  # Fail before any work: a destination Icechunk cannot use (path, storage options, unknown S3
+  # region) or cannot reach would fail at the first write, or be overwritten.
   try:
+    storage = icechunk_utils.storage(path, storage_options)
+    fs, fs_path = fsspec.url_to_fs(path, **icechunk_utils.fsspec_options(path, storage_options))
     exists = fs.exists(fs_path)
   except Exception as exc:
-    logger.warning(f"Could not check existence of {path}: {exc}")
-    exists = False
+    raise click.ClickException(f"Could not check whether {path} exists: {exc}") from exc
 
-  if exists:
-    if overwrite:
-      logger.info(f"Overwriting existing output destination {path}")
-    else:
-      raise click.ClickException(f"Output destination {path} already exists")
+  if not exists:
+    return
+  # Outputs are Icechunk repositories, replaced by a new version: anything else is left alone.
+  try:
+    if repository is None and icechunk.Repository.exists(storage):
+      repository = icechunk_utils.open_repository(storage)
+    # A repository whose `main` is still its first snapshot holds no version yet: a first run
+    # failed there (its branch may hold what it wrote), and a retry needs no --replace.
+    unwritten = repository is not None and icechunk_utils.has_no_version(repository)
+  except Exception as exc:
+    raise click.ClickException(f"Could not check whether {path} is a repository: {exc}") from exc
+  if unwritten:
+    logger.info(f"{path} holds no version yet: writing its first one")
+    return
+  if not replace:
+    raise click.ClickException(
+      f"Output destination {path} already exists (--replace writes a new version of it)"
+    )
+  if repository is None:
+    raise click.ClickException(
+      f"Output destination {path} exists and is not an Icechunk repository: remove it first"
+    )
+  logger.info(f"Writing a new version of {path} (the current one stays in its history)")
 
 
 def set_default_logger(log_level: str = "info"):
@@ -86,3 +132,17 @@ def set_default_logger(log_level: str = "info"):
     level=log_level.upper(),
     force=True,
   )
+
+
+def check_aws_profile(*paths: object, copernicus_marine: bool = False) -> None:
+  """Fail before any work if `s3://` paths or Copernicus Marine parts meet an unknown AWS profile.
+
+  Raises:
+    click.ClickException: naming the profile (see `settings.check_aws_profile`).
+  """
+  from arcomake import settings
+
+  try:
+    settings.check_aws_profile(paths, copernicus_marine=copernicus_marine)
+  except settings.SettingsError as error:
+    raise click.ClickException(str(error)) from None

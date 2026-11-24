@@ -1,0 +1,19 @@
+# A two-step "climatology" of the first four days of the sample dataset (two periods of two days).
+time_dim = "time"
+period = 2
+window = 1
+weighting = "constant"
+
+[read]
+engine = "icechunk"  # the output of the sample download
+
+[[preprocess]]
+name = "isel"
+time = {start = 0, stop = 4}
+
+[[preprocess]]
+name = "drop_static_vars"
+time_dim = "time"
+
+[save]
+compressors = [{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuffle = "shuffle"}}]

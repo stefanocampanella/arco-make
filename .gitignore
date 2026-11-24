@@ -1,2 +1,26 @@
+# Python and tooling
 .venv
 .idea
+__pycache__/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Secrets and environment files: never commit them.
+.env
+*.env
+.*_env
+*.key
+*.pem
+
+# Written by the image build (the commit it was built from)
+src/arcomake/BUILD_COMMIT
+
+# Run artefacts
+logs/
+*.log
+*.sif
+
+# Local, machine-specific notes for Claude Code
+CLAUDE.local.md

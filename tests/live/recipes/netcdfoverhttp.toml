@@ -1,0 +1,18 @@
+# Live check: a NetCDF file over HTTPS (GloFAS upstream area, static), a small box.
+time_dim = "time"
+start = 2020-01-01T00:00:00
+end = 2020-01-02T00:00:00
+step = "1D"
+
+[[datasets.uparea.parts]]
+filename_or_obj = "https://confluence.ecmwf.int/download/attachments/242067380/uparea_glofas_v4_0.nc"
+engine = "netcdfoverhttp"
+
+[[datasets.uparea.postprocess]]
+name = "sel"
+latitude = {start = 46.0, stop = 40.0}
+longitude = {start = 12.0, stop = 20.0}
+
+[save]
+chunks = {time = 1}
+compressors = [{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuffle = "shuffle"}}]

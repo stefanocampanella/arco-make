@@ -1,20 +1,21 @@
 # SPDX-FileCopyrightText: 2026 Stefano Campanella
 # SPDX-License-Identifier: MIT
 import logging
-from typing import get_args
+from typing import Any
 
 import click
-import xarray as xr
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from arcomake import icechunk_utils, provenance
 from arcomake.cli_utils import (
-  check_if_overwriting,
+  check_aws_profile,
+  check_destination,
   check_path,
   read_configs,
   set_default_logger,
 )
-from arcomake.dask_utils import DaskSetupType, get_client
-from arcomake.dataset_utils import ReadConfig, SaveConfig, safe_to_zarr
+from arcomake.dask_utils import DaskSetupType, dask_setup_option, get_client
+from arcomake.dataset_utils import ReadConfig, SaveConfig, inline_grids, open_input, write_output
 from arcomake.processing_utils import ProcessingStepConfig
 
 logger = logging.getLogger(__name__)
@@ -23,14 +24,16 @@ logger = logging.getLogger(__name__)
 class ProcessConfig(BaseModel):
   model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-  time_dim: str = "time"
-  skipna: bool = Field(
-    default=False,
-    description="Whether to skip NaNs when computing the statistic.",
-  )
   read: ReadConfig = Field(default_factory=ReadConfig)
   process: list[ProcessingStepConfig] = Field(default_factory=list)
   save: SaveConfig = Field(default_factory=SaveConfig)
+  # Target grids of `regrid` steps, by name (see `dataset_utils.inline_grids`).
+  grids: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+  @model_validator(mode="before")
+  @classmethod
+  def _inline_grids(cls, data: Any) -> Any:
+    return inline_grids(data)
 
 
 @click.command()
@@ -52,20 +55,16 @@ class ProcessConfig(BaseModel):
   type=str,
 )
 @click.option(
-  "--overwrite/--no-overwrite",
-  help="Whether to overwrite existing outputs",
+  "--replace/--no-replace",
+  help=(
+    "Write a new version of an existing output (an Icechunk repository): it replaces what `main`"
+    " shows once the run succeeds; earlier versions stay in its history until the recipe's"
+    " [save] keep_history or keep_versions expires them"
+  ),
   default=False,
   is_flag=True,
 )
-@click.option(
-  "--dask-setup",
-  default="mpi",
-  type=click.Choice(
-    get_args(DaskSetupType),
-    case_sensitive=False,
-  ),
-  help="Type of Dask scheduler to use.",
-)
+@dask_setup_option
 @click.option(
   "--frisky",
   "use_frisky",
@@ -83,28 +82,16 @@ def process(
   configs_path: str,
   input_path: str,
   output_path: str,
-  overwrite: bool = False,
-  dask_setup: DaskSetupType = "mpi",
+  replace: bool = False,
+  dask_setup: DaskSetupType = "threads",
   use_frisky: bool = False,
   log_level: str = "info",
 ):
-  """
-  Compute a statistic of a Zarr dataset over time and save it to Zarr.
+  """Apply recipe steps to a dataset and save the result to Zarr.
 
-  Parameters
-  ----------
-  configs_path : pathlib.Path
-      Path to TOML configuration file containing configuration options.
-  input_path : pathlib.Path
-      Path to the input Zarr dataset.
-  output_path : pathlib.Path
-      Path to the output Zarr dataset.
-  overwrite : bool, default False
-      Whether to overwrite existing output.
-  dask_setup : DaskSetupType, default "mpi"
-      Type of Dask scheduler to use.
-  log_level : {"debug", "info", "warning", "error", "critical"}, default "info"
-      Logging verbosity.
+  CONFIGS_PATH is a TOML recipe with a [read] table (arguments of xarray.open_dataset), a list of
+  [[process]] steps (see `arco-make steps`; e.g. a time mean) and a [save] table. INPUT_PATH and
+  OUTPUT_PATH may be local paths or fsspec URLs.
   """
 
   # Set up logging.
@@ -113,23 +100,29 @@ def process(
   # Set up Dask client.
   with get_client(dask_setup=dask_setup, use_frisky=use_frisky):
     try:
-      # Check output path.
-      check_if_overwriting(output_path, overwrite=overwrite)
-      # Read configs
+      # Read configs, then check the output path (with the recipe's storage options).
       configs = read_configs(configs_path, schema=ProcessConfig)
+      check_aws_profile(input_path, output_path)
+      check_destination(output_path, replace=replace, save_configs=configs.save)
       # Read input dataset
       logger.info(f"Opening input dataset from {input_path} with configs {configs.read}")
-      with xr.open_dataset(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
+      with open_input(input_path, **configs.read.model_dump(exclude_unset=True)) as dataset:
         # Process dataset
         if configs.process:
           dataset = dataset.arcomake.process(steps=configs.process)
         # Save stats
-        safe_to_zarr(
-          dataset=dataset,
-          destination=output_path,
-          configs=configs.save,
-          compute=True,
+        write_output(
+          dataset,
+          output_path,
+          configs.save,
+          message=f"process {input_path}",
+          command="process",
+          recipe=provenance.fingerprint(configs, exclude={"read"}),
         )
+    except click.ClickException:
+      raise
+    except icechunk_utils.PromotionError as exc:
+      raise click.ClickException(str(exc)) from exc
     except Exception as exc:
       logger.exception("An error occurred while processing dataset")
       raise click.ClickException(f"An error occurred ({type(exc).__name__}). Aborting.") from exc

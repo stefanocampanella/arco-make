@@ -14,6 +14,22 @@ InclusiveOptions = Literal["left", "right", "neither", "both"]
 logger = logging.getLogger(__name__)
 
 
+def naive_utc(value: datetime | None, what: str) -> datetime | None:
+  """`value` without its time zone, if it has one and it is UTC.
+
+  The sources' stamps have no zone and are read as UTC: a UTC time is that stamp, another offset
+  would be converted to a different one than written.
+
+  Raises:
+    ValueError: for another offset, starting with `what`.
+  """
+  if value is None or value.tzinfo is None:
+    return value
+  if value.utcoffset() != timedelta(0):
+    raise ValueError(f"{what}: without a time zone, or in UTC")
+  return value.replace(tzinfo=None)
+
+
 @dataclass
 class DateInterval:
   """Represents a right open date interval."""
@@ -72,12 +88,15 @@ class DateInterval:
 
 @dataclass
 class IterableDateInterval(Iterable[DateInterval]):
-  """Represents a right open date interval, which can be iterated over with arbitrary step size.
+  """A right-open interval [start, end), iterated as consecutive blocks of length `step`.
+
+  Blocks share their boundaries and the last one is cut at `end`, so the blocks cover the
+  interval exactly once.
 
   Attributes:
     start (datetime.datetime): The start date of the interval.
-    end (datetime.datetime): The stop date of the interval.
-    step (datetime.timedelta): Datetime resolution. Defaults to 1 day.
+    end (datetime.datetime): The (excluded) end date of the interval.
+    step (datetime.timedelta): Length of each block (no default).
   """
 
   start: datetime

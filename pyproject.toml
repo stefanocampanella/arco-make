@@ -1,6 +1,6 @@
 [project]
 name = "arcomake"
-version = "0.1.0"
+version = "0.2.0"
 requires-python = ">=3.13"
 dependencies = [
     "botocore[crt]",
@@ -8,30 +8,34 @@ dependencies = [
     "cfgrib",
     "cftime",
     "click",
-    "copernicusmarine@git+https://github.com/stefanocampanella/copernicus-marine-toolbox.git@arco-make",
+    # Upstream main after the merge of COPERNICUSMARINE_MAX_POOL_CONNECTIONS (#532), not yet in a
+    # release; move to the first release that has it. The backend relies on chunk_size_limit=False
+    # returning lazily indexed arrays (undocumented): tests/live checks it.
+    "copernicusmarine @ git+https://github.com/mercator-ocean/copernicus-marine-toolbox.git@f66a8b8c700654fec981b986fc79f6450298e96a",
     "dask",
-    "dask_mpi",
+    "distributed",
     "eccodes",
     "etils",
     "gcsfs",
     "google-cloud-storage",
     "h5netcdf",
     "matplotlib",
-    "mpi4py",
     "nc-time-axis",
     "netCDF4",
-    "numcodecs < 0.16",
     "numpy",
     "pandas",
     "pydantic",
     "requests",
     "s3fs>2026",
-    "scipy",
     "tqdm",
     "xarray[complete]",
     "xarray-regrid[accel]",
-    # TODO: Port to Zarr v3
-    "zarr >= 2, < 3",
+    "zarr >= 3.4",
+    "pydantic-settings>=2.6",
+    "python-dotenv>=1.0",
+    "numba>=0.61",
+    "icechunk>=2.3.1",
+    "aiohttp>=3.10",
 ]
 authors = [{name = "Stefano Campanella", email = "scampanella@ogs.it"}]
 description = "Utility to download and preprocess data into ARCO format."
@@ -41,14 +45,26 @@ license = "MIT"
 [project.optional-dependencies]
 dev = [
     "pandas-stubs~=3.0.3",
-    "scipy-stubs~=1.18.1",
     "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "reuse",
     "ruff",
     "ty",
     "memray",
 ]
+# Live checks (tests/live): ECMWF's ecCodes build, recent enough for GloFAS GRIB, matching the
+# `eccodes` bindings in uv.lock.
+live = [
+    "eccodeslib==2.49.*",
+]
+# `--dask-setup mpi`. mpi4py's wheels load the MPI library found at run time (Open MPI, or MPICH
+# and the MPIs compatible with it); for another MPI, build mpi4py from source (--no-binary mpi4py).
+mpi = [
+    "dask_mpi",
+    "mpi4py",
+]
 experimental = [
-    "flox>=0.11.2",
     "frisky",
 ]
 
@@ -56,6 +72,8 @@ experimental = [
 copernicusmarine = "arcomake.backends:CopernicusMarine"
 netcdfoverhttp = "arcomake.backends:NetCDFOverHTTP"
 earlywarningdatastore = "arcomake.backends:EarlyWarningDataStore"
+ecmwfopendata = "arcomake.backends:ECMWFOpenData"
+icechunk = "arcomake.backends:Icechunk"
 
 [project.scripts]
 arco-make = "arcomake:cli"
@@ -76,7 +94,6 @@ extend-exclude = [
     "build",
     "dist",
     "scripts",
-    "notebooks",
 ]
 
 [tool.ruff.lint]
@@ -98,5 +115,14 @@ include = ["src/arcomake/**/*.py"]
 respect-ignore-files = true
 
 [tool.ty.rules]
-# Disable type-checking for now.
+# Every rule is an error: the type checker gates commits (pre-commit) and CI.
 all = "error"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Live checks (marker `network`) are skipped unless `--live` is given (tests/conftest.py).
+addopts = ["-ra", "--strict-markers"]
+xfail_strict = true
+markers = [
+    "network: needs the live services and their credentials; never run on pull requests",
+]

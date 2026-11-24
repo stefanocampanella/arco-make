@@ -1,0 +1,15 @@
+# Checks of the sample dataset.
+[read]
+engine = "icechunk"  # the output of the sample download
+
+[checks.valid_time_coordinate]
+start = 2020-02-26T00:00:00
+end = 2020-03-02T00:00:00
+freq = "1D"
+
+[checks.valid_global_ecmwf_coordinates]
+latitude_dim = "lat"
+longitude_dim = "lon"
+
+[checks.ensure_no_nans]
+sea_mask = ["thetao"]

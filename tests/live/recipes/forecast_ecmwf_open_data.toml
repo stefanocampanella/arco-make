@@ -1,0 +1,52 @@
+# Live check: a forecast download from ECMWF's open data on AWS (anonymous), a small box, three
+# lead days, a window of two runs. The test gives the runs (recent ones: the archive keeps them).
+
+[forecast]
+horizon = "3D"
+window = 2
+
+[datasets.ifs]
+forecast = "runs"
+flag = "ifs_forecast"
+
+[[datasets.ifs.parts]]
+filename_or_obj = "s3://ecmwf-forecasts"
+engine = "ecmwfopendata"
+param = ["2t"]
+
+[[datasets.ifs.postprocess]]
+name = "sel"
+latitude = {start = 46.0, stop = 40.0}
+longitude = {start = 12.0, stop = 20.0}
+
+[[datasets.ifs.postprocess]]
+name = "resample"
+time = "1D"
+label = "left"
+closed = "left"
+reduce = "mean"
+
+[datasets.ifs_accumulated]
+forecast = "runs"
+flag = "ifs_forecast"
+
+[[datasets.ifs_accumulated.parts]]
+filename_or_obj = "s3://ecmwf-forecasts"
+engine = "ecmwfopendata"
+param = ["tp"]
+
+[[datasets.ifs_accumulated.postprocess]]
+name = "sel"
+latitude = {start = 46.0, stop = 40.0}
+longitude = {start = 12.0, stop = 20.0}
+
+[[datasets.ifs_accumulated.postprocess]]
+name = "resample"
+time = "1D"
+label = "left"
+closed = "left"
+reduce = "sum"
+
+[save]
+chunks = {init_time = 1}
+compressors = [{name = "blosc", configuration = {cname = "lz4", clevel = 1, shuffle = "shuffle"}}]
