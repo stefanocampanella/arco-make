@@ -28,11 +28,14 @@ Dask clusters over the ranks of an MPI job (`--dask-setup mpi`) need the `mpi` e
 libraries; build mpi4py from source for another MPI).
 
 A container image (with ecCodes built from source, without MPI) is published on the GitHub Container
-Registry:
+Registry for each version, tagged as the version (`v0.2.0`), and for the tip of `master`, as `latest`:
 
 ```bash
-apptainer exec oras://ghcr.io/stefanocampanella/arco-make:latest arco-make download --help
+apptainer exec oras://ghcr.io/stefanocampanella/arco-make:v0.2.0 arco-make download --help
 ```
+
+A version's image stays as published: use it for production runs, which should not change with
+`master`.
 
 ## Commands
 
