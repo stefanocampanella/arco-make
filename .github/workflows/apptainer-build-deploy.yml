@@ -3,6 +3,8 @@ name: Build Apptainer Image
 on:
   push:
     branches: [ master ]
+    # A version tag (v0.2.0) publishes an image of its own, kept whatever master becomes.
+    tags: [ 'v*' ]
   pull_request:
     branches: [ master ]
   workflow_dispatch:
@@ -31,12 +33,25 @@ jobs:
         run: |
            apptainer build container.sif Apptainer
 
+      - name: Check the tag against the version
+        # The image of tag vX.Y.Z must hold version X.Y.Z of the package.
+        if: github.ref_type == 'tag'
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml)"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} is not the package's version (${version})" >&2
+            exit 1
+          fi
+
       - name: Login and Deploy Container
-        # Pull requests only build: a branch must not replace the published image.
-        if: github.event_name != 'pull_request'
+        # Master is pushed as :latest, a version tag as itself (:v0.2.0). Other branches and pull
+        # requests only build: they must not replace a published image.
+        if: >-
+          github.event_name != 'pull_request'
+          && (github.ref_type == 'tag' || github.ref == 'refs/heads/master')
         # Use default registry user ${{ github.repository_owner }} , or set a secret ${{ secrets.GHCR_USERNAME }}
         env:
-          tag: latest
+          tag: ${{ github.ref_type == 'tag' && github.ref_name || 'latest' }}
         run: |
           echo ${{ secrets.GITHUB_TOKEN }} | apptainer registry login -u ${{ github.repository_owner }} --password-stdin oras://ghcr.io
           apptainer push container.sif oras://ghcr.io/${GITHUB_REPOSITORY}:${tag}

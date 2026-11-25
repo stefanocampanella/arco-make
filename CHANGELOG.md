@@ -6,10 +6,13 @@ commands and their options, the layout of outputs, and the commit metadata that 
 that break: 1.0.0 will declare it stable, once a production dataset has been made with it. A version that
 changes what an unchanged recipe writes says so here.
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-11-25)
 
 Most of arco-make was rewritten (pull requests #1 to #22; reasons and measurements are in
 [docs/logbook.md](docs/logbook.md)). Recipes and outputs of 0.1.0 do not carry over: see below.
+
+The image of this version is `oras://ghcr.io/stefanocampanella/arco-make:v0.2.0`: from this version on,
+each version tag publishes its own image, besides `latest` (the tip of `master`).
 
 ### Upgrading from 0.1.0
 
