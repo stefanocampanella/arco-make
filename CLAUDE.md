@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`arco-make` (package `arcomake`, Python ≥ 3.13) builds Analysis-Ready Cloud-Optimized (ARCO) Zarr timeseries from heterogeneous sources (Copernicus Marine, Climate Data Store / Early Warning Data Store, remote NetCDF over HTTP, Zarr on GCS/S3). Every command is driven by a TOML "recipe" plus CLI arguments. It was built to produce ARCO-OCEAN; the reference recipe lives in the external `inogs/arco-ocean` repo under `configs/download/`.
+`arco-make` (package `arcomake`, Python ≥ 3.13) builds Analysis-Ready Cloud-Optimized (ARCO) Zarr timeseries from heterogeneous sources (Copernicus Marine, Climate Data Store / Early Warning Data Store, remote NetCDF over HTTP, Zarr on GCS/S3). Every command is driven by a TOML "recipe" plus CLI arguments. It was built to produce ARCO-OCEAN; the reference recipe lives in the external `stefanocampanella/arco-ocean` repo under `configs/download/`.
 
 ## Commands
 
