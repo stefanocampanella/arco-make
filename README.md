@@ -159,7 +159,10 @@ request and gcsfs does not retry it): set `timeout`. Copernicus Marine parts and
 on their own timeouts. A block that fails with a transient error (a timeout, a dropped connection, a server
 or throttling answer, from a source or from the output's storage) is redone, after a wait that doubles each time: `[retries] attempts = 5`, `wait =
 "1min"`, `max_wait = "30min"` by default. Other errors (a recipe or data error) stop the run at once; the
-log says which kind it was.
+log says which kind it was. `[retries] block_timeout` (e.g. `"1h"`; none by default) bounds each attempt
+of a block, for a wait nothing else ends: past it, the log gets every thread's stack and the process
+ends with exit status 124, the block not committed (`--resume` writes it again). Set it well above a
+block's usual time: it counts reading the sources too.
 
 A download that fails leaves `main` as it was and its committed blocks on its branch: rerun it with
 `--resume` (same recipe and `--start`) to write only the missing blocks. Each block's commit

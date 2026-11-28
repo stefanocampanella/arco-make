@@ -281,3 +281,77 @@ def test_expected_errors_are_raised_unlogged(caplog: pytest.LogCaptureFixture):
   with caplog.at_level(logging.INFO), pytest.raises(Outcome):
     with_retries(action, RetryConfig(), "block", sleep=lambda s: None, expected=(Outcome,))
   assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_a_block_timeout_in_the_recipe():
+  """Absent by default; a duration; positive. Left out of the fingerprint with `[retries]`: a run
+  resumes with one added."""
+  assert RetryConfig().block_timeout is None
+  config = RetryConfig.model_validate({"block_timeout": "1h"})
+  assert config.block_timeout == datetime.timedelta(hours=1)
+  with pytest.raises(ValidationError):
+    RetryConfig.model_validate({"block_timeout": "0s"})
+
+
+@pytest.fixture
+def exits(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+  """The exit statuses a deadline ended the process with (it keeps running in tests), and the
+  temporary directories cleaned up first."""
+  statuses: list[int] = []
+  monkeypatch.setattr(retries, "_exit", statuses.append)
+  monkeypatch.setattr(
+    retries.temporary_utils, "cleanup_all_active_registries", lambda: statuses.append(0)
+  )
+  return statuses
+
+
+def test_a_block_past_its_deadline_ends_the_process(exits, caplog):
+  """With every thread's stack in the log (where it waits), the temporary directories cleaned
+  up, and the exit status of a timeout."""
+  import threading
+
+  blocked = threading.Event()
+  with retries.deadline(datetime.timedelta(seconds=0.2), "Block [2020-01-01, 2020-02-01)"):
+    blocked.wait(2)  # stands for a wait nothing else ends
+  assert exits == [0, retries.BLOCK_TIMEOUT_EXIT]
+  assert "Block [2020-01-01, 2020-02-01): not committed after 0:00:00.200000" in caplog.text
+  assert "thread(s)" in caplog.text and "blocked.wait(2)" in caplog.text
+
+
+def test_a_block_within_its_deadline_or_without_one_goes_on(exits):
+  import time as time_module
+
+  with retries.deadline(datetime.timedelta(seconds=0.2), "a block"):
+    pass
+  with retries.deadline(None, "a block"):
+    time_module.sleep(0.3)
+  time_module.sleep(0.3)  # the first timer would have fired by now
+  assert exits == []
+
+
+def test_a_download_whose_block_outlasts_the_deadline_ends(
+  tmp_path: pathlib.Path, sources: pathlib.Path, monkeypatch: pytest.MonkeyPatch, exits
+):
+  """Each attempt of a block has `[retries] block_timeout`: the second block, too slow, ends the
+  process (here it goes on, `_exit` replaced, and completes)."""
+  import time as time_module
+
+  download = importlib.import_module("arcomake.download")  # the module, not the command
+  real = download.maybe_checkpointing_download_and_process
+
+  def slow(configs, start, end, **kwargs):
+    if start == datetime.datetime(2020, 2, 28):
+      time_module.sleep(8)
+    return real(configs, start, end, **kwargs)
+
+  monkeypatch.setattr(download, "maybe_checkpointing_download_and_process", slow)
+  recipe = render_recipe("sample_download.toml", tmp_path, SOURCES=str(sources))
+  recipe.write_text(recipe.read_text() + '\n[retries]\nblock_timeout = "5s"\n')
+  result = CliRunner().invoke(
+    cli, ["download", "--dask-setup", "threads", str(recipe), str(tmp_path / "out")]
+  )
+  assert result.exit_code == 0, result.output
+  # The slow block (others take well under the timeout, but a loaded machine may stretch them).
+  assert exits.count(retries.BLOCK_TIMEOUT_EXIT) >= 1
+  expired = [line for line in result.output.splitlines() if "not committed after 0:00:05" in line]
+  assert any("2020-02-28" in line for line in expired), result.output

@@ -1777,3 +1777,16 @@ whole run each. Storage errors of the network are now transient, read from the m
 timeout, an answer cut short, S3's SlowDown and the like); others (access denied, a missing
 object, a malformed answer) stop the run as before. A block redone after a storage error writes
 in a new session: its predecessor's chunks were never committed.
+
+**A deadline per block.** With the settings applied, an upload left unanswered is cut after
+`WRITE_ATTEMPT_TIMEOUT_MS` and retried. But the 3 h hang was not proven to be such an upload (no
+stack), and other waits have no bound of arco-make's: a lock, a library's request without one.
+`[retries] block_timeout` (none by default) bounds each attempt of a block: past it, a timer
+thread logs every thread's Python stack (grouped: most are idle workers), cleans up the temporary
+directories and ends the process with exit status 124. Ending the process is the only sure stop:
+a thread blocked in native code or on a lock cannot be interrupted, a retry in the same process
+would share whatever holds it, and a normal exit joins such threads (SIGTERM did not end the
+hung process). The block is not committed: `--resume` writes it again, as a script that reruns a
+failed download does on its own. `[retries]` is left out of the recipe's fingerprint, so a run
+resumes with a timeout added. A value well above a block's usual time: it counts the sources'
+reads too (ARCO-OCEAN's 0.25 deg blocks take about 13 min, the first one about 30).

@@ -10,16 +10,22 @@ times, cdsapi up to 500, the Copernicus Marine toolbox 9.
 """
 
 import asyncio
+import contextlib
 import datetime
 import errno
 import logging
+import os
 import socket
+import sys
+import threading
 import time
-from collections.abc import Callable, Iterator
+import traceback
+from collections.abc import Callable, Generator, Iterator
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from arcomake import temporary_utils
 from arcomake.datetime_utils import may_parse_timedelta
 
 logger = logging.getLogger(__name__)
@@ -59,17 +65,31 @@ ICECHUNK_TRANSIENT = (
 )
 
 
+# Exit status of a download whose block outlasted `[retries] block_timeout` (as coreutils'
+# `timeout`): the block is not committed, `--resume` writes it again.
+BLOCK_TIMEOUT_EXIT = 124
+
+
 class RetryConfig(BaseModel):
   """The `[retries]` table of a download recipe: how often a block is redone after a transient
-  error, waiting `wait`, doubled at each attempt up to `max_wait`."""
+  error, waiting `wait`, doubled at each attempt up to `max_wait`; and how long an attempt may
+  take, `block_timeout` (none by default), past which the process ends (`deadline`)."""
 
   model_config = ConfigDict(extra="forbid")
 
   attempts: int = Field(default=5, ge=1)
   wait: datetime.timedelta = datetime.timedelta(minutes=1)
   max_wait: datetime.timedelta = datetime.timedelta(minutes=30)
+  block_timeout: datetime.timedelta | None = None
 
-  @field_validator("wait", "max_wait", mode="before")
+  @field_validator("block_timeout")
+  @classmethod
+  def _positive(cls, value: datetime.timedelta | None) -> datetime.timedelta | None:
+    if value is not None and value <= datetime.timedelta(0):
+      raise ValueError("block_timeout must be positive")
+    return value
+
+  @field_validator("wait", "max_wait", "block_timeout", mode="before")
   @classmethod
   def _parse_duration(cls, value: Any) -> Any:
     return may_parse_timedelta(value) if isinstance(value, str) else value
@@ -148,6 +168,66 @@ def is_transient(error: BaseException) -> bool:
   return False
 
 
+# How the process ends at a deadline (replaced in tests).
+_exit = os._exit
+
+
+def _stacks() -> str:
+  """Every thread's Python stack, threads with the same stack together (most are idle workers)."""
+  names = {thread.ident: thread.name for thread in threading.enumerate()}
+  stacks: dict[str, list[str]] = {}
+  for ident, frame in sys._current_frames().items():
+    stack = "".join(traceback.format_stack(frame))
+    stacks.setdefault(stack, []).append(names.get(ident, str(ident)))
+  return "\n".join(
+    f"{len(threads)} thread(s) ({', '.join(threads[:5])}{', ...' if len(threads) > 5 else ''}):"
+    f"\n{stack}"
+    for stack, threads in sorted(stacks.items(), key=lambda item: -len(item[1]))
+  )
+
+
+@contextlib.contextmanager
+def deadline(timeout: datetime.timedelta | None, what: str) -> Generator[None]:
+  """End the process if the block is still running after `timeout` (none: no limit): log every
+  thread's stack, clean up the temporary directories, exit with `BLOCK_TIMEOUT_EXIT`.
+
+  For a wait nothing else ends: a request without a bound, a lock never released (on 27 Nov 2026
+  a production download stood idle 3 h in a block, logbook 28 Nov). Exiting is the only sure
+  stop: a thread blocked in a library's native code, or on a lock, cannot be interrupted, and a
+  retry in the same process would share whatever holds it. The block is not committed; a run
+  stopped this way resumes with `--resume` (a script that reruns it does so on its own)."""
+  if timeout is None:
+    yield
+    return
+  lock = threading.Lock()
+  done = False
+
+  def expire() -> None:
+    with lock:
+      if done:
+        return
+      logger.error(
+        f"{what}: not committed after {timeout} ([retries] block_timeout): ending the process"
+        f" (exit status {BLOCK_TIMEOUT_EXIT}); --resume writes it again. Every thread's stack:\n"
+        f"{_stacks()}"
+      )
+      temporary_utils.cleanup_all_active_registries()
+      # `os._exit` flushes nothing: the log (the root logger's handlers) and what was printed.
+      for stream in (*logging.getLogger().handlers, sys.stdout, sys.stderr):
+        stream.flush()
+      _exit(BLOCK_TIMEOUT_EXIT)
+
+  timer = threading.Timer(timeout.total_seconds(), expire)
+  timer.daemon = True
+  timer.start()
+  try:
+    yield
+  finally:
+    with lock:
+      done = True
+    timer.cancel()
+
+
 def with_retries[T](
   action: Callable[[], T],
   config: RetryConfig,
@@ -157,12 +237,14 @@ def with_retries[T](
 ) -> T:
   """Run `action`, again after each transient error (`is_transient`) as `config` says; other
   errors, and the last transient one, are raised. The log tells which is which. `expected`
-  errors are outcomes the caller handles (a forecast run not published yet): raised unlogged."""
+  errors are outcomes the caller handles (a forecast run not published yet): raised unlogged.
+  Each attempt is bounded by `config.block_timeout` (`deadline`)."""
   waits = config.waits()
   attempt = 1
   while True:
     try:
-      return action()
+      with deadline(config.block_timeout, what):
+        return action()
     except expected:
       raise
     except Exception as error:
