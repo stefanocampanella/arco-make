@@ -53,7 +53,7 @@ STREAM_TIMEOUT = 5
 # opened to read (`open_repository`): an upload's answer begins once its body is sent, so a read
 # timeout cut every try of a 1.6 GB shard (logbook, 21 Nov). Repositories opened to write (their
 # runs read too) bound each attempt instead, long enough for any upload of a shard. They apply
-# only to a storage that has served no request yet (see `_config`).
+# only to a storage that has served no request yet (see `_settings`).
 CONNECT_TIMEOUT_MS = 10_000
 READ_TIMEOUT_MS = 5_000
 WRITE_ATTEMPT_TIMEOUT_MS = 600_000
@@ -200,18 +200,18 @@ def storage(
   )
 
 
-def _config(write: bool) -> icechunk.RepositoryConfig:
+def _settings(write: bool) -> icechunk.StorageSettings:
   """Requests tried `MAX_TRIES` times, each try bounded: to read, by `CONNECT_TIMEOUT_MS` and
   `READ_TIMEOUT_MS`; to write, by `CONNECT_TIMEOUT_MS` and `WRITE_ATTEMPT_TIMEOUT_MS` (a read
   timeout would cut uploads).
 
   Icechunk (2.3.1) builds a storage's S3 client at its first request and keeps it, with that
-  request's settings: a storage asked `Repository.exists` (icechunk's defaults) and then opened
-  with these settings, or a repository reopened with others (`Repository.reopen`), keeps the
-  first ones. Every opening therefore gets a storage of its own (`storage` again: the bucket's
-  region is asked once). On 26-28 Nov 2026 a production download wrote with the defaults (a
-  3.1 s connect timeout, no bound on an attempt): an upload left unanswered held it for 3 h
-  (logbook, 28 Nov)."""
+  request's settings: a storage asked `Repository.exists` without settings (icechunk's
+  defaults) and then opened with these, or a repository reopened with others
+  (`Repository.reopen`), keeps the first ones. Every opening therefore gets a storage of its
+  own (`storage` again: the bucket's region is asked once), and `exists` these settings. On
+  26-28 Nov 2026 a production download wrote with the defaults (a 3.1 s connect timeout, no bound
+  on an attempt): an upload left unanswered most likely held it for 3 h (logbook, 28 Nov)."""
   if write:
     timeouts = icechunk.StorageTimeoutSettings(
       connect_timeout_ms=CONNECT_TIMEOUT_MS, operation_attempt_timeout_ms=WRITE_ATTEMPT_TIMEOUT_MS
@@ -221,16 +221,18 @@ def _config(write: bool) -> icechunk.RepositoryConfig:
       connect_timeout_ms=CONNECT_TIMEOUT_MS, read_timeout_ms=READ_TIMEOUT_MS
     )
   retries = icechunk.StorageRetriesSettings(max_tries=MAX_TRIES)
-  return icechunk.RepositoryConfig(
-    storage=icechunk.StorageSettings(timeouts=timeouts, retries=retries)
-  )
+  return icechunk.StorageSettings(timeouts=timeouts, retries=retries)
+
+
+def _config(write: bool) -> icechunk.RepositoryConfig:
+  return icechunk.RepositoryConfig(storage=_settings(write))
 
 
 def open_repository(
   repository_storage: icechunk.Storage, *, create: bool = False
 ) -> icechunk.Repository:
   """The repository at `repository_storage`, opened to read, or with `create` to write (created
-  if there is none); see `_config` for the bounds of its requests."""
+  if there is none); see `_settings` for the bounds of its requests."""
   if create:
     return icechunk.Repository.open_or_create(repository_storage, config=_config(write=True))
   return icechunk.Repository.open(repository_storage, config=_config(write=False))
@@ -241,8 +243,9 @@ def existing_repository(
 ) -> icechunk.Repository | None:
   """The repository at `path`, opened to read, or `None` if there is none: one opening for the
   checks a command makes before writing (`check_destination`, `main_tip`, `waiting_run`). The
-  question and the opening use storages of their own (see `_config`)."""
-  if not icechunk.Repository.exists(storage(path, storage_options)):
+  question and the opening use storages of their own, the question the read settings (see
+  `_settings`)."""
+  if not icechunk.Repository.exists(storage(path, storage_options), _settings(write=False)):
     return None
   return open_repository(storage(path, storage_options))
 
@@ -251,7 +254,7 @@ def is_repository(
   path: str | pathlib.Path, storage_options: Mapping[str, Any] | None = None
 ) -> bool:
   """Whether `path` holds an Icechunk repository."""
-  return icechunk.Repository.exists(storage(path, storage_options))
+  return icechunk.Repository.exists(storage(path, storage_options), _settings(write=False))
 
 
 def has_no_version(repo: icechunk.Repository) -> bool:

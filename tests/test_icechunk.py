@@ -409,27 +409,44 @@ def test_a_run_writes_with_the_write_settings(served, monkeypatch):
   assert len(served.held) == 3  # MAX_TRIES
 
 
+def test_the_existence_check_has_the_read_settings(served, monkeypatch):
+  """`Repository.exists` without settings asks with icechunk's defaults (no read timeout: a
+  stalled endpoint held it forever): it gets the read settings."""
+  import threading
+
+  monkeypatch.setattr(icechunk_utils, "READ_TIMEOUT_MS", 300)
+  monkeypatch.setattr(icechunk_utils, "MAX_TRIES", 2)
+  served.stall.set()
+  outcome = ["still waiting"]
+
+  def check():
+    try:
+      icechunk_utils.existing_repository("s3://b/p")
+      outcome[0] = "answered"
+    except icechunk.IcechunkError as exc:
+      outcome[0] = str(exc)
+
+  checking = threading.Thread(target=check, daemon=True)
+  checking.start()
+  checking.join(20)
+  assert "read timeout" in outcome[0]
+
+
 @pytest.mark.xfail(
   strict=True,
-  reason="icechunk 2.3.1 builds a storage's client at its first request, with that request's"
-  " settings, and keeps it: hence a storage per opening (`icechunk_utils._config`)",
+  reason="icechunk 2.3.1 keeps a storage's client, built at its first request with that request's"
+  " settings, when a repository is reopened with others: hence a storage per opening"
+  " (`icechunk_utils._settings`)",
 )
-@pytest.mark.parametrize("first", ["exists", "reopen"])
-def test_icechunk_applies_the_settings_of_each_opening(served, first: str):
-  """Pins icechunk's behaviour: should it apply each opening's settings, this fails (XPASS)."""
+def test_icechunk_applies_the_settings_of_a_reopening(served):
+  """Pins icechunk's behaviour: should `reopen` apply its settings, this fails (XPASS)."""
   settings = icechunk.StorageSettings(
     timeouts=icechunk.StorageTimeoutSettings(operation_attempt_timeout_ms=300),
     retries=icechunk.StorageRetriesSettings(max_tries=1),
   )
-  config = icechunk.RepositoryConfig(storage=settings)
-  storage = served.storage()
-  if first == "exists":
-    assert icechunk.Repository.exists(storage)
-    repo = icechunk.Repository.open(storage, config=config)
-  else:
-    slow = icechunk.StorageSettings(
-      timeouts=icechunk.StorageTimeoutSettings(read_timeout_ms=60_000)
-    )
-    opened = icechunk.Repository.open(storage, config=icechunk.RepositoryConfig(storage=slow))
-    repo = opened.reopen(config=config)
+  slow = icechunk.StorageSettings(timeouts=icechunk.StorageTimeoutSettings(read_timeout_ms=60_000))
+  opened = icechunk.Repository.open(
+    served.storage(), config=icechunk.RepositoryConfig(storage=slow)
+  )
+  repo = opened.reopen(config=icechunk.RepositoryConfig(storage=settings))
   assert "operation attempt timeout" in stalled_read(served, repo, wait=5)

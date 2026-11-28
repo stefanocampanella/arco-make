@@ -1764,9 +1764,10 @@ too. So the run wrote with the defaults: a 3.1 s connect timeout, no bound on an
 after 2 s and 2 requests; asked `exists` first, it waits forever; opened to read and reopened
 with a 300 ms attempt timeout and 4 tries, it keeps the read settings (2 tries of 1 s). Fixed:
 every opening gets a storage of its own, and a run opens the repository to write itself instead
-of reopening the checked one (one opening more per command: a few small reads). Two tests pin
-icechunk's behaviour (`xfail(strict=True)`): an icechunk that applies each opening's settings
-makes them pass, and the storage per opening can then go.
+of reopening the checked one (one opening more per command: a few small reads). `exists` takes
+the settings of its request (`storage_settings`, documented): it gets the read settings, else
+the check before any block still asked with the defaults. A test pins `reopen`'s behaviour
+(`xfail(strict=True)`): an icechunk that applies a reopening's settings makes it pass.
 
 **A storage error ended the run instead of the block.** Failures 2 and 3 were logged "(not
 transient: no retry)": `is_transient` knows Python's network errors and those of requests,
