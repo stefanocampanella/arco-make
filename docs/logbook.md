@@ -1734,3 +1734,36 @@ ERA5's `long_name`, `short_name` and `units`, CF standard names (`eastward_wind`
 deg). **[Moby-Dick]** In the published dataset, read `ssrd` as a daily total in J m-2 whatever
 its standard name; `tp` and `dis24_outlets` are both metres of water per day over the cell.
 
+
+### 28 Nov: the production download's failures — icechunk's settings, its errors, a deadline
+
+The 0.25 deg historical download of ARCO-OCEAN (image 0.2.0, started 26 Nov, 32-day blocks of
+about 13 min) failed three times in two days, each time a block before its commit; nothing
+committed was lost, and `--resume` continues.
+
+1. **27 Nov, a hang of 3 h.** Writing a block, the process went idle (every thread waiting, no
+   CPU, nothing read) for 3 h 20 min, until killed. Its one S3 connection had sent its data, all
+   acknowledged, and received nothing since: most likely an upload whose answer never came.
+   `WRITE_ATTEMPT_TIMEOUT_MS` (600 s) should have cut it. No Python stack: py-spy crashed on the
+   process (inside the image).
+2. **28 Nov 06:33, connection reset by peer** connecting to S3 to write a shard
+   (`icechunk.StorageError: ... dispatch failure: io error: client error (Connect)`).
+3. **28 Nov 07:44, "HTTP connect timeout occurred after 3.1s"**, the same, after 4 blocks.
+
+Six network errors in two days in all (the others on Copernicus Marine reads, retried by its
+toolbox): blips that should cost a retry, not a run.
+
+**The timeouts and retries of `_config` never applied.** 3.1 s is the AWS SDK's default connect
+timeout, not `CONNECT_TIMEOUT_MS`. Icechunk 2.3.1 builds a storage's S3 client at its first
+request, with that request's settings, and keeps it. `existing_repository` asked
+`Repository.exists` (icechunk's defaults) and opened the repository on the same storage; `Run`
+reopened that repository with the write settings (`Repository.reopen`), which keeps the client
+too. So the run wrote with the defaults: a 3.1 s connect timeout, no bound on an attempt
+(failure 1), the default retries. Measured against a local endpoint that stops answering
+(`tests/test_icechunk.py`): a fresh storage opened with a 1 s read timeout and 2 tries fails
+after 2 s and 2 requests; asked `exists` first, it waits forever; opened to read and reopened
+with a 300 ms attempt timeout and 4 tries, it keeps the read settings (2 tries of 1 s). Fixed:
+every opening gets a storage of its own, and a run opens the repository to write itself instead
+of reopening the checked one (one opening more per command: a few small reads). Two tests pin
+icechunk's behaviour (`xfail(strict=True)`): an icechunk that applies each opening's settings
+makes them pass, and the storage per opening can then go.

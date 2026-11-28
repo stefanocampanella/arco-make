@@ -296,3 +296,140 @@ def test_requests_waiting_for_an_answer_are_retried_then_fail(monkeypatch, creat
   server.close()
   assert outcome and "timeout" in str(outcome[0])
   assert len(held) > 1  # retried
+
+
+class ServedRepository:
+  """An S3 endpoint serving, to GET requests, a repository made on local disk; once `stall` is
+  set, it accepts requests and never answers them (`held`). Enough for icechunk to check, open
+  and read the repository."""
+
+  def __init__(self, root: pathlib.Path):
+    import hashlib
+    import http.server
+    import threading
+
+    icechunk.Repository.create(icechunk.local_filesystem_storage(str(root)))
+    self.stall, self.closing, self.held = threading.Event(), threading.Event(), []
+    served = self
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+      protocol_version = "HTTP/1.1"
+
+      def do_GET(self):  # noqa: N802 (http.server's name)
+        if served.stall.is_set():
+          served.held.append(self.path)
+          served.closing.wait()
+          return
+        file = root / self.path.split("?")[0].removeprefix("/b/p/")
+        body = file.read_bytes() if file.is_file() else b""
+        self.send_response(200 if file.is_file() else 404)
+        self.send_header("ETag", f'"{hashlib.md5(body).hexdigest()}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+      def log_message(self, *args):
+        pass
+
+    self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    self.server.daemon_threads = True
+    threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+  def storage(self, path=None, storage_options=None) -> icechunk.Storage:
+    """A new storage of the endpoint (`icechunk_utils.storage`'s signature)."""
+    return icechunk.s3_storage(
+      bucket="b",
+      prefix="p",
+      region="us-east-1",
+      endpoint_url=f"http://127.0.0.1:{self.server.server_port}",
+      allow_http=True,
+      access_key_id="x",
+      secret_access_key="y",
+    )
+
+  def close(self):
+    self.closing.set()
+    self.server.shutdown()
+    self.server.server_close()
+
+
+@pytest.fixture
+def served(tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch):
+  repository = ServedRepository(tmp_path / "repository")
+  monkeypatch.setattr(icechunk_utils, "storage", repository.storage)
+  yield repository
+  repository.close()
+
+
+def stalled_read(served: ServedRepository, repo: icechunk.Repository, wait: float = 20) -> str:
+  """What a read of `repo` raises once the endpoint stalls ("still waiting" after `wait` s)."""
+  import threading
+
+  served.stall.set()
+  outcome = ["still waiting"]
+
+  def read():
+    try:
+      repo.lookup_branch("main")
+      outcome[0] = "answered"
+    except icechunk.IcechunkError as exc:
+      outcome[0] = str(exc)
+
+  reading = threading.Thread(target=read, daemon=True)
+  reading.start()
+  reading.join(wait)
+  return outcome[0]
+
+
+def test_a_checked_repository_reads_with_the_read_settings(served, monkeypatch):
+  """`existing_repository` asks whether a repository exists, then opens it: on one storage, the
+  opening kept icechunk's defaults (the client is built at the first request, with its settings),
+  and a read the endpoint never answered waited forever."""
+  monkeypatch.setattr(icechunk_utils, "READ_TIMEOUT_MS", 300)
+  monkeypatch.setattr(icechunk_utils, "MAX_TRIES", 2)
+  repo = icechunk_utils.existing_repository("s3://b/p")
+  assert repo is not None
+  assert "read timeout" in stalled_read(served, repo)
+  assert len(served.held) == 2  # MAX_TRIES
+
+
+def test_a_run_writes_with_the_write_settings(served, monkeypatch):
+  """A run opens the repository to write on a storage of its own: a repository opened to read
+  and reopened kept the read settings (a read timeout cuts uploads of large shards), and one asked
+  whether it exists first kept icechunk's defaults (no bound on an attempt: an upload left
+  unanswered held a production download for 3 h, logbook 28 Nov)."""
+  monkeypatch.setattr(icechunk_utils, "READ_TIMEOUT_MS", 60_000)
+  monkeypatch.setattr(icechunk_utils, "WRITE_ATTEMPT_TIMEOUT_MS", 300)
+  monkeypatch.setattr(icechunk_utils, "MAX_TRIES", 3)
+  checked = icechunk_utils.existing_repository("s3://b/p")  # as `download` checks first
+  assert checked is not None
+  waiting = icechunk_utils.WaitingRun("l", "download", "main", "x", (), None, True)
+  run = icechunk_utils.Run("s3://b/p", None, "l", waiting=waiting)
+  assert "operation attempt timeout" in stalled_read(served, run.repo)
+  assert len(served.held) == 3  # MAX_TRIES
+
+
+@pytest.mark.xfail(
+  strict=True,
+  reason="icechunk 2.3.1 builds a storage's client at its first request, with that request's"
+  " settings, and keeps it: hence a storage per opening (`icechunk_utils._config`)",
+)
+@pytest.mark.parametrize("first", ["exists", "reopen"])
+def test_icechunk_applies_the_settings_of_each_opening(served, first: str):
+  """Pins icechunk's behaviour: should it apply each opening's settings, this fails (XPASS)."""
+  settings = icechunk.StorageSettings(
+    timeouts=icechunk.StorageTimeoutSettings(operation_attempt_timeout_ms=300),
+    retries=icechunk.StorageRetriesSettings(max_tries=1),
+  )
+  config = icechunk.RepositoryConfig(storage=settings)
+  storage = served.storage()
+  if first == "exists":
+    assert icechunk.Repository.exists(storage)
+    repo = icechunk.Repository.open(storage, config=config)
+  else:
+    slow = icechunk.StorageSettings(
+      timeouts=icechunk.StorageTimeoutSettings(read_timeout_ms=60_000)
+    )
+    opened = icechunk.Repository.open(storage, config=icechunk.RepositoryConfig(storage=slow))
+    repo = opened.reopen(config=config)
+  assert "operation attempt timeout" in stalled_read(served, repo, wait=5)

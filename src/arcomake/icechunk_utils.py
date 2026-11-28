@@ -52,7 +52,8 @@ STREAM_TIMEOUT = 5
 # for an answer, and one to a server that never answers waits forever. Only for repositories
 # opened to read (`open_repository`): an upload's answer begins once its body is sent, so a read
 # timeout cut every try of a 1.6 GB shard (logbook, 21 Nov). Repositories opened to write (their
-# runs read too) bound each attempt instead, long enough for any upload of a shard.
+# runs read too) bound each attempt instead, long enough for any upload of a shard. They apply
+# only to a storage that has served no request yet (see `_config`).
 CONNECT_TIMEOUT_MS = 10_000
 READ_TIMEOUT_MS = 5_000
 WRITE_ATTEMPT_TIMEOUT_MS = 600_000
@@ -202,7 +203,15 @@ def storage(
 def _config(write: bool) -> icechunk.RepositoryConfig:
   """Requests tried `MAX_TRIES` times, each try bounded: to read, by `CONNECT_TIMEOUT_MS` and
   `READ_TIMEOUT_MS`; to write, by `CONNECT_TIMEOUT_MS` and `WRITE_ATTEMPT_TIMEOUT_MS` (a read
-  timeout would cut uploads)."""
+  timeout would cut uploads).
+
+  Icechunk (2.3.1) builds a storage's S3 client at its first request and keeps it, with that
+  request's settings: a storage asked `Repository.exists` (icechunk's defaults) and then opened
+  with these settings, or a repository reopened with others (`Repository.reopen`), keeps the
+  first ones. Every opening therefore gets a storage of its own (`storage` again: the bucket's
+  region is asked once). On 26-28 Nov 2026 a production download wrote with the defaults (a
+  3.1 s connect timeout, no bound on an attempt): an upload left unanswered held it for 3 h
+  (logbook, 28 Nov)."""
   if write:
     timeouts = icechunk.StorageTimeoutSettings(
       connect_timeout_ms=CONNECT_TIMEOUT_MS, operation_attempt_timeout_ms=WRITE_ATTEMPT_TIMEOUT_MS
@@ -231,12 +240,11 @@ def existing_repository(
   path: str | pathlib.Path, storage_options: Mapping[str, Any] | None = None
 ) -> icechunk.Repository | None:
   """The repository at `path`, opened to read, or `None` if there is none: one opening for the
-  checks a command makes before writing (`check_destination`, `main_tip`, `waiting_run`), passed
-  on to its `Run`."""
-  repository_storage = storage(path, storage_options)
-  if not icechunk.Repository.exists(repository_storage):
+  checks a command makes before writing (`check_destination`, `main_tip`, `waiting_run`). The
+  question and the opening use storages of their own (see `_config`)."""
+  if not icechunk.Repository.exists(storage(path, storage_options)):
     return None
-  return open_repository(repository_storage)
+  return open_repository(storage(path, storage_options))
 
 
 def is_repository(
@@ -459,19 +467,15 @@ class Run:
     *,
     waiting: "WaitingRun | None" = None,
     recipe: str | None = None,
-    repository: icechunk.Repository | None = None,
   ) -> None:
     """Start a run labelled `label`, or continue `waiting` (a run that failed, see
-    `waiting_run`) on its branch. `recipe`: its fingerprint, in every commit's metadata.
-    `repository`: the repository at `path` if the command opened it already (to check it), taken
-    over to write instead of opened again."""
+    `waiting_run`) on its branch. `recipe`: its fingerprint, in every commit's metadata. The
+    repository is opened to write on a storage of its own, even if the command opened it to
+    check it: a reopened repository keeps the read settings (see `_config`)."""
     self.path = str(path)
     self.recipe = recipe
     provenance.environment()  # what made the output, read when the run starts
-    if repository is not None:
-      self.repo = repository.reopen(config=_config(write=True))
-    else:
-      self.repo = open_repository(storage(path, storage_options), create=True)
+    self.repo = open_repository(storage(path, storage_options), create=True)
     if waiting is not None:
       self.label, self.branch, self.base = waiting.label, waiting.branch, waiting.base
       logger.info(f"Continuing {self.path} on branch {self.branch} (from {self.base})")
