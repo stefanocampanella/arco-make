@@ -19,7 +19,8 @@ does not change, nor does its fingerprint: a download started with 0.2.0 resumes
 - **Icechunk storage errors of the network are transient:** a connection reset, a timeout or a
   throttling answer while writing redoes the block (`[retries]`) instead of failing the run.
 - **`[retries] block_timeout`** (new, none by default) bounds each attempt of a block: past it, the
-  log gets every thread's stack and the process ends with exit status 124; `--resume` continues.
+  every thread's stack goes to standard error and the process ends with exit status 124; `--resume`
+  continues. The existence check of the output asks with arco-make's read settings too.
 
 ## 0.2.0 (2026-11-25)
 

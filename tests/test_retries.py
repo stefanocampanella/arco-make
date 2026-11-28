@@ -314,7 +314,7 @@ def test_a_block_timeout_in_the_recipe():
 @pytest.fixture
 def exits(monkeypatch: pytest.MonkeyPatch) -> list[int]:
   """The exit statuses a deadline ended the process with (it keeps running in tests), and the
-  temporary directories cleaned up first."""
+  temporary directories cleaned up first (0)."""
   statuses: list[int] = []
   monkeypatch.setattr(retries, "_exit", statuses.append)
   monkeypatch.setattr(
@@ -323,17 +323,52 @@ def exits(monkeypatch: pytest.MonkeyPatch) -> list[int]:
   return statuses
 
 
-def test_a_block_past_its_deadline_ends_the_process(exits, caplog):
-  """With every thread's stack in the log (where it waits), the temporary directories cleaned
-  up, and the exit status of a timeout."""
+def test_a_block_past_its_deadline_ends_the_process(exits, caplog, capfd):
+  """Every thread's stack on standard error (where it waits), the reason in the log, the
+  temporary directories cleaned up, the exit status of a timeout."""
   import threading
 
   blocked = threading.Event()
   with retries.deadline(datetime.timedelta(seconds=0.2), "Block [2020-01-01, 2020-02-01)"):
     blocked.wait(2)  # stands for a wait nothing else ends
   assert exits == [0, retries.BLOCK_TIMEOUT_EXIT]
-  assert "Block [2020-01-01, 2020-02-01): not committed after 0:00:00.200000" in caplog.text
-  assert "thread(s)" in caplog.text and "blocked.wait(2)" in caplog.text
+  assert "Block [2020-01-01, 2020-02-01): still running after 0:00:00.200000" in caplog.text
+  stderr = capfd.readouterr().err
+  assert "thread(s)" in stderr and "blocked.wait(2)" in stderr
+
+
+def test_the_process_ends_whatever_fails_or_hangs_before(exits, monkeypatch):
+  """A broken standard stream (the detached run's) or a cleanup stuck on a lock the hung thread
+  holds must not keep the process alive: the exit comes after `TIDY_SECONDS` at most."""
+  import io
+  import threading
+
+  broken = io.StringIO()
+  broken.close()  # flushing it raises
+  monkeypatch.setattr(retries.sys, "stdout", broken)
+  monkeypatch.setattr(retries, "_stacks", lambda: 1 / 0)  # the grouped stacks fail too
+  stuck = threading.Event()
+  monkeypatch.setattr(retries.temporary_utils, "cleanup_all_active_registries", stuck.wait)
+  monkeypatch.setattr(retries, "TIDY_SECONDS", 0.5)
+  with retries.deadline(datetime.timedelta(seconds=0.1), "a block"):
+    threading.Event().wait(1.5)
+  stuck.set()
+  assert exits == [retries.BLOCK_TIMEOUT_EXIT]
+
+
+def test_the_child_processes_end_with_the_process(exits):
+  """Workers of a process-based Dask setup would outlive `os._exit`, holding their memory."""
+  import subprocess
+  import sys as sys_module
+  import time as time_module
+
+  child = subprocess.Popen([sys_module.executable, "-c", "import time; time.sleep(60)"])
+  try:
+    with retries.deadline(datetime.timedelta(seconds=0.1), "a block"):
+      time_module.sleep(1)
+    assert child.wait(timeout=10) != 0  # killed
+  finally:
+    child.kill()
 
 
 def test_a_block_within_its_deadline_or_without_one_goes_on(exits):
@@ -371,5 +406,5 @@ def test_a_download_whose_block_outlasts_the_deadline_ends(
   assert result.exit_code == 0, result.output
   # The slow block (others take well under the timeout, but a loaded machine may stretch them).
   assert exits.count(retries.BLOCK_TIMEOUT_EXIT) >= 1
-  expired = [line for line in result.output.splitlines() if "not committed after 0:00:05" in line]
+  expired = [line for line in result.output.splitlines() if "still running after 0:00:05" in line]
   assert any("2020-02-28" in line for line in expired), result.output

@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import datetime
 import errno
+import faulthandler
 import logging
 import os
 import socket
@@ -181,8 +182,10 @@ def is_transient(error: BaseException) -> bool:
   return False
 
 
-# How the process ends at a deadline (replaced in tests).
+# How the process ends at a deadline (replaced in tests), and how long it may first take to say
+# why and tidy up.
 _exit = os._exit
+TIDY_SECONDS = 60
 
 
 def _stacks() -> str:
@@ -199,16 +202,52 @@ def _stacks() -> str:
   )
 
 
+def _write_stacks(header: str) -> None:
+  """Every thread's stack to standard error's descriptor, taking no lock (a hung thread may hold
+  the logging handler's): grouped, or as `faulthandler` writes them if that fails."""
+  try:
+    data = f"{header}\n{_stacks()}\n".encode()
+    while data:
+      data = data[os.write(2, data) :]
+  except Exception:
+    faulthandler.dump_traceback(file=2, all_threads=True)
+
+
+def _tidy(message: str) -> None:
+  """Say why the process ends, end its child processes (workers of a process-based Dask setup,
+  which `os._exit` would leave running), clean up the temporary directories, and flush the log
+  (`os._exit` flushes nothing). Each step on its own: one failing does not keep the others."""
+  steps = [
+    lambda: logger.error(message),
+    _kill_children,
+    temporary_utils.cleanup_all_active_registries,
+    *(stream.flush for stream in (*logging.getLogger().handlers, sys.stdout, sys.stderr)),
+  ]
+  for step in steps:
+    with contextlib.suppress(Exception):
+      step()
+
+
+def _kill_children() -> None:
+  import psutil
+
+  for child in psutil.Process().children(recursive=True):
+    with contextlib.suppress(psutil.Error):
+      child.kill()
+
+
 @contextlib.contextmanager
 def deadline(timeout: datetime.timedelta | None, what: str) -> Generator[None]:
-  """End the process if the block is still running after `timeout` (none: no limit): log every
-  thread's stack, clean up the temporary directories, exit with `BLOCK_TIMEOUT_EXIT`.
+  """End the process if the block is still running after `timeout` (none: no limit): every
+  thread's stack to standard error, then `_tidy` (at most `TIDY_SECONDS`), then exit with
+  `BLOCK_TIMEOUT_EXIT`, whatever fails or hangs before.
 
   For a wait nothing else ends: a request without a bound, a lock never released (on 27 Nov 2026
   a production download stood idle 3 h in a block, logbook 28 Nov). Exiting is the only sure
   stop: a thread blocked in a library's native code, or on a lock, cannot be interrupted, and a
-  retry in the same process would share whatever holds it. The block is not committed; a run
-  stopped this way resumes with `--resume` (a script that reruns it does so on its own)."""
+  retry in the same process would share whatever holds it. Its commit may have landed just
+  before; if not, `--resume` writes the block again (a script that reruns a failed download
+  does so on its own)."""
   if timeout is None:
     yield
     return
@@ -219,15 +258,17 @@ def deadline(timeout: datetime.timedelta | None, what: str) -> Generator[None]:
     with lock:
       if done:
         return
-      logger.error(
-        f"{what}: not committed after {timeout} ([retries] block_timeout): ending the process"
-        f" (exit status {BLOCK_TIMEOUT_EXIT}); --resume writes it again. Every thread's stack:\n"
-        f"{_stacks()}"
-      )
-      temporary_utils.cleanup_all_active_registries()
-      # `os._exit` flushes nothing: the log (the root logger's handlers) and what was printed.
-      for stream in (*logging.getLogger().handlers, sys.stdout, sys.stderr):
-        stream.flush()
+    message = (
+      f"{what}: still running after {timeout} ([retries] block_timeout): ending the process (exit"
+      f" status {BLOCK_TIMEOUT_EXIT}), every thread's stack on standard error. If its commit did"
+      " not land, --resume writes it again."
+    )
+    try:
+      _write_stacks(message)
+      tidying = threading.Thread(target=_tidy, args=(message,), daemon=True)
+      tidying.start()
+      tidying.join(TIDY_SECONDS)
+    finally:
       _exit(BLOCK_TIMEOUT_EXIT)
 
   timer = threading.Timer(timeout.total_seconds(), expire)

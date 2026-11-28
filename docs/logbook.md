@@ -1786,11 +1786,16 @@ in a new session: its predecessor's chunks were never committed.
 `WRITE_ATTEMPT_TIMEOUT_MS` and retried. But the 3 h hang was not proven to be such an upload (no
 stack), and other waits have no bound of arco-make's: a lock, a library's request without one.
 `[retries] block_timeout` (none by default) bounds each attempt of a block: past it, a timer
-thread logs every thread's Python stack (grouped: most are idle workers), cleans up the temporary
-directories and ends the process with exit status 124. Ending the process is the only sure stop:
+thread writes every thread's Python stack (grouped: most are idle workers) to standard error's
+descriptor, taking no lock (a hung thread may hold the logging handler's); then, within
+`TIDY_SECONDS`, it logs why, kills child processes (a process-based Dask setup's workers would
+outlive the exit, holding their memory), cleans up the temporary directories and flushes the
+streams, each step on its own; and ends the process with exit status 124, in a `finally`, so
+that a broken stream or a stuck lock cannot keep it alive (review of #27). Ending the process is the only sure stop:
 a thread blocked in native code or on a lock cannot be interrupted, a retry in the same process
 would share whatever holds it, and a normal exit joins such threads (SIGTERM did not end the
-hung process). The block is not committed: `--resume` writes it again, as a script that reruns a
+hung process). The block is most likely not committed (its commit may have landed just
+before): `--resume` writes it again if not, as a script that reruns a
 failed download does on its own. `[retries]` is left out of the recipe's fingerprint, so a run
 resumes with a timeout added. A value well above a block's usual time: it counts the sources'
 reads too (ARCO-OCEAN's 0.25 deg blocks take about 13 min, the first one about 30).
