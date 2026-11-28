@@ -105,6 +105,9 @@ ICECHUNK_NETWORK_ERRORS = [
   "object store error request has timed out: operation attempt timeout (single attempt) occurred"
   " after 400ms",
   'object store error service error: unhandled error (SlowDown): Error { code: "SlowDown" }',
+  # A stalled stream (`network_stream_timeout_seconds`), as aws-smithy words it.
+  "object store error minimum throughput was specified at 1 B/s, but throughput of 0 B/s was"
+  " observed",
 ]
 
 
@@ -125,6 +128,21 @@ def test_icechunk_errors_that_would_recur():
   assert not is_transient(icechunk.StorageError(denied))
   assert not is_transient(icechunk.StorageError("storage error: Object should have an etag"))
   assert not is_transient(icechunk.ConflictError("dispatch failure"))  # not a storage error
+  # Only the error chain is read: the context icechunk appends holds names and arguments.
+  context = f'{denied}\n\ncontext:\n   0: icechunk::store::set\n           with key="timeout"'
+  assert not is_transient(icechunk.StorageError(context))
+  # An answer that does not parse would recur.
+  assert not is_transient(icechunk.StorageError("object store error response error: unparseable"))
+
+
+def test_icechunk_kinds_of_the_network_are_transient():
+  """Icechunk's own throttling error, whatever its message; and I/O errors."""
+  import icechunk
+
+  throttled = icechunk.StorageError("storage throttled the request: x", "throttled")
+  assert is_transient(throttled)
+  assert is_transient(icechunk.StorageError("anything", "io"))
+  assert not is_transient(icechunk.StorageError("anything", "object-store"))
 
 
 def test_an_icechunk_connection_refused_is_transient():

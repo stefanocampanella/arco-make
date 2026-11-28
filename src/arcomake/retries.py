@@ -45,24 +45,37 @@ TRANSIENT_ERRNOS = {
 # early without an error), so read again; a chunk corrupt at the source fails once the attempts
 # are spent. numcodecs raises it as a bare RuntimeError (zarr 2 and 3 alike).
 DECOMPRESSION_ERRORS = ("error during blosc decompression",)
-# Icechunk's storage errors (`icechunk.StorageError`) carry only a message, the chain of the Rust
-# errors: worth another try are those of the network (the request not sent or not answered:
-# "dispatch failure", a connection refused or reset, any timeout; an answer cut short), and S3's
-# answers asking to try again. Others (access denied, a missing object, a malformed answer)
-# would recur. Icechunk retries a request first (`icechunk_utils.MAX_TRIES`): such an error is a
-# network failure that outlasted them, or a connect timeout of its defaults (logbook, 28 Nov).
+# Icechunk's storage errors (`icechunk.StorageError`) carry a message, the chain of the Rust
+# errors, and a `kind`, which tells a network failure from a refusal only for throttling and
+# I/O ("object-store" covers a connection reset and an access denied alike). Worth another try:
+# those kinds, and messages naming a failure of the network (a request not sent or not
+# answered, "dispatch failure"; an I/O error; any timeout, the stream's minimum throughput
+# included; a connection closed) or one of S3's answers asking to try again. Others (access
+# denied, a missing object, an answer that does not parse) would recur. Only the error chain is
+# read, not the context icechunk appends (names and arguments). Icechunk retries a request first
+# (`icechunk_utils.MAX_TRIES`): such an error is a failure that outlasted them (logbook, 28 Nov).
+ICECHUNK_TRANSIENT_KINDS = {"throttled", "io"}
 ICECHUNK_TRANSIENT = (
   "dispatch failure",
+  "io error",
   "timed out",
   "timeout",
-  "response error",
+  "throughput",
   "connection closed",
+  "throttled",
   "SlowDown",
   "ServiceUnavailable",
   "InternalError",
   "RequestTimeout",
   "Throttling",
 )
+
+
+def _icechunk_transient(error: BaseException) -> bool:
+  if getattr(error, "kind", None) in ICECHUNK_TRANSIENT_KINDS:
+    return True
+  chain = str(error).split("\ncontext:", 1)[0]
+  return any(text in chain for text in ICECHUNK_TRANSIENT)
 
 
 # Exit status of a download whose block outlasted `[retries] block_timeout` (as coreutils'
@@ -161,7 +174,7 @@ def is_transient(error: BaseException) -> bool:
       "botocore.exceptions.ConnectTimeoutError",
     ):
       return True
-    if name == "icechunk.StorageError" and any(text in str(cause) for text in ICECHUNK_TRANSIENT):
+    if name == "icechunk.StorageError" and _icechunk_transient(cause):
       return True
     if _status(cause) in TRANSIENT_STATUSES:
       return True

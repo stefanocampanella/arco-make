@@ -1773,10 +1773,13 @@ the check before any block still asked with the defaults. A test pins `reopen`'s
 transient: no retry)": `is_transient` knows Python's network errors and those of requests,
 aiohttp and botocore, but `icechunk.StorageError` carries only its message, so the recipe's
 `[retries]` (6 attempts at 2 min there) never ran, and `download.sh` used its own attempts, a
-whole run each. Storage errors of the network are now transient, read from the message
-(`retries.ICECHUNK_TRANSIENT`: "dispatch failure" for a request not sent or not answered, any
-timeout, an answer cut short, S3's SlowDown and the like); others (access denied, a missing
-object, a malformed answer) stop the run as before. A block redone after a storage error writes
+whole run each. Storage errors of the network are now transient: those of `kind` `throttled`
+or `io`, and those whose error chain (the context icechunk appends, names and arguments, left
+out) names one (`retries.ICECHUNK_TRANSIENT`: "dispatch failure" for a request not sent or not
+answered, an I/O error, any timeout, the stream's minimum throughput, a connection closed, S3's
+SlowDown and the like). `kind` alone does not tell: `object-store` covers a connection reset and
+an access denied alike. Others (access denied, a missing object, an answer that does not parse)
+stop the run as before. A block redone after a storage error writes
 in a new session: its predecessor's chunks were never committed.
 
 **A deadline per block.** With the settings applied, an upload left unanswered is cut after
