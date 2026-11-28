@@ -169,9 +169,13 @@ def test_access_and_retention_do_not_change_the_fingerprint(recipe):
   assert download_module.recipe_fingerprint(sources) == download_module.recipe_fingerprint(configs)
 
 
-def test_an_extension_opens_the_output_once(recipe, tmp_path, monkeypatch):
-  """Its checks (the tip of `main`, a failed run waiting, the destination) and its run share one
-  opening of the repository: each opening reads its configuration and references again."""
+def test_an_extension_opens_the_output_once_to_check_and_once_to_write(
+  recipe, tmp_path, monkeypatch
+):
+  """Its checks (the tip of `main`, a failed run waiting, the destination) share one opening of
+  the repository (each opening reads its configuration and references again; there were four);
+  its run opens it to write, on a storage of its own: a reopened repository keeps the settings it
+  was opened with (logbook, 28 Nov)."""
   output = tmp_path / "out"
   assert run(recipe, output, f"--start={START}", f"--end={MIDDLE}").exit_code == 0
   opened = []
@@ -185,7 +189,7 @@ def test_an_extension_opens_the_output_once(recipe, tmp_path, monkeypatch):
     monkeypatch.setattr(icechunk.Repository, name, counting)
   extended = run(recipe, output, "--extend", f"--end={END}")
   assert extended.exit_code == 0, extended.output
-  assert opened == ["open"]
+  assert opened == ["open", "open_or_create"]
 
 
 def test_an_extension_refuses_a_main_that_moved_meanwhile(recipe, tmp_path, monkeypatch):

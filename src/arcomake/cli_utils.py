@@ -94,7 +94,7 @@ def check_destination(
   # Fail before any work: a destination Icechunk cannot use (path, storage options, unknown S3
   # region) or cannot reach would fail at the first write, or be overwritten.
   try:
-    storage = icechunk_utils.storage(path, storage_options)
+    icechunk_utils.storage(path, storage_options)  # unusable paths and options fail here
     fs, fs_path = fsspec.url_to_fs(path, **icechunk_utils.fsspec_options(path, storage_options))
     exists = fs.exists(fs_path)
   except Exception as exc:
@@ -104,8 +104,8 @@ def check_destination(
     return
   # Outputs are Icechunk repositories, replaced by a new version: anything else is left alone.
   try:
-    if repository is None and icechunk.Repository.exists(storage):
-      repository = icechunk_utils.open_repository(storage)
+    if repository is None:
+      repository = icechunk_utils.existing_repository(path, storage_options)
     # A repository whose `main` is still its first snapshot holds no version yet: a first run
     # failed there (its branch may hold what it wrote), and a retry needs no --replace.
     unwritten = repository is not None and icechunk_utils.has_no_version(repository)

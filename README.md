@@ -157,9 +157,13 @@ On GCS, a stalled answer is requested again by gcsfs (6 attempts): GCS answers s
 minutes. gcsfs's own `requests_timeout` is refused in a part's storage options (it bounds a whole
 request and gcsfs does not retry it): set `timeout`. Copernicus Marine parts and Icechunk inputs rely
 on their own timeouts. A block that fails with a transient error (a timeout, a dropped connection, a server
-or throttling answer) is redone, after a wait that doubles each time: `[retries] attempts = 5`, `wait =
+or throttling answer, from a source or from the output's storage) is redone, after a wait that doubles each time: `[retries] attempts = 5`, `wait =
 "1min"`, `max_wait = "30min"` by default. Other errors (a recipe or data error) stop the run at once; the
-log says which kind it was.
+log says which kind it was. `[retries] block_timeout` (e.g. `"1h"`; none by default) bounds each attempt
+of a block, for a wait nothing else ends: past it, every thread's stack goes to standard error, child
+processes are ended, and the process ends with exit status 124 (`--resume` writes the block again if its
+commit did not land). Set it well above a
+block's usual time: it counts reading the sources too.
 
 A download that fails leaves `main` as it was and its committed blocks on its branch: rerun it with
 `--resume` (same recipe and `--start`) to write only the missing blocks. Each block's commit

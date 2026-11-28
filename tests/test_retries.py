@@ -95,6 +95,81 @@ def test_botocore_errors():
   assert is_transient(slow_down) and not is_transient(denied)
 
 
+# What icechunk raised in a production download (logbook, 28 Nov), and for a stalled endpoint.
+ICECHUNK_NETWORK_ERRORS = [
+  "object store error dispatch failure: io error: client error (Connect): Connection reset by"
+  " peer (os error 104)",
+  "object store error dispatch failure: timeout: client error (Connect): HTTP connect timeout"
+  " occurred after 3.1s: timed out",
+  "object store error dispatch failure: timeout: HTTP read timeout occurred after 300ms: timed out",
+  "object store error request has timed out: operation attempt timeout (single attempt) occurred"
+  " after 400ms",
+  'object store error service error: unhandled error (SlowDown): Error { code: "SlowDown" }',
+  # A stalled stream (`network_stream_timeout_seconds`), as aws-smithy words it.
+  "object store error minimum throughput was specified at 1 B/s, but throughput of 0 B/s was"
+  " observed",
+]
+
+
+@pytest.mark.parametrize("message", ICECHUNK_NETWORK_ERRORS)
+def test_icechunk_network_errors_are_transient(message):
+  """Icechunk's storage errors carry only their message: a network failure that outlasted its
+  own retries redoes the block (it failed the whole run, logbook 28 Nov)."""
+  import icechunk
+
+  assert is_transient(icechunk.StorageError(message))
+  assert is_transient(raised_from(ValueError("dask task failed"), icechunk.StorageError(message)))
+
+
+def test_icechunk_errors_that_would_recur():
+  import icechunk
+
+  denied = "object store error service error: unhandled error (AccessDenied): Error { code: x }"
+  assert not is_transient(icechunk.StorageError(denied))
+  assert not is_transient(icechunk.StorageError("storage error: Object should have an etag"))
+  assert not is_transient(icechunk.ConflictError("dispatch failure"))  # not a storage error
+  # Only the error chain is read: the context icechunk appends holds names and arguments.
+  context = f'{denied}\n\ncontext:\n   0: icechunk::store::set\n           with key="timeout"'
+  assert not is_transient(icechunk.StorageError(context))
+  # An answer that does not parse would recur.
+  assert not is_transient(icechunk.StorageError("object store error response error: unparseable"))
+
+
+def test_icechunk_kinds_of_the_network_are_transient():
+  """Icechunk's own throttling error, whatever its message; and I/O errors."""
+  import icechunk
+
+  throttled = icechunk.StorageError("storage throttled the request: x", "throttled")
+  assert is_transient(throttled)
+  assert is_transient(icechunk.StorageError("anything", "io"))
+  assert not is_transient(icechunk.StorageError("anything", "object-store"))
+
+
+def test_an_icechunk_connection_refused_is_transient():
+  """As icechunk raises it (one try, to a port nobody listens on)."""
+  import socket
+
+  import icechunk
+
+  with socket.socket() as probe:
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+  storage = icechunk.s3_storage(
+    bucket="b",
+    prefix="p",
+    region="us-east-1",
+    endpoint_url=f"http://127.0.0.1:{port}",
+    allow_http=True,
+    access_key_id="x",
+    secret_access_key="y",
+  )
+  retries = icechunk.StorageRetriesSettings(max_tries=1)
+  config = icechunk.RepositoryConfig(storage=icechunk.StorageSettings(retries=retries))
+  with pytest.raises(icechunk.StorageError) as raised:
+    icechunk.Repository.open(storage, config=config)
+  assert is_transient(raised.value)
+
+
 def test_waits_grow_up_to_the_limit():
   config = RetryConfig(attempts=6, wait="1min", max_wait="5min")  # type: ignore[arg-type]
   assert [w.total_seconds() / 60 for w in config.waits()] == [1, 2, 4, 5, 5]
@@ -145,10 +220,21 @@ def test_retries_in_the_recipe():
     RetryConfig.model_validate({"tries": 3})
 
 
+@pytest.mark.parametrize(
+  "error",
+  [
+    TimeoutError("simulated GCS read timeout"),
+    pytest.param(ICECHUNK_NETWORK_ERRORS[0], id="icechunk-reset"),
+  ],
+)
 def test_a_block_failing_once_is_redone(
-  tmp_path: pathlib.Path, sources: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+  tmp_path: pathlib.Path, sources: pathlib.Path, monkeypatch: pytest.MonkeyPatch, error
 ):
-  """A download whose second block times out once retries it and completes."""
+  """A download whose second block fails once on the network retries it and completes."""
+  import icechunk
+
+  if isinstance(error, str):
+    error = icechunk.StorageError(error)
   download = importlib.import_module("arcomake.download")  # the module, not the command
   real = download.maybe_checkpointing_download_and_process
   failures = []
@@ -156,7 +242,7 @@ def test_a_block_failing_once_is_redone(
   def flaky(configs, start, end, **kwargs):
     if start == datetime.datetime(2020, 2, 28) and not failures:
       failures.append(start)
-      raise TimeoutError("simulated GCS read timeout")
+      raise error
     return real(configs, start, end, **kwargs)
 
   monkeypatch.setattr(download, "maybe_checkpointing_download_and_process", flaky)
@@ -168,7 +254,8 @@ def test_a_block_failing_once_is_redone(
   )
   assert result.exit_code == 0, result.output
   # The command's own log handler writes to its output.
-  assert failures and "TimeoutError: simulated GCS read timeout (transient" in result.output
+  assert failures and f"{type(error).__name__}: {str(error)[:20]}" in result.output
+  assert "(transient: attempt 2/" in result.output
   assert open_output(output).sizes["time"] == 5
 
 
@@ -212,3 +299,112 @@ def test_expected_errors_are_raised_unlogged(caplog: pytest.LogCaptureFixture):
   with caplog.at_level(logging.INFO), pytest.raises(Outcome):
     with_retries(action, RetryConfig(), "block", sleep=lambda s: None, expected=(Outcome,))
   assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_a_block_timeout_in_the_recipe():
+  """Absent by default; a duration; positive. Left out of the fingerprint with `[retries]`: a run
+  resumes with one added."""
+  assert RetryConfig().block_timeout is None
+  config = RetryConfig.model_validate({"block_timeout": "1h"})
+  assert config.block_timeout == datetime.timedelta(hours=1)
+  with pytest.raises(ValidationError):
+    RetryConfig.model_validate({"block_timeout": "0s"})
+
+
+@pytest.fixture
+def exits(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+  """The exit statuses a deadline ended the process with (it keeps running in tests), and the
+  temporary directories cleaned up first (0)."""
+  statuses: list[int] = []
+  monkeypatch.setattr(retries, "_exit", statuses.append)
+  monkeypatch.setattr(
+    retries.temporary_utils, "cleanup_all_active_registries", lambda: statuses.append(0)
+  )
+  return statuses
+
+
+def test_a_block_past_its_deadline_ends_the_process(exits, caplog, capfd):
+  """Every thread's stack on standard error (where it waits), the reason in the log, the
+  temporary directories cleaned up, the exit status of a timeout."""
+  import threading
+
+  blocked = threading.Event()
+  with retries.deadline(datetime.timedelta(seconds=0.2), "Block [2020-01-01, 2020-02-01)"):
+    blocked.wait(2)  # stands for a wait nothing else ends
+  assert exits == [0, retries.BLOCK_TIMEOUT_EXIT]
+  assert "Block [2020-01-01, 2020-02-01): still running after 0:00:00.200000" in caplog.text
+  stderr = capfd.readouterr().err
+  assert "thread(s)" in stderr and "blocked.wait(2)" in stderr
+
+
+def test_the_process_ends_whatever_fails_or_hangs_before(exits, monkeypatch):
+  """A broken standard stream (the detached run's) or a cleanup stuck on a lock the hung thread
+  holds must not keep the process alive: the exit comes after `TIDY_SECONDS` at most."""
+  import io
+  import threading
+
+  broken = io.StringIO()
+  broken.close()  # flushing it raises
+  monkeypatch.setattr(retries.sys, "stdout", broken)
+  monkeypatch.setattr(retries, "_stacks", lambda: 1 / 0)  # the grouped stacks fail too
+  stuck = threading.Event()
+  monkeypatch.setattr(retries.temporary_utils, "cleanup_all_active_registries", stuck.wait)
+  monkeypatch.setattr(retries, "TIDY_SECONDS", 0.5)
+  with retries.deadline(datetime.timedelta(seconds=0.1), "a block"):
+    threading.Event().wait(1.5)
+  stuck.set()
+  assert exits == [retries.BLOCK_TIMEOUT_EXIT]
+
+
+def test_the_child_processes_end_with_the_process(exits):
+  """Workers of a process-based Dask setup would outlive `os._exit`, holding their memory."""
+  import subprocess
+  import sys as sys_module
+  import time as time_module
+
+  child = subprocess.Popen([sys_module.executable, "-c", "import time; time.sleep(60)"])
+  try:
+    with retries.deadline(datetime.timedelta(seconds=0.1), "a block"):
+      time_module.sleep(1)
+    assert child.wait(timeout=10) != 0  # killed
+  finally:
+    child.kill()
+
+
+def test_a_block_within_its_deadline_or_without_one_goes_on(exits):
+  import time as time_module
+
+  with retries.deadline(datetime.timedelta(seconds=0.2), "a block"):
+    pass
+  with retries.deadline(None, "a block"):
+    time_module.sleep(0.3)
+  time_module.sleep(0.3)  # the first timer would have fired by now
+  assert exits == []
+
+
+def test_a_download_whose_block_outlasts_the_deadline_ends(
+  tmp_path: pathlib.Path, sources: pathlib.Path, monkeypatch: pytest.MonkeyPatch, exits
+):
+  """Each attempt of a block has `[retries] block_timeout`: the second block, too slow, ends the
+  process (here it goes on, `_exit` replaced, and completes)."""
+  import time as time_module
+
+  download = importlib.import_module("arcomake.download")  # the module, not the command
+  real = download.maybe_checkpointing_download_and_process
+
+  def slow(configs, start, end, **kwargs):
+    if start == datetime.datetime(2020, 2, 28):
+      time_module.sleep(8)
+    return real(configs, start, end, **kwargs)
+
+  monkeypatch.setattr(download, "maybe_checkpointing_download_and_process", slow)
+  recipe = render_recipe("sample_download.toml", tmp_path, SOURCES=str(sources))
+  recipe.write_text(recipe.read_text() + '\n[retries]\nblock_timeout = "5s"\n')
+  result = CliRunner().invoke(
+    cli, ["download", "--dask-setup", "threads", str(recipe), str(tmp_path / "out")]
+  )
+  assert result.exit_code == 0, result.output
+  # The slow block (others take well under the timeout, but a loaded machine may stretch them).
+  assert exits.count(retries.BLOCK_TIMEOUT_EXIT) >= 1
+  expired = [line for line in result.output.splitlines() if "still running after 0:00:05" in line]
+  assert any("2020-02-28" in line for line in expired), result.output

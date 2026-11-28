@@ -6,6 +6,22 @@ commands and their options, the layout of outputs, and the commit metadata that 
 that break: 1.0.0 will declare it stable, once a production dataset has been made with it. A version that
 changes what an unchanged recipe writes says so here.
 
+## Unreleased
+
+Fixes from the first weeks of a production download (logbook, 28 Nov). What an unchanged recipe writes
+does not change, nor does its fingerprint: a download started with 0.2.0 resumes with this version.
+
+- **Icechunk requests use arco-make's timeouts and retries.** Icechunk keeps the settings of a storage's
+  first request: the output was asked whether it exists, with icechunk's defaults, then opened on the same
+  storage, so every download wrote with a 3.1 s connect timeout and no bound on an attempt (a connect
+  timeout failed a run; an upload left unanswered most likely hung one for 3 h). Each opening now has a
+  storage of its own, and a run opens the repository to write itself.
+- **Icechunk storage errors of the network are transient:** a connection reset, a timeout or a
+  throttling answer while writing redoes the block (`[retries]`) instead of failing the run.
+- **`[retries] block_timeout`** (new, none by default) bounds each attempt of a block: past it, the
+  every thread's stack goes to standard error and the process ends with exit status 124; `--resume`
+  continues. The existence check of the output asks with arco-make's read settings too.
+
 ## 0.2.0 (2026-11-25)
 
 Most of arco-make was rewritten (pull requests #1 to #26; reasons and measurements are in

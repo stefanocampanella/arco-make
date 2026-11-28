@@ -418,7 +418,6 @@ def download(
         icechunk_utils.run_label(EXTEND_COMMAND if extend else DOWNLOAD_COMMAND),
         waiting=waiting if resume else None,
         recipe=recipe,
-        repository=repo,
       )
     except Exception as exc:
       raise click.ClickException(f"Could not start writing {output_path}: {exc}") from exc

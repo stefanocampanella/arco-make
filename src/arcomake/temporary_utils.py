@@ -39,7 +39,7 @@ _ACTIVE_REGISTRIES_LOCK = threading.Lock()
 _SIGNAL_HANDLERS_INSTALLED = False
 
 
-def _cleanup_all_active_registries() -> None:
+def cleanup_all_active_registries() -> None:
   """Clean up all currently active registries on process exit or termination."""
   with _ACTIVE_REGISTRIES_LOCK:
     registries = list(_ACTIVE_REGISTRIES)
@@ -54,7 +54,7 @@ def _cleanup_all_active_registries() -> None:
       logger.warning(f"Error during registry cleanup on process termination: {exc}")
 
 
-atexit.register(_cleanup_all_active_registries)
+atexit.register(cleanup_all_active_registries)
 
 
 def _install_signal_handlers() -> None:
@@ -76,7 +76,7 @@ def _install_signal_handlers() -> None:
 
         def _handler(signum: int, frame: Any, prev: Any = prev_handler) -> None:
           logger.info(f"Received signal {signum}, cleaning up active temporary registries.")
-          _cleanup_all_active_registries()
+          cleanup_all_active_registries()
           if callable(prev):
             prev(signum, frame)
           else:

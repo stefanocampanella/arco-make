@@ -1734,3 +1734,68 @@ ERA5's `long_name`, `short_name` and `units`, CF standard names (`eastward_wind`
 deg). **[Moby-Dick]** In the published dataset, read `ssrd` as a daily total in J m-2 whatever
 its standard name; `tp` and `dis24_outlets` are both metres of water per day over the cell.
 
+
+### 28 Nov: the production download's failures — icechunk's settings, its errors, a deadline
+
+The 0.25 deg historical download of ARCO-OCEAN (image 0.2.0, started 26 Nov, 32-day blocks of
+about 13 min) failed three times in two days, each time a block before its commit; nothing
+committed was lost, and `--resume` continues.
+
+1. **27 Nov, a hang of 3 h.** Writing a block, the process went idle (every thread waiting, no
+   CPU, nothing read) for 3 h 20 min, until killed. Its one S3 connection had sent its data, all
+   acknowledged, and received nothing since: most likely an upload whose answer never came.
+   `WRITE_ATTEMPT_TIMEOUT_MS` (600 s) should have cut it. No Python stack: py-spy crashed on the
+   process (inside the image).
+2. **28 Nov 06:33, connection reset by peer** connecting to S3 to write a shard
+   (`icechunk.StorageError: ... dispatch failure: io error: client error (Connect)`).
+3. **28 Nov 07:44, "HTTP connect timeout occurred after 3.1s"**, the same, after 4 blocks.
+
+Six network errors in two days in all (the others on Copernicus Marine reads, retried by its
+toolbox): blips that should cost a retry, not a run.
+
+**The timeouts and retries of `_config` never applied.** 3.1 s is the AWS SDK's default connect
+timeout, not `CONNECT_TIMEOUT_MS`. Icechunk 2.3.1 builds a storage's S3 client at its first
+request, with that request's settings, and keeps it. `existing_repository` asked
+`Repository.exists` (icechunk's defaults) and opened the repository on the same storage; `Run`
+reopened that repository with the write settings (`Repository.reopen`), which keeps the client
+too. So the run wrote with the defaults: a 3.1 s connect timeout, no bound on an attempt
+(failure 1), the default retries. Measured against a local endpoint that stops answering
+(`tests/test_icechunk.py`): a fresh storage opened with a 1 s read timeout and 2 tries fails
+after 2 s and 2 requests; asked `exists` first, it waits forever; opened to read and reopened
+with a 300 ms attempt timeout and 4 tries, it keeps the read settings (2 tries of 1 s). Fixed:
+every opening gets a storage of its own, and a run opens the repository to write itself instead
+of reopening the checked one (one opening more per command: a few small reads). `exists` takes
+the settings of its request (`storage_settings`, documented): it gets the read settings, else
+the check before any block still asked with the defaults. A test pins `reopen`'s behaviour
+(`xfail(strict=True)`): an icechunk that applies a reopening's settings makes it pass.
+
+**A storage error ended the run instead of the block.** Failures 2 and 3 were logged "(not
+transient: no retry)": `is_transient` knows Python's network errors and those of requests,
+aiohttp and botocore, but `icechunk.StorageError` carries only its message, so the recipe's
+`[retries]` (6 attempts at 2 min there) never ran, and `download.sh` used its own attempts, a
+whole run each. Storage errors of the network are now transient: those of `kind` `throttled`
+or `io`, and those whose error chain (the context icechunk appends, names and arguments, left
+out) names one (`retries.ICECHUNK_TRANSIENT`: "dispatch failure" for a request not sent or not
+answered, an I/O error, any timeout, the stream's minimum throughput, a connection closed, S3's
+SlowDown and the like). `kind` alone does not tell: `object-store` covers a connection reset and
+an access denied alike. Others (access denied, a missing object, an answer that does not parse)
+stop the run as before. A block redone after a storage error writes
+in a new session: its predecessor's chunks were never committed.
+
+**A deadline per block.** With the settings applied, an upload left unanswered is cut after
+`WRITE_ATTEMPT_TIMEOUT_MS` and retried. But the 3 h hang was not proven to be such an upload (no
+stack), and other waits have no bound of arco-make's: a lock, a library's request without one.
+`[retries] block_timeout` (none by default) bounds each attempt of a block: past it, a timer
+thread writes every thread's Python stack (grouped: most are idle workers) to standard error's
+descriptor, taking no lock (a hung thread may hold the logging handler's); then, within
+`TIDY_SECONDS`, it logs why, kills child processes (a process-based Dask setup's workers would
+outlive the exit, holding their memory), cleans up the temporary directories and flushes the
+streams, each step on its own; and ends the process with exit status 124, in a `finally`, so
+that a broken stream or a stuck lock cannot keep it alive (review of #27). Ending the process is the only sure stop:
+a thread blocked in native code or on a lock cannot be interrupted, a retry in the same process
+would share whatever holds it, and a normal exit joins such threads (SIGTERM did not end the
+hung process). The block is most likely not committed (its commit may have landed just
+before): `--resume` writes it again if not, as a script that reruns a
+failed download does on its own. `[retries]` is left out of the recipe's fingerprint, so a run
+resumes with a timeout added. A value well above a block's usual time: it counts the sources'
+reads too (ARCO-OCEAN's 0.25 deg blocks take about 13 min, the first one about 30).
