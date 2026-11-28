@@ -95,6 +95,63 @@ def test_botocore_errors():
   assert is_transient(slow_down) and not is_transient(denied)
 
 
+# What icechunk raised in a production download (logbook, 28 Nov), and for a stalled endpoint.
+ICECHUNK_NETWORK_ERRORS = [
+  "object store error dispatch failure: io error: client error (Connect): Connection reset by"
+  " peer (os error 104)",
+  "object store error dispatch failure: timeout: client error (Connect): HTTP connect timeout"
+  " occurred after 3.1s: timed out",
+  "object store error dispatch failure: timeout: HTTP read timeout occurred after 300ms: timed out",
+  "object store error request has timed out: operation attempt timeout (single attempt) occurred"
+  " after 400ms",
+  'object store error service error: unhandled error (SlowDown): Error { code: "SlowDown" }',
+]
+
+
+@pytest.mark.parametrize("message", ICECHUNK_NETWORK_ERRORS)
+def test_icechunk_network_errors_are_transient(message):
+  """Icechunk's storage errors carry only their message: a network failure that outlasted its
+  own retries redoes the block (it failed the whole run, logbook 28 Nov)."""
+  import icechunk
+
+  assert is_transient(icechunk.StorageError(message))
+  assert is_transient(raised_from(ValueError("dask task failed"), icechunk.StorageError(message)))
+
+
+def test_icechunk_errors_that_would_recur():
+  import icechunk
+
+  denied = "object store error service error: unhandled error (AccessDenied): Error { code: x }"
+  assert not is_transient(icechunk.StorageError(denied))
+  assert not is_transient(icechunk.StorageError("storage error: Object should have an etag"))
+  assert not is_transient(icechunk.ConflictError("dispatch failure"))  # not a storage error
+
+
+def test_an_icechunk_connection_refused_is_transient():
+  """As icechunk raises it (one try, to a port nobody listens on)."""
+  import socket
+
+  import icechunk
+
+  with socket.socket() as probe:
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+  storage = icechunk.s3_storage(
+    bucket="b",
+    prefix="p",
+    region="us-east-1",
+    endpoint_url=f"http://127.0.0.1:{port}",
+    allow_http=True,
+    access_key_id="x",
+    secret_access_key="y",
+  )
+  retries = icechunk.StorageRetriesSettings(max_tries=1)
+  config = icechunk.RepositoryConfig(storage=icechunk.StorageSettings(retries=retries))
+  with pytest.raises(icechunk.StorageError) as raised:
+    icechunk.Repository.open(storage, config=config)
+  assert is_transient(raised.value)
+
+
 def test_waits_grow_up_to_the_limit():
   config = RetryConfig(attempts=6, wait="1min", max_wait="5min")  # type: ignore[arg-type]
   assert [w.total_seconds() / 60 for w in config.waits()] == [1, 2, 4, 5, 5]
@@ -145,10 +202,21 @@ def test_retries_in_the_recipe():
     RetryConfig.model_validate({"tries": 3})
 
 
+@pytest.mark.parametrize(
+  "error",
+  [
+    TimeoutError("simulated GCS read timeout"),
+    pytest.param(ICECHUNK_NETWORK_ERRORS[0], id="icechunk-reset"),
+  ],
+)
 def test_a_block_failing_once_is_redone(
-  tmp_path: pathlib.Path, sources: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+  tmp_path: pathlib.Path, sources: pathlib.Path, monkeypatch: pytest.MonkeyPatch, error
 ):
-  """A download whose second block times out once retries it and completes."""
+  """A download whose second block fails once on the network retries it and completes."""
+  import icechunk
+
+  if isinstance(error, str):
+    error = icechunk.StorageError(error)
   download = importlib.import_module("arcomake.download")  # the module, not the command
   real = download.maybe_checkpointing_download_and_process
   failures = []
@@ -156,7 +224,7 @@ def test_a_block_failing_once_is_redone(
   def flaky(configs, start, end, **kwargs):
     if start == datetime.datetime(2020, 2, 28) and not failures:
       failures.append(start)
-      raise TimeoutError("simulated GCS read timeout")
+      raise error
     return real(configs, start, end, **kwargs)
 
   monkeypatch.setattr(download, "maybe_checkpointing_download_and_process", flaky)
@@ -168,7 +236,8 @@ def test_a_block_failing_once_is_redone(
   )
   assert result.exit_code == 0, result.output
   # The command's own log handler writes to its output.
-  assert failures and "TimeoutError: simulated GCS read timeout (transient" in result.output
+  assert failures and f"{type(error).__name__}: {str(error)[:20]}" in result.output
+  assert "(transient: attempt 2/" in result.output
   assert open_output(output).sizes["time"] == 5
 
 

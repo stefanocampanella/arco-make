@@ -1767,3 +1767,13 @@ every opening gets a storage of its own, and a run opens the repository to write
 of reopening the checked one (one opening more per command: a few small reads). Two tests pin
 icechunk's behaviour (`xfail(strict=True)`): an icechunk that applies each opening's settings
 makes them pass, and the storage per opening can then go.
+
+**A storage error ended the run instead of the block.** Failures 2 and 3 were logged "(not
+transient: no retry)": `is_transient` knows Python's network errors and those of requests,
+aiohttp and botocore, but `icechunk.StorageError` carries only its message, so the recipe's
+`[retries]` (6 attempts at 2 min there) never ran, and `download.sh` used its own attempts, a
+whole run each. Storage errors of the network are now transient, read from the message
+(`retries.ICECHUNK_TRANSIENT`: "dispatch failure" for a request not sent or not answered, any
+timeout, an answer cut short, S3's SlowDown and the like); others (access denied, a missing
+object, a malformed answer) stop the run as before. A block redone after a storage error writes
+in a new session: its predecessor's chunks were never committed.

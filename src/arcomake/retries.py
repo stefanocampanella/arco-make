@@ -39,6 +39,24 @@ TRANSIENT_ERRNOS = {
 # early without an error), so read again; a chunk corrupt at the source fails once the attempts
 # are spent. numcodecs raises it as a bare RuntimeError (zarr 2 and 3 alike).
 DECOMPRESSION_ERRORS = ("error during blosc decompression",)
+# Icechunk's storage errors (`icechunk.StorageError`) carry only a message, the chain of the Rust
+# errors: worth another try are those of the network (the request not sent or not answered:
+# "dispatch failure", a connection refused or reset, any timeout; an answer cut short), and S3's
+# answers asking to try again. Others (access denied, a missing object, a malformed answer)
+# would recur. Icechunk retries a request first (`icechunk_utils.MAX_TRIES`): such an error is a
+# network failure that outlasted them, or a connect timeout of its defaults (logbook, 28 Nov).
+ICECHUNK_TRANSIENT = (
+  "dispatch failure",
+  "timed out",
+  "timeout",
+  "response error",
+  "connection closed",
+  "SlowDown",
+  "ServiceUnavailable",
+  "InternalError",
+  "RequestTimeout",
+  "Throttling",
+)
 
 
 class RetryConfig(BaseModel):
@@ -96,8 +114,8 @@ def _status(error: BaseException) -> int | None:
 
 def is_transient(error: BaseException) -> bool:
   """Whether `error` (or an error it comes from) is worth another try: a timeout, a dropped or
-  refused connection, an HTTP answer of `TRANSIENT_STATUSES`, or a chunk that does not
-  decompress (`DECOMPRESSION_ERRORS`)."""
+  refused connection, an HTTP answer of `TRANSIENT_STATUSES`, a chunk that does not decompress
+  (`DECOMPRESSION_ERRORS`), or an icechunk storage error of the network (`ICECHUNK_TRANSIENT`)."""
   for cause in _causes(error):
     if isinstance(cause, TimeoutError | asyncio.TimeoutError | socket.timeout | ConnectionError):
       return True
@@ -122,6 +140,8 @@ def is_transient(error: BaseException) -> bool:
       "botocore.exceptions.ReadTimeoutError",
       "botocore.exceptions.ConnectTimeoutError",
     ):
+      return True
+    if name == "icechunk.StorageError" and any(text in str(cause) for text in ICECHUNK_TRANSIENT):
       return True
     if _status(cause) in TRANSIENT_STATUSES:
       return True

@@ -157,7 +157,7 @@ On GCS, a stalled answer is requested again by gcsfs (6 attempts): GCS answers s
 minutes. gcsfs's own `requests_timeout` is refused in a part's storage options (it bounds a whole
 request and gcsfs does not retry it): set `timeout`. Copernicus Marine parts and Icechunk inputs rely
 on their own timeouts. A block that fails with a transient error (a timeout, a dropped connection, a server
-or throttling answer) is redone, after a wait that doubles each time: `[retries] attempts = 5`, `wait =
+or throttling answer, from a source or from the output's storage) is redone, after a wait that doubles each time: `[retries] attempts = 5`, `wait =
 "1min"`, `max_wait = "30min"` by default. Other errors (a recipe or data error) stop the run at once; the
 log says which kind it was.
 
